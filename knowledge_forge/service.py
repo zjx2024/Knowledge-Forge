@@ -747,7 +747,7 @@ class KnowledgeForgeService:
                         self._assert_ingestion_active(job_id, document_id)
                         mentions, relations = self.resolver.resolve_chunk(
                             project, document_id, chunk, extraction, int(schema_record["version"]),
-                            session=resolution_session,
+                            session=resolution_session, ingestion_run_id=job_id,
                         )
                     total_mentions += len(mentions); total_relations += len(relations)
                     detail = f"{len(mentions)} 个实体提及，{len(relations)} 条关系"
@@ -863,6 +863,7 @@ class KnowledgeForgeService:
             if not project: raise LookupError("项目不存在")
             documents = [item for item in self.db.list_documents(project_id) if item["status"] == "indexed"]
             self.graph.ensure_schema()
+            self.graph.delete_project(project_id)
             for index, document in enumerate(documents, 1):
                 chunks = self.db.list_document_chunks(int(document["id"]))
                 self.graph.replace_document(project, document, chunks)
@@ -1036,9 +1037,15 @@ class KnowledgeForgeService:
         entities = {int(item["id"]): dict(item) for item in lexical["entities"]}
         for item in self.db.get_entities_by_ids(project_id, list(entity_scores)):
             value = entities.setdefault(int(item["id"]), dict(item)); value["score"] = entity_scores[int(item["id"])]
-        relations = {int(item["id"]): dict(item) for item in lexical["relations"]}
-        for item in self.db.get_relations_by_ids(project_id, list(relation_scores)):
-            value = relations.setdefault(int(item["id"]), dict(item)); value["score"] = relation_scores[int(item["id"])]
+        relation_ids = {
+            *(int(item["id"]) for item in lexical["relations"]),
+            *relation_scores,
+        }
+        relations = {}
+        for item in self.db.get_relations_by_ids(project_id, list(relation_ids)):
+            value = relations.setdefault(int(item["id"]), dict(item))
+            if int(item["id"]) in relation_scores:
+                value["score"] = relation_scores[int(item["id"])]
         return {"query": query, "chunks": self.vectors.search(project, query, top_k),
                 "entities": sorted(entities.values(), key=lambda item: item.get("score", 0), reverse=True)[:limit],
                 "relations": sorted(relations.values(), key=lambda item: item.get("score", item.get("confidence", 0)), reverse=True)[:limit]}

@@ -195,7 +195,7 @@ class HugeGraphStore:
         graph = self.client().graph(); project_id, document_id = int(project["id"]), int(document["id"])
         common = {"kf_project_id": project_id, "kf_project_key": project["project_key"], "kf_doc_id": document_id, "kf_updated_at": self._now()}
         mentions = self.db.list_document_mentions(document_id)
-        relations = self.db.list_document_relations(document_id, publishable_only=True)
+        relations = self.db.list_document_relations(document_id)
         entities = {int(item["canonical_entity_id"]): item for item in mentions}
         for entity_id, mention in entities.items():
             vertex_id = self.entity_vertex_id(project_id, entity_id)

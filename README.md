@@ -222,9 +222,11 @@ Edge:   kf_contains, kf_mentions, kf_related
 
 ## 实体与关系抽取
 
-每个实体和关系必须携带能够在原知识块中精确定位的证据文本。系统先校验实体是否真实
-出现、关系端点是否存在，以及关系类型是否符合活动 Schema 的起止类型约束。高置信且
-证据完整的关系由规则直接通过；其余关系按知识块批量交给 LLM 复核，避免逐候选调用模型。
+每个实体和关系必须携带能够在完整原知识块中精确定位的证据文本。实体名称及参与验证的
+别名必须在正文中具有真实来源 span；短 ASCII 名称使用词边界匹配。关系端点、谓词和方向
+由严格 verifier 按知识块批量复核，单纯共现、类型兼容或模型自报高分不会自动发布。
+默认搜索、关系列表、首页统计、关系 ID 回取和 HugeGraph 同步统一只消费
+`rules_verified`、`llm_verified`、`manual_verified`，其他状态保留用于审计但不会发布。
 
 信息量较高但主抽取为空，或已经抽取多个实体却遗漏明显关系的知识块，会额外执行一次
 针对性补抽取。相关行为可通过 `EXTRACTION_GLEANING_*`、
@@ -274,9 +276,25 @@ Top-K 检索候选，不再将项目全部实体向量加载到 Python 中逐个
 - `entity_mentions`
 - `entity_resolution_decisions`
 - `relation_assertions`
+- `relation_candidates`、`relation_verification_events`
 - `jobs`、`models`、`settings`
 
 Knowledge Forge 不依赖 RAGFlow；项目、文档、知识块和向量均由本项目自己的 PostgreSQL 表管理。
+
+## P0 verifier 策略升级
+
+当前关系验证策略版本为 `relation-verifier-p0-v1`。升级后首次启动会幂等执行数据库迁移：
+缺少该策略版本的历史 `rules_verified` 会降级为 `legacy_unverified`，所有非发布关系的旧
+relation vector 会被停用。数据库迁移不会在启动时静默执行耗时的 HugeGraph 全量重建。
+
+服务升级并启动后，必须为每个已有项目显式触发一次图谱重同步：
+
+```bash
+curl -X POST http://127.0.0.1:8011/api/projects/<PROJECT_ID>/graph
+```
+
+该任务会先清除项目在 HugeGraph 中的旧顶点和边，再从 PostgreSQL 按当前发布白名单重建，
+因此可移除升级前遗留的弱规则边。通过页面任务日志或任务 API 确认任务完成后再开放检索。
 
 ## 验证
 

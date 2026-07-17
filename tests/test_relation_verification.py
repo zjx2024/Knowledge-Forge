@@ -250,6 +250,7 @@ def test_reversed_orientation_swaps_endpoints_and_preserves_original_candidate(m
     assert relation["_original_candidate"]["source"] == "e2"
     assert relation["orientation"] == "reversed"
     assert relation["verification_status"] == "llm_verified"
+    assert relation["description"] == "Alpha located_in Shanghai"
 
 
 def test_cooccurrence_and_high_self_reported_confidence_are_not_rules_verified(monkeypatch):
@@ -311,7 +312,8 @@ def test_synthetic_chunk_header_is_not_extractable_but_body_evidence_is_located(
         monkeypatch, ScriptedVerifier(extracted, []), extracted_chunk=chunk, verification=False,
     )
     assert [item["name"] for item in result["entities"]] == ["Alpha"]
-    assert result["entities"][0]["evidence_start"] == 0
+    entity = result["entities"][0]
+    assert chunk["content"][entity["evidence_start"]:entity["evidence_end"]] == "Alpha"
     assert "secret-file.pdf" not in result["_diagnostics"]
 
 
@@ -319,3 +321,94 @@ def test_publishable_statuses_are_an_explicit_allowlist():
     assert PUBLISHABLE_RELATION_STATUSES == {"rules_verified", "llm_verified", "manual_verified"}
     for status in ("evidence_unverified", "verification_missing", "verification_failed", "uncertain", "rejected"):
         assert not is_publishable_relation(status)
+
+
+def test_full_chunk_offsets_cover_entities_relations_blank_lines_and_natural_marker(monkeypatch):
+    body = "\n\nAlpha produces Beta.\n分块: this is ordinary source text."
+    full_content = (
+        "# Intro\n\n章节ID: s1\n来源文档: source.pdf\n\n分块: 1/1\n\n" + body
+    )
+    chunk = {
+        "id": 9,
+        "chunk_key": "s1_p001",
+        "content": full_content,
+        "metadata": {"section_key": "s1", "section_title": "Intro"},
+    }
+    result = run_extract(
+        monkeypatch,
+        ScriptedVerifier(extraction(), [lambda values: {"decisions": [decision(values[0])]}]),
+        extracted_chunk=chunk,
+    )
+    for item in [*result["entities"], *result["relations"]]:
+        assert full_content[item["evidence_start"]:item["evidence_end"]] == item["evidence_text"]
+    original = result["relations"][0]["_original_candidate"]
+    assert full_content[original["evidence_start"]:original["evidence_end"]] == original["evidence_text"]
+    assert "分块: this is ordinary source text." in result["relations"][0]["evidence_text"] or full_content.endswith(
+        "分块: this is ordinary source text."
+    )
+
+
+def test_duplicate_exact_quote_uses_match_nearest_candidate_offset():
+    content = "Alpha produces Beta. filler Alpha produces Beta."
+    second = content.rfind("Alpha produces Beta.")
+    evidence, start, end = SchemaEvolutionService._locate_evidence(
+        content, "Alpha produces Beta.", near=second,
+    )
+    assert (evidence, start, end) == (
+        "Alpha produces Beta.", second, second + len("Alpha produces Beta."),
+    )
+
+
+def test_fictitious_name_with_common_alias_cannot_publish_relation(monkeypatch):
+    extracted = {
+        "entities": [
+            {"id": "e1", "name": "Invented Corporation", "type": "Organization",
+             "description": "", "aliases": ["company"], "evidence": "company", "confidence": 0.9},
+            {"id": "e2", "name": "Beta", "type": "Product", "description": "",
+             "aliases": [], "evidence": "Beta", "confidence": 0.9},
+        ],
+        "relations": [{"source": "e1", "target": "e2", "type": "produces",
+                       "description": "", "evidence": "The company produces Beta.", "confidence": 0.9}],
+    }
+    result = run_extract(
+        monkeypatch,
+        ScriptedVerifier(extracted, []),
+        source="The company produces Beta.",
+        verification=False,
+    )
+    assert [item["name"] for item in result["entities"]] == ["Beta"]
+    assert result["relations"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [("AI", "The claim was rejected."), ("US", "The service uses encryption.")],
+)
+def test_short_ascii_entity_does_not_match_inside_another_word(monkeypatch, name, source):
+    extracted = {
+        "entities": [{"id": "e1", "name": name, "type": "GenericEntity",
+                      "description": "", "aliases": [], "evidence": name, "confidence": 0.9}],
+        "relations": [],
+    }
+    result = run_extract(
+        monkeypatch, ScriptedVerifier(extracted, []), source=source, verification=False,
+    )
+    assert result["entities"] == []
+
+
+@pytest.mark.parametrize(
+    ("verdict", "status"),
+    [("contradicted", "rejected"), ("insufficient_evidence", "uncertain")],
+)
+def test_unknown_proposed_type_can_be_rejected_without_schema_error(monkeypatch, verdict, status):
+    extracted = extraction([{
+        "source": "e1", "target": "e2", "type": "unknown_predicate",
+        "description": "bad proposal", "evidence": "Alpha produces Beta.", "confidence": 0.9,
+    }])
+
+    def reject(values):
+        return {"decisions": [decision(values[0], verdict, reason="source does not support it")]}
+
+    result = run_extract(monkeypatch, ScriptedVerifier(extracted, [reject]))
+    assert result["relations"][0]["verification_status"] == status
+    assert result["relations"][0]["verification_reason"] == "source does not support it"

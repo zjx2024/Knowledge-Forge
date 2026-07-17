@@ -6,7 +6,11 @@ from knowledge_forge.hugegraph_store import HugeGraphStore
 
 class Result:
     def __init__(self, one=None, rows=None):
-        self.one = one or {"id": 1}
+        self.one = one or {
+            "id": 1,
+            "project_id": 1,
+            "verification_status": "unverified",
+        }
         self.rows = rows or []
 
     def fetchone(self):
@@ -80,39 +84,67 @@ def test_confidence_zero_is_preserved_for_mentions_candidates_and_relations():
 def test_publishable_relation_query_uses_explicit_status_allowlist():
     connection = RecordingConnection()
     database = database_with_connection(connection)
-    database.list_document_relations(9, publishable_only=True)
+    database.list_document_relations(9)
     statement, params = connection.calls[0]
     assert "verification_status=ANY" in statement
     assert set(params[1]) == {"rules_verified", "llm_verified", "manual_verified"}
 
 
 class Graph:
-    pass
+    def __init__(self):
+        self.edges = []
+
+    def addEdge(self, label, source, target, properties):
+        self.edges.append((label, source, target, properties))
+        return None
 
 
 class Client:
+    def __init__(self):
+        self.instance = Graph()
+
     def graph(self):
-        return Graph()
+        return self.instance
 
 
 class GraphDatabase:
     def __init__(self):
-        self.publishable_only = None
+        self.default_listing_called = False
 
     def list_document_mentions(self, document_id):
         return []
 
-    def list_document_relations(self, document_id, *, publishable_only=False):
-        self.publishable_only = publishable_only
-        return []
+    def list_document_relations(self, document_id):
+        self.default_listing_called = True
+        return [{
+            "id": 7,
+            "source_entity_id": 11,
+            "target_entity_id": 12,
+            "chunk_id": 3,
+            "relation_type": "uses",
+            "description": "Alpha uses Beta",
+            "confidence": 0.9,
+            "verification_status": "llm_verified",
+        }]
+
+    def list_all_document_relations(self, document_id):
+        return [
+            *self.list_document_relations(document_id),
+            {"id": 8, "verification_status": "rejected"},
+        ]
+
+    def set_relation_graph_id(self, relation_id, edge_id):
+        pass
 
 
 def test_hugegraph_sync_requests_only_publishable_relations(monkeypatch):
     database = GraphDatabase()
     store = HugeGraphStore(database)
-    monkeypatch.setattr(store, "client", lambda: Client())
+    client = Client()
+    monkeypatch.setattr(store, "client", lambda: client)
     report = store.sync_document_assertions(
         {"id": 1, "project_key": "p1", "active_schema_version": 1}, {"id": 2},
     )
-    assert database.publishable_only is True
-    assert report["relations"] == 0
+    assert database.default_listing_called is True
+    assert report["relations"] == 1
+    assert len(client.instance.edges) == 1

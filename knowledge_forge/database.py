@@ -18,7 +18,13 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from .config import Config
-from .relation_verification import PUBLISHABLE_RELATION_STATUSES, UNCERTAIN
+from .relation_verification import (
+    LEGACY_UNVERIFIED,
+    PUBLISHABLE_RELATION_STATUSES,
+    RELATION_VERIFICATION_POLICY_VERSION,
+    UNCERTAIN,
+    is_publishable_relation,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -148,7 +154,7 @@ CREATE TABLE IF NOT EXISTS relation_assertions (
     chunk_id BIGINT NOT NULL REFERENCES chunks(id), source_entity_id BIGINT NOT NULL REFERENCES canonical_entities(id),
     target_entity_id BIGINT NOT NULL REFERENCES canonical_entities(id), relation_key TEXT NOT NULL, relation_type TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '', confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5,
-    extraction_version TEXT NOT NULL DEFAULT 'v1', graph_edge_id TEXT,
+    extraction_version TEXT NOT NULL DEFAULT 'v1', ingestion_run_id TEXT NOT NULL DEFAULT '', graph_edge_id TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     UNIQUE(project_id,relation_key)
@@ -163,6 +169,7 @@ CREATE TABLE IF NOT EXISTS relation_candidates (
     target_mention_id TEXT NOT NULL, target_name TEXT NOT NULL, proposed_relation_type TEXT NOT NULL,
     proposed_evidence TEXT NOT NULL DEFAULT '', evidence_start INTEGER, evidence_end INTEGER,
     model_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5, status TEXT NOT NULL,
+    ingestion_run_id TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '', corrected_relation_type TEXT, orientation TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), is_deleted BOOLEAN NOT NULL DEFAULT FALSE
@@ -178,7 +185,7 @@ CREATE TABLE IF NOT EXISTS relation_verification_events (
     id BIGSERIAL PRIMARY KEY, candidate_id TEXT NOT NULL REFERENCES relation_candidates(candidate_id),
     project_id BIGINT NOT NULL REFERENCES projects(id), document_id BIGINT NOT NULL REFERENCES documents(id),
     chunk_id BIGINT NOT NULL, attempt INTEGER NOT NULL, model_name TEXT NOT NULL,
-    prompt_version TEXT NOT NULL, schema_version INTEGER NOT NULL,
+    prompt_version TEXT NOT NULL, schema_version INTEGER NOT NULL, ingestion_run_id TEXT NOT NULL DEFAULT '',
     request_json JSONB NOT NULL DEFAULT '{}'::jsonb, raw_response JSONB,
     verdict TEXT, reason TEXT NOT NULL DEFAULT '', error_category TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -218,6 +225,9 @@ ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS evidence_text TEXT NOT 
 ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS evidence_start INTEGER;
 ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS evidence_end INTEGER;
 ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'unverified';
+ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS ingestion_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_candidates ADD COLUMN IF NOT EXISTS ingestion_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_verification_events ADD COLUMN IF NOT EXISTS ingestion_run_id TEXT NOT NULL DEFAULT '';
 UPDATE documents SET structure_ready_at=COALESCE(structure_ready_at,updated_at)
 WHERE structure_ready_at IS NULL
   AND CASE WHEN COALESCE(parse_quality->>'block_count','') ~ '^[0-9]+$'
@@ -257,6 +267,7 @@ class Database:
                 "ADD COLUMN IF NOT EXISTS normalized_aliases TEXT[] NOT NULL DEFAULT '{}'"
             )
             conn.execute(SCHEMA_SQL)
+            self._migrate_relation_verification_policy(conn)
             self._migrate_vector_storage(conn)
             self._migrate_entity_aliases(conn)
             self._seed_settings(conn)
@@ -351,7 +362,78 @@ class Database:
 
     @staticmethod
     def _json(value: Any) -> str:
-        return json.dumps(value or {}, ensure_ascii=False)
+        return json.dumps({} if value is None else value, ensure_ascii=False)
+
+    @staticmethod
+    def _publishable_relation_clause(alias: str = "r") -> tuple[str, list[str]]:
+        """Return the single default-product allowlist predicate and its parameter."""
+
+        return (
+            f"{alias}.verification_status=ANY(%s)",
+            sorted(PUBLISHABLE_RELATION_STATUSES),
+        )
+
+    @classmethod
+    def _migrate_relation_verification_policy(
+        cls, conn: psycopg.Connection,
+    ) -> dict[str, int]:
+        """Conservatively quarantine weak pre-policy rules and their vectors."""
+
+        assertion_result = conn.execute(
+            """UPDATE relation_assertions
+               SET verification_status=%s,
+                   metadata=metadata || %s::jsonb,
+                   graph_edge_id=NULL,
+                   updated_at=NOW()
+               WHERE verification_status='rules_verified'
+                 AND COALESCE(metadata->>'verification_policy_version','')<>%s""",
+            (
+                LEGACY_UNVERIFIED,
+                cls._json({
+                    "legacy_verification_status": "rules_verified",
+                    "migration_reason": "missing current strict verifier policy",
+                }),
+                RELATION_VERIFICATION_POLICY_VERSION,
+            ),
+        )
+        candidate_result = conn.execute(
+            """UPDATE relation_candidates
+               SET status=%s,
+                   metadata=metadata || %s::jsonb,
+                   updated_at=NOW()
+               WHERE status='rules_verified'
+                 AND COALESCE(metadata->>'verification_policy_version','')<>%s""",
+            (
+                LEGACY_UNVERIFIED,
+                cls._json({
+                    "legacy_verification_status": "rules_verified",
+                    "migration_reason": "missing current strict verifier policy",
+                }),
+                RELATION_VERIFICATION_POLICY_VERSION,
+            ),
+        )
+        vector_result = conn.execute(
+            """UPDATE vector_embeddings v
+               SET is_deleted=TRUE,updated_at=NOW()
+               FROM relation_assertions r
+               WHERE v.project_id=r.project_id
+                 AND v.object_type='relation'
+                 AND v.object_key=r.id::text
+                 AND v.is_deleted=FALSE
+                 AND NOT (r.verification_status=ANY(%s))""",
+            (sorted(PUBLISHABLE_RELATION_STATUSES),),
+        )
+        return {
+            "assertions_quarantined": max(0, assertion_result.rowcount or 0),
+            "candidates_quarantined": max(0, candidate_result.rowcount or 0),
+            "vectors_retired": max(0, vector_result.rowcount or 0),
+        }
+
+    def migrate_relation_verification_policy(self) -> dict[str, int]:
+        """Run the idempotent database-only part of the P0 verification upgrade."""
+
+        with self.connection() as conn:
+            return self._migrate_relation_verification_policy(conn)
 
     @staticmethod
     def _seed_settings(conn: psycopg.Connection) -> None:
@@ -1039,12 +1121,17 @@ class Database:
 
     def upsert_relation_candidate(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as conn:
-            return conn.execute(
+            return self._upsert_relation_candidate(conn, values)
+
+    def _upsert_relation_candidate(
+        self, conn: psycopg.Connection, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        return conn.execute(
                 """INSERT INTO relation_candidates(candidate_id,project_id,document_id,chunk_id,candidate_ordinal,
                 source_mention_id,source_name,target_mention_id,target_name,proposed_relation_type,
-                proposed_evidence,evidence_start,evidence_end,model_confidence,status,reason,
+                proposed_evidence,evidence_start,evidence_end,model_confidence,status,ingestion_run_id,reason,
                 corrected_relation_type,orientation,metadata)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                 ON CONFLICT(candidate_id) DO UPDATE SET project_id=EXCLUDED.project_id,
                 document_id=EXCLUDED.document_id,chunk_id=EXCLUDED.chunk_id,
                 candidate_ordinal=EXCLUDED.candidate_ordinal,source_mention_id=EXCLUDED.source_mention_id,
@@ -1052,7 +1139,7 @@ class Database:
                 target_name=EXCLUDED.target_name,proposed_relation_type=EXCLUDED.proposed_relation_type,
                 proposed_evidence=EXCLUDED.proposed_evidence,evidence_start=EXCLUDED.evidence_start,
                 evidence_end=EXCLUDED.evidence_end,model_confidence=EXCLUDED.model_confidence,
-                status=EXCLUDED.status,reason=EXCLUDED.reason,
+                status=EXCLUDED.status,ingestion_run_id=EXCLUDED.ingestion_run_id,reason=EXCLUDED.reason,
                 corrected_relation_type=EXCLUDED.corrected_relation_type,orientation=EXCLUDED.orientation,
                 metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                 (
@@ -1062,7 +1149,8 @@ class Database:
                     values.get("proposed_relation_type") or "", values.get("proposed_evidence") or "",
                     values.get("evidence_start"), values.get("evidence_end"),
                     0.5 if values.get("model_confidence") is None else values.get("model_confidence"),
-                    values.get("status") or UNCERTAIN, values.get("reason") or "",
+                    values.get("status") or UNCERTAIN, values.get("ingestion_run_id") or "",
+                    values.get("reason") or "",
                     values.get("corrected_relation_type"), values.get("orientation"),
                     self._json(values.get("metadata")),
                 ),
@@ -1072,14 +1160,20 @@ class Database:
         """Append one immutable verifier attempt record."""
 
         with self.connection() as conn:
-            return conn.execute(
+            return self._add_relation_verification_event(conn, values)
+
+    def _add_relation_verification_event(
+        self, conn: psycopg.Connection, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        return conn.execute(
                 """INSERT INTO relation_verification_events(candidate_id,project_id,document_id,chunk_id,
-                attempt,model_name,prompt_version,schema_version,request_json,raw_response,verdict,reason,error_category)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s) RETURNING *""",
+                attempt,model_name,prompt_version,schema_version,ingestion_run_id,request_json,raw_response,verdict,reason,error_category)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s) RETURNING *""",
                 (
                     values["candidate_id"], values["project_id"], values["document_id"], values["chunk_id"],
                     values["attempt"], values.get("model_name") or "", values.get("prompt_version") or "",
-                    int(values.get("schema_version") or 1), self._json(values.get("request_json")),
+                    int(values.get("schema_version") or 1), values.get("ingestion_run_id") or "",
+                    self._json(values.get("request_json")),
                     self._json(values.get("raw_response")) if values.get("raw_response") is not None else None,
                     values.get("verdict") or None, values.get("reason") or "",
                     values.get("error_category") or "",
@@ -1088,24 +1182,72 @@ class Database:
 
     def add_relation_assertion(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as conn:
-            return conn.execute(
-                """INSERT INTO relation_assertions(project_id,document_id,chunk_id,source_entity_id,target_entity_id,relation_key,relation_type,description,confidence,extraction_version,evidence_text,evidence_start,evidence_end,verification_status,metadata)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                ON CONFLICT(project_id,relation_key) DO UPDATE SET relation_type=EXCLUDED.relation_type,description=EXCLUDED.description,
+            return self._add_relation_assertion(conn, values)
+
+    def _add_relation_assertion(
+        self, conn: psycopg.Connection, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        row = conn.execute(
+                """INSERT INTO relation_assertions(project_id,document_id,chunk_id,source_entity_id,target_entity_id,relation_key,relation_type,description,confidence,extraction_version,ingestion_run_id,evidence_text,evidence_start,evidence_end,verification_status,metadata)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                ON CONFLICT(project_id,relation_key) DO UPDATE SET document_id=EXCLUDED.document_id,
+                chunk_id=EXCLUDED.chunk_id,source_entity_id=EXCLUDED.source_entity_id,
+                target_entity_id=EXCLUDED.target_entity_id,relation_type=EXCLUDED.relation_type,description=EXCLUDED.description,
                 confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                 evidence_end=EXCLUDED.evidence_end,verification_status=EXCLUDED.verification_status,
-                metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW() RETURNING *""",
-                (values["project_id"],values["document_id"],values["chunk_id"],values["source_entity_id"],values["target_entity_id"],values["relation_key"],values["relation_type"],values.get("description") or "",0.5 if values.get("confidence") is None else values.get("confidence"),values.get("extraction_version") or "v2",values.get("evidence_text") or "",values.get("evidence_start"),values.get("evidence_end"),values.get("verification_status") or "unverified",self._json(values.get("metadata"))),
+                ingestion_run_id=EXCLUDED.ingestion_run_id,metadata=EXCLUDED.metadata,
+                is_deleted=FALSE,updated_at=NOW() RETURNING *""",
+                (values["project_id"],values["document_id"],values["chunk_id"],values["source_entity_id"],values["target_entity_id"],values["relation_key"],values["relation_type"],values.get("description") or "",0.5 if values.get("confidence") is None else values.get("confidence"),values.get("extraction_version") or "v2",values.get("ingestion_run_id") or "",values.get("evidence_text") or "",values.get("evidence_start"),values.get("evidence_end"),values.get("verification_status") or "unverified",self._json(values.get("metadata"))),
             ).fetchone()
+        if not is_publishable_relation(row.get("verification_status")):
+            conn.execute(
+                """UPDATE vector_embeddings SET is_deleted=TRUE,updated_at=NOW()
+                   WHERE project_id=%s AND object_type='relation' AND object_key=%s""",
+                (row["project_id"], str(row["id"])),
+            )
+        return row
+
+    def persist_relation_audit_chain(
+        self,
+        candidates: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        assertions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist one Chunk's relation audit chain in a single PostgreSQL transaction."""
+
+        with self.connection() as conn:
+            for values in candidates:
+                self._upsert_relation_candidate(conn, values)
+            for values in events:
+                self._add_relation_verification_event(conn, values)
+            return [self._add_relation_assertion(conn, values) for values in assertions]
 
     def list_project_relations(self, project_id: int) -> list[dict[str, Any]]:
+        clause, statuses = self._publishable_relation_clause()
         with self.connection() as conn:
             return conn.execute(
                 """SELECT r.*,s.name AS source_name,s.entity_type AS source_type,t.name AS target_name,t.entity_type AS target_type,
                 d.original_filename,c.content AS chunk_content FROM relation_assertions r
                 JOIN canonical_entities s ON s.id=r.source_entity_id JOIN canonical_entities t ON t.id=r.target_entity_id
                 JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
-                WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE ORDER BY r.id""", (project_id,)
+                WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                AND """ + clause + " ORDER BY r.id", (project_id, statuses)
+            ).fetchall()
+
+    def list_all_project_relations(self, project_id: int) -> list[dict[str, Any]]:
+        """Audit-only relation listing. Callers explicitly opt into quarantined states."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT r.*,s.name AS source_name,s.entity_type AS source_type,
+                t.name AS target_name,t.entity_type AS target_type,d.original_filename,
+                c.content AS chunk_content FROM relation_assertions r
+                JOIN canonical_entities s ON s.id=r.source_entity_id
+                JOIN canonical_entities t ON t.id=r.target_entity_id
+                JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
+                WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                ORDER BY r.id""",
+                (project_id,),
             ).fetchall()
 
     def list_document_mentions(self, document_id: int) -> list[dict[str, Any]]:
@@ -1115,20 +1257,44 @@ class Database:
                 JOIN canonical_entities e ON e.id=m.canonical_entity_id WHERE m.document_id=%s AND m.is_deleted=FALSE""", (document_id,)
             ).fetchall()
 
-    def list_document_relations(
-        self, document_id: int, *, publishable_only: bool = False,
-    ) -> list[dict[str, Any]]:
-        condition = " AND r.verification_status=ANY(%s)" if publishable_only else ""
-        params: list[Any] = [document_id]
-        if publishable_only:
-            params.append(sorted(PUBLISHABLE_RELATION_STATUSES))
+    def list_document_relations(self, document_id: int) -> list[dict[str, Any]]:
+        clause, statuses = self._publishable_relation_clause()
         with self.connection() as conn:
             return conn.execute(
-                f"""SELECT r.*,s.graph_vertex_id AS source_vertex_id,t.graph_vertex_id AS target_vertex_id
+                """SELECT r.*,s.graph_vertex_id AS source_vertex_id,t.graph_vertex_id AS target_vertex_id
                 FROM relation_assertions r JOIN canonical_entities s ON s.id=r.source_entity_id
                 JOIN canonical_entities t ON t.id=r.target_entity_id
-                WHERE r.document_id=%s AND r.is_deleted=FALSE{condition}""", params
+                WHERE r.document_id=%s AND r.is_deleted=FALSE AND """ + clause,
+                (document_id, statuses),
             ).fetchall()
+
+    def list_all_document_relations(self, document_id: int) -> list[dict[str, Any]]:
+        """Audit-only document relation listing including quarantined assertions."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT r.*,s.graph_vertex_id AS source_vertex_id,
+                t.graph_vertex_id AS target_vertex_id FROM relation_assertions r
+                JOIN canonical_entities s ON s.id=r.source_entity_id
+                JOIN canonical_entities t ON t.id=r.target_entity_id
+                WHERE r.document_id=%s AND r.is_deleted=FALSE""",
+                (document_id,),
+            ).fetchall()
+
+    def list_relation_candidates(
+        self, project_id: int, document_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Audit-only candidate listing; never use this as a product relation feed."""
+
+        statement = """SELECT * FROM relation_candidates
+            WHERE project_id=%s AND is_deleted=FALSE"""
+        params: list[Any] = [project_id]
+        if document_id is not None:
+            statement += " AND document_id=%s"
+            params.append(document_id)
+        statement += " ORDER BY updated_at DESC,candidate_ordinal"
+        with self.connection() as conn:
+            return conn.execute(statement, params).fetchall()
 
     def set_entity_graph_id(self, entity_id: int, graph_vertex_id: str) -> None:
         with self.connection() as conn: conn.execute("UPDATE canonical_entities SET graph_vertex_id=%s,updated_at=NOW() WHERE id=%s", (graph_vertex_id,entity_id))
@@ -1156,18 +1322,24 @@ class Database:
             self._retire_orphan_entities(conn)
 
     def statistics(self, project_id: int) -> dict[str, int]:
+        clause, statuses = self._publishable_relation_clause("r")
+        statement = f"""SELECT
+            (SELECT COUNT(*) FROM documents WHERE project_id=%s AND is_deleted=FALSE) documents,
+            (SELECT COUNT(*) FROM chunks WHERE project_id=%s AND is_deleted=FALSE) chunks,
+            (SELECT COUNT(*) FROM canonical_entities WHERE project_id=%s AND is_deleted=FALSE) entities,
+            (SELECT COUNT(*) FROM relation_assertions r WHERE r.project_id=%s
+                AND r.is_deleted=FALSE AND {clause}) relations,
+            (SELECT COUNT(*) FROM relation_candidates rc WHERE rc.project_id=%s
+                AND rc.is_deleted=FALSE) relation_candidates"""
         with self.connection() as conn:
             row = conn.execute(
-                """SELECT
-                (SELECT COUNT(*) FROM documents WHERE project_id=%s AND is_deleted=FALSE) documents,
-                (SELECT COUNT(*) FROM chunks WHERE project_id=%s AND is_deleted=FALSE) chunks,
-                (SELECT COUNT(*) FROM canonical_entities WHERE project_id=%s AND is_deleted=FALSE) entities,
-                (SELECT COUNT(*) FROM relation_assertions WHERE project_id=%s AND is_deleted=FALSE) relations""",
-                (project_id,project_id,project_id,project_id),
+                statement,
+                (project_id,project_id,project_id,project_id,statuses,project_id),
             ).fetchone(); return {key:int(value or 0) for key,value in row.items()}
 
     def search_graph_text(self, project_id: int, query: str, limit: int = 20) -> dict[str, list[dict[str, Any]]]:
         pattern = f"%{query}%"
+        clause, statuses = self._publishable_relation_clause()
         with self.connection() as conn:
             entities = conn.execute(
                 """SELECT id,name,entity_type,description,aliases,source_count FROM canonical_entities
@@ -1180,8 +1352,10 @@ class Database:
                 JOIN canonical_entities s ON s.id=r.source_entity_id JOIN canonical_entities t ON t.id=r.target_entity_id
                 JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
                 WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                AND """ + clause + """
                 AND (s.name ILIKE %s OR t.name ILIKE %s OR r.relation_type ILIKE %s OR r.description ILIKE %s)
-                ORDER BY r.confidence DESC,r.id LIMIT %s""", (project_id,pattern,pattern,pattern,pattern,limit)
+                ORDER BY r.confidence DESC,r.id LIMIT %s""",
+                (project_id,statuses,pattern,pattern,pattern,pattern,limit)
             ).fetchall()
         return {"entities": entities, "relations": relations}
 
@@ -1195,11 +1369,14 @@ class Database:
 
     def get_relations_by_ids(self, project_id: int, ids: list[int]) -> list[dict[str, Any]]:
         if not ids: return []
+        clause, statuses = self._publishable_relation_clause()
         with self.connection() as conn:
             return conn.execute(
                 """SELECT r.id,s.name AS source_name,r.relation_type,t.name AS target_name,r.description,r.confidence,
-                d.original_filename,d.storage_path,c.chunk_key FROM relation_assertions r
+                r.verification_status,d.original_filename,d.storage_path,c.chunk_key FROM relation_assertions r
                 JOIN canonical_entities s ON s.id=r.source_entity_id JOIN canonical_entities t ON t.id=r.target_entity_id
                 JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
-                WHERE r.project_id=%s AND r.id=ANY(%s) AND r.is_deleted=FALSE AND d.is_deleted=FALSE""", (project_id,ids)
+                WHERE r.project_id=%s AND r.id=ANY(%s) AND r.is_deleted=FALSE
+                AND d.is_deleted=FALSE AND """ + clause,
+                (project_id,ids,statuses)
             ).fetchall()

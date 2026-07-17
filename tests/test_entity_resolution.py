@@ -156,6 +156,11 @@ class FakeResolutionDatabase:
         self.verification_events.append(values)
         return values
 
+    def persist_relation_audit_chain(self, candidates, events, assertions):
+        self.relation_candidates.extend(candidates)
+        self.verification_events.extend(events)
+        return [{"id": 13 + index, **values} for index, values in enumerate(assertions)]
+
 
 def test_dense_candidate_is_sent_to_llm_and_resolution_is_audited():
     database = FakeResolutionDatabase()

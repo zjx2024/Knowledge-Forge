@@ -181,17 +181,42 @@ def _chunk_title(chunk: dict[str, Any]) -> str:
     return ""
 
 
-def _chunk_body(chunk: dict[str, Any]) -> str:
+def _chunk_body_with_offset(chunk: dict[str, Any]) -> tuple[str, int]:
     content = str(chunk.get("content") or "")
     framed = re.match(
-        r"(?s)^\s*(?:# [^\n]*\n+)?章节ID\s*:[^\n]*\n+来源文档\s*:[^\n]*\n+"
-        r"分块\s*:\s*\d+\s*/\s*\d+\s*\n+(.*)$",
+        r"(?s)^# [^\n]*\n\n章节ID: [^\n]*\n来源文档: [^\n]*\n\n"
+        r"分块:\s*\d+/\d+\n\n(.*)$",
         content,
     )
     if framed:
-        return framed.group(1).strip()
-    marker = re.search(r"(?:^|\n)分块\s*:[^\n]*\n+", content)
-    return content[marker.end():].strip() if marker else content.strip()
+        raw_body = framed.group(1)
+        leading = len(raw_body) - len(raw_body.lstrip())
+        return raw_body.strip(), framed.start(1) + leading
+    leading = len(content) - len(content.lstrip())
+    return content.strip(), leading
+
+
+def _chunk_body(chunk: dict[str, Any]) -> str:
+    return _chunk_body_with_offset(chunk)[0]
+
+
+def _surface_spans(content: str, surface: str) -> list[tuple[int, int]]:
+    """Locate source-backed surface forms without ASCII substring collisions."""
+
+    value = str(surface or "").strip()
+    if not value:
+        return []
+    parts = [part for part in re.split(r"\s+", value) if part]
+    core = r"\s+".join(re.escape(part) for part in parts)
+    if not core:
+        return []
+    if value.isascii() and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+\-/]*", value):
+        core = rf"(?<![A-Za-z0-9]){core}(?![A-Za-z0-9])"
+    return [(match.start(), match.end()) for match in re.finditer(core, content, re.IGNORECASE)]
+
+
+def _contains_surface(content: str, surface: str) -> bool:
+    return bool(_surface_spans(content, surface))
 
 
 def _looks_like_table_of_contents(title: str, body: str) -> bool:
@@ -735,21 +760,22 @@ class SchemaEvolutionService:
         }
 
     @staticmethod
-    def _locate_evidence(content: str, evidence: str, alternatives: list[str] | None = None) -> tuple[str, int | None, int | None]:
+    def _locate_evidence(
+        content: str,
+        evidence: str,
+        alternatives: list[str] | None = None,
+        *,
+        near: int | None = None,
+    ) -> tuple[str, int | None, int | None]:
         candidates = [evidence, *(alternatives or [])]
         for value in candidates:
             raw_candidate = str(value or "").strip()
             if not raw_candidate:
                 continue
-            candidate = re.sub(r"\s+", " ", raw_candidate)
-            position = content.find(candidate)
-            if position < 0:
-                position = content.casefold().find(candidate.casefold())
-            if position >= 0:
-                return content[position:position + len(candidate)], position, position + len(candidate)
             pattern = r"\s+".join(re.escape(part) for part in re.split(r"\s+", raw_candidate) if part)
-            match = re.search(pattern, content, re.IGNORECASE) if pattern else None
-            if match:
+            matches = list(re.finditer(pattern, content, re.IGNORECASE)) if pattern else []
+            if matches:
+                match = min(matches, key=lambda item: abs(item.start() - near)) if near is not None else matches[0]
                 return match.group(0), match.start(), match.end()
         return "", None, None
 
@@ -795,22 +821,31 @@ class SchemaEvolutionService:
             if not local_id or not name or local_id in local_entities:
                 rejected_entities += 1
                 continue
-            aliases = list(dict.fromkeys(
+            raw_aliases = list(dict.fromkeys(
                 re.sub(r"\s+", " ", str(value)).strip()
                 for value in raw.get("aliases") or [] if str(value).strip()
             ))
-            evidence, start, end = self._locate_evidence(
-                content, str(raw.get("evidence") or ""), [name, *aliases]
-            )
-            if not evidence:
+            name_spans = _surface_spans(content, name)
+            if not name_spans:
                 rejected_entities += 1
                 continue
+            aliases = [alias for alias in raw_aliases if _surface_spans(content, alias)]
+            verified_surface_forms = list(dict.fromkeys([name, *aliases]))
+            evidence, start, end = self._locate_evidence(
+                content, str(raw.get("evidence") or ""), verified_surface_forms,
+                near=name_spans[0][0],
+            )
+            if not evidence or not any(_contains_surface(evidence, form) for form in verified_surface_forms):
+                start, end = name_spans[0]
+                evidence = content[start:end]
             entity = {
                 "id": local_id,
                 "name": name,
                 "type": raw.get("type") if raw.get("type") in allowed_entities else "GenericEntity",
                 "description": str(raw.get("description") or "")[:1000],
                 "aliases": aliases,
+                "raw_aliases": raw_aliases,
+                "verified_surface_forms": verified_surface_forms,
                 "confidence": coerce_confidence(raw.get("confidence"), 0.5),
                 "evidence_text": evidence,
                 "evidence_start": start,
@@ -835,14 +870,14 @@ class SchemaEvolutionService:
             compatible = bool(
                 definition and self._compatible_relation(definition, source["type"], target["type"])
             )
-            source_names = [source["name"], *source.get("aliases", [])]
-            target_names = [target["name"], *target.get("aliases", [])]
+            source_names = source.get("verified_surface_forms") or [source["name"]]
+            target_names = target.get("verified_surface_forms") or [target["name"]]
             evidence, start, end = self._locate_evidence(content, str(raw.get("evidence") or ""))
             confidence = coerce_confidence(raw.get("confidence"), 0.5)
             explicit_endpoints = bool(
                 evidence
-                and any(name.casefold() in evidence.casefold() for name in source_names if name)
-                and any(name.casefold() in evidence.casefold() for name in target_names if name)
+                and any(_contains_surface(evidence, name) for name in source_names if name)
+                and any(_contains_surface(evidence, name) for name in target_names if name)
             )
             relation = {
                 "source": source_id,
@@ -1245,9 +1280,6 @@ class SchemaEvolutionService:
         reason = str(decision.get("reason") or "").strip()
         if verdict not in RELATION_VERDICTS or orientation not in RELATION_ORIENTATIONS or not reason:
             return "verdict, orientation or reason is invalid"
-        corrected_type = str(decision.get("corrected_type") or relation.get("type") or "").strip()
-        if corrected_type not in relation_definitions:
-            return "corrected relation type is not in the allowed schema"
         if verdict == "contradicted":
             relation["verification_status"] = REJECTED
             relation["verification_reason"] = reason
@@ -1257,6 +1289,9 @@ class SchemaEvolutionService:
             relation["verification_reason"] = reason
             return ""
 
+        corrected_type = str(decision.get("corrected_type") or relation.get("type") or "").strip()
+        if corrected_type not in relation_definitions:
+            return "corrected relation type is not in the allowed schema"
         source_id, target_id = str(relation.get("source")), str(relation.get("target"))
         if orientation == "reversed":
             source_id, target_id = target_id, source_id
@@ -1266,28 +1301,36 @@ class SchemaEvolutionService:
             return "corrected endpoints or relation type are not in the allowed schema"
         if not self._compatible_relation(definition, source["type"], target["type"]):
             return "corrected relation type is incompatible with endpoint types"
-        evidence = str(decision.get("evidence") or "").strip()
-        start = content.find(evidence) if evidence else -1
-        if start < 0:
+        evidence, start, end = self._locate_evidence(
+            content,
+            str(decision.get("evidence") or ""),
+            near=relation.get("evidence_start"),
+        )
+        if start is None or end is None:
             return "supported decision evidence is not an exact source quote"
-        folded = evidence.casefold()
-        source_names = [source["name"], *(source.get("aliases") or [])]
-        target_names = [target["name"], *(target.get("aliases") or [])]
-        if not any(str(name).casefold() in folded for name in source_names if name) or not any(
-            str(name).casefold() in folded for name in target_names if name
+        source_names = source.get("verified_surface_forms") or [source["name"]]
+        target_names = target.get("verified_surface_forms") or [target["name"]]
+        if not any(_contains_surface(evidence, str(name)) for name in source_names if name) or not any(
+            _contains_surface(evidence, str(name)) for name in target_names if name
         ):
             return "supported evidence does not contain both corrected endpoints"
+        changed = (
+            orientation == "reversed"
+            or corrected_type != str(relation.get("type") or "")
+        )
         relation.update({
             "source": source_id,
             "target": target_id,
             "type": corrected_type,
             "evidence_text": evidence,
             "evidence_start": start,
-            "evidence_end": start + len(evidence),
+            "evidence_end": end,
             "verification_status": LLM_VERIFIED,
             "verification_reason": reason,
             "orientation": orientation,
         })
+        if changed:
+            relation["description"] = f"{source['name']} {corrected_type} {target['name']}"
         return ""
 
     def _fail_relation_batch(
@@ -1338,7 +1381,7 @@ class SchemaEvolutionService:
 
     def extract_chunk(self, project: dict[str, Any], schema_record: dict[str, Any], chunk: dict[str, Any]) -> dict[str, Any]:
         logical = schema_record["schema_json"]
-        content = _chunk_body(chunk)
+        content, body_start = _chunk_body_with_offset(chunk)
         model = project.get("llm_model") or Config.default_llm_model
         entity_schema = logical.get("entity_types") or []
         relation_schema = logical.get("relation_types") or []
@@ -1418,4 +1461,13 @@ class SchemaEvolutionService:
         extraction["relations"] = relations
         extraction["_verification_events"] = verification_events
         extraction["_diagnostics"] = diagnostics
+        for entity in extraction.get("entities") or []:
+            for key in ("evidence_start", "evidence_end"):
+                if entity.get(key) is not None:
+                    entity[key] = int(entity[key]) + body_start
+        for relation in extraction.get("relations") or []:
+            for record in (relation, relation.get("_original_candidate") or {}):
+                for key in ("evidence_start", "evidence_end"):
+                    if record.get(key) is not None:
+                        record[key] = int(record[key]) + body_start
         return extraction

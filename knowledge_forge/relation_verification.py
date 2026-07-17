@@ -9,11 +9,14 @@ RULES_VERIFIED = "rules_verified"
 LLM_VERIFIED = "llm_verified"
 MANUAL_VERIFIED = "manual_verified"
 
+RELATION_VERIFICATION_POLICY_VERSION = "relation-verifier-p0-v1"
+
 REJECTED = "rejected"
 UNCERTAIN = "uncertain"
 VERIFICATION_FAILED = "verification_failed"
 VERIFICATION_MISSING = "verification_missing"
 EVIDENCE_UNVERIFIED = "evidence_unverified"
+LEGACY_UNVERIFIED = "legacy_unverified"
 
 PUBLISHABLE_RELATION_STATUSES = frozenset({
     RULES_VERIFIED,
@@ -26,6 +29,7 @@ NON_PUBLISHABLE_RELATION_STATUSES = frozenset({
     VERIFICATION_FAILED,
     VERIFICATION_MISSING,
     EVIDENCE_UNVERIFIED,
+    LEGACY_UNVERIFIED,
     "unverified",
 })
 
