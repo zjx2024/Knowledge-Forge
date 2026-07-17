@@ -31,12 +31,16 @@ from .graph_policy import (
     GRAPH_REBUILDING,
     GRAPH_STALE,
     GraphNotReadyError,
+    graph_policy_hash,
     is_current_graph,
+    project_graph_policy_hash,
 )
 from .hugegraph_store import HugeGraphStore
 from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
+from .policy import P1_RELATION_SHADOW_POLICY_SET
+from .relation_pipeline import VersionedRelationPipeline
 from .schema_evolution import SchemaEvolutionService
 from .vector_store import VectorStore
 
@@ -66,6 +70,7 @@ class KnowledgeForgeService:
         self.vectors = VectorStore(self.db, self.ollama)
         self.schemas = SchemaEvolutionService(self.db, self.ollama)
         self.resolver = EntityResolver(self.db, self.vectors)
+        self.relation_shadow = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
         self.graph = HugeGraphStore(self.db)
         self._document_locks_guard = threading.Lock()
         self._document_locks: dict[int, threading.RLock] = {}
@@ -788,6 +793,10 @@ class KnowledgeForgeService:
                     self._assert_ingestion_active(job_id, document_id)
                     extraction = self.schemas.extract_chunk(project, schema_record, chunk)
                     diagnostics = extraction.get("_diagnostics") or {}
+                    if Config.relation_shadow_enabled:
+                        self._run_relation_shadow(
+                            job_id, project, document_id, chunk, extraction, schema_record,
+                        )
                     with self._document_lock(document_id):
                         self._assert_ingestion_active(job_id, document_id)
                         mentions, relations = self.resolver.resolve_chunk(
@@ -977,6 +986,74 @@ class KnowledgeForgeService:
             self.db.update_job(job_id, status="failed", progress=100, log=f"处理失败：{exc}", error=str(exc),
                                metadata={"stage": "failed"})
 
+    def _run_relation_shadow(
+        self,
+        ingestion_run_id: str,
+        project: dict[str, Any],
+        document_id: int,
+        chunk: dict[str, Any],
+        extraction: dict[str, Any],
+        schema_record: dict[str, Any],
+    ) -> None:
+        """Run P1 relation treatment in isolation; never fail or mutate the control path."""
+
+        schema_version = int(schema_record.get("version") or 1)
+        treatment_hash = graph_policy_hash(
+            P1_RELATION_SHADOW_POLICY_SET,
+            schema_version=schema_version,
+            config_summary={
+                "max_candidates": Config.relation_classifier_max_candidates,
+                "output_reserve": Config.relation_classifier_output_reserve,
+                "safety_margin": Config.relation_classifier_safety_margin,
+            },
+        )
+        run_material = (
+            f"{ingestion_run_id}|{project['id']}|{document_id}|{chunk['id']}|{treatment_hash}"
+        )
+        run_id = "relshadow_" + hashlib.sha256(run_material.encode("utf-8")).hexdigest()
+        started = False
+        try:
+            self.db.start_relation_shadow_run({
+                "id": run_id,
+                "project_id": int(project["id"]),
+                "document_id": document_id,
+                "chunk_id": int(chunk["id"]),
+                "control_policy_hash": GRAPH_POLICY_HASH,
+                "treatment_policy_hash": treatment_hash,
+                "policy_set": P1_RELATION_SHADOW_POLICY_SET,
+            })
+            started = True
+            result = self.relation_shadow.classify_shadow(
+                classifier=self.ollama,
+                model=project.get("llm_model") or Config.default_llm_model,
+                model_max_tokens=int(project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS),
+                project_scope=str(project.get("project_key") or project["id"]),
+                chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
+                content=str(chunk.get("content") or ""),
+                entities=list(extraction.get("entities") or []),
+                logical_schema=schema_record.get("schema_json") or {},
+            )
+            candidates = [asdict(item) for item in result.plan.candidates]
+            self.db.finish_relation_shadow_run(
+                run_id,
+                candidates=candidates,
+                decisions=result.decisions,
+                metrics={**result.metrics, "batches": result.batches},
+                status=result.status,
+                error_message=result.error,
+            )
+        except Exception as exc:
+            LOGGER.warning("Relation shadow failed without affecting control: %s", exc)
+            if started:
+                try:
+                    self.db.finish_relation_shadow_run(
+                        run_id, candidates=[], decisions=[],
+                        metrics={"shadow_exception": type(exc).__name__},
+                        status="failed", error_message=str(exc)[:2000],
+                    )
+                except Exception:
+                    LOGGER.exception("Unable to persist isolated relation shadow failure")
+
     def _rebuild_project_graph(
         self,
         project_id: int,
@@ -1064,7 +1141,7 @@ class KnowledgeForgeService:
                 completed = self.db.complete_graph_rebuild(
                     project_id,
                     fixed_generation,
-                    policy_hash=GRAPH_POLICY_HASH,
+                    policy_hash=project_graph_policy_hash(project),
                     empty=True,
                 )
                 if not completed:
@@ -1076,7 +1153,7 @@ class KnowledgeForgeService:
             completed = self.db.complete_graph_rebuild(
                 project_id,
                 fixed_generation,
-                policy_hash=GRAPH_POLICY_HASH,
+                policy_hash=project_graph_policy_hash(project),
             )
             if not completed:
                 raise RuntimeError("图谱重建完成时目标代次已过期")

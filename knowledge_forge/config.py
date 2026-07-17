@@ -144,6 +144,21 @@ class Config:
     extraction_rule_accept_confidence = float(os.getenv("EXTRACTION_RULE_ACCEPT_CONFIDENCE", "0.78"))
     extraction_min_relation_confidence = float(os.getenv("EXTRACTION_MIN_RELATION_CONFIDENCE", "0.55"))
     extraction_gleaning_information_score = float(os.getenv("EXTRACTION_GLEANING_INFORMATION_SCORE", "0.35"))
+    relation_shadow_enabled = os.getenv("RELATION_SHADOW_ENABLED", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    relation_classifier_output_reserve = max(
+        128, int(os.getenv("RELATION_CLASSIFIER_OUTPUT_RESERVE", "512")),
+    )
+    relation_classifier_safety_margin = max(
+        128, int(os.getenv("RELATION_CLASSIFIER_SAFETY_MARGIN", "512")),
+    )
+    relation_classifier_max_candidates = max(
+        1, int(os.getenv("RELATION_CLASSIFIER_MAX_CANDIDATES", "32")),
+    )
+    relation_classifier_gleaning_window = max(
+        1, min(3, int(os.getenv("RELATION_CLASSIFIER_GLEANING_WINDOW", "2"))),
+    )
     files_root = PROJECT_ROOT / "KnowledgeFiles"
     docs_root = files_root / "docs"
     chunks_root = files_root / "chunks"

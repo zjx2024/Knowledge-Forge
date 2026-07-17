@@ -28,6 +28,7 @@ from .graph_policy import (
     GRAPH_READY,
     GRAPH_REBUILDING,
     GRAPH_STALE,
+    graph_policy_hash,
 )
 from .relation_verification import (
     LEGACY_UNVERIFIED,
@@ -39,6 +40,7 @@ from .relation_verification import (
     is_publishable_relation,
 )
 from .observability import InstrumentedConnection, current_metrics, increment
+from .policy import POLICY_AXES, normalize_policy_set
 
 
 LOGGER = logging.getLogger(__name__)
@@ -71,11 +73,29 @@ CREATE TABLE IF NOT EXISTS projects (
     graph_generation BIGINT NOT NULL DEFAULT 0,
     graph_ready_generation BIGINT NOT NULL DEFAULT 0,
     graph_policy_hash TEXT NOT NULL DEFAULT '',
+    active_policy_hash TEXT NOT NULL DEFAULT '',
+    entity_extraction_policy_version TEXT NOT NULL DEFAULT 'entity-extraction-p0-v1',
+    entity_resolution_policy_version TEXT NOT NULL DEFAULT 'entity-resolution-p0-v1',
+    relation_candidate_policy_version TEXT NOT NULL DEFAULT 'relation-candidate-p0-v1',
+    relation_classifier_policy_version TEXT NOT NULL DEFAULT 'relation-classifier-p0-v1',
+    verification_policy_version TEXT NOT NULL DEFAULT 'relation-verifier-p0-v1',
+    schema_policy_version TEXT NOT NULL DEFAULT 'schema-policy-p0-v1',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived','failed')),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), is_deleted BOOLEAN NOT NULL DEFAULT FALSE, deleted_at TIMESTAMPTZ
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_projects_name_active ON projects(name) WHERE is_deleted=FALSE;
+CREATE TABLE IF NOT EXISTS policy_snapshots (
+    id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    policy_set JSONB NOT NULL, policy_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('building','ready','active','failed','rolled_back')),
+    source_generation BIGINT NOT NULL, expected_documents INTEGER NOT NULL DEFAULT 0,
+    completed_documents INTEGER NOT NULL DEFAULT 0, snapshot_manifest JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb, error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ, activated_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_policy_snapshots_project
+    ON policy_snapshots(project_id,status,created_at DESC);
 CREATE TABLE IF NOT EXISTS documents (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id), doc_hash TEXT NOT NULL,
     original_filename TEXT NOT NULL, stored_filename TEXT NOT NULL, storage_path TEXT NOT NULL, local_path TEXT NOT NULL,
@@ -86,6 +106,15 @@ CREATE TABLE IF NOT EXISTS documents (
     deleted_at TIMESTAMPTZ, UNIQUE(project_id, doc_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id,is_deleted,updated_at DESC);
+CREATE TABLE IF NOT EXISTS policy_snapshot_documents (
+    snapshot_id TEXT NOT NULL REFERENCES policy_snapshots(id),
+    document_id BIGINT NOT NULL REFERENCES documents(id),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','ready','failed')),
+    shadow_run_count INTEGER NOT NULL DEFAULT 0, error_message TEXT NOT NULL DEFAULT '',
+    completed_at TIMESTAMPTZ, PRIMARY KEY(snapshot_id,document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_policy_snapshot_documents_status
+    ON policy_snapshot_documents(snapshot_id,status,document_id);
 CREATE TABLE IF NOT EXISTS sections (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id), document_id BIGINT NOT NULL REFERENCES documents(id),
     section_key TEXT NOT NULL, title TEXT NOT NULL, level INTEGER NOT NULL DEFAULT 1, content TEXT NOT NULL,
@@ -269,6 +298,7 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_error TEXT NOT NULL DEFAULT 
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_generation BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_ready_generation BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_policy_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_policy_hash TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS model_max_tokens INTEGER NOT NULL DEFAULT 32768;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS chunk_max_tokens INTEGER NOT NULL DEFAULT 512;
 ALTER TABLE projects DROP COLUMN IF EXISTS ragflow_dataset_id;
@@ -317,6 +347,40 @@ ALTER TABLE relation_verification_events ADD COLUMN IF NOT EXISTS batch_id TEXT
     REFERENCES relation_verification_batches(id);
 CREATE INDEX IF NOT EXISTS idx_relation_verification_event_batch
     ON relation_verification_events(batch_id) WHERE batch_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS relation_shadow_runs (
+    id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT NOT NULL REFERENCES documents(id), chunk_id BIGINT NOT NULL REFERENCES chunks(id),
+    control_policy_hash TEXT NOT NULL, treatment_policy_hash TEXT NOT NULL,
+    policy_set JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running','completed','failed','deferred')),
+    raw_pairs INTEGER NOT NULL DEFAULT 0, blocked_pairs INTEGER NOT NULL DEFAULT 0,
+    admitted_candidates INTEGER NOT NULL DEFAULT 0, classified INTEGER NOT NULL DEFAULT 0,
+    deferred INTEGER NOT NULL DEFAULT 0, model_calls INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+    snapshot_id TEXT REFERENCES policy_snapshots(id),
+    error_message TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_relation_shadow_runs_scope
+    ON relation_shadow_runs(project_id,document_id,chunk_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS relation_shadow_decisions (
+    id BIGSERIAL PRIMARY KEY, shadow_run_id TEXT NOT NULL REFERENCES relation_shadow_runs(id),
+    candidate_id TEXT NOT NULL, source_mention_id TEXT NOT NULL, target_mention_id TEXT NOT NULL,
+    allowed_predicates TEXT[] NOT NULL DEFAULT '{}', predicate TEXT NOT NULL,
+    direction TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL,
+    status TEXT NOT NULL, request_batch_id TEXT, metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(shadow_run_id,candidate_id)
+);
+CREATE INDEX IF NOT EXISTS idx_relation_shadow_decisions_run
+    ON relation_shadow_decisions(shadow_run_id,status,candidate_id);
+
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS entity_extraction_policy_version TEXT NOT NULL DEFAULT 'entity-extraction-p0-v1';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS entity_resolution_policy_version TEXT NOT NULL DEFAULT 'entity-resolution-p0-v1';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS relation_candidate_policy_version TEXT NOT NULL DEFAULT 'relation-candidate-p0-v1';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS relation_classifier_policy_version TEXT NOT NULL DEFAULT 'relation-classifier-p0-v1';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS verification_policy_version TEXT NOT NULL DEFAULT 'relation-verifier-p0-v1';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS schema_policy_version TEXT NOT NULL DEFAULT 'schema-policy-p0-v1';
 INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
 SELECT m.project_id,m.canonical_entity_id,m.document_id
 FROM entity_mentions m
@@ -601,7 +665,8 @@ class Database:
                SET graph_status=%s,graph_policy_version='',graph_policy_hash='',
                    graph_error=%s,updated_at=NOW()
                WHERE is_deleted=FALSE AND graph_status<>%s
-                 AND (graph_policy_version<>%s OR graph_policy_hash<>%s
+                 AND (graph_policy_version<>%s
+                      OR graph_policy_hash<>COALESCE(NULLIF(active_policy_hash,''),%s)
                       OR graph_generation<>graph_ready_generation)""",
             (
                 GRAPH_STALE,
@@ -741,12 +806,14 @@ class Database:
             return conn.execute(
                 """UPDATE projects
                    SET graph_status=%s,graph_policy_version=%s,graph_policy_hash=%s,
+                       active_policy_hash=%s,
                        graph_ready_generation=%s,graph_error='',updated_at=NOW()
                    WHERE id=%s AND is_deleted=FALSE AND graph_generation=%s
                    RETURNING *""",
                 (
                     status,
                     GRAPH_POLICY_VERSION,
+                    policy_hash,
                     policy_hash,
                     target_generation,
                     project_id,
@@ -1957,6 +2024,240 @@ class Database:
                 }
                 self._add_relation_verification_event(conn, event_values)
             return [self._add_relation_assertion(conn, values) for values in assertions]
+
+    def start_relation_shadow_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Start an isolated treatment run without mutating product projection state."""
+
+        policy_set = normalize_policy_set(values["policy_set"])
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO relation_shadow_runs(
+                   id,project_id,document_id,chunk_id,control_policy_hash,treatment_policy_hash,policy_set)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(id) DO UPDATE SET error_message='',status='running',
+                   policy_set=EXCLUDED.policy_set,metadata='{}'::jsonb,completed_at=NULL
+                   RETURNING *""",
+                (
+                    values["id"], values["project_id"], values["document_id"], values["chunk_id"],
+                    values["control_policy_hash"], values["treatment_policy_hash"],
+                    self._json(policy_set),
+                ),
+            ).fetchone()
+
+    def finish_relation_shadow_run(
+        self,
+        run_id: str,
+        *,
+        candidates: list[dict[str, Any]],
+        decisions: list[dict[str, Any]],
+        metrics: dict[str, Any],
+        status: str = "completed",
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        """Atomically persist treatment-only decisions and final run counters."""
+
+        if status not in {"completed", "failed", "deferred"}:
+            raise ValueError(f"非法 shadow 状态: {status}")
+        candidate_map = {str(item["candidate_id"]): item for item in candidates}
+        if any(str(item.get("candidate_id") or "") not in candidate_map for item in decisions):
+            raise ValueError("shadow decision 引用了未知 candidate")
+        with self.connection() as conn:
+            for decision in decisions:
+                candidate = candidate_map[str(decision["candidate_id"])]
+                conn.execute(
+                    """INSERT INTO relation_shadow_decisions(
+                       shadow_run_id,candidate_id,source_mention_id,target_mention_id,allowed_predicates,
+                       predicate,direction,evidence,reason,status,request_batch_id,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(shadow_run_id,candidate_id) DO UPDATE SET
+                       predicate=EXCLUDED.predicate,direction=EXCLUDED.direction,evidence=EXCLUDED.evidence,
+                       reason=EXCLUDED.reason,status=EXCLUDED.status,
+                       request_batch_id=EXCLUDED.request_batch_id,metadata=EXCLUDED.metadata""",
+                    (
+                        run_id, decision["candidate_id"], candidate["source_mention_id"],
+                        candidate["target_mention_id"], candidate.get("allowed_predicates") or [],
+                        decision["predicate"], decision["direction"], decision.get("evidence") or "",
+                        decision.get("reason") or "", decision.get("status") or "classified",
+                        decision.get("request_batch_id"), self._json(decision.get("metadata")),
+                    ),
+                )
+            row = conn.execute(
+                """UPDATE relation_shadow_runs SET status=%s,raw_pairs=%s,blocked_pairs=%s,
+                   admitted_candidates=%s,classified=%s,deferred=%s,model_calls=%s,
+                   input_tokens=%s,output_tokens=%s,error_message=%s,metadata=%s::jsonb,
+                   completed_at=NOW() WHERE id=%s RETURNING *""",
+                (
+                    status, int(metrics.get("raw_pairs") or 0), int(metrics.get("blocked_pairs") or 0),
+                    int(metrics.get("admitted_candidates") or 0), int(metrics.get("classified") or 0),
+                    int(metrics.get("deferred") or 0), int(metrics.get("model_calls") or 0),
+                    int(metrics.get("input_tokens") or 0), int(metrics.get("output_tokens") or 0),
+                    error_message or "", self._json(metrics), run_id,
+                ),
+            ).fetchone()
+            if not row:
+                raise LookupError("shadow run 不存在")
+            return row
+
+    def create_policy_snapshot(
+        self,
+        project_id: int,
+        policy_set: dict[str, Any],
+        *,
+        expected_documents: int,
+        snapshot_manifest: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized = normalize_policy_set(policy_set)
+        snapshot_id = uuid.uuid4().hex
+        with self.connection() as conn:
+            project = conn.execute(
+                """SELECT graph_generation,active_schema_version
+                   FROM projects WHERE id=%s AND is_deleted=FALSE""",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            policy_hash = graph_policy_hash(
+                normalized,
+                schema_version=int(project.get("active_schema_version") or 1),
+            )
+            documents = conn.execute(
+                """SELECT id FROM documents
+                   WHERE project_id=%s AND status='indexed' AND is_deleted=FALSE ORDER BY id""",
+                (project_id,),
+            ).fetchall()
+            actual_documents = len(documents)
+            if int(expected_documents) != actual_documents:
+                raise ValueError(
+                    f"策略快照文档数与当前 indexed 文档不一致: expected={expected_documents}, "
+                    f"actual={actual_documents}"
+                )
+            row = conn.execute(
+                """INSERT INTO policy_snapshots(
+                   id,project_id,policy_set,policy_hash,status,source_generation,
+                   expected_documents,snapshot_manifest)
+                   VALUES(%s,%s,%s::jsonb,%s,'building',%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    snapshot_id, project_id, self._json(normalized), policy_hash,
+                    int(project.get("graph_generation") or 0), actual_documents,
+                    self._json(snapshot_manifest),
+                ),
+            ).fetchone()
+            for document in documents:
+                conn.execute(
+                    """INSERT INTO policy_snapshot_documents(snapshot_id,document_id)
+                       VALUES(%s,%s) ON CONFLICT(snapshot_id,document_id) DO NOTHING""",
+                    (snapshot_id, document["id"]),
+                )
+            return row
+
+    def complete_policy_snapshot_document(
+        self,
+        snapshot_id: str,
+        document_id: int,
+        *,
+        shadow_run_count: int,
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        status = "failed" if error_message else "ready"
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE policy_snapshot_documents
+                   SET status=%s,shadow_run_count=%s,error_message=%s,completed_at=NOW()
+                   WHERE snapshot_id=%s AND document_id=%s RETURNING *""",
+                (status, shadow_run_count, error_message or "", snapshot_id, document_id),
+            ).fetchone()
+            if not row:
+                raise LookupError("策略快照文档不存在")
+            return row
+
+    def complete_policy_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        completed_documents: int,
+        metrics: dict[str, Any],
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            snapshot = conn.execute(
+                "SELECT * FROM policy_snapshots WHERE id=%s FOR UPDATE", (snapshot_id,),
+            ).fetchone()
+            if not snapshot:
+                raise LookupError("策略快照不存在")
+            coverage = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          COUNT(*) FILTER (WHERE status='ready') AS ready,
+                          COUNT(*) FILTER (WHERE status='failed') AS failed
+                   FROM policy_snapshot_documents WHERE snapshot_id=%s""",
+                (snapshot_id,),
+            ).fetchone() or {}
+            ready_documents = int(coverage.get("ready") or 0)
+            if int(completed_documents) != ready_documents:
+                raise ValueError("策略快照完成数与数据库文档清单不一致")
+            complete = bool(
+                not error_message
+                and int(coverage.get("total") or 0) == int(snapshot["expected_documents"])
+                and ready_documents == int(snapshot["expected_documents"])
+                and not int(coverage.get("failed") or 0)
+            )
+            status = "ready" if complete else "failed"
+            return conn.execute(
+                """UPDATE policy_snapshots SET status=%s,completed_documents=%s,metrics=%s::jsonb,
+                   error_message=%s,completed_at=NOW() WHERE id=%s RETURNING *""",
+                (status, ready_documents, self._json(metrics), error_message or "", snapshot_id),
+            ).fetchone()
+
+    def activate_policy_snapshot(self, project_id: int, snapshot_id: str) -> dict[str, Any]:
+        """Atomically switch a complete snapshot and invalidate the current graph projection."""
+
+        with self.connection() as conn:
+            snapshot = conn.execute(
+                """SELECT * FROM policy_snapshots
+                   WHERE id=%s AND project_id=%s FOR UPDATE""",
+                (snapshot_id, project_id),
+            ).fetchone()
+            if not snapshot or snapshot.get("status") not in {"ready", "rolled_back"}:
+                raise ValueError("策略快照未完整就绪，禁止激活")
+            coverage = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          COUNT(*) FILTER (WHERE status='ready') AS ready,
+                          COUNT(*) FILTER (WHERE status='failed') AS failed
+                   FROM policy_snapshot_documents WHERE snapshot_id=%s""",
+                (snapshot_id,),
+            ).fetchone()
+            if (
+                int((coverage or {}).get("total") or 0) != int(snapshot.get("expected_documents") or 0)
+                or int((coverage or {}).get("ready") or 0) != int(snapshot.get("expected_documents") or 0)
+                or int((coverage or {}).get("failed") or 0)
+            ):
+                raise ValueError("策略快照文档覆盖不完整，禁止激活")
+            policy_set = normalize_policy_set(snapshot["policy_set"])
+            conn.execute(
+                """UPDATE policy_snapshots SET status='rolled_back'
+                   WHERE project_id=%s AND status='active'""",
+                (project_id,),
+            )
+            assignments = ",".join(f"{axis}=%s" for axis in POLICY_AXES)
+            row = conn.execute(
+                f"""UPDATE projects SET {assignments},graph_generation=graph_generation+1,
+                    graph_status=%s,graph_policy_version='',graph_policy_hash='',
+                    active_policy_hash=%s,
+                    graph_error=%s,updated_at=NOW()
+                    WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                (
+                    *(policy_set[axis] for axis in POLICY_AXES), GRAPH_STALE,
+                    snapshot["policy_hash"],
+                    "策略集合已切换，等待全量图重建", project_id,
+                ),
+            ).fetchone()
+            if not row:
+                raise LookupError("项目不存在")
+            conn.execute(
+                """UPDATE policy_snapshots SET status='active',activated_at=NOW()
+                   WHERE id=%s""",
+                (snapshot_id,),
+            )
+            return row
 
     def list_relation_verification_events(
         self, project_id: int, document_id: int | None = None,
