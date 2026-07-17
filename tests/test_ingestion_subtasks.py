@@ -24,6 +24,11 @@ class FakeJobDatabase:
             self.job["metadata"] = {**self.job["metadata"], **metadata}
         return self.job
 
+    def begin_graph_mutation(self, job_id):
+        assert job_id == "job-1"
+        self.job["status"] = "running"
+        return self.job
+
 
 def service_with_fake_job():
     service = KnowledgeForgeService.__new__(KnowledgeForgeService)

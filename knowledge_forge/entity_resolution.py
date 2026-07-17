@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,8 +22,16 @@ from .entity_identity import (
     types_are_compatible,
 )
 from .entity_reranker import EntityReranker
+from .relation_verification import (
+    RELATION_VERIFICATION_POLICY_VERSION,
+    UNCERTAIN,
+    is_publishable_relation,
+)
 from .value_parsing import coerce_confidence
 from .vector_store import VectorStore
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def lexical_name_similarity(left: str, right: str) -> float:
@@ -377,6 +386,7 @@ class EntityResolver:
         extraction: dict[str, Any],
         schema_version: int,
         session: EntityResolutionSession | None = None,
+        ingestion_run_id: str = "",
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         project_id = int(project["id"])
         session = session or self.start_session(project)
@@ -390,10 +400,12 @@ class EntityResolver:
             local_map[raw["id"]] = entity
             mention = self.db.add_entity_mention({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "canonical_entity_id": int(entity["id"]), "mention_text": raw["name"], "normalized_name": normalized,
-                "entity_type": raw["type"], "description": raw.get("description") or "", "confidence": raw.get("confidence") or 0.5,
+                "entity_type": raw["type"], "description": raw.get("description") or "",
+                "confidence": 0.5 if raw.get("confidence") is None else raw.get("confidence"),
                 "extraction_version": "v2", "evidence_text": raw.get("evidence_text") or "",
                 "evidence_start": raw.get("evidence_start"), "evidence_end": raw.get("evidence_end"),
-                "metadata": {"raw_aliases": raw.get("aliases") or [], "accepted_aliases": aliases,
+                "metadata": {"raw_aliases": raw.get("raw_aliases") or [], "accepted_aliases": aliases,
+                    "verified_surface_forms": raw.get("verified_surface_forms") or [],
                     "resolution": resolution}})
             self.db.add_entity_resolution_decision({
                 "project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
@@ -404,23 +416,110 @@ class EntityResolver:
                 "metadata": {"schema_version": schema_version},
             })
             mentions.append(mention)
-        relations = []
+        raw_entity_map = {str(item["id"]): item for item in extraction.get("entities") or []}
+        candidate_values: list[dict[str, Any]] = []
+        for raw in extraction.get("relations") or []:
+            original = raw.get("_original_candidate") or {}
+            original_source_id = str(original.get("source") or raw.get("source") or "")
+            original_target_id = str(original.get("target") or raw.get("target") or "")
+            original_source = raw_entity_map.get(original_source_id, {})
+            original_target = raw_entity_map.get(original_target_id, {})
+            candidate_values.append({
+                "candidate_id": raw["candidate_id"], "project_id": project_id,
+                "document_id": document_id, "chunk_id": int(chunk["id"]),
+                "candidate_ordinal": int(raw.get("candidate_ordinal") or 0),
+                "source_mention_id": original_source_id,
+                "source_name": original.get("source_name") or original_source.get("name") or "",
+                "target_mention_id": original_target_id,
+                "target_name": original.get("target_name") or original_target.get("name") or "",
+                "proposed_relation_type": original.get("type") or raw.get("type") or "",
+                "proposed_evidence": original.get("evidence_text") or "",
+                "evidence_start": original.get("evidence_start"),
+                "evidence_end": original.get("evidence_end"),
+                "model_confidence": (
+                    0.5 if original.get("confidence") is None else original.get("confidence")
+                ),
+                "status": raw.get("verification_status") or UNCERTAIN,
+                "ingestion_run_id": ingestion_run_id,
+                "reason": raw.get("verification_reason") or "",
+                "corrected_relation_type": (
+                    raw.get("type") if raw.get("type") != original.get("type") else None
+                ),
+                "orientation": raw.get("orientation") or "as_is",
+                "metadata": {
+                    "schema_version": schema_version,
+                    "verification_policy_version": RELATION_VERIFICATION_POLICY_VERSION,
+                    "original_candidate": original,
+                },
+            })
+        event_values = [
+            {
+                **event, "project_id": project_id, "document_id": document_id,
+                "chunk_id": int(chunk["id"]),
+                "ingestion_run_id": ingestion_run_id,
+            }
+            for event in extraction.get("_verification_events") or []
+        ]
+        assertion_values: list[dict[str, Any]] = []
+        assertion_context: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for raw in extraction.get("relations") or []:
             source, target = local_map.get(raw["source"]), local_map.get(raw["target"])
             if not source or not target or source["id"] == target["id"]: continue
             relation_key = hashlib.sha256(
-                f"{project_id}|{document_id}|{chunk['id']}|{source['id']}|{raw['type']}|{target['id']}".encode()
+                f"{project_id}|{document_id}|{chunk['id']}|{raw.get('candidate_id')}|"
+                f"{source['id']}|{raw['type']}|{target['id']}".encode()
             ).hexdigest()
-            relation = self.db.add_relation_assertion({"project_id": project_id, "document_id": document_id,
+            assertion_values.append({"project_id": project_id, "document_id": document_id,
                 "chunk_id": int(chunk["id"]), "source_entity_id": int(source["id"]), "target_entity_id": int(target["id"]),
                 "relation_key": relation_key, "relation_type": raw["type"], "description": raw.get("description") or "",
-                "confidence": raw.get("confidence") or 0.5, "extraction_version": "v2",
+                "confidence": 0.5 if raw.get("confidence") is None else raw.get("confidence"),
+                "extraction_version": "v2", "ingestion_run_id": ingestion_run_id,
                 "evidence_text": raw.get("evidence_text") or "", "evidence_start": raw.get("evidence_start"),
                 "evidence_end": raw.get("evidence_end"),
                 "verification_status": raw.get("verification_status") or "unverified",
                 "metadata": {"schema_version": schema_version,
+                             "verification_policy_version": RELATION_VERIFICATION_POLICY_VERSION,
+                             "candidate_id": raw.get("candidate_id"),
+                             "verification_reason": raw.get("verification_reason") or "",
                              "verification_status": raw.get("verification_status") or "unverified"}})
-            self.vectors.upsert_relation_embedding(project_id, document_id, int(chunk["id"]), relation,
-                                                   source["name"], target["name"], session.embedding_model)
-            relations.append(relation)
+            assertion_context.append((source, target))
+
+        relations = self.db.persist_relation_audit_chain(
+            candidate_values,
+            event_values,
+            assertion_values,
+        )
+        for relation, (source, target) in zip(relations, assertion_context):
+            if is_publishable_relation(
+                relation.get("verification_status"), relation.get("metadata"),
+            ):
+                try:
+                    self.vectors.upsert_relation_embedding(
+                        project_id, document_id, int(chunk["id"]), relation,
+                        source["name"], target["name"], session.embedding_model,
+                    )
+                    self.db.complete_indexing_failure(
+                        project_id, "relation", str(relation["id"]), session.embedding_model,
+                    )
+                except Exception as exc:
+                    self.db.record_indexing_failure({
+                        "project_id": project_id,
+                        "document_id": document_id,
+                        "chunk_id": int(chunk["id"]),
+                        "object_type": "relation",
+                        "object_key": str(relation["id"]),
+                        "model_name": session.embedding_model,
+                        "last_error": str(exc),
+                        "payload": {
+                            "source_name": source["name"],
+                            "target_name": target["name"],
+                            "relation_type": relation["relation_type"],
+                            "relation_key": relation["relation_key"],
+                        },
+                    })
+                    relation["indexing_pending"] = True
+                    LOGGER.warning(
+                        "Relation embedding deferred for assertion %s: %s",
+                        relation.get("id"), exc,
+                    )
         return mentions, relations

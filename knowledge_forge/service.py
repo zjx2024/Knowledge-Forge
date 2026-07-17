@@ -22,6 +22,16 @@ from .chunking import ProcessingResult, build_processing_result, parse_document_
 from .config import Config
 from .database import Database
 from .entity_resolution import EntityResolver
+from .graph_policy import (
+    GRAPH_EMPTY,
+    GRAPH_FAILED,
+    GRAPH_POLICY_VERSION,
+    GRAPH_READY,
+    GRAPH_REBUILDING,
+    GRAPH_STALE,
+    GraphNotReadyError,
+    is_current_graph,
+)
 from .hugegraph_store import HugeGraphStore
 from .media import DocumentMediaService
 from .ollama import OllamaClient
@@ -57,6 +67,8 @@ class KnowledgeForgeService:
         self.graph = HugeGraphStore(self.db)
         self._document_locks_guard = threading.Lock()
         self._document_locks: dict[int, threading.RLock] = {}
+        self._graph_locks_guard = threading.Lock()
+        self._graph_locks: dict[int, threading.RLock] = {}
         # A single worker keeps multi-file ingestion deterministic and prevents local LLM contention.
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="knowledge-forge")
         # Cleanup must be able to wait for an active document without blocking queued ingestion work.
@@ -292,12 +304,18 @@ class KnowledgeForgeService:
         if not document: raise LookupError("文档不存在")
         if document["status"] == "processing": raise ValueError("该文档正在处理")
         job = self.db.create_job("ingestion", int(document["project_id"]), document_id)
+        project = self.db.get_project(int(document["project_id"]))
+        if project and project.get("graph_status") == GRAPH_READY:
+            self.db.set_graph_state(
+                int(document["project_id"]), GRAPH_STALE,
+                error="文档重新入库后图谱需要重建",
+            )
         self.executor.submit(self._ingest_document, job["id"], document_id)
         return str(job["id"])
 
     def submit_graph_build(self, project_id: int) -> str:
         if not self.db.get_project(project_id): raise LookupError("项目不存在")
-        job = self.db.create_job("graph_sync", project_id)
+        job = self.db.create_graph_rebuild_job(project_id)
         self.executor.submit(self._sync_project_graph, job["id"], project_id)
         return str(job["id"])
 
@@ -328,8 +346,13 @@ class KnowledgeForgeService:
 
     def hubble_project_url(self, project_id: int) -> str:
         """Resolve Hubble and prefill a cross-document provenance query."""
-        if not self.db.get_project(project_id):
+        project = self.db.get_project(project_id)
+        if not project:
             raise LookupError("项目不存在")
+        if not is_current_graph(project):
+            raise GraphNotReadyError(
+                project.get("graph_error") or "图谱需要按当前验证策略重建"
+            )
         base_url = Config.hugegraph_hubble_url.rstrip("/")
         endpoint = f"{base_url}/api/v1.2/graph-connections"
 
@@ -469,6 +492,7 @@ class KnowledgeForgeService:
         }
 
     def _start_ingestion_job(self, job_id: str, document_id: int) -> None:
+        self.db.begin_graph_mutation(job_id)
         subtasks = self._empty_ingestion_subtasks()
         subtasks["structure"] = {"status": "running", "progress": 0, "detail": ""}
         self._job(
@@ -541,6 +565,13 @@ class KnowledgeForgeService:
     def _document_lock(self, document_id: int) -> threading.RLock:
         with self._document_locks_guard:
             return self._document_locks.setdefault(document_id, threading.RLock())
+
+    def _graph_lock(self, project_id: int) -> threading.RLock:
+        if not hasattr(self, "_graph_locks_guard"):
+            self._graph_locks_guard = threading.Lock()
+            self._graph_locks = {}
+        with self._graph_locks_guard:
+            return self._graph_locks.setdefault(project_id, threading.RLock())
 
     def _assert_ingestion_active(self, job_id: str, document_id: int) -> None:
         job = self.db.get_job(job_id)
@@ -680,7 +711,6 @@ class KnowledgeForgeService:
                 detail=f"{count} 个向量索引", progress=42, log=f"已生成并保存 {count} 个向量索引",
             )
             self.db.update_document(document_id, processing_stage="graph")
-            self.db.update_project(int(project["id"]), graph_status="building")
             self._job_subtask(
                 job_id, "schema_base", subtask_status="running", subtask_progress=0,
                 progress=44, log="===== 阶段三：Schema、实体关系与知识图谱 =====", stage="graph",
@@ -707,13 +737,10 @@ class KnowledgeForgeService:
                 log=f"逻辑 Schema v{schema_record['version']}：{schema_detail}",
             )
 
-            with self._document_lock(document_id):
-                self._assert_ingestion_active(job_id, document_id)
-                self.graph.replace_document(project, document, stored_chunks)
             self._job_subtask(
                 job_id, "schema_base", subtask_status="completed", subtask_progress=100,
                 detail=f"{len(stored_chunks)} 个基础知识块", progress=50,
-                log=f"文档与 {len(stored_chunks)} 个知识块已写入 HugeGraph",
+                log=f"Schema 与 {len(stored_chunks)} 个基础知识块已就绪，等待关系发布后统一重建图谱",
             )
             extraction_chunks = [
                 item for item in stored_chunks
@@ -726,6 +753,18 @@ class KnowledgeForgeService:
             resolution_session = self.resolver.start_session(project)
             total_mentions = total_relations = extraction_errors = 0
             gleaning_chunks = verified_relations = rejected_relations = 0
+            verification_totals = {
+                "verification_requested": 0,
+                "rules_verified": 0,
+                "llm_verified": 0,
+                "rejected": 0,
+                "uncertain": 0,
+                "missing_decisions": 0,
+                "verifier_failures": 0,
+                "retry_count": 0,
+                "quarantined": 0,
+                "published": 0,
+            }
             for index, chunk in enumerate(extraction_chunks, start=1):
                 try:
                     self._assert_ingestion_active(job_id, document_id)
@@ -735,7 +774,7 @@ class KnowledgeForgeService:
                         self._assert_ingestion_active(job_id, document_id)
                         mentions, relations = self.resolver.resolve_chunk(
                             project, document_id, chunk, extraction, int(schema_record["version"]),
-                            session=resolution_session,
+                            session=resolution_session, ingestion_run_id=job_id,
                         )
                     total_mentions += len(mentions); total_relations += len(relations)
                     detail = f"{len(mentions)} 个实体提及，{len(relations)} 条关系"
@@ -744,11 +783,13 @@ class KnowledgeForgeService:
                         detail += "，已执行针对性补抽取"
                     verified_relations += int(diagnostics.get("verified") or 0)
                     rejected_relations += int(diagnostics.get("verification_rejected") or 0)
+                    for key in verification_totals:
+                        verification_totals[key] += int(diagnostics.get(key) or 0)
                     if diagnostics.get("verification_candidates"):
                         detail += (
                             f"，复核 {int(diagnostics['verification_candidates'])} 条候选"
-                            f"（通过 {int(diagnostics.get('verified') or 0)}，拒绝 "
-                            f"{int(diagnostics.get('verification_rejected') or 0)}）"
+                            f"（发布 {int(diagnostics.get('published') or 0)}，隔离 "
+                            f"{int(diagnostics.get('quarantined') or 0)}）"
                         )
                 except IngestionCancelled:
                     raise
@@ -779,10 +820,12 @@ class KnowledgeForgeService:
             with self._document_lock(document_id):
                 self._assert_ingestion_active(job_id, document_id)
                 self.db.retire_orphan_entities()
-                graph_report = self.graph.sync_document_assertions(project, document)
-                self.graph.prune_project_entities(int(project["id"]))
-                self.db.update_project(int(project["id"]), graph_status="ready")
-                graph_ready_at = datetime.now(timezone.utc)
+            self._assert_ingestion_active(job_id, document_id)
+            graph_report = self._rebuild_project_graph(
+                int(project["id"]), include_document_id=document_id,
+            )
+            self._assert_ingestion_active(job_id, document_id)
+            graph_ready_at = datetime.now(timezone.utc)
             self._job_subtask(
                 job_id, "graph_sync", subtask_status="completed", subtask_progress=100,
                 detail=f"{graph_report['entities']} 个实体，{graph_report['relations']} 条关系",
@@ -799,27 +842,44 @@ class KnowledgeForgeService:
                               "schema_version": schema_record["version"], "entity_mentions": total_mentions,
                               "relations": total_relations, "extraction_errors": extraction_errors,
                               "gleaning_chunks": gleaning_chunks, "verified_relations": verified_relations,
-                              "rejected_relations": rejected_relations})
+                              "rejected_relations": rejected_relations,
+                              "relation_verification": verification_totals})
             completion = "文档知识库与知识图谱入库完成"
             if extraction_errors:
                 completion += f"；{extraction_errors} 个知识块的图谱抽取已降级"
             completion += (
-                f"；补抽取 {gleaning_chunks} 个知识块，复核通过 {verified_relations} 条关系，"
-                f"拒绝 {rejected_relations} 条缺少充分证据的关系"
+                f"；补抽取 {gleaning_chunks} 个知识块；关系复核请求 "
+                f"{verification_totals['verification_requested']}，规则通过 {verification_totals['rules_verified']}，"
+                f"LLM 通过 {verification_totals['llm_verified']}，拒绝 {verification_totals['rejected']}，"
+                f"不确定 {verification_totals['uncertain']}，漏答 {verification_totals['missing_decisions']}，"
+                f"复核失败 {verification_totals['verifier_failures']}，重试 {verification_totals['retry_count']}；"
+                f"隔离 {verification_totals['quarantined']}，发布到 HugeGraph {graph_report['relations']}"
             )
             self._job(job_id, "completed", 100, completion, stage="completed", graph_ready=True,
                       extraction_errors=extraction_errors, gleaning_chunks=gleaning_chunks,
-                      verified_relations=verified_relations, rejected_relations=rejected_relations)
+                      verified_relations=verified_relations, rejected_relations=rejected_relations,
+                      relation_verification=verification_totals,
+                      published_to_hugegraph=graph_report["relations"])
         except IngestionCancelled as exc:
             LOGGER.info("Document ingestion cancelled: %s: %s", document_id, exc)
-            self._fail_active_ingestion_subtask(job_id, str(exc), cancelled=True)
             job = self.db.get_job(job_id)
+            if job and job.get("project_id"):
+                self.db.set_graph_state(
+                    int(job["project_id"]), GRAPH_STALE,
+                    error="文档任务已取消，图谱需要重新同步",
+                )
+            self._fail_active_ingestion_subtask(job_id, str(exc), cancelled=True)
             if job and job.get("status") != "cancelled":
                 self.db.update_job(job_id, status="cancelled", log=str(exc), metadata={"stage": "cancelled"})
         except Exception as exc:
             job = self.db.get_job(job_id)
             if (job and job.get("status") == "cancelled") or not self.db.get_document(document_id):
                 LOGGER.info("Document ingestion stopped after deletion/cancellation: %s: %s", document_id, exc)
+                if job and job.get("project_id"):
+                    self.db.set_graph_state(
+                        int(job["project_id"]), GRAPH_STALE,
+                        error="文档任务已取消，图谱需要重新同步",
+                    )
                 self._fail_active_ingestion_subtask(job_id, "文档已删除，任务已取消", cancelled=True)
                 if job and job.get("status") != "cancelled":
                     self.db.update_job(
@@ -830,28 +890,140 @@ class KnowledgeForgeService:
                     )
                 return
             LOGGER.exception("Document ingestion failed: %s", document_id)
+            if job and job.get("project_id"):
+                self.db.set_graph_state(
+                    int(job["project_id"]), GRAPH_FAILED, error=str(exc),
+                )
             self._fail_active_ingestion_subtask(job_id, str(exc))
             self.db.update_document(document_id, status="failed", processing_stage="failed", error_message=str(exc))
             self.db.update_job(job_id, status="failed", progress=100, log=f"处理失败：{exc}", error=str(exc),
                                metadata={"stage": "failed"})
 
+    def _rebuild_project_graph(
+        self, project_id: int, *, include_document_id: int | None = None,
+    ) -> dict[str, int]:
+        """Purge and deterministically rebuild one project graph, then verify counts."""
+
+        with self._graph_lock(project_id):
+            return self._rebuild_project_graph_locked(
+                project_id, include_document_id=include_document_id,
+            )
+
+    def _rebuild_project_graph_locked(
+        self, project_id: int, *, include_document_id: int | None = None,
+    ) -> dict[str, int]:
+        """Execute a rebuild while the process-local project graph lock is held."""
+
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        self._retry_relation_indexing_failures(project)
+        documents = [
+            item for item in self.db.list_documents(project_id)
+            if item["status"] == "indexed" or int(item["id"]) == include_document_id
+        ]
+        document_ids = [int(item["id"]) for item in documents]
+        self.graph.ensure_schema()
+        self.graph.delete_project(project_id)
+        written_relations = 0
+        written_entities = 0
+        for document in documents:
+            chunks = self.db.list_document_chunks(int(document["id"]))
+            self.graph.replace_document(project, document, chunks)
+            report = self.graph.sync_document_assertions(project, document)
+            written_relations += int(report.get("relations") or 0)
+            written_entities += int(report.get("entities") or 0)
+        self.graph.prune_project_entities(project_id)
+        expected_relations = self.db.count_publishable_relations(project_id, document_ids)
+        graph_stats = self.graph.statistics(project_id)
+        graph_relations = int(graph_stats.get("relations") or 0)
+        if written_relations != expected_relations or graph_relations != expected_relations:
+            raise RuntimeError(
+                "图谱关系一致性检查失败："
+                f"PostgreSQL={expected_relations}, written={written_relations}, HugeGraph={graph_relations}"
+            )
+        if not documents:
+            self.db.set_graph_state(project_id, GRAPH_EMPTY)
+            return {"documents": 0, "entities": 0, "relations": 0}
+        self.db.set_graph_state(project_id, GRAPH_READY, current_policy=True)
+        return {
+            "documents": len(documents),
+            "entities": written_entities,
+            "relations": graph_relations,
+        }
+
+    def _retry_relation_indexing_failures(self, project: dict[str, Any]) -> int:
+        """Retry derived relation vectors without changing assertion publication."""
+
+        project_id = int(project["id"])
+        model = str(project.get("embedding_model") or Config.default_embedding_model)
+        failures = self.db.list_pending_indexing_failures(project_id, "relation")
+        completed = 0
+        for failure in failures:
+            if str(failure.get("model_name") or "") != model:
+                continue
+            object_key = str(failure.get("object_key") or "")
+            relation_rows = self.db.get_relations_by_ids(
+                project_id, [int(object_key)] if object_key.isdigit() else [],
+            )
+            if not relation_rows:
+                # The assertion was removed or is no longer publishable. There is
+                # no derived index left to repair, so retire the outbox record.
+                self.db.complete_indexing_failure(
+                    project_id, "relation", object_key, model,
+                )
+                completed += 1
+                continue
+            relation = relation_rows[0]
+            payload = failure.get("payload") if isinstance(failure.get("payload"), dict) else {}
+            relation_for_index = {
+                **relation,
+                "relation_key": payload.get("relation_key") or f"relation:{object_key}",
+            }
+            try:
+                self.vectors.upsert_relation_embedding(
+                    project_id,
+                    int(failure.get("document_id") or 0),
+                    int(failure.get("chunk_id") or 0),
+                    relation_for_index,
+                    str(relation.get("source_name") or payload.get("source_name") or ""),
+                    str(relation.get("target_name") or payload.get("target_name") or ""),
+                    model,
+                )
+                self.db.complete_indexing_failure(
+                    project_id, "relation", object_key, model,
+                )
+                completed += 1
+            except Exception as exc:
+                self.db.record_indexing_failure({
+                    "project_id": project_id,
+                    "document_id": failure.get("document_id"),
+                    "chunk_id": failure.get("chunk_id"),
+                    "object_type": "relation",
+                    "object_key": object_key,
+                    "model_name": model,
+                    "last_error": str(exc),
+                    "payload": payload,
+                })
+                LOGGER.warning("Relation embedding retry deferred for %s: %s", object_key, exc)
+        return completed
+
     def _sync_project_graph(self, job_id: str, project_id: int) -> None:
-        self._job(job_id, "running", 5, "开始同步项目知识图谱")
         try:
-            project = self.db.get_project(project_id)
-            if not project: raise LookupError("项目不存在")
-            documents = [item for item in self.db.list_documents(project_id) if item["status"] == "indexed"]
-            self.graph.ensure_schema()
-            for index, document in enumerate(documents, 1):
-                chunks = self.db.list_document_chunks(int(document["id"]))
-                self.graph.replace_document(project, document, chunks)
-                report = self.graph.sync_document_assertions(project, document)
-                self._job(job_id, progress=5 + int(index / max(1, len(documents)) * 90),
-                          log=f"{document['original_filename']}：{report['entities']} 个实体，{report['relations']} 条关系")
-            self.db.update_project(project_id, graph_status="ready")
-            self._job(job_id, "completed", 100, f"项目图谱同步完成，共处理 {len(documents)} 个文档")
+            self.db.begin_graph_mutation(job_id)
+            self._job(job_id, progress=5, log="开始按当前验证策略重建项目知识图谱")
+            report = self._rebuild_project_graph(project_id)
+            self._job(
+                job_id, "completed", 100,
+                f"项目图谱同步完成，共处理 {report['documents']} 个文档、{report['relations']} 条关系",
+                graph_ready=True,
+            )
         except Exception as exc:
             LOGGER.exception("Project graph sync failed: %s", project_id)
+            try:
+                self.db.set_graph_state(project_id, GRAPH_FAILED, error=str(exc))
+            except LookupError:
+                pass
             self.db.update_job(job_id, status="failed", progress=100, log=str(exc), error=str(exc))
 
     def _reassess_project_schema(self, job_id: str, project_id: int) -> None:
@@ -931,6 +1103,10 @@ class KnowledgeForgeService:
         # in-flight resolver call releases the per-document lock and reapplies the
         # soft-delete cascade to catch writes that were already in progress.
         self.db.soft_delete_document(document_id)
+        self.db.set_graph_state(
+            int(document["project_id"]), GRAPH_STALE,
+            error="项目文档已删除，图谱正在重新收敛",
+        )
         document_name = str(document.get("original_filename") or f"文档 {document_id}")
         job = self.db.create_job("document_cleanup", int(document["project_id"]), document_id)
         self.db.update_job(
@@ -960,13 +1136,6 @@ class KnowledgeForgeService:
                 # Repeat the cascade after the worker exits so no late mention,
                 # relation or vector contribution can survive deletion.
                 self.db.soft_delete_document(document_id)
-                try:
-                    self.graph.delete_document(document_id)
-                    self._job(job_id, "running", 55, "HugeGraph 文档数据已清理", stage="cleanup")
-                except Exception as exc:
-                    LOGGER.warning("HugeGraph document cleanup deferred for %s: %s", document_id, exc)
-                    self._job(job_id, "running", 55, f"HugeGraph 清理失败，已记录：{exc}", stage="cleanup")
-
                 trash_dir = Config.trash_root / Config.project_storage_key(project_id, document["project_name"])
                 trash_dir.mkdir(parents=True, exist_ok=True)
                 stamp = datetime.now().strftime('%Y%m%d%H%M%S')
@@ -985,13 +1154,19 @@ class KnowledgeForgeService:
                 if self.db.count_documents(project_id) == 0:
                     self.schemas.activate_base(project_id)
 
-            try:
-                self.graph.prune_project_entities(project_id)
-            except Exception as exc:
-                LOGGER.warning("HugeGraph orphan pruning deferred for project %s: %s", project_id, exc)
+            report = self._rebuild_project_graph(project_id)
+            self._job(
+                job_id, "running", 92,
+                f"HugeGraph 已按剩余文档重建：{report['relations']} 条关系",
+                stage="cleanup",
+            )
             self._job(job_id, "completed", 100, "文档及其派生数据清理完成", stage="completed")
         except Exception as exc:
             LOGGER.exception("Document cleanup failed: %s", document_id)
+            try:
+                self.db.set_graph_state(project_id, GRAPH_FAILED, error=str(exc))
+            except LookupError:
+                pass
             self.db.update_job(
                 job_id,
                 status="failed",
@@ -1015,9 +1190,15 @@ class KnowledgeForgeService:
         entities = {int(item["id"]): dict(item) for item in lexical["entities"]}
         for item in self.db.get_entities_by_ids(project_id, list(entity_scores)):
             value = entities.setdefault(int(item["id"]), dict(item)); value["score"] = entity_scores[int(item["id"])]
-        relations = {int(item["id"]): dict(item) for item in lexical["relations"]}
-        for item in self.db.get_relations_by_ids(project_id, list(relation_scores)):
-            value = relations.setdefault(int(item["id"]), dict(item)); value["score"] = relation_scores[int(item["id"])]
+        relation_ids = {
+            *(int(item["id"]) for item in lexical["relations"]),
+            *relation_scores,
+        }
+        relations = {}
+        for item in self.db.get_relations_by_ids(project_id, list(relation_ids)):
+            value = relations.setdefault(int(item["id"]), dict(item))
+            if int(item["id"]) in relation_scores:
+                value["score"] = relation_scores[int(item["id"])]
         return {"query": query, "chunks": self.vectors.search(project, query, top_k),
                 "entities": sorted(entities.values(), key=lambda item: item.get("score", 0), reverse=True)[:limit],
                 "relations": sorted(relations.values(), key=lambda item: item.get("score", item.get("confidence", 0)), reverse=True)[:limit]}
