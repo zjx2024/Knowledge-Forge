@@ -73,6 +73,49 @@ def test_stage_one_mentions_produce_stable_blocked_candidates_and_counts():
     assert renamed_ids.candidates[0].candidate_id == first.candidates[0].candidate_id
 
 
+def test_relation_planner_checks_only_sentence_local_pairs_without_changing_denominator(
+    monkeypatch,
+):
+    import knowledge_forge.relation_pipeline as relation_pipeline
+
+    entity_count = 100
+    sentences = [f"Entity{index} is present." for index in range(entity_count)]
+    content = " ".join(sentences)
+    entities = []
+    cursor = 0
+    for index, sentence in enumerate(sentences):
+        name = f"Entity{index}"
+        start = content.index(name, cursor)
+        cursor = start + len(sentence)
+        entities.append({
+            "id": f"m{index}", "name": name, "type": "GenericEntity",
+            "evidence_text": name, "evidence_start": start,
+            "evidence_end": start + len(name),
+        })
+    checks = 0
+    original = relation_pipeline._type_allowed
+
+    def counted(actual, expected):
+        nonlocal checks
+        checks += 1
+        return original(actual, expected)
+
+    monkeypatch.setattr(relation_pipeline, "_type_allowed", counted)
+    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+        project_scope="project-1", chunk_key="chunk-dense", content=content,
+        entities=entities,
+        logical_schema={"relation_types": [{
+            "name": "related_to", "source_types": ["GenericEntity"],
+            "target_types": ["GenericEntity"], "symmetric": False,
+        }]},
+        sentence_window=1,
+    )
+
+    assert plan.raw_pairs == entity_count * (entity_count - 1)
+    assert plan.blocked_pairs + plan.admitted_count == plan.raw_pairs
+    assert checks < entity_count * 10
+
+
 def test_compact_batches_repeat_context_once_and_defer_without_truncation():
     pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
     plan = pipeline.plan(

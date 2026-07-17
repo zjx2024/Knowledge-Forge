@@ -5,17 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping
 
 from .chunking import estimate_tokens
 from .config import Config
+from .observability import increment
 from .policy import normalize_policy_set
 
 
 NO_RELATION = "NO_RELATION"
 ALLOWED_DIRECTIONS = frozenset({"as_is", "reversed", "symmetric"})
-_SENTENCE_RE = re.compile(r"[^。！？!?\n]+[。！？!?]?|[^\n]+$")
+_SENTENCE_RE = re.compile(r"[^。！？!?\.\n]+[。！？!?\.]?|[^\n]+$")
 _RELATION_CUE = re.compile(
     r"\b(?:uses?|causes?|contains?|includes?|supports?|owns?|produces?|located|part of|"
     r"depends?|relates?|works? for|is a)\b|导致|使用|包含|属于|位于|支持|依赖|生产|关联",
@@ -157,20 +159,35 @@ class VersionedRelationPipeline:
             })
         raw_pairs = len(fixed) * max(0, len(fixed) - 1)
         sentences = _sentences(content)
-        locations = {
-            str(item["id"]): _sentence_index(sentences, int(item.get("evidence_start") or 0))
+        locations = [
+            _sentence_index(sentences, int(item.get("evidence_start") or 0))
             for item in fixed
-        }
+        ]
+        sentence_buckets: dict[int, list[int]] = defaultdict(list)
+        for entity_index, sentence_index in enumerate(locations):
+            if sentence_index is not None:
+                sentence_buckets[sentence_index].append(entity_index)
         definitions = _relation_types(logical_schema)
         candidates: list[RelationCandidate] = []
-        blocked = 0
-        ordinal = 0
-        for source in fixed:
-            for target in fixed:
-                if source is target:
-                    continue
+        pair_checks = 0
+        for source_index, source in enumerate(fixed):
+            source_sentence = locations[source_index]
+            if source_sentence is None:
+                continue
+            target_indexes = sorted(
+                target_index
+                for sentence_index in range(
+                    max(0, source_sentence - sentence_window),
+                    min(len(sentences), source_sentence + sentence_window + 1),
+                )
+                for target_index in sentence_buckets.get(sentence_index, ())
+                if target_index != source_index
+            )
+            for target_index in target_indexes:
+                pair_checks += 1
+                target = fixed[target_index]
                 source_id, target_id = str(source["id"]), str(target["id"])
-                left_index, right_index = locations.get(source_id), locations.get(target_id)
+                left_index, right_index = source_sentence, locations[target_index]
                 allowed_directions: dict[str, str] = {}
                 source_type = str(source.get("type") or "GenericEntity")
                 target_type = str(target.get("type") or "GenericEntity")
@@ -196,8 +213,7 @@ class VersionedRelationPipeline:
                     # predicate (when present in the schema), not by a duplicate candidate
                     # for the forward predicate.
                 allowed = tuple(allowed_directions)
-                if left_index is None or right_index is None or not allowed:
-                    blocked += 1
+                if right_index is None or not allowed:
                     continue
                 sentence_distance = abs(left_index - right_index)
                 context_start, context_end = sorted((left_index, right_index))
@@ -205,7 +221,6 @@ class VersionedRelationPipeline:
                 if sentence_distance > sentence_window or (
                     sentence_distance > 0 and not _RELATION_CUE.search(context)
                 ):
-                    blocked += 1
                     continue
                 material = "\x1f".join((
                     project_scope, chunk_key, source_id, target_id,
@@ -226,10 +241,12 @@ class VersionedRelationPipeline:
                     sentence_start=context_start,
                     sentence_end=context_end,
                 ))
-                ordinal += 1
+        increment("relation_raw_pairs", raw_pairs)
+        increment("relation_pair_checks", pair_checks)
+        increment("relation_candidates", len(candidates))
         return RelationPlan(
             policy_set=dict(self.policy_set), raw_pairs=raw_pairs,
-            blocked_pairs=blocked, candidates=candidates,
+            blocked_pairs=raw_pairs - len(candidates), candidates=candidates,
         )
 
     @staticmethod
