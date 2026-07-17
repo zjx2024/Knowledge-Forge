@@ -45,6 +45,8 @@ class EntityResolutionSession:
     llm_model: str
     model_max_tokens: int
     exact_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    exact_candidates_cache: dict[tuple[str, str], list[dict[str, Any]]] = field(default_factory=dict)
+    query_vector_cache: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     population_cache: dict[str, int] = field(default_factory=dict)
 
 
@@ -164,7 +166,11 @@ class EntityResolver:
         content = entity_identity_text(
             raw["name"], raw["type"], raw.get("description") or "", raw.get("aliases") or [],
         )
-        query_vector = self.vectors.ollama.embed([content], session.embedding_model)[0]
+        cache_key = (raw["type"], normalized)
+        query_vector = session.query_vector_cache.get(cache_key)
+        if query_vector is None:
+            query_vector = self.vectors.ollama.embed([content], session.embedding_model)[0]
+            session.query_vector_cache[cache_key] = query_vector
         vector_rows = self.db.search_entity_vector_candidates(
             session.project_id,
             raw["type"],
@@ -289,7 +295,13 @@ class EntityResolver:
                 "scores": {str(cached["id"]): {"combined": 1.0}}, "reason": "同一文档会话内精确命中",
             }
         else:
-            exact = self.db.find_exact_entity_candidates(session.project_id, raw["type"], normalized)
+            if cache_key in session.exact_candidates_cache:
+                exact = session.exact_candidates_cache[cache_key]
+            else:
+                exact = self.db.find_exact_entity_candidates(
+                    session.project_id, raw["type"], normalized,
+                )
+                session.exact_candidates_cache[cache_key] = exact
             entity = exact[0] if exact else None
         if entity and not cached:
             decision = {
@@ -353,7 +365,15 @@ class EntityResolver:
                 "normalized_aliases": normalized_aliases, "description": raw.get("description") or "",
                 "schema_version": schema_version, "metadata": {"resolution": "new"},
             })
-            self.vectors.upsert_entity_embedding(session.project_id, entity, session.embedding_model)
+            query_vector = session.query_vector_cache.get(cache_key)
+            if query_vector is not None and hasattr(self.vectors, "upsert_entity_embedding_with_vector"):
+                self.vectors.upsert_entity_embedding_with_vector(
+                    session.project_id, entity, session.embedding_model, query_vector,
+                )
+            else:
+                self.vectors.upsert_entity_embedding(
+                    session.project_id, entity, session.embedding_model,
+                )
             if decision["decision"] == "llm_separate":
                 decision["decision"] = "new_after_llm"
         else:
@@ -390,15 +410,60 @@ class EntityResolver:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         project_id = int(project["id"])
         session = session or self.start_session(project)
+        raw_entities = [
+            raw for raw in (extraction.get("entities") or [])
+            if normalize_name(raw.get("name") or "")
+        ]
+        unique_raws: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw in raw_entities:
+            key = (str(raw["type"]), normalize_name(raw["name"]))
+            unique_raws.setdefault(key, raw)
+        exact_requests = [
+            key for key in unique_raws
+            if key not in session.exact_cache and key not in session.exact_candidates_cache
+        ]
+        if exact_requests:
+            if hasattr(self.db, "find_exact_entity_candidates_batch"):
+                session.exact_candidates_cache.update(
+                    self.db.find_exact_entity_candidates_batch(project_id, exact_requests)
+                )
+            else:
+                for entity_type, normalized in exact_requests:
+                    session.exact_candidates_cache[(entity_type, normalized)] = (
+                        self.db.find_exact_entity_candidates(project_id, entity_type, normalized)
+                    )
+        embedding_requests = [
+            (key, raw)
+            for key, raw in unique_raws.items()
+            if key not in session.exact_cache
+            and not session.exact_candidates_cache.get(key)
+            and key not in session.query_vector_cache
+        ]
+        batch_size = max(1, Config.entity_embedding_batch_size)
+        for start in range(0, len(embedding_requests), batch_size):
+            batch = embedding_requests[start : start + batch_size]
+            contents = [
+                entity_identity_text(
+                    raw["name"], raw["type"], raw.get("description") or "",
+                    raw.get("aliases") or [],
+                )
+                for _, raw in batch
+            ]
+            vectors = self.vectors.ollama.embed(contents, session.embedding_model)
+            if len(vectors) != len(batch):
+                raise RuntimeError("实体 embedding 批次返回数量不一致")
+            for (key, _), vector in zip(batch, vectors):
+                session.query_vector_cache[key] = vector
         local_map: dict[str, dict[str, Any]] = {}
-        mentions: list[dict[str, Any]] = []
-        for raw in extraction.get("entities") or []:
+        mention_values: list[dict[str, Any]] = []
+        decision_values: list[dict[str, Any]] = []
+        for raw in raw_entities:
             normalized = normalize_name(raw["name"])
             if not normalized: continue
             aliases = credible_aliases(raw["name"], raw.get("aliases") or [])
             entity, resolution = self._resolve_one(session, raw, chunk, schema_version)
             local_map[raw["id"]] = entity
-            mention = self.db.add_entity_mention({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
+            mention_values.append({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "canonical_entity_id": int(entity["id"]), "mention_text": raw["name"], "normalized_name": normalized,
                 "entity_type": raw["type"], "description": raw.get("description") or "",
                 "confidence": 0.5 if raw.get("confidence") is None else raw.get("confidence"),
@@ -407,7 +472,7 @@ class EntityResolver:
                 "metadata": {"raw_aliases": raw.get("raw_aliases") or [], "accepted_aliases": aliases,
                     "verified_surface_forms": raw.get("verified_surface_forms") or [],
                     "resolution": resolution}})
-            self.db.add_entity_resolution_decision({
+            decision_values.append({
                 "project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "canonical_entity_id": int(entity["id"]), "mention_text": raw["name"],
                 "normalized_name": normalized, "entity_type": raw["type"], "decision": resolution["decision"],
@@ -415,7 +480,13 @@ class EntityResolver:
                 "reason": resolution.get("reason") or "", "model_name": session.llm_model,
                 "metadata": {"schema_version": schema_version},
             })
-            mentions.append(mention)
+        if hasattr(self.db, "persist_entity_resolution_batch"):
+            mentions = self.db.persist_entity_resolution_batch(mention_values, decision_values)
+        else:
+            mentions = []
+            for mention_values_item, decision_values_item in zip(mention_values, decision_values):
+                mentions.append(self.db.add_entity_mention(mention_values_item))
+                self.db.add_entity_resolution_decision(decision_values_item)
         raw_entity_map = {str(item["id"]): item for item in extraction.get("entities") or []}
         candidate_values: list[dict[str, Any]] = []
         for raw in extraction.get("relations") or []:

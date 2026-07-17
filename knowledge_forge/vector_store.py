@@ -73,6 +73,21 @@ class VectorStore:
             entity.get("aliases") or [],
         )
         vector = self.ollama.embed([content], model)[0]
+        self.upsert_entity_embedding_with_vector(project_id, entity, model, vector, content=content)
+
+    def upsert_entity_embedding_with_vector(
+        self,
+        project_id: int,
+        entity: dict[str, Any],
+        model: str,
+        vector: list[float],
+        *,
+        content: str | None = None,
+    ) -> None:
+        content = content or entity_identity_text(
+            entity["name"], entity["entity_type"], entity.get("description") or "",
+            entity.get("aliases") or [],
+        )
         self.db.upsert_embedding({
             "project_id": project_id,
             "document_id": None,

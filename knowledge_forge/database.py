@@ -9,6 +9,8 @@ import math
 import re
 import unicodedata
 import uuid
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
@@ -174,6 +176,20 @@ CREATE TABLE IF NOT EXISTS entity_mentions (
 CREATE INDEX IF NOT EXISTS idx_mentions_entity ON entity_mentions(canonical_entity_id,is_deleted);
 CREATE INDEX IF NOT EXISTS idx_mentions_document ON entity_mentions(document_id,is_deleted);
 
+CREATE TABLE IF NOT EXISTS canonical_entity_documents (
+    id BIGSERIAL PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    canonical_entity_id BIGINT NOT NULL REFERENCES canonical_entities(id),
+    document_id BIGINT NOT NULL REFERENCES documents(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    UNIQUE(canonical_entity_id,document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_entity_documents_project
+    ON canonical_entity_documents(project_id,canonical_entity_id,is_deleted);
+CREATE INDEX IF NOT EXISTS idx_canonical_entity_documents_document
+    ON canonical_entity_documents(document_id,is_deleted);
+
 CREATE TABLE IF NOT EXISTS entity_resolution_decisions (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
     document_id BIGINT NOT NULL REFERENCES documents(id), chunk_id BIGINT NOT NULL REFERENCES chunks(id),
@@ -219,6 +235,17 @@ CREATE INDEX IF NOT EXISTS idx_relation_candidates_document
     ON relation_candidates(document_id,is_deleted,chunk_id);
 CREATE INDEX IF NOT EXISTS idx_relation_candidates_chunk
     ON relation_candidates(project_id,chunk_id,is_deleted);
+
+CREATE TABLE IF NOT EXISTS relation_verification_batches (
+    id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT NOT NULL REFERENCES documents(id), chunk_id BIGINT NOT NULL,
+    attempt INTEGER NOT NULL, model_name TEXT NOT NULL, prompt_version TEXT NOT NULL,
+    schema_version INTEGER NOT NULL, ingestion_run_id TEXT NOT NULL DEFAULT '',
+    request_json JSONB NOT NULL DEFAULT '{}'::jsonb, raw_response JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_relation_verification_batch_scope
+    ON relation_verification_batches(project_id,document_id,chunk_id,created_at);
 
 CREATE TABLE IF NOT EXISTS relation_verification_events (
     id BIGSERIAL PRIMARY KEY, candidate_id TEXT NOT NULL REFERENCES relation_candidates(candidate_id),
@@ -286,6 +313,22 @@ ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS verification_status TEX
 ALTER TABLE relation_assertions ADD COLUMN IF NOT EXISTS ingestion_run_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE relation_candidates ADD COLUMN IF NOT EXISTS ingestion_run_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE relation_verification_events ADD COLUMN IF NOT EXISTS ingestion_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_verification_events ADD COLUMN IF NOT EXISTS batch_id TEXT
+    REFERENCES relation_verification_batches(id);
+CREATE INDEX IF NOT EXISTS idx_relation_verification_event_batch
+    ON relation_verification_events(batch_id) WHERE batch_id IS NOT NULL;
+INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
+SELECT m.project_id,m.canonical_entity_id,m.document_id
+FROM entity_mentions m
+WHERE m.is_deleted=FALSE
+GROUP BY m.project_id,m.canonical_entity_id,m.document_id
+ON CONFLICT(canonical_entity_id,document_id) DO UPDATE
+SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW();
+UPDATE canonical_entities e SET source_count=s.cnt,updated_at=NOW()
+FROM (
+    SELECT canonical_entity_id,COUNT(*)::INTEGER AS cnt
+    FROM canonical_entity_documents WHERE is_deleted=FALSE GROUP BY canonical_entity_id
+) s WHERE e.id=s.canonical_entity_id AND e.source_count<>s.cnt;
 UPDATE documents SET structure_ready_at=COALESCE(structure_ready_at,updated_at)
 WHERE structure_ready_at IS NULL
   AND CASE WHEN COALESCE(parse_quality->>'block_count','') ~ '^[0-9]+$'
@@ -307,6 +350,10 @@ ALTER TABLE IF EXISTS graph_jobs DROP COLUMN IF EXISTS ragflow_task_id;
 
 
 class Database:
+    _hnsw_cache: OrderedDict[tuple[str, str, str, int], None] = OrderedDict()
+    _hnsw_cache_lock = threading.RLock()
+    _hnsw_cache_limit = 256
+
     def __init__(self, config: type[Config] = Config):
         self.config = config
 
@@ -393,11 +440,25 @@ class Database:
             raise ValueError("Embedding 向量不能为空且必须全部为有限数值")
         return "[" + ",".join(format(value, ".12g") for value in vector) + "]"
 
-    @staticmethod
-    def _ensure_hnsw_index(conn: psycopg.Connection, model_name: str, dimension: int) -> None:
+    @classmethod
+    def _reset_hnsw_cache_for_tests(cls) -> None:
+        with cls._hnsw_cache_lock:
+            cls._hnsw_cache.clear()
+
+    def _ensure_hnsw_index(self, conn: psycopg.Connection, model_name: str, dimension: int) -> None:
         if dimension <= 0 or dimension > Config.pgvector_hnsw_max_dimensions:
+            increment("hnsw_degraded_exact_scan")
             LOGGER.info("向量维度 %s 不适合 HNSW vector 索引，将使用精确 pgvector 检索", dimension)
             return
+        schema_row = conn.execute("SELECT current_schema() AS schema").fetchone()
+        schema_name = str((schema_row or {}).get("schema") or "public")
+        database_name = str(self.config.postgres.get("dbname") or "")
+        cache_key = (database_name, schema_name, str(model_name), int(dimension))
+        with self._hnsw_cache_lock:
+            if cache_key in self._hnsw_cache:
+                self._hnsw_cache.move_to_end(cache_key)
+                increment("hnsw_cache_hit")
+                return
         suffix = hashlib.sha256(f"{model_name}|{dimension}".encode()).hexdigest()[:12]
         statement = sql.SQL(
             """CREATE INDEX IF NOT EXISTS {} ON vector_embeddings
@@ -412,7 +473,17 @@ class Database:
             sql.Literal(model_name),
             sql.Literal(dimension),
         )
-        conn.execute(statement)
+        with self._hnsw_cache_lock:
+            if cache_key in self._hnsw_cache:
+                self._hnsw_cache.move_to_end(cache_key)
+                increment("hnsw_cache_hit")
+                return
+            conn.execute(statement)
+            self._hnsw_cache[cache_key] = None
+            self._hnsw_cache.move_to_end(cache_key)
+            while len(self._hnsw_cache) > self._hnsw_cache_limit:
+                self._hnsw_cache.popitem(last=False)
+            increment("hnsw_index_ensured")
 
     @contextmanager
     def connection(self) -> Iterator[psycopg.Connection]:
@@ -825,6 +896,15 @@ class Database:
 
     def soft_delete_document(self, document_id: int) -> dict[str, Any] | None:
         with self.connection() as conn:
+            scope = conn.execute(
+                "SELECT project_id FROM documents WHERE id=%s", (document_id,)
+            ).fetchone()
+            affected_rows = conn.execute(
+                "SELECT DISTINCT canonical_entity_id AS id FROM entity_mentions "
+                "WHERE document_id=%s AND is_deleted=FALSE",
+                (document_id,),
+            ).fetchall()
+            affected_ids = [int(item["id"]) for item in affected_rows]
             row = conn.execute(
                 """UPDATE documents SET is_deleted=TRUE,status='deleted',deleted_at=NOW(),updated_at=NOW()
                 WHERE id=%s AND is_deleted=FALSE RETURNING *""", (document_id,)
@@ -833,10 +913,17 @@ class Database:
             conn.execute("UPDATE chunks SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             conn.execute("UPDATE vector_embeddings SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             conn.execute("UPDATE entity_mentions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
+            conn.execute(
+                "UPDATE canonical_entity_documents SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s",
+                (document_id,),
+            )
             conn.execute("UPDATE entity_resolution_decisions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             conn.execute("UPDATE relation_assertions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             conn.execute("UPDATE relation_candidates SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            self._retire_orphan_entities(conn)
+            if scope:
+                self._retire_orphan_entities(
+                    conn, project_id=int(scope["project_id"]), entity_ids=affected_ids,
+                )
             if row:
                 conn.execute(
                     """UPDATE projects
@@ -854,12 +941,22 @@ class Database:
                 (document_id,),
             ).fetchone()
             if not document: raise LookupError("文档不存在或已删除")
+            affected_rows = conn.execute(
+                "SELECT DISTINCT canonical_entity_id AS id FROM entity_mentions "
+                "WHERE document_id=%s AND is_deleted=FALSE",
+                (document_id,),
+            ).fetchall()
+            affected_ids = [int(item["id"]) for item in affected_rows]
             conn.execute("UPDATE relation_candidates SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM indexing_failures WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM vector_embeddings WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM relation_assertions WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM entity_resolution_decisions WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM entity_mentions WHERE document_id=%s", (document_id,))
+            conn.execute("DELETE FROM canonical_entity_documents WHERE document_id=%s", (document_id,))
+            self._retire_orphan_entities(
+                conn, project_id=int(document["project_id"]), entity_ids=affected_ids,
+            )
             conn.execute("DELETE FROM chunks WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM sections WHERE document_id=%s", (document_id,))
             section_ids: dict[str, int] = {}
@@ -1411,6 +1508,56 @@ class Database:
                 ),
             ).fetchall()
 
+    def find_exact_entity_candidates_batch(
+        self,
+        project_id: int,
+        requests: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        unique_requests = list(dict.fromkeys(
+            (str(entity_type), str(normalized_name))
+            for entity_type, normalized_name in requests
+            if normalized_name
+        ))
+        result = {request: [] for request in unique_requests}
+        if not unique_requests:
+            return result
+        entity_types = [item[0] for item in unique_requests]
+        normalized_names = [item[1] for item in unique_requests]
+        with self.connection() as conn:
+            rows = conn.execute(
+                """WITH requested AS (
+                       SELECT entity_type,normalized_name,ordinality
+                       FROM unnest(%s::text[],%s::text[]) WITH ORDINALITY
+                            AS request(entity_type,normalized_name,ordinality)
+                   )
+                   SELECT request.entity_type AS requested_entity_type,
+                          request.normalized_name AS requested_normalized_name,
+                          entity.*,
+                          CASE WHEN entity.normalized_name=request.normalized_name
+                               THEN 1.0 ELSE 0.99 END AS lexical_score
+                   FROM requested request
+                   JOIN canonical_entities entity
+                     ON entity.project_id=%s AND entity.is_deleted=FALSE
+                    AND (request.entity_type='GenericEntity'
+                         OR entity.entity_type=request.entity_type
+                         OR entity.entity_type='GenericEntity')
+                    AND (entity.normalized_name=request.normalized_name
+                         OR request.normalized_name=ANY(entity.normalized_aliases))
+                   ORDER BY request.ordinality,
+                            (entity.entity_type=request.entity_type) DESC,
+                            (entity.normalized_name=request.normalized_name) DESC,
+                            entity.source_count DESC,entity.id""",
+                (entity_types, normalized_names, project_id),
+            ).fetchall()
+        for row in rows:
+            key = (
+                str(row.pop("requested_entity_type")),
+                str(row.pop("requested_normalized_name")),
+            )
+            if len(result[key]) < 10:
+                result[key].append(row)
+        return result
+
     def search_entity_name_candidates(
         self,
         project_id: int,
@@ -1533,7 +1680,16 @@ class Database:
                 evidence_end=EXCLUDED.evidence_end,metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                 (values["project_id"],values["document_id"],values["chunk_id"],values["canonical_entity_id"],values["mention_text"],values["normalized_name"],values["entity_type"],values.get("description") or "",0.5 if values.get("confidence") is None else values.get("confidence"),values.get("extraction_version") or "v2",values.get("evidence_text") or "",values.get("evidence_start"),values.get("evidence_end"),self._json(values.get("metadata"))),
             ).fetchone()
-            conn.execute("UPDATE canonical_entities SET source_count=(SELECT COUNT(DISTINCT document_id) FROM entity_mentions WHERE canonical_entity_id=%s AND is_deleted=FALSE),updated_at=NOW() WHERE id=%s", (values["canonical_entity_id"],values["canonical_entity_id"]))
+            conn.execute(
+                """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
+                   VALUES(%s,%s,%s)
+                   ON CONFLICT(canonical_entity_id,document_id) DO UPDATE
+                   SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
+                (values["project_id"], values["canonical_entity_id"], values["document_id"]),
+            )
+            self._refresh_entity_source_counts(
+                conn, int(values["project_id"]), [int(values["canonical_entity_id"])],
+            )
             return row
 
     def add_entity_resolution_decision(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -1555,6 +1711,97 @@ class Database:
                     self._json(values.get("metadata")),
                 ),
             ).fetchone()
+
+    @staticmethod
+    def _mention_conflict_key(values: dict[str, Any]) -> tuple[int, int, int, str]:
+        return (
+            int(values["document_id"]), int(values["chunk_id"]),
+            int(values["canonical_entity_id"]), str(values["mention_text"]),
+        )
+
+    @staticmethod
+    def _decision_conflict_key(values: dict[str, Any]) -> tuple[int, int, str, str]:
+        return (
+            int(values["document_id"]), int(values["chunk_id"]),
+            str(values["mention_text"]), str(values["entity_type"]),
+        )
+
+    def persist_entity_resolution_batch(
+        self,
+        mentions: list[dict[str, Any]],
+        decisions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist one Chunk's mention decisions and source counts atomically."""
+
+        if not mentions:
+            return []
+        project_id = int(mentions[0]["project_id"])
+        document_id = int(mentions[0]["document_id"])
+        if any(
+            int(item["project_id"]) != project_id or int(item["document_id"]) != document_id
+            for item in [*mentions, *decisions]
+        ):
+            raise ValueError("实体批次必须属于同一项目和文档")
+        unique_mentions: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+        for item in mentions:
+            unique_mentions[self._mention_conflict_key(item)] = item
+        unique_decisions: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+        for item in decisions:
+            unique_decisions[self._decision_conflict_key(item)] = item
+
+        with self.connection() as conn:
+            persisted_by_key: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+            for key, values in unique_mentions.items():
+                row = conn.execute(
+                    """INSERT INTO entity_mentions(project_id,document_id,chunk_id,canonical_entity_id,
+                    mention_text,normalized_name,entity_type,description,confidence,extraction_version,
+                    evidence_text,evidence_start,evidence_end,metadata)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    ON CONFLICT(document_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET
+                    description=EXCLUDED.description,confidence=EXCLUDED.confidence,
+                    evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
+                    evidence_end=EXCLUDED.evidence_end,metadata=EXCLUDED.metadata,
+                    is_deleted=FALSE,updated_at=NOW() RETURNING *""",
+                    (
+                        values["project_id"], values["document_id"], values["chunk_id"],
+                        values["canonical_entity_id"], values["mention_text"], values["normalized_name"],
+                        values["entity_type"], values.get("description") or "",
+                        0.5 if values.get("confidence") is None else values.get("confidence"),
+                        values.get("extraction_version") or "v2", values.get("evidence_text") or "",
+                        values.get("evidence_start"), values.get("evidence_end"),
+                        self._json(values.get("metadata")),
+                    ),
+                ).fetchone()
+                persisted_by_key[key] = row
+            for values in unique_decisions.values():
+                conn.execute(
+                    """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,
+                    canonical_entity_id,mention_text,normalized_name,entity_type,decision,
+                    candidate_entity_ids,scores,reason,model_name,metadata)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                    ON CONFLICT(document_id,chunk_id,mention_text,entity_type) DO UPDATE SET
+                    canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
+                    candidate_entity_ids=EXCLUDED.candidate_entity_ids,scores=EXCLUDED.scores,
+                    reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
+                    is_deleted=FALSE,updated_at=NOW()""",
+                    (
+                        values["project_id"], values["document_id"], values["chunk_id"],
+                        values["canonical_entity_id"], values["mention_text"], values["normalized_name"],
+                        values["entity_type"], values["decision"], values.get("candidate_entity_ids") or [],
+                        self._json(values.get("scores")), values.get("reason") or "",
+                        values.get("model_name"), self._json(values.get("metadata")),
+                    ),
+                )
+            affected_ids = sorted({int(item["canonical_entity_id"]) for item in mentions})
+            conn.execute(
+                """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
+                   SELECT %s,entity_id,%s FROM unnest(%s::bigint[]) AS entity_id
+                   ON CONFLICT(canonical_entity_id,document_id) DO UPDATE
+                   SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
+                (project_id, document_id, affected_ids),
+            )
+            self._refresh_entity_source_counts(conn, project_id, affected_ids)
+        return [persisted_by_key[self._mention_conflict_key(item)] for item in mentions]
 
     def upsert_relation_candidate(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as conn:
@@ -1604,8 +1851,9 @@ class Database:
     ) -> dict[str, Any]:
         return conn.execute(
                 """INSERT INTO relation_verification_events(candidate_id,project_id,document_id,chunk_id,
-                attempt,model_name,prompt_version,schema_version,ingestion_run_id,request_json,raw_response,verdict,reason,error_category)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s) RETURNING *""",
+                attempt,model_name,prompt_version,schema_version,ingestion_run_id,request_json,raw_response,
+                verdict,reason,error_category,batch_id)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s) RETURNING *""",
                 (
                     values["candidate_id"], values["project_id"], values["document_id"], values["chunk_id"],
                     values["attempt"], values.get("model_name") or "", values.get("prompt_version") or "",
@@ -1614,8 +1862,44 @@ class Database:
                     self._json(values.get("raw_response")) if values.get("raw_response") is not None else None,
                     values.get("verdict") or None, values.get("reason") or "",
                     values.get("error_category") or "",
+                    values.get("batch_id"),
                 ),
             ).fetchone()
+
+    @staticmethod
+    def _relation_verification_batch_key(values: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            int(values["project_id"]), int(values["document_id"]), int(values["chunk_id"]),
+            int(values["attempt"]), values.get("model_name") or "",
+            values.get("prompt_version") or "", int(values.get("schema_version") or 1),
+            values.get("ingestion_run_id") or "",
+            json.dumps(values.get("request_json") or {}, ensure_ascii=False, sort_keys=True),
+            json.dumps(values.get("raw_response"), ensure_ascii=False, sort_keys=True)
+            if values.get("raw_response") is not None else None,
+        )
+
+    def _upsert_relation_verification_batch(
+        self, conn: psycopg.Connection, values: dict[str, Any],
+    ) -> str:
+        key = self._relation_verification_batch_key(values)
+        digest = hashlib.sha256(
+            json.dumps(key, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """INSERT INTO relation_verification_batches(id,project_id,document_id,chunk_id,attempt,
+               model_name,prompt_version,schema_version,ingestion_run_id,request_json,raw_response)
+               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+               ON CONFLICT(id) DO NOTHING""",
+            (
+                digest, values["project_id"], values["document_id"], values["chunk_id"],
+                values["attempt"], values.get("model_name") or "",
+                values.get("prompt_version") or "", int(values.get("schema_version") or 1),
+                values.get("ingestion_run_id") or "", self._json(values.get("request_json")),
+                self._json(values.get("raw_response"))
+                if values.get("raw_response") is not None else None,
+            ),
+        )
+        return digest
 
     def add_relation_assertion(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as conn:
@@ -1655,9 +1939,42 @@ class Database:
         with self.connection() as conn:
             for values in candidates:
                 self._upsert_relation_candidate(conn, values)
+            batches: dict[tuple[Any, ...], str] = {}
             for values in events:
-                self._add_relation_verification_event(conn, values)
+                if not values.get("request_json") and values.get("raw_response") is None:
+                    self._add_relation_verification_event(conn, values)
+                    continue
+                key = self._relation_verification_batch_key(values)
+                batch_id = batches.get(key)
+                if batch_id is None:
+                    batch_id = self._upsert_relation_verification_batch(conn, values)
+                    batches[key] = batch_id
+                event_values = {
+                    **values,
+                    "batch_id": batch_id,
+                    "request_json": {},
+                    "raw_response": None,
+                }
+                self._add_relation_verification_event(conn, event_values)
             return [self._add_relation_assertion(conn, values) for values in assertions]
+
+    def list_relation_verification_events(
+        self, project_id: int, document_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        document_clause = "" if document_id is None else " AND event.document_id=%s"
+        params: tuple[Any, ...] = (project_id,) if document_id is None else (project_id, document_id)
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT event.*,
+                   CASE WHEN event.batch_id IS NULL THEN event.request_json ELSE batch.request_json END
+                       AS effective_request_json,
+                   CASE WHEN event.batch_id IS NULL THEN event.raw_response ELSE batch.raw_response END
+                       AS effective_raw_response
+                   FROM relation_verification_events event
+                   LEFT JOIN relation_verification_batches batch ON batch.id=event.batch_id
+                   WHERE event.project_id=%s""" + document_clause + " ORDER BY event.id",
+                params,
+            ).fetchall()
 
     def list_project_relations(self, project_id: int) -> list[dict[str, Any]]:
         clause, policy_params = self._publishable_relation_clause()
@@ -1762,20 +2079,60 @@ class Database:
         with self.connection() as conn: conn.execute("UPDATE relation_assertions SET graph_edge_id=%s,updated_at=NOW() WHERE id=%s", (edge_id,relation_id))
 
     @staticmethod
-    def _retire_orphan_entities(conn: psycopg.Connection) -> None:
+    def _refresh_entity_source_counts(
+        conn: psycopg.Connection,
+        project_id: int,
+        entity_ids: list[int] | None = None,
+    ) -> None:
+        ids = sorted({int(value) for value in (entity_ids or [])})
+        id_filter = " AND e.id=ANY(%s)" if ids else ""
+        params: list[Any] = [project_id]
+        if ids:
+            params.append(ids)
         conn.execute(
-            """UPDATE canonical_entities e SET source_count=COALESCE(x.cnt,0),is_deleted=COALESCE(x.cnt,0)=0,updated_at=NOW()
-            FROM (SELECT e2.id,COUNT(DISTINCT m.document_id) FILTER (WHERE m.is_deleted=FALSE) AS cnt
-            FROM canonical_entities e2 LEFT JOIN entity_mentions m ON m.canonical_entity_id=e2.id GROUP BY e2.id) x WHERE e.id=x.id"""
-        )
-        conn.execute(
-            """UPDATE vector_embeddings v SET is_deleted=e.is_deleted,updated_at=NOW()
-            FROM canonical_entities e WHERE v.object_type='entity' AND v.object_key=e.id::text"""
+            """UPDATE canonical_entities e
+               SET source_count=(
+                       SELECT COUNT(*) FROM canonical_entity_documents source
+                       WHERE source.project_id=e.project_id
+                         AND source.canonical_entity_id=e.id AND source.is_deleted=FALSE
+                   ),
+                   is_deleted=NOT EXISTS(
+                       SELECT 1 FROM canonical_entity_documents source
+                       WHERE source.project_id=e.project_id
+                         AND source.canonical_entity_id=e.id AND source.is_deleted=FALSE
+                   ),
+                   updated_at=NOW()
+               WHERE e.project_id=%s""" + id_filter,
+            params,
         )
 
-    def retire_orphan_entities(self) -> None:
+    @classmethod
+    def _retire_orphan_entities(
+        cls,
+        conn: psycopg.Connection,
+        project_id: int,
+        entity_ids: list[int] | None = None,
+    ) -> None:
+        cls._refresh_entity_source_counts(conn, project_id, entity_ids)
+        ids = sorted({int(value) for value in (entity_ids or [])})
+        id_filter = " AND e.id=ANY(%s)" if ids else ""
+        params: list[Any] = [project_id]
+        if ids:
+            params.append(ids)
+        conn.execute(
+            """UPDATE vector_embeddings v SET is_deleted=e.is_deleted,updated_at=NOW()
+            FROM canonical_entities e
+            WHERE e.project_id=%s""" + id_filter + """
+              AND v.project_id=e.project_id AND v.object_type='entity'
+              AND v.object_key=e.id::text""",
+            params,
+        )
+
+    def retire_orphan_entities(
+        self, project_id: int, entity_ids: list[int] | None = None,
+    ) -> None:
         with self.connection() as conn:
-            self._retire_orphan_entities(conn)
+            self._retire_orphan_entities(conn, project_id, entity_ids)
 
     def statistics(self, project_id: int) -> dict[str, int]:
         clause, policy_params = self._publishable_relation_clause("r")

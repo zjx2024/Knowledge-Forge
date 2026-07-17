@@ -68,6 +68,7 @@ class Config:
     pgvector_hnsw_ef_construction = int(os.getenv("PGVECTOR_HNSW_EF_CONSTRUCTION", "64"))
     pgvector_hnsw_ef_search = int(os.getenv("PGVECTOR_HNSW_EF_SEARCH", "100"))
     pgvector_hnsw_max_dimensions = int(os.getenv("PGVECTOR_HNSW_MAX_DIMENSIONS", "2000"))
+    entity_embedding_batch_size = max(1, int(os.getenv("ENTITY_EMBEDDING_BATCH_SIZE", "16")))
     indexing_retry_batch_size = max(1, int(os.getenv("INDEXING_RETRY_BATCH_SIZE", "100")))
     indexing_retry_max_attempts = max(1, int(os.getenv("INDEXING_RETRY_MAX_ATTEMPTS", "8")))
     indexing_retry_base_seconds = max(1, int(os.getenv("INDEXING_RETRY_BASE_SECONDS", "30")))

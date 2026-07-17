@@ -837,7 +837,7 @@ class KnowledgeForgeService:
             )
             with self._document_lock(document_id):
                 self._assert_ingestion_active(job_id, document_id)
-                self.db.retire_orphan_entities()
+                self.db.retire_orphan_entities(int(project["id"]))
             self._assert_ingestion_active(job_id, document_id)
             document_values = {
                 "status": "indexed",
