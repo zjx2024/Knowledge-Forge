@@ -1,0 +1,2 @@
+# Local cross-encoder inference for conservative entity identity review.
+transformers>=5.0,<6

@@ -1,0 +1,14 @@
+services:
+  hubble:
+    build: .
+    image: knowledge-forge-hubble:latest
+    container_name: hugegraph-hubble
+    restart: unless-stopped
+    ports:
+      - "18088:8088"
+    volumes:
+      - knowledge-forge-hubble-data:/hubble/data
+
+volumes:
+  knowledge-forge-hubble-data:
+    name: knowledge-forge-hubble-data

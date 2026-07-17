@@ -1,0 +1,7 @@
+# Layout-aware parser for scanned or complex PDF/DOCX documents.
+# CUDA wheels retain CPU execution for automatic OOM fallback.
+--extra-index-url https://download.pytorch.org/whl/cu128
+-r requirements.txt
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+docling>=2.0.0
