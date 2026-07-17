@@ -399,6 +399,8 @@ CREATE INDEX IF NOT EXISTS idx_mention_relation_assertion_scope
     ON mention_relation_assertions(project_id,document_id,chunk_id);
 CREATE INDEX IF NOT EXISTS idx_mention_relation_assertion_endpoints
     ON mention_relation_assertions(project_id,source_mention_key,target_mention_key);
+CREATE INDEX IF NOT EXISTS idx_mention_relation_assertion_canonical
+    ON mention_relation_assertions(project_id,canonical_assertion_id);
 
 CREATE TABLE IF NOT EXISTS relation_verification_batches (
     id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
@@ -587,6 +589,34 @@ SELECT m.project_id,m.id,m.canonical_entity_id,1,'entity-resolution-p0-v1','lega
 FROM entity_mentions m
 WHERE m.is_deleted=FALSE
 ON CONFLICT(project_id,mention_id) WHERE active=TRUE DO NOTHING;
+WITH source_keys AS (
+    SELECT DISTINCT ON (fact.id) fact.id,mention.mention_key
+    FROM mention_relation_assertions fact
+    JOIN relation_assertions assertion ON assertion.id=fact.canonical_assertion_id
+    JOIN entity_mentions mention
+      ON mention.project_id=fact.project_id AND mention.document_id=fact.document_id
+     AND mention.chunk_id=fact.chunk_id
+     AND mention.canonical_entity_id=assertion.source_entity_id
+     AND mention.is_deleted=FALSE AND mention.mention_key<>''
+    WHERE fact.source_mention_key !~ '^mention_'
+    ORDER BY fact.id,mention.id
+)
+UPDATE mention_relation_assertions fact SET source_mention_key=source_keys.mention_key
+FROM source_keys WHERE fact.id=source_keys.id;
+WITH target_keys AS (
+    SELECT DISTINCT ON (fact.id) fact.id,mention.mention_key
+    FROM mention_relation_assertions fact
+    JOIN relation_assertions assertion ON assertion.id=fact.canonical_assertion_id
+    JOIN entity_mentions mention
+      ON mention.project_id=fact.project_id AND mention.document_id=fact.document_id
+     AND mention.chunk_id=fact.chunk_id
+     AND mention.canonical_entity_id=assertion.target_entity_id
+     AND mention.is_deleted=FALSE AND mention.mention_key<>''
+    WHERE fact.target_mention_key !~ '^mention_'
+    ORDER BY fact.id,mention.id
+)
+UPDATE mention_relation_assertions fact SET target_mention_key=target_keys.mention_key
+FROM target_keys WHERE fact.id=target_keys.id;
 UPDATE canonical_entities e SET source_count=s.cnt,updated_at=NOW()
 FROM (
     SELECT canonical_entity_id,COUNT(*)::INTEGER AS cnt
@@ -1408,6 +1438,21 @@ class Database:
                    AND status='pending' AND next_attempt_at<=NOW()
                    ORDER BY next_attempt_at,id LIMIT %s""",
                 (project_id, object_type, page_size),
+            ).fetchall()
+
+    def list_blocking_indexing_failures(
+        self, project_id: int, graph_generation: int,
+    ) -> list[dict[str, Any]]:
+        """Return unresolved derived indexes that explicitly gate one graph generation."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM indexing_failures
+                   WHERE project_id=%s AND status IN ('pending','permanent_failed')
+                     AND COALESCE(payload->>'blocks_graph_generation','') ~ '^[0-9]+$'
+                     AND (payload->>'blocks_graph_generation')::BIGINT=%s
+                   ORDER BY object_type,object_key""",
+                (project_id, graph_generation),
             ).fetchall()
 
     def cleanup_indexing_failures(self) -> int:
@@ -2770,21 +2815,51 @@ class Database:
                project_id,assertion_id,source_entity_id,target_entity_id,
                assignment_generation,policy_hash,publishable,quarantine_reason)
                SELECT r.project_id,r.id,
-                      COALESCE(sr.target_entity_id,r.source_entity_id),
-                      COALESCE(tr.target_entity_id,r.target_entity_id),
+                      COALESCE(source_assignment.canonical_entity_id,
+                               source_redirect.target_entity_id,r.source_entity_id),
+                      COALESCE(target_assignment.canonical_entity_id,
+                               target_redirect.target_entity_id,r.target_entity_id),
                       %s,%s,
-                      COALESCE(sr.target_entity_id,r.source_entity_id)
-                        <>COALESCE(tr.target_entity_id,r.target_entity_id),
-                      CASE WHEN COALESCE(sr.target_entity_id,r.source_entity_id)
-                                     =COALESCE(tr.target_entity_id,r.target_entity_id)
+                      COALESCE(source_assignment.canonical_entity_id,
+                               source_redirect.target_entity_id,r.source_entity_id)
+                        <>COALESCE(target_assignment.canonical_entity_id,
+                                   target_redirect.target_entity_id,r.target_entity_id),
+                      CASE WHEN COALESCE(source_assignment.canonical_entity_id,
+                                         source_redirect.target_entity_id,r.source_entity_id)
+                                     =COALESCE(target_assignment.canonical_entity_id,
+                                               target_redirect.target_entity_id,r.target_entity_id)
                            THEN 'self relation after entity assignment change' ELSE '' END
                FROM relation_assertions r
-               LEFT JOIN canonical_entity_redirects sr
-                 ON sr.project_id=r.project_id AND sr.source_entity_id=r.source_entity_id
-                AND sr.active=TRUE
-               LEFT JOIN canonical_entity_redirects tr
-                 ON tr.project_id=r.project_id AND tr.source_entity_id=r.target_entity_id
-                AND tr.active=TRUE
+               LEFT JOIN LATERAL (
+                   SELECT fact.source_mention_key,fact.target_mention_key
+                   FROM mention_relation_assertions fact
+                   WHERE fact.project_id=r.project_id AND fact.canonical_assertion_id=r.id
+                   ORDER BY fact.created_at DESC,fact.id DESC LIMIT 1
+               ) mention_fact ON TRUE
+               LEFT JOIN entity_mentions source_mention
+                 ON source_mention.project_id=r.project_id
+                AND source_mention.mention_key=mention_fact.source_mention_key
+                AND source_mention.is_deleted=FALSE
+               LEFT JOIN entity_assignments source_assignment
+                 ON source_assignment.project_id=r.project_id
+                AND source_assignment.mention_id=source_mention.id
+                AND source_assignment.active=TRUE
+               LEFT JOIN entity_mentions target_mention
+                 ON target_mention.project_id=r.project_id
+                AND target_mention.mention_key=mention_fact.target_mention_key
+                AND target_mention.is_deleted=FALSE
+               LEFT JOIN entity_assignments target_assignment
+                 ON target_assignment.project_id=r.project_id
+                AND target_assignment.mention_id=target_mention.id
+                AND target_assignment.active=TRUE
+               LEFT JOIN canonical_entity_redirects source_redirect
+                 ON source_redirect.project_id=r.project_id
+                AND source_redirect.source_entity_id=r.source_entity_id
+                AND source_redirect.active=TRUE
+               LEFT JOIN canonical_entity_redirects target_redirect
+                 ON target_redirect.project_id=r.project_id
+                AND target_redirect.source_entity_id=r.target_entity_id
+                AND target_redirect.active=TRUE
                WHERE r.project_id=%s AND r.is_deleted=FALSE
                ON CONFLICT(project_id,assertion_id) DO UPDATE SET
                source_entity_id=EXCLUDED.source_entity_id,
@@ -2837,6 +2912,107 @@ class Database:
                     (project_id, row["assertion_id"]),
                 )
 
+    @staticmethod
+    def _refresh_entity_document_projections(
+        conn: psycopg.Connection,
+        project_id: int,
+        entity_ids: list[int],
+    ) -> None:
+        """Rebuild bounded canonical-to-document provenance from active assignments."""
+
+        ids = sorted({int(value) for value in entity_ids})
+        if not ids:
+            return
+        conn.execute(
+            """UPDATE canonical_entity_documents SET is_deleted=TRUE,updated_at=NOW()
+               WHERE project_id=%s AND canonical_entity_id=ANY(%s)""",
+            (project_id, ids),
+        )
+        conn.execute(
+            """INSERT INTO canonical_entity_documents(
+                   project_id,canonical_entity_id,document_id)
+               SELECT assignment.project_id,assignment.canonical_entity_id,mention.document_id
+               FROM entity_assignments assignment
+               JOIN entity_mentions mention ON mention.id=assignment.mention_id
+               JOIN documents document ON document.id=mention.document_id
+               WHERE assignment.project_id=%s AND assignment.active=TRUE
+                 AND assignment.canonical_entity_id=ANY(%s)
+                 AND mention.is_deleted=FALSE AND document.is_deleted=FALSE
+               GROUP BY assignment.project_id,assignment.canonical_entity_id,mention.document_id
+               ON CONFLICT(canonical_entity_id,document_id) DO UPDATE SET
+               project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
+            (project_id, ids),
+        )
+
+    @staticmethod
+    def _refresh_assignment_aliases(
+        conn: psycopg.Connection,
+        project_id: int,
+        entity_ids: list[int],
+        policy_version: str,
+    ) -> None:
+        """Refresh assignment-derived aliases while retaining audited manual aliases."""
+
+        ids = sorted({int(value) for value in entity_ids})
+        if not ids:
+            return
+        conn.execute(
+            """UPDATE canonical_entity_aliases SET active=FALSE,updated_at=NOW()
+               WHERE project_id=%s AND canonical_entity_id=ANY(%s)
+                 AND alias_kind='assignment'""",
+            (project_id, ids),
+        )
+        conn.execute(
+            """INSERT INTO canonical_entity_aliases(
+                   project_id,canonical_entity_id,entity_type,alias,normalized_alias,
+                   alias_kind,active,evidence,policy_version)
+               SELECT DISTINCT ON (assignment.canonical_entity_id,mention.normalized_name)
+                   assignment.project_id,assignment.canonical_entity_id,entity.entity_type,
+                   mention.mention_text,mention.normalized_name,'assignment',TRUE,
+                   jsonb_build_object('mention_key',mention.mention_key),%s
+               FROM entity_assignments assignment
+               JOIN entity_mentions mention ON mention.id=assignment.mention_id
+               JOIN canonical_entities entity ON entity.id=assignment.canonical_entity_id
+               WHERE assignment.project_id=%s AND assignment.active=TRUE
+                 AND assignment.canonical_entity_id=ANY(%s)
+                 AND mention.is_deleted=FALSE AND mention.normalized_name<>''
+               ORDER BY assignment.canonical_entity_id,mention.normalized_name,mention.id
+               ON CONFLICT(project_id,canonical_entity_id,normalized_alias,alias_kind)
+               DO UPDATE SET alias=EXCLUDED.alias,entity_type=EXCLUDED.entity_type,
+               active=TRUE,evidence=EXCLUDED.evidence,policy_version=EXCLUDED.policy_version,
+               updated_at=NOW()""",
+            (policy_version, project_id, ids),
+        )
+        conn.execute(
+            """UPDATE canonical_entities entity SET
+                   aliases=COALESCE(alias_set.aliases,'{}'::TEXT[]),
+                   normalized_aliases=COALESCE(alias_set.normalized_aliases,'{}'::TEXT[]),
+                   updated_at=NOW()
+               FROM (
+                   SELECT canonical_entity_id,
+                          ARRAY_AGG(DISTINCT alias ORDER BY alias) AS aliases,
+                          ARRAY_AGG(DISTINCT normalized_alias ORDER BY normalized_alias)
+                              AS normalized_aliases
+                   FROM canonical_entity_aliases
+                   WHERE project_id=%s AND canonical_entity_id=ANY(%s) AND active=TRUE
+                     AND alias_kind<>'canonical_name'
+                   GROUP BY canonical_entity_id
+               ) alias_set
+               WHERE entity.project_id=%s AND entity.id=alias_set.canonical_entity_id""",
+            (project_id, ids, project_id),
+        )
+        conn.execute(
+            """UPDATE canonical_entities entity SET aliases='{}',normalized_aliases='{}',
+                   updated_at=NOW()
+               WHERE entity.project_id=%s AND entity.id=ANY(%s)
+                 AND NOT EXISTS(
+                     SELECT 1 FROM canonical_entity_aliases alias
+                     WHERE alias.project_id=entity.project_id
+                       AND alias.canonical_entity_id=entity.id AND alias.active=TRUE
+                       AND alias.alias_kind<>'canonical_name'
+                 )""",
+            (project_id, ids),
+        )
     def manual_merge_entities(
         self,
         project_id: int,
@@ -2952,7 +3128,9 @@ class Database:
                    project_id,canonical_entity_id,entity_type,alias,normalized_alias,
                    alias_kind,active,evidence,policy_version)
                    SELECT project_id,%s,entity_type,alias,normalized_alias,'merge',TRUE,
-                          jsonb_build_object('source_entity_id',%s,'event_id',%s),%s
+                          jsonb_build_object(
+                              'source_entity_id',%s::BIGINT,'event_id',%s::TEXT
+                          ),%s
                    FROM canonical_entity_aliases
                    WHERE project_id=%s AND canonical_entity_id=%s AND active=TRUE
                    ON CONFLICT(project_id,canonical_entity_id,normalized_alias,alias_kind)
@@ -2969,12 +3147,24 @@ class Database:
             project = self._mark_graph_stale_in_transaction(
                 conn, project_id, f"实体合并 {source_entity_id}->{target_entity_id}，等待重建",
             )
+            affected_entity_ids = [source_entity_id, target_entity_id]
+            self._refresh_entity_document_projections(
+                conn, project_id, affected_entity_ids,
+            )
+            self._refresh_assignment_aliases(
+                conn, project_id, affected_entity_ids, policy_version,
+            )
             policy_hash = str(project.get("active_policy_hash") or GRAPH_POLICY_HASH)
             self._refresh_relation_projections(
                 conn, project_id, policy_hash, int(project["graph_generation"]),
             )
-            self._refresh_entity_source_counts(conn, project_id, [source_entity_id, target_entity_id])
-            return {"event_id": event_id, "project": project, "assignments": len(assignments)}
+            self._refresh_entity_source_counts(conn, project_id, affected_entity_ids)
+            return {
+                "event_id": event_id,
+                "project": project,
+                "assignments": len(assignments),
+                "affected_entity_ids": affected_entity_ids,
+            }
 
     def undo_entity_resolution_event(
         self,
@@ -3045,14 +3235,24 @@ class Database:
             project = self._mark_graph_stale_in_transaction(
                 conn, project_id, f"实体合并事件 {event_id} 已回滚，等待重建",
             )
+            affected_entity_ids = [source_id, int(event["target_entity_id"])]
+            self._refresh_entity_document_projections(
+                conn, project_id, affected_entity_ids,
+            )
+            self._refresh_assignment_aliases(
+                conn, project_id, affected_entity_ids, str(event["policy_version"]),
+            )
             policy_hash = str(project.get("active_policy_hash") or GRAPH_POLICY_HASH)
             self._refresh_relation_projections(
                 conn, project_id, policy_hash, int(project["graph_generation"]),
             )
-            self._refresh_entity_source_counts(
-                conn, project_id, [source_id, int(event["target_entity_id"])],
-            )
-            return {"event_id": undo_id, "project": project, "reversed_event_id": event_id}
+            self._refresh_entity_source_counts(conn, project_id, affected_entity_ids)
+            return {
+                "event_id": undo_id,
+                "project": project,
+                "reversed_event_id": event_id,
+                "affected_entity_ids": affected_entity_ids,
+            }
 
     def split_entity_mentions(
         self,
@@ -3075,7 +3275,10 @@ class Database:
         )
         with self.connection() as conn:
             rows = conn.execute(
-                """SELECT a.* FROM entity_assignments a
+                """SELECT a.id,a.project_id,a.mention_id,a.canonical_entity_id,
+                          a.assignment_generation,a.policy_version,a.event_id,a.reason,
+                          a.active,a.metadata
+                   FROM entity_assignments a
                    WHERE a.project_id=%s AND a.mention_id=ANY(%s)
                      AND a.canonical_entity_id=%s AND a.active=TRUE
                    ORDER BY a.mention_id FOR UPDATE""",
@@ -3114,14 +3317,24 @@ class Database:
             project = self._mark_graph_stale_in_transaction(
                 conn, project_id, f"实体 mention split {source_entity_id}->{target_entity_id}，等待重建",
             )
+            affected_entity_ids = [source_entity_id, target_entity_id]
+            self._refresh_entity_document_projections(
+                conn, project_id, affected_entity_ids,
+            )
+            self._refresh_assignment_aliases(
+                conn, project_id, affected_entity_ids, policy_version,
+            )
             self._refresh_relation_projections(
                 conn, project_id, str(project.get("active_policy_hash") or GRAPH_POLICY_HASH),
                 int(project["graph_generation"]),
             )
-            self._refresh_entity_source_counts(
-                conn, project_id, [source_entity_id, target_entity_id],
-            )
-            return {"event_id": event_id, "project": project, "mentions": len(selected)}
+            self._refresh_entity_source_counts(conn, project_id, affected_entity_ids)
+            return {
+                "event_id": event_id,
+                "project": project,
+                "mentions": len(selected),
+                "affected_entity_ids": affected_entity_ids,
+            }
 
     def create_entity_shadow_namespace(
         self,
@@ -3438,9 +3651,70 @@ class Database:
         if not ids: return []
         with self.connection() as conn:
             return conn.execute(
-                """SELECT id,name,entity_type,description,aliases,source_count FROM canonical_entities
+                """SELECT * FROM canonical_entities
                 WHERE project_id=%s AND id=ANY(%s) AND is_deleted=FALSE""", (project_id,ids)
             ).fetchall()
+
+    def list_project_relations_for_entities(
+        self, project_id: int, entity_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        """List publishable projected relations touching a bounded entity set."""
+
+        ids = sorted({int(value) for value in entity_ids})
+        if not ids:
+            return []
+        clause, policy_params = self._publishable_relation_clause()
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT r.*,
+                   COALESCE(projection.source_entity_id,r.source_entity_id) AS source_entity_id,
+                   COALESCE(projection.target_entity_id,r.target_entity_id) AS target_entity_id,
+                   source.name AS source_name,target.name AS target_name
+                   FROM relation_assertions r
+                   LEFT JOIN canonical_relation_projections projection
+                     ON projection.project_id=r.project_id AND projection.assertion_id=r.id
+                   JOIN canonical_entities source
+                     ON source.id=COALESCE(projection.source_entity_id,r.source_entity_id)
+                   JOIN canonical_entities target
+                     ON target.id=COALESCE(projection.target_entity_id,r.target_entity_id)
+                   JOIN documents document ON document.id=r.document_id
+                   WHERE r.project_id=%s AND r.is_deleted=FALSE AND document.is_deleted=FALSE
+                     AND COALESCE(projection.publishable,TRUE)=TRUE
+                     AND (COALESCE(projection.source_entity_id,r.source_entity_id)=ANY(%s)
+                       OR COALESCE(projection.target_entity_id,r.target_entity_id)=ANY(%s))
+                     AND """ + clause + " ORDER BY r.id",
+                (project_id, ids, ids, *policy_params),
+            ).fetchall()
+
+    def retire_derived_embeddings_for_entity_change(
+        self, project_id: int, entity_ids: list[int], model_name: str,
+    ) -> None:
+        """Retire only entity/relation vectors invalidated by a canonical assignment change."""
+
+        ids = sorted({int(value) for value in entity_ids})
+        if not ids:
+            return
+        keys = [str(value) for value in ids]
+        with self.connection() as conn:
+            conn.execute(
+                """UPDATE vector_embeddings SET is_deleted=TRUE,updated_at=NOW()
+                   WHERE project_id=%s AND object_type='entity' AND model_name=%s
+                     AND object_key=ANY(%s)""",
+                (project_id, model_name, keys),
+            )
+            conn.execute(
+                """UPDATE vector_embeddings vector SET is_deleted=TRUE,updated_at=NOW()
+                   FROM relation_assertions relation
+                   LEFT JOIN canonical_relation_projections projection
+                     ON projection.project_id=relation.project_id
+                    AND projection.assertion_id=relation.id
+                   WHERE vector.project_id=%s AND vector.object_type='relation'
+                     AND vector.model_name=%s AND vector.object_key=relation.id::TEXT
+                     AND relation.project_id=%s
+                     AND (COALESCE(projection.source_entity_id,relation.source_entity_id)=ANY(%s)
+                       OR COALESCE(projection.target_entity_id,relation.target_entity_id)=ANY(%s))""",
+                (project_id, model_name, project_id, ids, ids),
+            )
 
     def get_relations_by_ids(self, project_id: int, ids: list[int]) -> list[dict[str, Any]]:
         if not ids: return []

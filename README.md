@@ -306,11 +306,107 @@ PostgreSQL 发布关系数、本次写入数和 HugeGraph 实际关系数。只�
 `ready` 并写入当前图策略版本；任一阶段失败均进入 `failed`。`stale`、`rebuilding` 和
 `failed` 状态下，服务端会拒绝生成 Hubble URL，直接访问 `/graph/view` 返回 HTTP 409。
 
+## P1-P3 策略、性能与回滚
+
+### 图代次与任务合并
+
+项目知识发生变化时，PostgreSQL 会递增 `graph_generation` 并把图标记为 `stale`。
+入库任务繁忙期间，后续请求只更新同一个待执行图任务的目标代次；系统在项目进入静默点后
+执行一次完整重建，因此连续入库 10 篇文档通常从 10 次全图重建降为 1 次。重建期间又产生
+新代次时，旧代次不能进入 `ready`，而会保留 pending 状态并由新代次接管。图清理、逐文档
+写入、关系数量核对或最终状态更新任一步失败，项目都会保持 `failed/stale`，可重试但不会
+暴露部分图。
+
+`relation_assertions` 是不可变来源事实，当前图端点由可重建的关系投影决定。实体合并、拆分、
+撤销或项目策略升级都会刷新投影、递增图代次并要求重建，原始 mention 和 assertion 不会被
+覆盖。
+
+### 策略版本与启用门禁
+
+构建策略按实体抽取、实体归一、关系候选、关系分类、关系验证和 Schema 六个版本轴组成完整
+快照。当前生产路径继续使用 `control`；P1 关系策略与 P2 实体策略仅以隔离的 `shadow`
+namespace 运行，不写正式实体、断言、向量、搜索结果或 HugeGraph。发布顺序为
+`control -> shadow -> canary -> limited -> expanded`，每一步均记录前一快照和回滚快照。
+
+非 control 快照只有在以下条件全部满足后才能激活：快照覆盖全部 indexed 文档、冻结数据集
+manifest 有效、标签由人工确认、holdout 与 dev 隔离、质量和成本门禁通过，并且数据库中
+存在 `production_approved` gate。仓库内 `tests/fixtures/kg_gold` 仅用于工程验证，明确不是
+人工 Gold，不能授权生产启用。因此当前新策略状态为 `engineering_complete`，默认仍关闭。
+
+### Prompt、批处理与溢出
+
+关系分类先生成有稳定 ID 的 mention/candidate，再按项目上下文预算分批。每批 Prompt 中
+Chunk 正文只出现一次，并为输出和安全余量预留非零 Token；单个候选超过预算时会显式进入
+`deferred`，不会使用切片截断或静默丢弃。模型必须为每个 admitted candidate 返回唯一
+决策，缺失、重复、非法方向或越出 Schema 的谓词均 fail-closed。相关上限由
+`RELATION_CLASSIFIER_OUTPUT_RESERVE`、`RELATION_CLASSIFIER_SAFETY_MARGIN`、
+`RELATION_CLASSIFIER_MAX_CANDIDATES` 和项目上下文 Token 上限共同控制。
+
+实体 exact 候选按 Chunk 批量预取，命中后不调用 Embedding、reranker 或 LLM；未命中的
+身份文本按 `ENTITY_EMBEDDING_BATCH_SIZE` 批量向量化。reranker 只处理有界 Top-K，所有
+外部调用、候选数、Token、数据库语句、重试和图重建均记录操作数指标，但不记录正文、完整
+Prompt、模型完整响应或凭据。
+
+### 数据库迁移与 HNSW
+
+应用启动时幂等创建规范 alias 表、实体到来源文档映射、mention assignment、cannot-link、
+shadow、策略快照、质量门禁、rollout、图代次和审计表；旧实体的规范名/别名及来源计数可
+重复回填，不删除兼容列。历史项目应逐项目显式触发策略快照和图重建，不在启动时做破坏性
+全量重入库。
+
+pgvector 会按 Embedding 模型和维度创建 partial HNSW 索引。维度不超过
+`PGVECTOR_HNSW_MAX_DIMENSIONS` 时必须走 HNSW Top-K；索引创建失败不会写入成功缓存，
+下一次会重试。超维模型进入可观测 degraded 精确扫描模式。真实 PostgreSQL 的 exact、
+trigram、来源映射和 HNSW 查询计划可用以下命令验证：
+
+```bash
+.venv/bin/python scripts/run_disposable_postgres_tests.py tests/test_p1_postgres_plans.py
+```
+
+脚本只在临时数据库生成 10k/100k 验证数据，测试结束无论成功或失败都会终止连接并删除该
+数据库，不会污染业务库。1M 基准只在独立资源充足的环境显式设置
+`RUN_LARGE_BENCHMARKS=1` 后运行。
+
+### 实体修订与回滚
+
+人工或受门禁策略可以追加实体 merge、mention split 和 undo 事件。每次操作保留操作者、
+原因、分数、证据、操作前后 assignment 和 redirect；merge 不重写原始关系断言，split
+只移动选定 mention，undo 通过补偿事件恢复旧 assignment。修改完成后关系投影、来源计数、
+实体向量和 HugeGraph 端点均按新代次重建。cannot-link 优先于 exact/alias 规则，存在冲突
+时禁止自动合并。
+
+### 质量评估与外部 smoke
+
+工程 fixture、操作数基准和人工标注包命令：
+
+```bash
+.venv/bin/python benchmarks/benchmark_kg_construction.py
+.venv/bin/python benchmarks/build_annotation_bundle.py --help
+.venv/bin/python benchmarks/evaluate_kg_gold.py --help
+```
+
+质量报告覆盖实体 exact/overlap span、类型 macro-F1、候选召回、pairwise/B3 聚类、严格关系
+与证据、Brier/ECE 校准、control/treatment discordant cases 和 Wilson 区间。生产报告必须
+使用独立人工确认且冻结的 Gold/holdout manifest；模型自产标签只能形成待人工审核队列。
+
+默认 pytest 不访问外部服务。环境具备时显式运行：
+
+```bash
+RUN_LIVE_MODEL_TESTS=1 .venv/bin/python -m pytest -q -m live_model
+RUN_HUGEGRAPH_INTEGRATION=1 .venv/bin/python -m pytest -q -m hugegraph_integration
+```
+
+模型 smoke 验证 Ollama 模型 digest/context、严格 JSON、Embedding 数量/顺序/维度/finite 和
+本地 reranker pair/score 对齐。HugeGraph smoke 只做只读图发现；purge、失败注入、409、
+重建和 retry 必须使用明确隔离物理图，不能在承载用户数据的 `knowledge_forge` 图中执行。
+fake HugeGraph 测试覆盖进程状态恢复、代次变化、数量不一致、失败重试和发布前 409。
+
 ## 验证
 
 ```bash
 .venv/bin/python -m py_compile knowledge_forge/*.py server.py
 .venv/bin/python -m pytest -q
+.venv/bin/python scripts/run_disposable_postgres_tests.py
 curl http://127.0.0.1:8011/health
 curl http://127.0.0.1:8080/graphs
 ```

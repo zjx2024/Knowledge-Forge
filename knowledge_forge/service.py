@@ -363,6 +363,11 @@ class KnowledgeForgeService:
         result = self.db.manual_merge_entities(
             project_id, source_entity_id, target_entity_id, **values,
         )
+        result["derived_index_failures"] = self._refresh_entity_change_indexes(
+            project_id,
+            result.get("affected_entity_ids") or [source_entity_id, target_entity_id],
+            int((result.get("project") or {}).get("graph_generation") or 0),
+        )
         result["graph_job_id"] = self.submit_graph_build(project_id)
         return result
 
@@ -372,14 +377,102 @@ class KnowledgeForgeService:
         result = self.db.split_entity_mentions(
             project_id, source_entity_id, target_entity_id, mention_ids, **values,
         )
+        result["derived_index_failures"] = self._refresh_entity_change_indexes(
+            project_id,
+            result.get("affected_entity_ids") or [source_entity_id, target_entity_id],
+            int((result.get("project") or {}).get("graph_generation") or 0),
+        )
         result["graph_job_id"] = self.submit_graph_build(project_id)
         return result
 
     def undo_entity_resolution_event(self, project_id: int, event_id: str,
                                      **values: Any) -> dict[str, Any]:
         result = self.db.undo_entity_resolution_event(project_id, event_id, **values)
+        result["derived_index_failures"] = self._refresh_entity_change_indexes(
+            project_id,
+            result.get("affected_entity_ids") or [],
+            int((result.get("project") or {}).get("graph_generation") or 0),
+        )
         result["graph_job_id"] = self.submit_graph_build(project_id)
         return result
+
+    def _refresh_entity_change_indexes(
+        self,
+        project_id: int,
+        entity_ids: list[int],
+        graph_generation: int,
+    ) -> int:
+        """Rebuild bounded entity/relation vectors after assignment changes."""
+
+        ids = sorted({int(value) for value in entity_ids})
+        if not ids:
+            return 0
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        model = str(project.get("embedding_model") or Config.default_embedding_model)
+        self.db.retire_derived_embeddings_for_entity_change(project_id, ids, model)
+        failures = 0
+        blocking_payload = {"blocks_graph_generation": int(graph_generation)}
+        for entity in self.db.get_entities_by_ids(project_id, ids):
+            object_key = str(entity["id"])
+            payload = {
+                **blocking_payload,
+                "name": str(entity.get("name") or ""),
+                "entity_type": str(entity.get("entity_type") or "GenericEntity"),
+            }
+            try:
+                self.vectors.upsert_entity_embedding(project_id, entity, model)
+                self.db.complete_indexing_failure(
+                    project_id, "entity", object_key, model,
+                )
+            except Exception as exc:
+                failures += 1
+                self.db.record_indexing_failure({
+                    "project_id": project_id,
+                    "object_type": "entity",
+                    "object_key": object_key,
+                    "model_name": model,
+                    "last_error": str(exc),
+                    "payload": payload,
+                })
+                LOGGER.warning("Entity embedding refresh deferred for %s: %s", object_key, exc)
+        for relation in self.db.list_project_relations_for_entities(project_id, ids):
+            object_key = str(relation["id"])
+            payload = {
+                **blocking_payload,
+                "relation_key": str(relation.get("relation_key") or f"relation:{object_key}"),
+                "source_name": str(relation.get("source_name") or ""),
+                "target_name": str(relation.get("target_name") or ""),
+            }
+            relation_for_index = {**relation, "relation_key": payload["relation_key"]}
+            try:
+                self.vectors.upsert_relation_embedding(
+                    project_id,
+                    int(relation.get("document_id") or 0),
+                    int(relation.get("chunk_id") or 0),
+                    relation_for_index,
+                    payload["source_name"],
+                    payload["target_name"],
+                    model,
+                )
+                self.db.complete_indexing_failure(
+                    project_id, "relation", object_key, model,
+                )
+            except Exception as exc:
+                failures += 1
+                self.db.record_indexing_failure({
+                    "project_id": project_id,
+                    "document_id": relation.get("document_id"),
+                    "chunk_id": relation.get("chunk_id"),
+                    "object_type": "relation",
+                    "object_key": object_key,
+                    "model_name": model,
+                    "last_error": str(exc),
+                    "payload": payload,
+                })
+                LOGGER.warning("Relation embedding refresh deferred for %s: %s", object_key, exc)
+        return failures
 
     def build_entity_shadow_namespace(self, project_id: int, snapshot_id: str = "") -> dict[str, Any]:
         """Replay indexed documents in stable order into an isolated P2 entity namespace."""
@@ -1258,7 +1351,14 @@ class KnowledgeForgeService:
         )
         if int(project.get("graph_generation") or 0) != fixed_generation:
             raise RuntimeError("图谱重建目标代次已过期")
+        self._retry_entity_indexing_failures(project)
         self._retry_relation_indexing_failures(project)
+        if hasattr(self.db, "list_blocking_indexing_failures"):
+            blocking = self.db.list_blocking_indexing_failures(project_id, fixed_generation)
+            if blocking:
+                raise RuntimeError(
+                    f"图谱代次 {fixed_generation} 仍有 {len(blocking)} 个派生索引待修复"
+                )
         documents = [
             item for item in self.db.list_documents(project_id)
             if item["status"] == "indexed" or int(item["id"]) == include_document_id
@@ -1316,6 +1416,47 @@ class KnowledgeForgeService:
             "entities": written_entities,
             "relations": graph_relations,
         }
+
+    def _retry_entity_indexing_failures(self, project: dict[str, Any]) -> int:
+        """Retry assignment-derived entity vectors before graph readiness checks."""
+
+        project_id = int(project["id"])
+        model = str(project.get("embedding_model") or Config.default_embedding_model)
+        failures = self.db.list_pending_indexing_failures(project_id, "entity")
+        completed = 0
+        for failure in failures:
+            if str(failure.get("object_type") or "") != "entity":
+                continue
+            if str(failure.get("model_name") or "") != model:
+                continue
+            object_key = str(failure.get("object_key") or "")
+            entities = self.db.get_entities_by_ids(
+                project_id, [int(object_key)] if object_key.isdigit() else [],
+            )
+            if not entities:
+                self.db.complete_indexing_failure(
+                    project_id, "entity", object_key, model,
+                )
+                completed += 1
+                continue
+            payload = failure.get("payload") if isinstance(failure.get("payload"), dict) else {}
+            try:
+                self.vectors.upsert_entity_embedding(project_id, entities[0], model)
+                self.db.complete_indexing_failure(
+                    project_id, "entity", object_key, model,
+                )
+                completed += 1
+            except Exception as exc:
+                self.db.record_indexing_failure({
+                    "project_id": project_id,
+                    "object_type": "entity",
+                    "object_key": object_key,
+                    "model_name": model,
+                    "last_error": str(exc),
+                    "payload": payload,
+                })
+                LOGGER.warning("Entity embedding retry deferred for %s: %s", object_key, exc)
+        return completed
 
     def _retry_relation_indexing_failures(self, project: dict[str, Any]) -> int:
         """Retry derived relation vectors without changing assertion publication."""

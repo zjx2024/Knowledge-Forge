@@ -487,6 +487,10 @@ class EntityResolver:
             for mention_values_item, decision_values_item in zip(mention_values, decision_values):
                 mentions.append(self.db.add_entity_mention(mention_values_item))
                 self.db.add_entity_resolution_decision(decision_values_item)
+        mention_key_by_raw_id = {
+            str(raw["id"]): str(mention.get("mention_key") or raw["id"])
+            for raw, mention in zip(raw_entities, mentions)
+        }
         raw_entity_map = {str(item["id"]): item for item in extraction.get("entities") or []}
         candidate_values: list[dict[str, Any]] = []
         for raw in extraction.get("relations") or []:
@@ -499,9 +503,13 @@ class EntityResolver:
                 "candidate_id": raw["candidate_id"], "project_id": project_id,
                 "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "candidate_ordinal": int(raw.get("candidate_ordinal") or 0),
-                "source_mention_id": original_source_id,
+                "source_mention_id": mention_key_by_raw_id.get(
+                    original_source_id, original_source_id,
+                ),
                 "source_name": original.get("source_name") or original_source.get("name") or "",
-                "target_mention_id": original_target_id,
+                "target_mention_id": mention_key_by_raw_id.get(
+                    original_target_id, original_target_id,
+                ),
                 "target_name": original.get("target_name") or original_target.get("name") or "",
                 "proposed_relation_type": original.get("type") or raw.get("type") or "",
                 "proposed_evidence": original.get("evidence_text") or "",
