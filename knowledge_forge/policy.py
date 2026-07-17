@@ -33,6 +33,12 @@ P1_RELATION_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
     "verification_policy_version": "relation-classifier-p1-shadow-v1",
 })
 
+P2_ENTITY_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **P1_RELATION_SHADOW_POLICY_SET,
+    "entity_extraction_policy_version": "entity-extraction-p2-shadow-v1",
+    "entity_resolution_policy_version": "entity-resolution-p2-shadow-v1",
+})
+
 PUBLISH_PREDICATE_VERSION = "publish-predicate-p0-v1"
 
 

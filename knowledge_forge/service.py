@@ -22,6 +22,7 @@ from .chunking import ProcessingResult, build_processing_result, parse_document_
 from .config import Config
 from .database import Database
 from .entity_resolution import EntityResolver
+from .entity_shadow import EntityShadowState
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
@@ -39,7 +40,7 @@ from .hugegraph_store import HugeGraphStore
 from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
-from .policy import P1_RELATION_SHADOW_POLICY_SET
+from .policy import P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW_POLICY_SET
 from .relation_pipeline import VersionedRelationPipeline
 from .schema_evolution import SchemaEvolutionService
 from .vector_store import VectorStore
@@ -350,6 +351,96 @@ class KnowledgeForgeService:
         job = self.db.create_job("schema_reassessment", project_id)
         self.executor.submit(self._reassess_project_schema, str(job["id"]), project_id)
         return str(job["id"])
+
+    def add_entity_cannot_link(self, project_id: int, **values: Any) -> dict[str, Any]:
+        if not self.db.get_project(project_id):
+            raise LookupError("项目不存在")
+        return self.db.add_entity_cannot_link(project_id, **values)
+
+    def merge_entities(self, project_id: int, source_entity_id: int, target_entity_id: int,
+                       **values: Any) -> dict[str, Any]:
+        result = self.db.manual_merge_entities(
+            project_id, source_entity_id, target_entity_id, **values,
+        )
+        result["graph_job_id"] = self.submit_graph_build(project_id)
+        return result
+
+    def split_entity_mentions(self, project_id: int, source_entity_id: int,
+                              target_entity_id: int, mention_ids: list[int],
+                              **values: Any) -> dict[str, Any]:
+        result = self.db.split_entity_mentions(
+            project_id, source_entity_id, target_entity_id, mention_ids, **values,
+        )
+        result["graph_job_id"] = self.submit_graph_build(project_id)
+        return result
+
+    def undo_entity_resolution_event(self, project_id: int, event_id: str,
+                                     **values: Any) -> dict[str, Any]:
+        result = self.db.undo_entity_resolution_event(project_id, event_id, **values)
+        result["graph_job_id"] = self.submit_graph_build(project_id)
+        return result
+
+    def build_entity_shadow_namespace(self, project_id: int, snapshot_id: str = "") -> dict[str, Any]:
+        """Replay indexed documents in stable order into an isolated P2 entity namespace."""
+
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        documents = [
+            item for item in self.db.list_documents(project_id)
+            if item.get("status") == "indexed" and not item.get("is_deleted")
+        ]
+        documents.sort(key=lambda item: int(item["id"]))
+        material = "|".join((
+            str(project_id), snapshot_id or "live",
+            *(str(item["id"]) for item in documents),
+            P2_ENTITY_SHADOW_POLICY_SET["entity_resolution_policy_version"],
+        ))
+        namespace_id = "entity_shadow_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+        self.db.create_entity_shadow_namespace(
+            project_id, namespace_id, dict(P2_ENTITY_SHADOW_POLICY_SET),
+            [int(item["id"]) for item in documents], snapshot_id or None,
+        )
+        state = EntityShadowState(
+            namespace=namespace_id,
+            policy_version=P2_ENTITY_SHADOW_POLICY_SET["entity_resolution_policy_version"],
+        )
+        mention_payloads: list[dict[str, Any]] = []
+        for document in documents:
+            for mention in sorted(
+                self.db.list_document_mentions(int(document["id"])),
+                key=lambda item: (int(item.get("chunk_id") or 0), int(item["id"])),
+            ):
+                mention_payloads.append({
+                    "mention_id": mention.get("mention_key") or f"legacy_mention_{mention['id']}",
+                    "surface": mention.get("evidence_text") or mention["mention_text"],
+                    "normalized_surface": mention["normalized_name"],
+                    "entity_type": mention["entity_type"],
+                    "aliases": (mention.get("metadata") or {}).get("accepted_aliases") or [],
+                    "document_id": int(document["id"]),
+                    "chunk_id": int(mention["chunk_id"]),
+                })
+        state.replay(mention_payloads)
+        snapshot = state.snapshot()
+        payload_by_mention = {item["mention_id"]: item for item in mention_payloads}
+        for assignment in snapshot["assignments"]:
+            assignment.update(payload_by_mention[assignment["mention_id"]])
+        self.db.persist_entity_shadow_snapshot(
+            namespace_id, snapshot["canonicals"], snapshot["assignments"],
+            metrics={
+                "documents": len(documents), "mentions": len(mention_payloads),
+                "canonicals": len(snapshot["canonicals"]),
+                "duplicate_canonical_rate": None,
+                "canonical_compression_rate": (
+                    0.0 if not mention_payloads
+                    else max(
+                        0.0,
+                        1.0 - (len(snapshot["canonicals"]) / len(mention_payloads)),
+                    )
+                ),
+            },
+        )
+        return {"namespace_id": namespace_id, **snapshot}
 
     @staticmethod
     def _project_provenance_gremlin(project_id: int) -> str:
