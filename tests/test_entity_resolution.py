@@ -105,6 +105,8 @@ class FakeResolutionDatabase:
         self.population = population
         self.lexical_limit = None
         self.vector_limit = None
+        self.relation_candidates = []
+        self.verification_events = []
 
     def count_canonical_entities(self, *args):
         return self.population
@@ -145,6 +147,14 @@ class FakeResolutionDatabase:
 
     def add_relation_assertion(self, values):
         return {"id": 13, **values}
+
+    def upsert_relation_candidate(self, values):
+        self.relation_candidates.append(values)
+        return values
+
+    def add_relation_verification_event(self, values):
+        self.verification_events.append(values)
+        return values
 
 
 def test_dense_candidate_is_sent_to_llm_and_resolution_is_audited():
@@ -207,6 +217,54 @@ def test_acronym_with_vector_and_reranker_evidence_can_rule_merge():
 
     assert database.decision["decision"] == "rule_merge"
     assert vectors.ollama.chat_calls == 0
+
+
+def test_relation_candidates_and_events_are_audited_but_only_publishable_relations_are_vectorized(monkeypatch):
+    database = FakeResolutionDatabase()
+    vectors = FakeVectors()
+    resolver = EntityResolver(database, vectors, reranker=FakeReranker())
+    entities = {
+        "e1": {"id": 21, "name": "Alpha", "entity_type": "Organization"},
+        "e2": {"id": 22, "name": "Beta", "entity_type": "Product"},
+    }
+    monkeypatch.setattr(
+        resolver, "_resolve_one",
+        lambda session, raw, chunk, version: (entities[raw["id"]], {"decision": "test", "candidate_ids": [], "scores": {}}),
+    )
+    base = {
+        "source": "e1", "target": "e2", "type": "produces", "description": "",
+        "confidence": 0, "evidence_text": "Alpha produces Beta.", "candidate_ordinal": 0,
+        "_original_candidate": {
+            "source": "e1", "source_name": "Alpha", "target": "e2", "target_name": "Beta",
+            "type": "produces", "evidence_text": "Alpha produces Beta.", "confidence": 0,
+        },
+    }
+    extraction = {
+        "entities": [
+            {"id": "e1", "name": "Alpha", "type": "Organization", "description": "", "aliases": [], "confidence": 0},
+            {"id": "e2", "name": "Beta", "type": "Product", "description": "", "aliases": [], "confidence": 0},
+        ],
+        "relations": [
+            {**base, "candidate_id": "c-verified", "verification_status": "llm_verified"},
+            {**base, "candidate_id": "c-missing", "candidate_ordinal": 1,
+             "verification_status": "verification_missing"},
+        ],
+        "_verification_events": [
+            {"candidate_id": "c-verified", "attempt": 1, "model_name": "chat",
+             "prompt_version": "p1", "schema_version": 1, "request_json": {}, "raw_response": {},
+             "verdict": "supported", "reason": "ok", "error_category": ""},
+        ],
+    }
+    mentions, relations = resolver.resolve_chunk(
+        {"id": 3, "embedding_model": "embed", "llm_model": "chat"},
+        5, {"id": 9, "content": "Alpha produces Beta."}, extraction, 1,
+    )
+    assert len(mentions) == 2
+    assert len(relations) == 2
+    assert [item["candidate_id"] for item in database.relation_candidates] == ["c-verified", "c-missing"]
+    assert database.verification_events[0]["candidate_id"] == "c-verified"
+    assert len(vectors.relation_updates) == 1
+    assert relations[0]["confidence"] == 0
 
 
 def test_candidate_recall_grows_sublinearly_and_respects_hard_caps():

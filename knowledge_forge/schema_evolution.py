@@ -14,6 +14,18 @@ from typing import Any
 from .config import Config
 from .database import Database
 from .ollama import OllamaClient
+from .relation_verification import (
+    LLM_VERIFIED,
+    REJECTED,
+    RELATION_ORIENTATIONS,
+    RELATION_VERDICTS,
+    RULES_VERIFIED,
+    UNCERTAIN,
+    VERIFICATION_FAILED,
+    VERIFICATION_MISSING,
+    is_publishable_relation,
+    relation_candidate_id,
+)
 from .value_parsing import coerce_confidence
 
 
@@ -66,21 +78,26 @@ EXTRACTION_FORMAT = {
 
 RELATION_VERIFICATION_FORMAT = {
     "type": "object",
+    "additionalProperties": False,
     "properties": {
         "decisions": {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
-                    "relation_index": {"type": "integer"},
-                    "supported": {"type": "boolean"},
+                    "candidate_id": {"type": "string"},
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["supported", "contradicted", "insufficient_evidence"],
+                    },
                     "corrected_type": {"type": "string"},
+                    "orientation": {"type": "string", "enum": ["as_is", "reversed"]},
                     "evidence": {"type": "string"},
-                    "confidence": {"type": "number"},
                     "reason": {"type": "string"},
                 },
                 "required": [
-                    "relation_index", "supported", "corrected_type", "evidence", "confidence", "reason"
+                    "candidate_id", "verdict", "orientation", "evidence", "reason"
                 ],
             },
         },
@@ -166,7 +183,14 @@ def _chunk_title(chunk: dict[str, Any]) -> str:
 
 def _chunk_body(chunk: dict[str, Any]) -> str:
     content = str(chunk.get("content") or "")
-    marker = re.search(r"(?:^|\n)分块\s*:[^\n]*\n", content)
+    framed = re.match(
+        r"(?s)^\s*(?:# [^\n]*\n+)?章节ID\s*:[^\n]*\n+来源文档\s*:[^\n]*\n+"
+        r"分块\s*:\s*\d+\s*/\s*\d+\s*\n+(.*)$",
+        content,
+    )
+    if framed:
+        return framed.group(1).strip()
+    marker = re.search(r"(?:^|\n)分块\s*:[^\n]*\n+", content)
     return content[marker.end():].strip() if marker else content.strip()
 
 
@@ -704,7 +728,7 @@ class SchemaEvolutionService:
                     "type": item.get("type") or item.get("relation"),
                     "description": item.get("description") or "",
                     "evidence": item.get("evidence") or "",
-                    "confidence": item.get("confidence") or 0.5,
+                    "confidence": 0.5 if item.get("confidence") is None else item.get("confidence"),
                 }
                 for item in items if isinstance(item, dict) and item.get("relation")
             ],
@@ -811,15 +835,9 @@ class SchemaEvolutionService:
             compatible = bool(
                 definition and self._compatible_relation(definition, source["type"], target["type"])
             )
-            if not compatible:
-                relation_type = "related_to"
-                definition = relation_definitions.get(relation_type, {})
-                compatible = self._compatible_relation(definition, source["type"], target["type"])
             source_names = [source["name"], *source.get("aliases", [])]
             target_names = [target["name"], *target.get("aliases", [])]
             evidence, start, end = self._locate_evidence(content, str(raw.get("evidence") or ""))
-            if not evidence:
-                evidence, start, end = self._sentence_evidence(content, source_names, target_names)
             confidence = coerce_confidence(raw.get("confidence"), 0.5)
             explicit_endpoints = bool(
                 evidence
@@ -835,14 +853,29 @@ class SchemaEvolutionService:
                 "evidence_text": evidence,
                 "evidence_start": start,
                 "evidence_end": end,
-                "verification_status": "rules_verified" if (
-                    explicit_endpoints
-                    and compatible
-                    and confidence >= Config.extraction_rule_accept_confidence
-                ) else "unverified",
+                "verification_status": UNCERTAIN,
+                "verification_reason": (
+                    "candidate requires semantic verification"
+                    if compatible
+                    else "relation type is unknown or incompatible with endpoint types"
+                ),
             }
-            relation["_needs_verification"] = relation["verification_status"] == "unverified"
+            # Co-occurrence, endpoint presence and model confidence are not
+            # sufficient proof of predicate meaning or direction.
+            relation["_needs_verification"] = True
             relation["_explicit_endpoints"] = explicit_endpoints
+            relation["_original_candidate"] = {
+                "source": source_id,
+                "source_name": source["name"],
+                "target": target_id,
+                "target_name": target["name"],
+                "type": relation_type,
+                "evidence_text": evidence,
+                "evidence_start": start,
+                "evidence_end": end,
+                "confidence": confidence,
+                "compatible": compatible,
+            }
             relations.append(relation)
         return {
             "entities": entities,
@@ -977,102 +1010,343 @@ class SchemaEvolutionService:
         logical: dict[str, Any],
         content: str,
         extraction: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-        relations = extraction.get("relations") or []
-        uncertain = [(index, item) for index, item in enumerate(relations) if item.get("_needs_verification")]
-        diagnostics = {"verification_candidates": len(uncertain), "verified": 0, "verification_rejected": 0}
-        if not uncertain:
-            return relations, diagnostics
-        decisions: dict[int, dict[str, Any]] = {}
-        if Config.extraction_verification_enabled:
-            try:
-                payload = [
-                    {
-                        "relation_index": index,
-                        "source": next(item["name"] for item in extraction["entities"] if item["id"] == relation["source"]),
-                        "type": relation["type"],
-                        "target": next(item["name"] for item in extraction["entities"] if item["id"] == relation["target"]),
-                        "evidence": relation.get("evidence_text") or "",
-                    }
-                    for index, relation in uncertain
-                ]
-                reviewed = self.ollama.json_chat(
-                    model=project.get("llm_model") or Config.default_llm_model,
-                    system=(
-                        "Verify relation assertions against the source text. Accept only relations explicitly supported by the text. "
-                        "Do not infer a relation from mere co-occurrence. Evidence must be an exact quote from the source."
-                    ),
-                    prompt=(
-                        f"Allowed relation schema:\n{json.dumps(logical.get('relation_types') or [], ensure_ascii=False)}\n\n"
-                        f"Candidate relations:\n{json.dumps(payload, ensure_ascii=False)}\n\nSource text:\n{content}"
-                    ),
-                    schema=RELATION_VERIFICATION_FORMAT,
-                    max_tokens=int(project.get("model_max_tokens") or 32768),
-                )
-                decisions = {
-                    int(item.get("relation_index")): item
-                    for item in reviewed.get("decisions") or [] if isinstance(item, dict)
-                }
-            except Exception as exc:
-                LOGGER.warning("Relation verification degraded to evidence rules: %s", exc)
-
-        allowed_relations = {item["name"] for item in logical.get("relation_types") or []}
+        schema_version: int,
+        chunk_key: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
+        relations = [dict(item) for item in extraction.get("relations") or []]
+        entity_map = {item["id"]: item for item in extraction.get("entities") or []}
         relation_definitions = {
             item["name"]: item for item in logical.get("relation_types") or []
         }
-        entity_map = {item["id"]: item for item in extraction.get("entities") or []}
-        accepted: list[dict[str, Any]] = []
-        for index, relation in enumerate(relations):
-            value = dict(relation)
-            value.pop("_needs_verification", None)
-            explicit_endpoints = bool(value.pop("_explicit_endpoints", False))
-            if index not in {candidate_index for candidate_index, _ in uncertain}:
-                accepted.append(value)
-                continue
-            decision = decisions.get(index)
-            if decision and not bool(decision.get("supported")):
-                diagnostics["verification_rejected"] += 1
-                continue
-            if decision:
-                corrected = str(decision.get("corrected_type") or "").strip()
-                corrected_definition = relation_definitions.get(corrected)
-                source = entity_map.get(value["source"], {})
-                target = entity_map.get(value["target"], {})
-                if corrected in allowed_relations and corrected_definition and self._compatible_relation(
-                    corrected_definition, str(source.get("type") or "GenericEntity"),
-                    str(target.get("type") or "GenericEntity"),
-                ):
-                    value["type"] = corrected
-                evidence, start, end = self._locate_evidence(
-                    content, str(decision.get("evidence") or ""), [value.get("evidence_text") or ""]
+        for ordinal, relation in enumerate(relations):
+            original = relation.get("_original_candidate") or {}
+            relation["candidate_id"] = relation_candidate_id(
+                project_scope=project.get("project_key") or project.get("id") or "",
+                chunk_key=chunk_key,
+                source_mention=original.get("source", relation.get("source")),
+                target_mention=original.get("target", relation.get("target")),
+                proposed_type=original.get("type", relation.get("type")),
+                ordinal=ordinal,
+                evidence_start=original.get("evidence_start", relation.get("evidence_start")),
+                evidence_end=original.get("evidence_end", relation.get("evidence_end")),
+                evidence=original.get("evidence_text", relation.get("evidence_text")),
+            )
+            relation["candidate_ordinal"] = ordinal
+
+        pending = [item for item in relations if item.get("_needs_verification")]
+        diagnostics = {
+            "verification_requested": len(pending),
+            "verification_candidates": len(pending),
+            "rules_verified": sum(
+                item.get("verification_status") == RULES_VERIFIED for item in relations
+            ),
+            "llm_verified": 0,
+            "verified": 0,
+            "rejected": 0,
+            "verification_rejected": 0,
+            "uncertain": 0,
+            "missing_decisions": 0,
+            "verifier_failures": 0,
+            "retry_count": 0,
+            "quarantined": 0,
+            "published": 0,
+            "verification_llm_calls": 0,
+        }
+        events: list[dict[str, Any]] = []
+        if pending and Config.extraction_verification_enabled:
+            model = project.get("llm_model") or Config.default_llm_model
+            batch_size = 8
+            for offset in range(0, len(pending), batch_size):
+                batch = pending[offset:offset + batch_size]
+                missing = self._review_relation_batch(
+                    project, logical, content, entity_map, relation_definitions,
+                    batch, events, diagnostics, model, schema_version, attempt=1,
                 )
-                if not evidence:
-                    diagnostics["verification_rejected"] += 1
-                    continue
-                value.update({
-                    "evidence_text": evidence,
-                    "evidence_start": start,
-                    "evidence_end": end,
-                    "confidence": coerce_confidence(decision.get("confidence"), value["confidence"]),
-                    "verification_status": "llm_verified",
-                })
-                diagnostics["verified"] += 1
-                accepted.append(value)
-            elif value.get("evidence_text") and (
-                explicit_endpoints or value["confidence"] >= Config.extraction_min_relation_confidence
-            ):
-                value["verification_status"] = "evidence_unverified"
-                accepted.append(value)
+                if missing:
+                    diagnostics["retry_count"] += 1
+                    retry_missing = self._review_relation_batch(
+                        project, logical, content, entity_map, relation_definitions,
+                        missing, events, diagnostics, model, schema_version, attempt=2,
+                    )
+                    for relation in retry_missing:
+                        relation["verification_status"] = VERIFICATION_MISSING
+                        relation["verification_reason"] = "verifier omitted candidate after one retry"
+                        diagnostics["missing_decisions"] += 1
+        elif pending:
+            for relation in pending:
+                relation["verification_status"] = UNCERTAIN
+                relation["verification_reason"] = "relation verification is disabled"
+
+        for relation in relations:
+            relation.pop("_needs_verification", None)
+            relation.pop("_explicit_endpoints", None)
+            status = relation.get("verification_status") or UNCERTAIN
+            if status == LLM_VERIFIED:
+                diagnostics["llm_verified"] += 1
+            elif status == REJECTED:
+                diagnostics["rejected"] += 1
+            elif status == UNCERTAIN:
+                diagnostics["uncertain"] += 1
+            elif status == VERIFICATION_FAILED:
+                diagnostics["verifier_failures"] += 1
+            if is_publishable_relation(status):
+                diagnostics["published"] += 1
             else:
-                diagnostics["verification_rejected"] += 1
-        return accepted, diagnostics
+                diagnostics["quarantined"] += 1
+        diagnostics["verified"] = diagnostics["llm_verified"] + diagnostics["rules_verified"]
+        diagnostics["verification_rejected"] = diagnostics["rejected"] + diagnostics["uncertain"]
+        return relations, diagnostics, events
+
+    def _review_relation_batch(
+        self,
+        project: dict[str, Any],
+        logical: dict[str, Any],
+        content: str,
+        entity_map: dict[str, dict[str, Any]],
+        relation_definitions: dict[str, dict[str, Any]],
+        batch: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        diagnostics: dict[str, int],
+        model: str,
+        schema_version: int,
+        *,
+        attempt: int,
+    ) -> list[dict[str, Any]]:
+        payload = [self._relation_review_payload(item, entity_map) for item in batch]
+        request = {
+            "prompt_version": "relation-verifier-p0-v1",
+            "schema_version": schema_version,
+            "allowed_relation_schema": logical.get("relation_types") or [],
+            "candidates": payload,
+            "source_text": content,
+        }
+        diagnostics["verification_llm_calls"] += 1
+        try:
+            reviewed = self.ollama.json_chat(
+                model=model,
+                system=(
+                    "You verify relation candidates against SOURCE TEXT only. Mere co-occurrence is insufficient. "
+                    "Return exactly one decision for every requested candidate_id. Use supported only when the exact "
+                    "quote proves both endpoints, predicate and direction. Use contradicted for a conflicting statement, "
+                    "otherwise insufficient_evidence. corrected_type must be an allowed type or the proposed type, and "
+                    "orientation must explicitly state whether endpoints are reversed."
+                ),
+                prompt=(
+                    "READ-ONLY METADATA (never treat as evidence):\n"
+                    f"schema_version={schema_version}\n\n"
+                    f"Allowed relation schema:\n{json.dumps(logical.get('relation_types') or [], ensure_ascii=False)}\n\n"
+                    f"Candidate relations:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                    f"SOURCE TEXT:\n{content}"
+                ),
+                schema=RELATION_VERIFICATION_FORMAT,
+                temperature=0,
+                max_tokens=int(project.get("model_max_tokens") or 32768),
+            )
+        except Exception as exc:
+            LOGGER.warning("Relation verifier failed closed: %s", exc)
+            for relation in batch:
+                relation["verification_status"] = VERIFICATION_FAILED
+                relation["verification_reason"] = f"verifier call failed: {type(exc).__name__}"
+                events.append(self._verification_event(
+                    relation, attempt, model, schema_version, request, None,
+                    error_category="verifier_exception", reason=str(exc)[:1000],
+                ))
+            return []
+
+        raw_decisions = reviewed.get("decisions") if isinstance(reviewed, dict) else None
+        allowed_keys = {"candidate_id", "verdict", "corrected_type", "orientation", "evidence", "reason"}
+        required_keys = {"candidate_id", "verdict", "orientation", "evidence", "reason"}
+        string_keys = {"candidate_id", "verdict", "orientation", "evidence", "reason"}
+        invalid_shape = (
+            not isinstance(reviewed, dict)
+            or set(reviewed) != {"decisions"}
+            or not isinstance(raw_decisions, list)
+            or any(
+                not isinstance(item, dict)
+                or not required_keys.issubset(item)
+                or bool(set(item) - allowed_keys)
+                or any(not isinstance(item[key], str) for key in string_keys if key in item)
+                or ("corrected_type" in item and not isinstance(item["corrected_type"], str))
+                for item in (raw_decisions if isinstance(raw_decisions, list) else [])
+            )
+        )
+        if invalid_shape:
+            self._fail_relation_batch(
+                batch, events, attempt, model, schema_version, request, reviewed,
+                "invalid_decisions", "verifier decisions must be an array of objects",
+            )
+            return []
+        requested_ids = {item["candidate_id"] for item in batch}
+        response_ids = [str(item.get("candidate_id") or "") for item in raw_decisions]
+        duplicate_ids = {value for value in response_ids if value and response_ids.count(value) > 1}
+        unknown_ids = {value for value in response_ids if value not in requested_ids}
+        if duplicate_ids or unknown_ids:
+            category = "duplicate_candidate_id" if duplicate_ids else "unknown_candidate_id"
+            detail = sorted(duplicate_ids or unknown_ids)
+            self._fail_relation_batch(
+                batch, events, attempt, model, schema_version, request, reviewed,
+                category, f"invalid verifier candidate ids: {detail}",
+            )
+            return []
+
+        decisions = {str(item.get("candidate_id")): item for item in raw_decisions}
+        missing: list[dict[str, Any]] = []
+        for relation in batch:
+            decision = decisions.get(relation["candidate_id"])
+            if decision is None:
+                missing.append(relation)
+                events.append(self._verification_event(
+                    relation, attempt, model, schema_version, request, reviewed,
+                    error_category="missing_decision", reason="candidate omitted by verifier",
+                ))
+                continue
+            error = self._apply_relation_decision(
+                relation, decision, content, entity_map, relation_definitions,
+            )
+            if error:
+                relation["verification_status"] = VERIFICATION_FAILED
+                relation["verification_reason"] = error
+            events.append(self._verification_event(
+                relation, attempt, model, schema_version, request, reviewed,
+                verdict=str(decision.get("verdict") or ""),
+                reason=str(error or decision.get("reason") or "")[:1000],
+                error_category="invalid_decision" if error else "",
+            ))
+        return missing
+
+    @staticmethod
+    def _relation_review_payload(
+        relation: dict[str, Any], entity_map: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        source = entity_map.get(str(relation.get("source")), {})
+        target = entity_map.get(str(relation.get("target")), {})
+        return {
+            "candidate_id": relation["candidate_id"],
+            "source_id": relation.get("source"),
+            "source_name": source.get("name") or "",
+            "source_type": source.get("type") or "GenericEntity",
+            "proposed_type": relation.get("type") or "",
+            "target_id": relation.get("target"),
+            "target_name": target.get("name") or "",
+            "target_type": target.get("type") or "GenericEntity",
+            "proposed_evidence": relation.get("evidence_text") or "",
+        }
+
+    def _apply_relation_decision(
+        self,
+        relation: dict[str, Any],
+        decision: dict[str, Any],
+        content: str,
+        entity_map: dict[str, dict[str, Any]],
+        relation_definitions: dict[str, dict[str, Any]],
+    ) -> str:
+        verdict = str(decision.get("verdict") or "")
+        orientation = str(decision.get("orientation") or "")
+        reason = str(decision.get("reason") or "").strip()
+        if verdict not in RELATION_VERDICTS or orientation not in RELATION_ORIENTATIONS or not reason:
+            return "verdict, orientation or reason is invalid"
+        corrected_type = str(decision.get("corrected_type") or relation.get("type") or "").strip()
+        if corrected_type not in relation_definitions:
+            return "corrected relation type is not in the allowed schema"
+        if verdict == "contradicted":
+            relation["verification_status"] = REJECTED
+            relation["verification_reason"] = reason
+            return ""
+        if verdict == "insufficient_evidence":
+            relation["verification_status"] = UNCERTAIN
+            relation["verification_reason"] = reason
+            return ""
+
+        source_id, target_id = str(relation.get("source")), str(relation.get("target"))
+        if orientation == "reversed":
+            source_id, target_id = target_id, source_id
+        source, target = entity_map.get(source_id), entity_map.get(target_id)
+        definition = relation_definitions.get(corrected_type)
+        if not source or not target or not definition:
+            return "corrected endpoints or relation type are not in the allowed schema"
+        if not self._compatible_relation(definition, source["type"], target["type"]):
+            return "corrected relation type is incompatible with endpoint types"
+        evidence = str(decision.get("evidence") or "").strip()
+        start = content.find(evidence) if evidence else -1
+        if start < 0:
+            return "supported decision evidence is not an exact source quote"
+        folded = evidence.casefold()
+        source_names = [source["name"], *(source.get("aliases") or [])]
+        target_names = [target["name"], *(target.get("aliases") or [])]
+        if not any(str(name).casefold() in folded for name in source_names if name) or not any(
+            str(name).casefold() in folded for name in target_names if name
+        ):
+            return "supported evidence does not contain both corrected endpoints"
+        relation.update({
+            "source": source_id,
+            "target": target_id,
+            "type": corrected_type,
+            "evidence_text": evidence,
+            "evidence_start": start,
+            "evidence_end": start + len(evidence),
+            "verification_status": LLM_VERIFIED,
+            "verification_reason": reason,
+            "orientation": orientation,
+        })
+        return ""
+
+    def _fail_relation_batch(
+        self,
+        batch: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        attempt: int,
+        model: str,
+        schema_version: int,
+        request: dict[str, Any],
+        response: Any,
+        category: str,
+        reason: str,
+    ) -> None:
+        for relation in batch:
+            relation["verification_status"] = VERIFICATION_FAILED
+            relation["verification_reason"] = reason
+            events.append(self._verification_event(
+                relation, attempt, model, schema_version, request, response,
+                error_category=category, reason=reason,
+            ))
+
+    @staticmethod
+    def _verification_event(
+        relation: dict[str, Any],
+        attempt: int,
+        model: str,
+        schema_version: int,
+        request: dict[str, Any],
+        response: Any,
+        *,
+        verdict: str = "",
+        reason: str = "",
+        error_category: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "candidate_id": relation["candidate_id"],
+            "attempt": attempt,
+            "model_name": model,
+            "prompt_version": "relation-verifier-p0-v1",
+            "schema_version": schema_version,
+            "request_json": request,
+            "raw_response": response,
+            "verdict": verdict,
+            "reason": reason,
+            "error_category": error_category,
+        }
 
     def extract_chunk(self, project: dict[str, Any], schema_record: dict[str, Any], chunk: dict[str, Any]) -> dict[str, Any]:
         logical = schema_record["schema_json"]
-        content = str(chunk.get("content") or "")
+        content = _chunk_body(chunk)
         model = project.get("llm_model") or Config.default_llm_model
         entity_schema = logical.get("entity_types") or []
         relation_schema = logical.get("relation_types") or []
+        metadata_context = {
+            "title": _chunk_title(chunk),
+            "section": _chunk_section(chunk),
+            "chunk_key": _chunk_key(chunk),
+        }
         primary = self.ollama.json_chat(
             model=model,
             system=(
@@ -1084,7 +1358,9 @@ class SchemaEvolutionService:
             ),
             prompt=(
                 f"Entity schema:\n{json.dumps(entity_schema, ensure_ascii=False)}\n\n"
-                f"Relation schema:\n{json.dumps(relation_schema, ensure_ascii=False)}\n\nSource text:\n{content}"
+                f"Relation schema:\n{json.dumps(relation_schema, ensure_ascii=False)}\n\n"
+                "Read-only context metadata (never extract entities or evidence from it):\n"
+                f"{json.dumps(metadata_context, ensure_ascii=False)}\n\nSource text:\n{content}"
             ),
             schema=EXTRACTION_FORMAT,
             max_tokens=int(project.get("model_max_tokens") or 32768),
@@ -1130,10 +1406,16 @@ class SchemaEvolutionService:
                 diagnostics["gleaning_error"] = str(exc)
                 LOGGER.warning("Targeted extraction pass failed: %s", exc)
 
-        relations, verification = self._verify_relations(project, logical, content, extraction)
-        if verification["verification_candidates"] and Config.extraction_verification_enabled:
-            diagnostics["llm_calls"] += 1
+        chunk_scope = (
+            f"doc={chunk.get('document_id') or ''}|id={chunk.get('id') or ''}|key={_chunk_key(chunk)}"
+        )
+        relations, verification, verification_events = self._verify_relations(
+            project, logical, content, extraction,
+            int(schema_record.get("version") or 1), chunk_scope,
+        )
+        diagnostics["llm_calls"] += verification.get("verification_llm_calls", 0)
         diagnostics.update(verification)
         extraction["relations"] = relations
+        extraction["_verification_events"] = verification_events
         extraction["_diagnostics"] = diagnostics
         return extraction

@@ -21,6 +21,7 @@ from .entity_identity import (
     types_are_compatible,
 )
 from .entity_reranker import EntityReranker
+from .relation_verification import UNCERTAIN, is_publishable_relation
 from .value_parsing import coerce_confidence
 from .vector_store import VectorStore
 
@@ -390,7 +391,8 @@ class EntityResolver:
             local_map[raw["id"]] = entity
             mention = self.db.add_entity_mention({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "canonical_entity_id": int(entity["id"]), "mention_text": raw["name"], "normalized_name": normalized,
-                "entity_type": raw["type"], "description": raw.get("description") or "", "confidence": raw.get("confidence") or 0.5,
+                "entity_type": raw["type"], "description": raw.get("description") or "",
+                "confidence": 0.5 if raw.get("confidence") is None else raw.get("confidence"),
                 "extraction_version": "v2", "evidence_text": raw.get("evidence_text") or "",
                 "evidence_start": raw.get("evidence_start"), "evidence_end": raw.get("evidence_end"),
                 "metadata": {"raw_aliases": raw.get("aliases") or [], "accepted_aliases": aliases,
@@ -404,23 +406,65 @@ class EntityResolver:
                 "metadata": {"schema_version": schema_version},
             })
             mentions.append(mention)
+        raw_entity_map = {str(item["id"]): item for item in extraction.get("entities") or []}
+        for raw in extraction.get("relations") or []:
+            original = raw.get("_original_candidate") or {}
+            original_source_id = str(original.get("source") or raw.get("source") or "")
+            original_target_id = str(original.get("target") or raw.get("target") or "")
+            original_source = raw_entity_map.get(original_source_id, {})
+            original_target = raw_entity_map.get(original_target_id, {})
+            self.db.upsert_relation_candidate({
+                "candidate_id": raw["candidate_id"], "project_id": project_id,
+                "document_id": document_id, "chunk_id": int(chunk["id"]),
+                "candidate_ordinal": int(raw.get("candidate_ordinal") or 0),
+                "source_mention_id": original_source_id,
+                "source_name": original.get("source_name") or original_source.get("name") or "",
+                "target_mention_id": original_target_id,
+                "target_name": original.get("target_name") or original_target.get("name") or "",
+                "proposed_relation_type": original.get("type") or raw.get("type") or "",
+                "proposed_evidence": original.get("evidence_text") or "",
+                "evidence_start": original.get("evidence_start"),
+                "evidence_end": original.get("evidence_end"),
+                "model_confidence": (
+                    0.5 if original.get("confidence") is None else original.get("confidence")
+                ),
+                "status": raw.get("verification_status") or UNCERTAIN,
+                "reason": raw.get("verification_reason") or "",
+                "corrected_relation_type": (
+                    raw.get("type") if raw.get("type") != original.get("type") else None
+                ),
+                "orientation": raw.get("orientation") or "as_is",
+                "metadata": {"schema_version": schema_version, "original_candidate": original},
+            })
+        for event in extraction.get("_verification_events") or []:
+            self.db.add_relation_verification_event({
+                **event, "project_id": project_id, "document_id": document_id,
+                "chunk_id": int(chunk["id"]),
+            })
         relations = []
         for raw in extraction.get("relations") or []:
             source, target = local_map.get(raw["source"]), local_map.get(raw["target"])
             if not source or not target or source["id"] == target["id"]: continue
             relation_key = hashlib.sha256(
-                f"{project_id}|{document_id}|{chunk['id']}|{source['id']}|{raw['type']}|{target['id']}".encode()
+                f"{project_id}|{document_id}|{chunk['id']}|{raw.get('candidate_id')}|"
+                f"{source['id']}|{raw['type']}|{target['id']}".encode()
             ).hexdigest()
             relation = self.db.add_relation_assertion({"project_id": project_id, "document_id": document_id,
                 "chunk_id": int(chunk["id"]), "source_entity_id": int(source["id"]), "target_entity_id": int(target["id"]),
                 "relation_key": relation_key, "relation_type": raw["type"], "description": raw.get("description") or "",
-                "confidence": raw.get("confidence") or 0.5, "extraction_version": "v2",
+                "confidence": 0.5 if raw.get("confidence") is None else raw.get("confidence"),
+                "extraction_version": "v2",
                 "evidence_text": raw.get("evidence_text") or "", "evidence_start": raw.get("evidence_start"),
                 "evidence_end": raw.get("evidence_end"),
                 "verification_status": raw.get("verification_status") or "unverified",
                 "metadata": {"schema_version": schema_version,
+                             "candidate_id": raw.get("candidate_id"),
+                             "verification_reason": raw.get("verification_reason") or "",
                              "verification_status": raw.get("verification_status") or "unverified"}})
-            self.vectors.upsert_relation_embedding(project_id, document_id, int(chunk["id"]), relation,
-                                                   source["name"], target["name"], session.embedding_model)
+            if is_publishable_relation(relation.get("verification_status")):
+                self.vectors.upsert_relation_embedding(
+                    project_id, document_id, int(chunk["id"]), relation,
+                    source["name"], target["name"], session.embedding_model,
+                )
             relations.append(relation)
         return mentions, relations

@@ -189,7 +189,8 @@ class FlatExtractionOllama:
         ]}
 
 
-def test_extract_chunk_accepts_flat_model_output():
+def test_extract_chunk_accepts_flat_model_output(monkeypatch):
+    monkeypatch.setattr(Config, "extraction_verification_enabled", False)
     service = SchemaEvolutionService(None, FlatExtractionOllama())
     result = service.extract_chunk(
         {"llm_model": "test"},
@@ -201,8 +202,8 @@ def test_extract_chunk_accepts_flat_model_output():
     assert {key: relation[key] for key in ("source", "target", "type", "description", "confidence")} == {
         "source": "e1", "target": "e2", "type": "located_in", "description": "", "confidence": 0.5
     }
-    assert relation["evidence_text"] == "星河机器人公司位于上海。"
-    assert relation["verification_status"] == "evidence_unverified"
+    assert relation["evidence_text"] == ""
+    assert relation["verification_status"] == "uncertain"
 
 
 class LabeledConfidenceOllama:
@@ -218,7 +219,8 @@ class LabeledConfidenceOllama:
         }
 
 
-def test_extract_chunk_normalizes_labeled_and_percentage_confidence():
+def test_extract_chunk_normalizes_labeled_and_percentage_confidence(monkeypatch):
+    monkeypatch.setattr(Config, "extraction_verification_enabled", False)
     result = SchemaEvolutionService(None, LabeledConfidenceOllama()).extract_chunk(
         {"llm_model": "test"},
         {"schema_json": BASE_SCHEMA},
@@ -280,6 +282,7 @@ class SequentialExtractionOllama:
 
 def test_informative_empty_first_pass_gets_one_targeted_second_pass(monkeypatch):
     monkeypatch.setattr(Config, "extraction_gleaning_enabled", True)
+    monkeypatch.setattr(Config, "extraction_verification_enabled", False)
     ollama = SequentialExtractionOllama([
         {"entities": [], "relations": []},
         {
@@ -303,28 +306,42 @@ def test_informative_empty_first_pass_gets_one_targeted_second_pass(monkeypatch)
     assert result["_diagnostics"]["gleaning_used"] is True
 
 
+class RejectingRelationOllama:
+    def __init__(self):
+        self.calls = 0
+
+    def json_chat(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "entities": [
+                    {"id": "e1", "name": "Alpha", "type": "Organization", "description": "", "aliases": [],
+                     "evidence": "Alpha", "confidence": 0.9},
+                    {"id": "e2", "name": "Beta", "type": "Product", "description": "", "aliases": [],
+                     "evidence": "Beta", "confidence": 0.9},
+                ],
+                "relations": [{"source": "e1", "target": "e2", "type": "produces", "description": "",
+                               "evidence": "Alpha and Beta", "confidence": 0.5}],
+            }
+        marker = "Candidate relations:\n"
+        payload = kwargs["prompt"].split(marker, 1)[1].split("\n\nSOURCE TEXT:", 1)[0]
+        candidate = __import__("json").loads(payload)[0]
+        return {"decisions": [{
+            "candidate_id": candidate["candidate_id"], "verdict": "insufficient_evidence",
+            "corrected_type": "produces", "orientation": "as_is",
+            "evidence": "Alpha and Beta", "reason": "co-occurrence only",
+        }]}
+
+
 def test_uncertain_relation_can_be_rejected_by_batch_verifier(monkeypatch):
     monkeypatch.setattr(Config, "extraction_gleaning_enabled", False)
     monkeypatch.setattr(Config, "extraction_verification_enabled", True)
-    ollama = SequentialExtractionOllama([
-        {
-            "entities": [
-                {"id": "e1", "name": "Alpha", "type": "Organization", "description": "", "aliases": [],
-                 "evidence": "Alpha", "confidence": 0.9},
-                {"id": "e2", "name": "Beta", "type": "Product", "description": "", "aliases": [],
-                 "evidence": "Beta", "confidence": 0.9},
-            ],
-            "relations": [{"source": "e1", "target": "e2", "type": "produces", "description": "",
-                           "evidence": "Alpha and Beta", "confidence": 0.5}],
-        },
-        {"decisions": [{"relation_index": 0, "supported": False, "corrected_type": "produces",
-                        "evidence": "Alpha and Beta", "confidence": 0.1, "reason": "co-occurrence only"}]},
-    ])
+    ollama = RejectingRelationOllama()
     result = SchemaEvolutionService(None, ollama).extract_chunk(
         {"llm_model": "test"}, {"schema_json": BASE_SCHEMA}, {"content": "Alpha and Beta are discussed."}
     )
     assert ollama.calls == 2
-    assert result["relations"] == []
+    assert result["relations"][0]["verification_status"] == "uncertain"
     assert result["_diagnostics"]["verification_rejected"] == 1
 
 

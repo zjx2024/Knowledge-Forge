@@ -726,6 +726,18 @@ class KnowledgeForgeService:
             resolution_session = self.resolver.start_session(project)
             total_mentions = total_relations = extraction_errors = 0
             gleaning_chunks = verified_relations = rejected_relations = 0
+            verification_totals = {
+                "verification_requested": 0,
+                "rules_verified": 0,
+                "llm_verified": 0,
+                "rejected": 0,
+                "uncertain": 0,
+                "missing_decisions": 0,
+                "verifier_failures": 0,
+                "retry_count": 0,
+                "quarantined": 0,
+                "published": 0,
+            }
             for index, chunk in enumerate(extraction_chunks, start=1):
                 try:
                     self._assert_ingestion_active(job_id, document_id)
@@ -744,11 +756,13 @@ class KnowledgeForgeService:
                         detail += "，已执行针对性补抽取"
                     verified_relations += int(diagnostics.get("verified") or 0)
                     rejected_relations += int(diagnostics.get("verification_rejected") or 0)
+                    for key in verification_totals:
+                        verification_totals[key] += int(diagnostics.get(key) or 0)
                     if diagnostics.get("verification_candidates"):
                         detail += (
                             f"，复核 {int(diagnostics['verification_candidates'])} 条候选"
-                            f"（通过 {int(diagnostics.get('verified') or 0)}，拒绝 "
-                            f"{int(diagnostics.get('verification_rejected') or 0)}）"
+                            f"（发布 {int(diagnostics.get('published') or 0)}，隔离 "
+                            f"{int(diagnostics.get('quarantined') or 0)}）"
                         )
                 except IngestionCancelled:
                     raise
@@ -799,17 +813,24 @@ class KnowledgeForgeService:
                               "schema_version": schema_record["version"], "entity_mentions": total_mentions,
                               "relations": total_relations, "extraction_errors": extraction_errors,
                               "gleaning_chunks": gleaning_chunks, "verified_relations": verified_relations,
-                              "rejected_relations": rejected_relations})
+                              "rejected_relations": rejected_relations,
+                              "relation_verification": verification_totals})
             completion = "文档知识库与知识图谱入库完成"
             if extraction_errors:
                 completion += f"；{extraction_errors} 个知识块的图谱抽取已降级"
             completion += (
-                f"；补抽取 {gleaning_chunks} 个知识块，复核通过 {verified_relations} 条关系，"
-                f"拒绝 {rejected_relations} 条缺少充分证据的关系"
+                f"；补抽取 {gleaning_chunks} 个知识块；关系复核请求 "
+                f"{verification_totals['verification_requested']}，规则通过 {verification_totals['rules_verified']}，"
+                f"LLM 通过 {verification_totals['llm_verified']}，拒绝 {verification_totals['rejected']}，"
+                f"不确定 {verification_totals['uncertain']}，漏答 {verification_totals['missing_decisions']}，"
+                f"复核失败 {verification_totals['verifier_failures']}，重试 {verification_totals['retry_count']}；"
+                f"隔离 {verification_totals['quarantined']}，发布到 HugeGraph {graph_report['relations']}"
             )
             self._job(job_id, "completed", 100, completion, stage="completed", graph_ready=True,
                       extraction_errors=extraction_errors, gleaning_chunks=gleaning_chunks,
-                      verified_relations=verified_relations, rejected_relations=rejected_relations)
+                      verified_relations=verified_relations, rejected_relations=rejected_relations,
+                      relation_verification=verification_totals,
+                      published_to_hugegraph=graph_report["relations"])
         except IngestionCancelled as exc:
             LOGGER.info("Document ingestion cancelled: %s: %s", document_id, exc)
             self._fail_active_ingestion_subtask(job_id, str(exc), cancelled=True)
