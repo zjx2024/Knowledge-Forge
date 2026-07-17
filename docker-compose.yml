@@ -1,0 +1,47 @@
+services:
+  postgres:
+    build:
+      context: deploy/postgres
+    image: knowledge-forge-postgres:pg16-vector
+    container_name: knowledge-forge-postgres
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    ports:
+      - "5433:5432"
+    volumes:
+      - knowledge-forge-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  knowledge-forge:
+    build: .
+    image: knowledge-forge:latest
+    container_name: knowledge-forge
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"
+      HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    gpus: all
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8011:8011"
+      - "8010:8010"
+    volumes:
+      - ./KnowledgeFiles:/app/KnowledgeFiles
+      - knowledge-forge-docling-cache:/root/.cache
+      - ${ENTITY_RERANKER_HOST_PATH:-/home/kdfy/models/bge-reranker-v2-m3}:/models/entity-reranker:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  knowledge-forge-postgres-data:
+  knowledge-forge-docling-cache:
