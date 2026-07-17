@@ -510,6 +510,47 @@ CREATE TABLE IF NOT EXISTS relation_shadow_decisions (
 CREATE INDEX IF NOT EXISTS idx_relation_shadow_decisions_run
     ON relation_shadow_decisions(shadow_run_id,status,candidate_id);
 
+CREATE TABLE IF NOT EXISTS quality_evaluation_runs (
+    id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    snapshot_id TEXT REFERENCES policy_snapshots(id), control_policy_hash TEXT NOT NULL,
+    treatment_policy_hash TEXT NOT NULL, dataset TEXT NOT NULL, dataset_version TEXT NOT NULL,
+    split TEXT NOT NULL CHECK (split IN ('dev','holdout','combined')),
+    manifest JSONB NOT NULL, manifest_valid BOOLEAN NOT NULL DEFAULT FALSE,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb, denominators JSONB NOT NULL DEFAULT '{}'::jsonb,
+    cost_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','completed','failed')),
+    error_message TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_quality_evaluation_project
+    ON quality_evaluation_runs(project_id,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS policy_activation_gates (
+    id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    snapshot_id TEXT NOT NULL REFERENCES policy_snapshots(id), evaluation_run_id TEXT NOT NULL
+        REFERENCES quality_evaluation_runs(id), manifest_valid BOOLEAN NOT NULL DEFAULT FALSE,
+    engineering_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    production_approved BOOLEAN NOT NULL DEFAULT FALSE,
+    failed_gates TEXT[] NOT NULL DEFAULT '{}', gate_report JSONB NOT NULL DEFAULT '{}'::jsonb,
+    approved_by TEXT, approved_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(project_id,snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS policy_rollouts (
+    id TEXT PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    snapshot_id TEXT NOT NULL REFERENCES policy_snapshots(id),
+    rollout_stage TEXT NOT NULL CHECK (rollout_stage IN
+        ('control','shadow','canary','limited','expanded','new_project_default','migrated','rolled_back')),
+    previous_snapshot_id TEXT REFERENCES policy_snapshots(id),
+    rollback_snapshot_id TEXT REFERENCES policy_snapshots(id),
+    percentage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned','active','completed','failed','rolled_back')),
+    reason TEXT NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_policy_rollout_project
+    ON policy_rollouts(project_id,created_at DESC);
+
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS entity_extraction_policy_version TEXT NOT NULL DEFAULT 'entity-extraction-p0-v1';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS entity_resolution_policy_version TEXT NOT NULL DEFAULT 'entity-resolution-p0-v1';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS relation_candidate_policy_version TEXT NOT NULL DEFAULT 'relation-candidate-p0-v1';
@@ -2472,6 +2513,30 @@ class Database:
 
         with self.connection() as conn:
             snapshot = conn.execute(
+                """SELECT policy_set FROM policy_snapshots
+                   WHERE id=%s AND project_id=%s FOR UPDATE""",
+                (snapshot_id, project_id),
+            ).fetchone()
+            if not snapshot:
+                raise LookupError("策略快照不存在")
+            from .policy import CONTROL_POLICY_SET
+            if normalize_policy_set(snapshot["policy_set"]) != dict(CONTROL_POLICY_SET):
+                gate = conn.execute(
+                    """SELECT id FROM policy_activation_gates
+                       WHERE project_id=%s AND snapshot_id=%s
+                         AND production_approved=TRUE AND manifest_valid=TRUE
+                       FOR UPDATE""",
+                    (project_id, snapshot_id),
+                ).fetchone()
+                if not gate:
+                    raise ValueError("非 control 策略缺少有效人工 Gold 门禁，禁止激活")
+            return self._activate_policy_snapshot_in_connection(conn, project_id, snapshot_id)
+
+    @staticmethod
+    def _activate_policy_snapshot_in_connection(
+        conn: psycopg.Connection, project_id: int, snapshot_id: str,
+    ) -> dict[str, Any]:
+            snapshot = conn.execute(
                 """SELECT * FROM policy_snapshots
                    WHERE id=%s AND project_id=%s FOR UPDATE""",
                 (snapshot_id, project_id),
@@ -2518,6 +2583,100 @@ class Database:
                 (snapshot_id,),
             )
             return row
+
+    def create_quality_evaluation_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(values.get("id") or uuid.uuid4().hex)
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO quality_evaluation_runs(
+                   id,project_id,snapshot_id,control_policy_hash,treatment_policy_hash,
+                   dataset,dataset_version,split,manifest,manifest_valid,metrics,denominators,
+                   cost_metrics,status,error_message,completed_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,
+                          %s::jsonb,%s,%s,CASE WHEN %s='running' THEN NULL ELSE NOW() END)
+                   RETURNING *""",
+                (
+                    run_id, values["project_id"], values.get("snapshot_id"),
+                    values["control_policy_hash"], values["treatment_policy_hash"],
+                    values["dataset"], values["dataset_version"], values.get("split") or "combined",
+                    self._json(values.get("manifest")), bool(values.get("manifest_valid")),
+                    self._json(values.get("metrics")), self._json(values.get("denominators")),
+                    self._json(values.get("cost_metrics")), values.get("status") or "completed",
+                    values.get("error_message") or "", values.get("status") or "completed",
+                ),
+            ).fetchone()
+
+    def upsert_policy_activation_gate(self, values: dict[str, Any]) -> dict[str, Any]:
+        gate_id = str(values.get("id") or uuid.uuid4().hex)
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO policy_activation_gates(
+                   id,project_id,snapshot_id,evaluation_run_id,manifest_valid,
+                   engineering_complete,production_approved,failed_gates,gate_report,
+                   approved_by,approved_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,
+                          CASE WHEN %s THEN NOW() ELSE NULL END)
+                   ON CONFLICT(project_id,snapshot_id) DO UPDATE SET
+                   evaluation_run_id=EXCLUDED.evaluation_run_id,
+                   manifest_valid=EXCLUDED.manifest_valid,
+                   engineering_complete=EXCLUDED.engineering_complete,
+                   production_approved=EXCLUDED.production_approved,
+                   failed_gates=EXCLUDED.failed_gates,gate_report=EXCLUDED.gate_report,
+                   approved_by=EXCLUDED.approved_by,approved_at=EXCLUDED.approved_at
+                   RETURNING *""",
+                (
+                    gate_id, values["project_id"], values["snapshot_id"],
+                    values["evaluation_run_id"], bool(values.get("manifest_valid")),
+                    bool(values.get("engineering_complete")),
+                    bool(values.get("production_approved")), values.get("failed_gates") or [],
+                    self._json(values.get("gate_report")), values.get("approved_by"),
+                    bool(values.get("production_approved")),
+                ),
+            ).fetchone()
+
+    def activate_policy_snapshot_with_gate(
+        self, project_id: int, snapshot_id: str,
+    ) -> dict[str, Any]:
+        """Activate treatment only after an immutable production approval gate."""
+
+        with self.connection() as conn:
+            gate = conn.execute(
+                """SELECT * FROM policy_activation_gates
+                   WHERE project_id=%s AND snapshot_id=%s
+                     AND production_approved=TRUE AND manifest_valid=TRUE
+                   FOR UPDATE""",
+                (project_id, snapshot_id),
+            ).fetchone()
+            if not gate:
+                raise ValueError("缺少有效人工 Gold 和 production_approved 门禁，禁止激活")
+            return self._activate_policy_snapshot_in_connection(conn, project_id, snapshot_id)
+
+    def record_policy_rollout(
+        self, project_id: int, snapshot_id: str, rollout_stage: str, *,
+        previous_snapshot_id: str | None = None,
+        rollback_snapshot_id: str | None = None,
+        percentage: float = 0.0, status: str = "planned", reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        stages = {
+            "control", "shadow", "canary", "limited", "expanded",
+            "new_project_default", "migrated", "rolled_back",
+        }
+        if rollout_stage not in stages:
+            raise ValueError("未知 rollout stage")
+        rollout_id = uuid.uuid4().hex
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO policy_rollouts(
+                   id,project_id,snapshot_id,rollout_stage,previous_snapshot_id,
+                   rollback_snapshot_id,percentage,status,reason,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    rollout_id, project_id, snapshot_id, rollout_stage,
+                    previous_snapshot_id, rollback_snapshot_id, min(100.0, max(0.0, percentage)),
+                    status, reason, self._json(metadata),
+                ),
+            ).fetchone()
 
     @staticmethod
     def _resolution_event_id(project_id: int, event_type: str, material: str) -> str:

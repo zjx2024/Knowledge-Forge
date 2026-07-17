@@ -41,6 +41,7 @@ from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
 from .policy import P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW_POLICY_SET
+from .quality import evaluate_release_gate, validate_gold_manifest
 from .relation_pipeline import VersionedRelationPipeline
 from .schema_evolution import SchemaEvolutionService
 from .vector_store import VectorStore
@@ -441,6 +442,66 @@ class KnowledgeForgeService:
             },
         )
         return {"namespace_id": namespace_id, **snapshot}
+
+    def evaluate_policy_snapshot_gate(
+        self,
+        project_id: int,
+        snapshot_id: str,
+        *,
+        manifest: dict[str, Any],
+        control_metrics: dict[str, float],
+        treatment_metrics: dict[str, float],
+        approved_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist an auditable gate; model-only labels can never approve production."""
+
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        manifest_report = validate_gold_manifest(manifest, require_production=False)
+        gate_report = evaluate_release_gate(
+            control=control_metrics, treatment=treatment_metrics,
+            manifest=manifest_report,
+        )
+        evaluation = self.db.create_quality_evaluation_run({
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "control_policy_hash": str(project.get("active_policy_hash") or "control"),
+            "treatment_policy_hash": snapshot_id,
+            "dataset": manifest["dataset"],
+            "dataset_version": manifest["version"],
+            "split": "combined",
+            "manifest": manifest,
+            "manifest_valid": manifest_report["production_valid"],
+            "metrics": {"control": control_metrics, "treatment": treatment_metrics},
+            "denominators": manifest_report,
+            "cost_metrics": {
+                "control": control_metrics.get("cost"),
+                "treatment": treatment_metrics.get("cost"),
+            },
+            "status": "completed",
+        })
+        gate = self.db.upsert_policy_activation_gate({
+            "project_id": project_id,
+            "snapshot_id": snapshot_id,
+            "evaluation_run_id": evaluation["id"],
+            "manifest_valid": gate_report["manifest_valid"],
+            "engineering_complete": True,
+            "production_approved": gate_report["production_approved"],
+            "failed_gates": gate_report["failed_gates"],
+            "gate_report": gate_report,
+            "approved_by": approved_by if gate_report["production_approved"] else None,
+        })
+        return {"evaluation": evaluation, "gate": gate, "report": gate_report}
+
+    def activate_treatment_snapshot(self, project_id: int, snapshot_id: str) -> dict[str, Any]:
+        project = self.db.activate_policy_snapshot_with_gate(project_id, snapshot_id)
+        rollout = self.db.record_policy_rollout(
+            project_id, snapshot_id, "canary", percentage=100.0, status="active",
+            reason="生产门禁通过后按项目级 canary 激活",
+        )
+        self.submit_graph_build(project_id)
+        return {"project": project, "rollout": rollout}
 
     @staticmethod
     def _project_provenance_gremlin(project_id: int) -> str:

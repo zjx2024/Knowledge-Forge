@@ -5,11 +5,23 @@
   "review_status": "pending_human_confirmation",
   "reviewer": null,
   "reviewed_at": null,
-  "frozen_at": null,
+  "frozen_at": "2026-07-17T00:00:00Z",
   "production_gate_eligible": false,
   "splits": {
     "dev": "review_queue.jsonl",
     "holdout": null
   },
-  "policy_compatibility": ["p0-control", "p1-p3-shadow"]
+  "schema_compatibility": [1],
+  "policy_compatibility": ["control-p0", "p1-p2-shadow"],
+  "items": [
+    {
+      "id": "fixture-dev-1",
+      "path": "source-dev-1.txt",
+      "content_sha256": "60c6452dbdc5a722c1c911669724f0479c921de4315f265ef30ad4a4b41cc5e8",
+      "split": "dev",
+      "label_source": "synthetic",
+      "reviewer": "",
+      "reviewed_at": ""
+    }
+  ]
 }
