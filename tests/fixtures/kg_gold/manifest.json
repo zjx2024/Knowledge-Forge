@@ -1,0 +1,15 @@
+{
+  "dataset": "knowledge-forge-p1-p3-review-queue",
+  "version": "0.1.0",
+  "label_source": "synthetic_candidate_unreviewed",
+  "review_status": "pending_human_confirmation",
+  "reviewer": null,
+  "reviewed_at": null,
+  "frozen_at": null,
+  "production_gate_eligible": false,
+  "splits": {
+    "dev": "review_queue.jsonl",
+    "holdout": null
+  },
+  "policy_compatibility": ["p0-control", "p1-p3-shadow"]
+}

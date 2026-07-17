@@ -35,6 +35,7 @@ from .graph_policy import (
 from .hugegraph_store import HugeGraphStore
 from .media import DocumentMediaService
 from .ollama import OllamaClient
+from .observability import recorded_job
 from .schema_evolution import SchemaEvolutionService
 from .vector_store import VectorStore
 
@@ -580,6 +581,7 @@ class KnowledgeForgeService:
         if not self.db.get_document(document_id):
             raise IngestionCancelled("文档已删除")
 
+    @recorded_job("ingestion")
     def _ingest_document(self, job_id: str, document_id: int) -> None:
         try:
             with self._document_lock(document_id):
@@ -1008,6 +1010,7 @@ class KnowledgeForgeService:
                 LOGGER.warning("Relation embedding retry deferred for %s: %s", object_key, exc)
         return completed
 
+    @recorded_job("graph_rebuild")
     def _sync_project_graph(self, job_id: str, project_id: int) -> None:
         try:
             self.db.begin_graph_mutation(job_id)

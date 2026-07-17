@@ -6,11 +6,13 @@ import base64
 import json
 import math
 import re
+import time
 from typing import Any, Iterable
 
 import requests
 
 from .config import Config
+from .observability import current_metrics, increment
 
 
 class OllamaClient:
@@ -19,12 +21,15 @@ class OllamaClient:
         self.timeout = timeout or Config.ollama_timeout
 
     def models(self) -> list[dict[str, Any]]:
-        response = requests.get(f"{self.base_url}/api/tags", timeout=min(self.timeout, 30))
+        increment("ollama_logical_calls")
+        response = self._request("get", f"{self.base_url}/api/tags", timeout=min(self.timeout, 30))
         response.raise_for_status()
         return response.json().get("models") or []
 
     def model_info(self, model: str) -> dict[str, Any]:
-        response = requests.post(
+        increment("ollama_logical_calls")
+        response = self._request(
+            "post",
             f"{self.base_url}/api/show",
             json={"model": model},
             timeout=min(self.timeout, 30),
@@ -46,7 +51,10 @@ class OllamaClient:
         values = [str(item) for item in texts]
         if not values:
             return []
-        response = requests.post(
+        increment("ollama_logical_calls")
+        increment("embedding_input_count", len(values))
+        response = self._request(
+            "post",
             f"{self.base_url}/api/embed",
             json={"model": model, "input": values, "keep_alive": Config.ollama_keep_alive},
             timeout=self.timeout,
@@ -60,7 +68,8 @@ class OllamaClient:
         return [[float(value) for value in vector] for vector in embeddings]
 
     def _legacy_embedding(self, text: str, model: str) -> list[float]:
-        response = requests.post(
+        response = self._request(
+            "post",
             f"{self.base_url}/api/embeddings",
             json={"model": model, "prompt": text, "keep_alive": Config.ollama_keep_alive},
             timeout=self.timeout,
@@ -79,6 +88,8 @@ class OllamaClient:
         max_tokens: int | None = None,
         images: Iterable[bytes] | None = None,
     ) -> dict[str, Any]:
+        increment("ollama_logical_calls")
+        increment("estimated_prompt_tokens", self._estimate_tokens("\n".join((system, prompt))))
         self._validate_project_context_budget(system, prompt, schema, max_tokens)
         user_message: dict[str, Any] = {"role": "user", "content": prompt}
         encoded_images = [base64.b64encode(value).decode("ascii") for value in (images or [])]
@@ -98,7 +109,11 @@ class OllamaClient:
         }
         parse_error: Exception | None = None
         for attempt in range(2):
-            response = requests.post(f"{self.base_url}/api/chat", json=body, timeout=self.timeout)
+            if attempt:
+                increment("http_retry_count")
+            response = self._request(
+                "post", f"{self.base_url}/api/chat", json=body, timeout=self.timeout
+            )
             response.raise_for_status()
             content = str((response.json().get("message") or {}).get("content") or "").strip()
             try:
@@ -107,6 +122,7 @@ class OllamaClient:
                 parse_error = exc
                 if attempt:
                     break
+                increment("json_repair_count")
                 if content:
                     messages.append({"role": "assistant", "content": content[:12000]})
                 messages.append({
@@ -117,6 +133,25 @@ class OllamaClient:
                     "temperature": 0,
                 }
         raise RuntimeError(f"Ollama JSON response invalid after retry: {parse_error}")
+
+    @staticmethod
+    def _request(method: str, url: str, **kwargs: Any):
+        """Count the actual HTTP boundary, including repair and legacy calls."""
+
+        increment("ollama_http_calls")
+        payload = kwargs.get("json")
+        if payload is not None:
+            try:
+                increment("candidate_payload_bytes", len(json.dumps(payload, ensure_ascii=False).encode("utf-8")))
+            except (TypeError, ValueError):
+                pass
+        started = time.perf_counter()
+        try:
+            return getattr(requests, method)(url, **kwargs)
+        finally:
+            metrics = current_metrics()
+            if metrics is not None:
+                metrics.duration("ollama_http", (time.perf_counter() - started) * 1000)
 
     @classmethod
     def _validate_project_context_budget(

@@ -35,6 +35,7 @@ from .relation_verification import (
     UNCERTAIN,
     is_publishable_relation,
 )
+from .observability import InstrumentedConnection, current_metrics, increment
 
 
 LOGGER = logging.getLogger(__name__)
@@ -44,6 +45,15 @@ SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS operation_metrics (
+    id BIGSERIAL PRIMARY KEY, run_id TEXT NOT NULL, kind TEXT NOT NULL,
+    project_id BIGINT, document_id BIGINT, job_id TEXT,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_operation_metrics_scope
+    ON operation_metrics(project_id,document_id,created_at DESC);
 CREATE TABLE IF NOT EXISTS models (
     id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, model_type TEXT NOT NULL CHECK (model_type IN ('llm','embedding')),
     provider TEXT NOT NULL DEFAULT 'ollama', base_url TEXT, is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -383,8 +393,33 @@ class Database:
 
     @contextmanager
     def connection(self) -> Iterator[psycopg.Connection]:
+        increment("db_connection_count")
         with psycopg.connect(**self.config.postgres, row_factory=dict_row) as conn:
-            yield conn
+            if current_metrics() is None:
+                yield conn
+            else:
+                yield InstrumentedConnection(conn)
+
+    def record_operation_metrics(
+        self,
+        *,
+        run_id: str,
+        kind: str,
+        metrics: dict[str, Any],
+        project_id: int | None = None,
+        document_id: int | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        """Best-effort callers persist aggregate metrics after the measured scope."""
+
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO operation_metrics(
+                       run_id,kind,project_id,document_id,job_id,metrics
+                   ) VALUES(%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(run_id) DO UPDATE SET metrics=EXCLUDED.metrics""",
+                (run_id, kind, project_id, document_id, job_id, self._json(metrics)),
+            )
 
     @staticmethod
     def _json(value: Any) -> str:
