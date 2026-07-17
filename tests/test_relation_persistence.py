@@ -87,7 +87,9 @@ def test_publishable_relation_query_uses_explicit_status_allowlist():
     database.list_document_relations(9)
     statement, params = connection.calls[0]
     assert "verification_status=ANY" in statement
-    assert set(params[1]) == {"rules_verified", "llm_verified", "manual_verified"}
+    assert params[1] == "manual_verified"
+    assert set(params[2]) == {"rules_verified", "llm_verified"}
+    assert params[3] == "relation-verifier-p0-v1"
 
 
 class Graph:

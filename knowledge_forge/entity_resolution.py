@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,6 +29,9 @@ from .relation_verification import (
 )
 from .value_parsing import coerce_confidence
 from .vector_store import VectorStore
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def lexical_name_similarity(left: str, right: str) -> float:
@@ -486,9 +490,36 @@ class EntityResolver:
             assertion_values,
         )
         for relation, (source, target) in zip(relations, assertion_context):
-            if is_publishable_relation(relation.get("verification_status")):
-                self.vectors.upsert_relation_embedding(
-                    project_id, document_id, int(chunk["id"]), relation,
-                    source["name"], target["name"], session.embedding_model,
-                )
+            if is_publishable_relation(
+                relation.get("verification_status"), relation.get("metadata"),
+            ):
+                try:
+                    self.vectors.upsert_relation_embedding(
+                        project_id, document_id, int(chunk["id"]), relation,
+                        source["name"], target["name"], session.embedding_model,
+                    )
+                    self.db.complete_indexing_failure(
+                        project_id, "relation", str(relation["id"]), session.embedding_model,
+                    )
+                except Exception as exc:
+                    self.db.record_indexing_failure({
+                        "project_id": project_id,
+                        "document_id": document_id,
+                        "chunk_id": int(chunk["id"]),
+                        "object_type": "relation",
+                        "object_key": str(relation["id"]),
+                        "model_name": session.embedding_model,
+                        "last_error": str(exc),
+                        "payload": {
+                            "source_name": source["name"],
+                            "target_name": target["name"],
+                            "relation_type": relation["relation_type"],
+                            "relation_key": relation["relation_key"],
+                        },
+                    })
+                    relation["indexing_pending"] = True
+                    LOGGER.warning(
+                        "Relation embedding deferred for assertion %s: %s",
+                        relation.get("id"), exc,
+                    )
         return mentions, relations

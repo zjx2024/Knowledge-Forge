@@ -41,10 +41,19 @@ RELATION_VERDICTS = frozenset({
 RELATION_ORIENTATIONS = frozenset({"as_is", "reversed"})
 
 
-def is_publishable_relation(status: object) -> bool:
-    """Return true only for explicitly approved relation states."""
+def is_publishable_relation(
+    status: object,
+    metadata: object = None,
+) -> bool:
+    """Return true only for manual review or current-policy automatic review."""
 
-    return str(status or "") in PUBLISHABLE_RELATION_STATUSES
+    normalized_status = str(status or "")
+    if normalized_status == MANUAL_VERIFIED:
+        return True
+    if normalized_status not in {RULES_VERIFIED, LLM_VERIFIED}:
+        return False
+    values = metadata if isinstance(metadata, dict) else {}
+    return values.get("verification_policy_version") == RELATION_VERIFICATION_POLICY_VERSION
 
 
 def relation_candidate_id(

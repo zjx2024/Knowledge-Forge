@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .config import Config
 from .chunking import CHUNK_STRATEGY_OPTIONS, PARSER_OPTIONS, docling_available, validate_processing_request
+from .graph_policy import GraphNotReadyError, is_current_graph
 from .service import KnowledgeForgeService
 
 
@@ -96,11 +97,16 @@ def render_page(project_id: int | None, message: tuple[str, str] | None = None) 
     settings_button = ""
     settings_dialog = ""
     if current:
-        graph_enabled = current.get("graph_status") == "ready" and not (active_job_id and active_job_kind == "ingestion")
+        graph_enabled = is_current_graph(current) and not active_job_id
+        graph_status = str(current.get("graph_status") or "empty")
+        graph_retry = "" if graph_enabled or active_job_id else (
+            f'<button class="button secondary" type="button" data-rebuild-graph="{_esc(current["id"])}">重建知识图谱</button>'
+        )
         current_block = f"""
         <div class="workspace-section graph-summary"><div class="stats"><div><b>{statistics['documents']}</b><span>文档</span></div><div><b>{statistics['chunks']}</b><span>知识块</span></div>
           <div><b>{statistics['entities']}</b><span>实体</span></div><div><b>{statistics['relations']}</b><span>关系</span></div></div>
         <div class="stats-actions"><span class="schema-chip">{_esc(schema_summary)}</span>
+          <span class="schema-chip">图谱：{_esc(graph_status)}</span>{graph_retry}
           <button class="button secondary" type="button" data-reassess-schema="{_esc(current['id'])}"{' disabled' if active_job_id else ''}>重新评估 Schema</button>
           <a id="view-knowledge-graph" class="button secondary{' disabled-link' if not graph_enabled else ''}" href="/graph/view?project={_esc(current['id'])}" target="_blank" rel="noopener noreferrer" aria-disabled="{'false' if graph_enabled else 'true'}">查看知识图谱</a></div></div>"""
         settings_button = '<button class="button secondary" type="button" id="open-project-settings">项目设置</button>'
@@ -286,6 +292,8 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 project_id = int(parse_qs(parsed.query).get("project", ["0"])[0])
                 self._redirect(SERVICE.hubble_project_url(project_id), project_id)
+            except GraphNotReadyError as exc:
+                self._respond(HTTPStatus.CONFLICT, str(exc), "text/plain; charset=utf-8")
             except Exception as exc:
                 self._redirect(f"/?kind=error&message={quote(str(exc))}", self._project())
             return
@@ -427,6 +435,7 @@ async function pollDeleteJob(jobId){try{const response=await fetch('/api/jobs/'+
 document.querySelectorAll('[data-delete]').forEach(button=>button.onclick=async()=>{if(!confirm('确认软删除该文档及其向量、实体提及和关系贡献吗？'))return;button.disabled=true;deleteSpinner.hidden=false;deleteResult.hidden=true;deleteResult.className='delete-result';deleteClose.disabled=true;deleteMessage.textContent='正在提交删除请求...';updateDeleteProgress(3,'正在取消相关任务','请稍候，不要重复点击删除。');deleteDialog?.showModal();try{const response=await fetch('/api/documents/'+button.dataset.delete+'/delete',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'删除失败');button.closest('tr')?.classList.add('deleting-row');deleteMessage.textContent='文档已从当前项目移除，正在完成后台清理';updateDeleteProgress(8,'文档已软删除','正在等待活动解析步骤安全退出。');pollDeleteJob(data.job_id)}catch(error){button.disabled=false;finishDeleteProgress(false,'删除失败',error.message||'删除请求执行失败')}});
 deleteClose?.addEventListener('click',()=>location.reload());deleteDialog?.addEventListener('cancel',event=>{if(deleteClose.disabled)event.preventDefault()});
 document.querySelector('[data-reassess-schema]')?.addEventListener('click',async event=>{if(!confirm('将基于当前项目全部已入库文档，从基础 Schema 重新评估类型和关系约束。该操作不会自动重跑已有文档的实体抽取，是否继续？'))return;const button=event.currentTarget;button.disabled=true;try{const response=await fetch('/api/projects/'+button.dataset.reassessSchema+'/schema/reassess',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'Schema 重新评估提交失败');monitor(data.job_id,'schema_reassessment')}catch(error){alert(error.message||'Schema 重新评估提交失败');button.disabled=false}});
+document.querySelector('[data-rebuild-graph]')?.addEventListener('click',async event=>{const button=event.currentTarget;button.disabled=true;try{const response=await fetch('/api/projects/'+button.dataset.rebuildGraph+'/graph',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'图谱重建提交失败');monitor(data.job_id,'graph_sync')}catch(error){alert(error.message||'图谱重建提交失败');button.disabled=false}});
 const createDialog=document.querySelector('#create-project-dialog');
 document.querySelector('#open-create-project')?.addEventListener('click',()=>createDialog?.showModal());
 document.querySelectorAll('[data-close-create-project]').forEach(button=>button.addEventListener('click',()=>createDialog?.close()));

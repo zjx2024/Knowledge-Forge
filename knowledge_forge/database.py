@@ -18,10 +18,20 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from .config import Config
+from .graph_policy import (
+    GRAPH_EMPTY,
+    GRAPH_FAILED,
+    GRAPH_POLICY_VERSION,
+    GRAPH_READY,
+    GRAPH_REBUILDING,
+    GRAPH_STALE,
+)
 from .relation_verification import (
     LEGACY_UNVERIFIED,
-    PUBLISHABLE_RELATION_STATUSES,
+    LLM_VERIFIED,
+    MANUAL_VERIFIED,
     RELATION_VERIFICATION_POLICY_VERSION,
+    RULES_VERIFIED,
     UNCERTAIN,
     is_publishable_relation,
 )
@@ -98,6 +108,19 @@ CREATE TABLE IF NOT EXISTS vector_embeddings (
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE, UNIQUE(project_id,object_type,object_key,model_name)
 );
 CREATE INDEX IF NOT EXISTS idx_vectors_lookup ON vector_embeddings(project_id,object_type,model_name,is_deleted);
+
+CREATE TABLE IF NOT EXISTS indexing_failures (
+    id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT REFERENCES documents(id), chunk_id BIGINT REFERENCES chunks(id),
+    object_type TEXT NOT NULL, object_key TEXT NOT NULL, model_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+    attempts INTEGER NOT NULL DEFAULT 1, last_error TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ,
+    UNIQUE(project_id,object_type,object_key,model_name)
+);
+CREATE INDEX IF NOT EXISTS idx_indexing_failures_pending
+    ON indexing_failures(project_id,status,updated_at) WHERE status='pending';
 
 CREATE TABLE IF NOT EXISTS graph_schemas (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id), version INTEGER NOT NULL,
@@ -198,6 +221,8 @@ CREATE INDEX IF NOT EXISTS idx_relation_verification_scope
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS schema_status TEXT NOT NULL DEFAULT 'base';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_schema_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_status TEXT NOT NULL DEFAULT 'empty';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_policy_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_error TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS model_max_tokens INTEGER NOT NULL DEFAULT 32768;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS chunk_max_tokens INTEGER NOT NULL DEFAULT 512;
 ALTER TABLE projects DROP COLUMN IF EXISTS ragflow_dataset_id;
@@ -268,6 +293,7 @@ class Database:
             )
             conn.execute(SCHEMA_SQL)
             self._migrate_relation_verification_policy(conn)
+            self._migrate_graph_policy(conn)
             self._migrate_vector_storage(conn)
             self._migrate_entity_aliases(conn)
             self._seed_settings(conn)
@@ -365,69 +391,95 @@ class Database:
         return json.dumps({} if value is None else value, ensure_ascii=False)
 
     @staticmethod
-    def _publishable_relation_clause(alias: str = "r") -> tuple[str, list[str]]:
-        """Return the single default-product allowlist predicate and its parameter."""
+    def _publishable_relation_clause(alias: str = "r") -> tuple[str, list[Any]]:
+        """Return the fail-closed product predicate and its parameters."""
 
         return (
-            f"{alias}.verification_status=ANY(%s)",
-            sorted(PUBLISHABLE_RELATION_STATUSES),
+            f"({alias}.verification_status=%s OR "
+            f"({alias}.verification_status=ANY(%s) AND "
+            f"COALESCE({alias}.metadata->>'verification_policy_version','')=%s))",
+            [
+                MANUAL_VERIFIED,
+                sorted({RULES_VERIFIED, LLM_VERIFIED}),
+                RELATION_VERIFICATION_POLICY_VERSION,
+            ],
         )
 
     @classmethod
     def _migrate_relation_verification_policy(
         cls, conn: psycopg.Connection,
     ) -> dict[str, int]:
-        """Conservatively quarantine weak pre-policy rules and their vectors."""
+        """Quarantine pre-policy automatic assertions/candidates and bad vectors."""
 
         assertion_result = conn.execute(
             """UPDATE relation_assertions
                SET verification_status=%s,
-                   metadata=metadata || %s::jsonb,
+                   metadata=(CASE WHEN jsonb_typeof(metadata)='object' THEN metadata
+                                  ELSE jsonb_build_object('legacy_metadata',metadata) END)
+                            || jsonb_build_object(
+                                'legacy_verification_status',verification_status,
+                                'migration_reason','missing current strict verifier policy'),
                    graph_edge_id=NULL,
                    updated_at=NOW()
-               WHERE verification_status='rules_verified'
+               WHERE verification_status=ANY(%s)
                  AND COALESCE(metadata->>'verification_policy_version','')<>%s""",
             (
                 LEGACY_UNVERIFIED,
-                cls._json({
-                    "legacy_verification_status": "rules_verified",
-                    "migration_reason": "missing current strict verifier policy",
-                }),
+                sorted({RULES_VERIFIED, LLM_VERIFIED}),
                 RELATION_VERIFICATION_POLICY_VERSION,
             ),
         )
         candidate_result = conn.execute(
             """UPDATE relation_candidates
                SET status=%s,
-                   metadata=metadata || %s::jsonb,
+                   metadata=(CASE WHEN jsonb_typeof(metadata)='object' THEN metadata
+                                  ELSE jsonb_build_object('legacy_metadata',metadata) END)
+                            || jsonb_build_object(
+                                'legacy_verification_status',status,
+                                'migration_reason','missing current strict verifier policy'),
                    updated_at=NOW()
-               WHERE status='rules_verified'
+               WHERE status=ANY(%s)
                  AND COALESCE(metadata->>'verification_policy_version','')<>%s""",
             (
                 LEGACY_UNVERIFIED,
-                cls._json({
-                    "legacy_verification_status": "rules_verified",
-                    "migration_reason": "missing current strict verifier policy",
-                }),
+                sorted({RULES_VERIFIED, LLM_VERIFIED}),
                 RELATION_VERIFICATION_POLICY_VERSION,
             ),
         )
+        clause, policy_params = cls._publishable_relation_clause("r")
         vector_result = conn.execute(
             """UPDATE vector_embeddings v
                SET is_deleted=TRUE,updated_at=NOW()
-               FROM relation_assertions r
-               WHERE v.project_id=r.project_id
-                 AND v.object_type='relation'
-                 AND v.object_key=r.id::text
-                 AND v.is_deleted=FALSE
-                 AND NOT (r.verification_status=ANY(%s))""",
-            (sorted(PUBLISHABLE_RELATION_STATUSES),),
+               WHERE v.object_type='relation' AND v.is_deleted=FALSE
+                 AND NOT EXISTS (
+                     SELECT 1 FROM relation_assertions r
+                     WHERE r.project_id=v.project_id AND r.id::text=v.object_key
+                       AND r.is_deleted=FALSE AND """ + clause + ")",
+            tuple(policy_params),
         )
         return {
             "assertions_quarantined": max(0, assertion_result.rowcount or 0),
             "candidates_quarantined": max(0, candidate_result.rowcount or 0),
             "vectors_retired": max(0, vector_result.rowcount or 0),
         }
+
+    @staticmethod
+    def _migrate_graph_policy(conn: psycopg.Connection) -> int:
+        """Mark every non-empty graph built under an old/unknown policy stale."""
+
+        result = conn.execute(
+            """UPDATE projects
+               SET graph_status=%s,graph_error=%s,updated_at=NOW()
+               WHERE is_deleted=FALSE AND graph_status<>%s
+                 AND graph_policy_version<>%s""",
+            (
+                GRAPH_STALE,
+                "图谱需要按当前关系验证策略重建",
+                GRAPH_EMPTY,
+                GRAPH_POLICY_VERSION,
+            ),
+        )
+        return max(0, result.rowcount or 0)
 
     def migrate_relation_verification_policy(self) -> dict[str, int]:
         """Run the idempotent database-only part of the P0 verification upgrade."""
@@ -490,7 +542,8 @@ class Database:
 
     def update_project(self, project_id: int, **values: Any) -> dict[str, Any]:
         allowed = {"llm_model", "embedding_model", "model_max_tokens", "chunk_max_tokens",
-                   "schema_status", "active_schema_version", "graph_status", "metadata", "status"}
+                   "schema_status", "active_schema_version", "graph_status",
+                   "graph_policy_version", "graph_error", "metadata", "status"}
         fields = [key for key in values if key in allowed]
         if not fields:
             return self.get_project(project_id) or {}
@@ -498,6 +551,30 @@ class Database:
         params = [self._json(values[key]) if key == "metadata" and not isinstance(values[key], str) else values[key] for key in fields] + [project_id]
         with self.connection() as conn:
             return conn.execute(f"UPDATE projects SET {assignments},updated_at=NOW() WHERE id=%s RETURNING *", params).fetchone()
+
+    def set_graph_state(
+        self,
+        project_id: int,
+        status: str,
+        *,
+        error: str = "",
+        current_policy: bool = False,
+    ) -> dict[str, Any]:
+        """Persist one fail-closed graph lifecycle transition."""
+
+        if status not in {GRAPH_EMPTY, GRAPH_STALE, GRAPH_REBUILDING, GRAPH_READY, GRAPH_FAILED}:
+            raise ValueError(f"未知图谱状态: {status}")
+        policy_version = GRAPH_POLICY_VERSION if current_policy else ""
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE projects SET graph_status=%s,graph_policy_version=%s,
+                   graph_error=%s,updated_at=NOW()
+                   WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                (status, policy_version, error or "", project_id),
+            ).fetchone()
+            if not row:
+                raise LookupError("项目不存在")
+            return row
 
     def create_document(self, values: dict[str, Any]) -> dict[str, Any]:
         columns = ("project_id","doc_hash","original_filename","stored_filename","storage_path","local_path",
@@ -594,6 +671,7 @@ class Database:
             ).fetchone()
             if not document: raise LookupError("文档不存在或已删除")
             conn.execute("UPDATE relation_candidates SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
+            conn.execute("DELETE FROM indexing_failures WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM vector_embeddings WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM relation_assertions WHERE document_id=%s", (document_id,))
             conn.execute("DELETE FROM entity_resolution_decisions WHERE document_id=%s", (document_id,))
@@ -668,15 +746,24 @@ class Database:
         candidate_limit = max(limit, min(Config.pgvector_max_candidates, limit * Config.pgvector_candidate_multiplier))
         pattern = f"%{query}%"
         vector_type = sql.SQL("vector({})").format(sql.Literal(dimension))
+        relation_filter = ""
+        relation_policy_params: list[Any] = []
+        if object_type == "relation":
+            relation_clause, relation_policy_params = self._publishable_relation_clause("r")
+            relation_filter = (
+                " AND EXISTS (SELECT 1 FROM relation_assertions r "
+                "WHERE r.project_id=v0.project_id AND r.id::text=v0.object_key "
+                "AND r.is_deleted=FALSE AND " + relation_clause + ")"
+            )
         statement = sql.SQL(
             """WITH vector_hits AS (
-                SELECT id FROM vector_embeddings
-                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE
+                SELECT id FROM vector_embeddings v0
+                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {}
                 ORDER BY embedding_vector::{} <=> %s::{}
                 LIMIT %s
             ), lexical_hits AS (
-                SELECT id FROM vector_embeddings
-                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE
+                SELECT id FROM vector_embeddings v0
+                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {}
                   AND content ILIKE %s
                 ORDER BY length(content),id LIMIT %s
             ), candidates AS (
@@ -692,15 +779,60 @@ class Database:
             WHERE (d.id IS NULL OR d.is_deleted=FALSE)
             ORDER BY v.embedding_vector::{} <=> %s::{}
             LIMIT %s"""
-        ).format(vector_type, vector_type, vector_type, vector_type, vector_type, vector_type)
+        ).format(
+            sql.SQL(relation_filter), vector_type, vector_type,
+            sql.SQL(relation_filter), vector_type, vector_type, vector_type, vector_type,
+        )
         params = (
-            project_id,object_type,model_name,dimension,vector_literal,candidate_limit,
-            project_id,object_type,model_name,dimension,pattern,candidate_limit,
+            project_id,object_type,model_name,dimension,*relation_policy_params,
+            vector_literal,candidate_limit,
+            project_id,object_type,model_name,dimension,*relation_policy_params,
+            pattern,candidate_limit,
             vector_literal,vector_literal,candidate_limit,
         )
         with self.connection() as conn:
             conn.execute("SELECT set_config('hnsw.ef_search',%s,TRUE)", (str(Config.pgvector_hnsw_ef_search),))
             return conn.execute(statement, params).fetchall()
+
+    def record_indexing_failure(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Persist a retryable derived-index failure without changing source truth."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO indexing_failures(project_id,document_id,chunk_id,object_type,
+                   object_key,model_name,last_error,payload)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(project_id,object_type,object_key,model_name) DO UPDATE SET
+                   document_id=EXCLUDED.document_id,chunk_id=EXCLUDED.chunk_id,status='pending',
+                   attempts=indexing_failures.attempts+1,last_error=EXCLUDED.last_error,
+                   payload=EXCLUDED.payload,completed_at=NULL,updated_at=NOW() RETURNING *""",
+                (
+                    values["project_id"], values.get("document_id"), values.get("chunk_id"),
+                    values["object_type"], str(values["object_key"]), values["model_name"],
+                    values.get("last_error") or "", self._json(values.get("payload")),
+                ),
+            ).fetchone()
+
+    def complete_indexing_failure(
+        self, project_id: int, object_type: str, object_key: str, model_name: str,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """UPDATE indexing_failures SET status='completed',last_error='',
+                   completed_at=NOW(),updated_at=NOW()
+                   WHERE project_id=%s AND object_type=%s AND object_key=%s AND model_name=%s""",
+                (project_id, object_type, str(object_key), model_name),
+            )
+
+    def list_pending_indexing_failures(
+        self, project_id: int, object_type: str = "relation",
+    ) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM indexing_failures WHERE project_id=%s AND object_type=%s
+                   AND status='pending' ORDER BY updated_at,id""",
+                (project_id, object_type),
+            ).fetchall()
 
     def list_embeddings(self, project_id: int, object_type: str, model_name: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -778,6 +910,70 @@ class Database:
         job_id = uuid.uuid4().hex
         with self.connection() as conn:
             return conn.execute("INSERT INTO jobs(id,kind,project_id,document_id) VALUES(%s,%s,%s,%s) RETURNING *", (job_id,kind,project_id,document_id)).fetchone()
+
+    def create_graph_rebuild_job(self, project_id: int) -> dict[str, Any]:
+        """Queue a rebuild and atomically close graph access before returning."""
+
+        job_id = uuid.uuid4().hex
+        with self.connection() as conn:
+            project = conn.execute(
+                "SELECT id FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            active = conn.execute(
+                """SELECT id FROM jobs WHERE project_id=%s
+                   AND kind=ANY(%s) AND status IN ('queued','running') LIMIT 1""",
+                (project_id, ["ingestion", "graph_sync", "schema_reassessment", "document_cleanup"]),
+            ).fetchone()
+            if active:
+                raise ValueError("当前项目已有会修改图谱的任务正在执行")
+            job = conn.execute(
+                """INSERT INTO jobs(id,kind,project_id) VALUES(%s,'graph_sync',%s)
+                   RETURNING *""",
+                (job_id, project_id),
+            ).fetchone()
+            conn.execute(
+                """UPDATE projects SET graph_status=%s,graph_policy_version='',graph_error='',
+                   updated_at=NOW() WHERE id=%s""",
+                (GRAPH_REBUILDING, project_id),
+            )
+            return job
+
+    def begin_graph_mutation(self, job_id: str) -> dict[str, Any]:
+        """Start one project graph writer while excluding other running writers."""
+
+        with self.connection() as conn:
+            job = conn.execute("SELECT * FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+            if not job:
+                raise LookupError("任务不存在")
+            if not job.get("project_id"):
+                raise ValueError("图谱写任务缺少项目")
+            conn.execute(
+                "SELECT id FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (job["project_id"],),
+            )
+            other = conn.execute(
+                """SELECT id FROM jobs WHERE project_id=%s AND id<>%s
+                   AND kind=ANY(%s) AND status='running' LIMIT 1""",
+                (
+                    job["project_id"], job_id,
+                    ["ingestion", "graph_sync", "schema_reassessment"],
+                ),
+            ).fetchone()
+            if other:
+                raise RuntimeError("当前项目已有图谱写任务正在运行")
+            conn.execute(
+                "UPDATE jobs SET status='running',updated_at=NOW() WHERE id=%s",
+                (job_id,),
+            )
+            conn.execute(
+                """UPDATE projects SET graph_status=%s,graph_policy_version='',graph_error='',
+                   updated_at=NOW() WHERE id=%s""",
+                (GRAPH_REBUILDING, job["project_id"]),
+            )
+            return {**job, "status": "running"}
 
     def update_job(self, job_id: str, *, status: str | None = None, progress: int | None = None, log: str = "", error: str = "", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.connection() as conn:
@@ -1199,7 +1395,7 @@ class Database:
                 is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                 (values["project_id"],values["document_id"],values["chunk_id"],values["source_entity_id"],values["target_entity_id"],values["relation_key"],values["relation_type"],values.get("description") or "",0.5 if values.get("confidence") is None else values.get("confidence"),values.get("extraction_version") or "v2",values.get("ingestion_run_id") or "",values.get("evidence_text") or "",values.get("evidence_start"),values.get("evidence_end"),values.get("verification_status") or "unverified",self._json(values.get("metadata"))),
             ).fetchone()
-        if not is_publishable_relation(row.get("verification_status")):
+        if not is_publishable_relation(row.get("verification_status"), row.get("metadata")):
             conn.execute(
                 """UPDATE vector_embeddings SET is_deleted=TRUE,updated_at=NOW()
                    WHERE project_id=%s AND object_type='relation' AND object_key=%s""",
@@ -1223,7 +1419,7 @@ class Database:
             return [self._add_relation_assertion(conn, values) for values in assertions]
 
     def list_project_relations(self, project_id: int) -> list[dict[str, Any]]:
-        clause, statuses = self._publishable_relation_clause()
+        clause, policy_params = self._publishable_relation_clause()
         with self.connection() as conn:
             return conn.execute(
                 """SELECT r.*,s.name AS source_name,s.entity_type AS source_type,t.name AS target_name,t.entity_type AS target_type,
@@ -1231,8 +1427,27 @@ class Database:
                 JOIN canonical_entities s ON s.id=r.source_entity_id JOIN canonical_entities t ON t.id=r.target_entity_id
                 JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
                 WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
-                AND """ + clause + " ORDER BY r.id", (project_id, statuses)
+                AND """ + clause + " ORDER BY r.id", (project_id, *policy_params)
             ).fetchall()
+
+    def count_publishable_relations(
+        self, project_id: int, document_ids: list[int] | None = None,
+    ) -> int:
+        clause, policy_params = self._publishable_relation_clause("r")
+        document_filter = ""
+        document_params: list[Any] = []
+        if document_ids is not None:
+            document_filter = " AND r.document_id=ANY(%s)"
+            document_params.append(document_ids)
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS count FROM relation_assertions r
+                   JOIN documents d ON d.id=r.document_id
+                   WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                   """ + document_filter + " AND " + clause,
+                (project_id, *document_params, *policy_params),
+            ).fetchone()
+            return int(row["count"] if row else 0)
 
     def list_all_project_relations(self, project_id: int) -> list[dict[str, Any]]:
         """Audit-only relation listing. Callers explicitly opt into quarantined states."""
@@ -1258,14 +1473,14 @@ class Database:
             ).fetchall()
 
     def list_document_relations(self, document_id: int) -> list[dict[str, Any]]:
-        clause, statuses = self._publishable_relation_clause()
+        clause, policy_params = self._publishable_relation_clause()
         with self.connection() as conn:
             return conn.execute(
                 """SELECT r.*,s.graph_vertex_id AS source_vertex_id,t.graph_vertex_id AS target_vertex_id
                 FROM relation_assertions r JOIN canonical_entities s ON s.id=r.source_entity_id
                 JOIN canonical_entities t ON t.id=r.target_entity_id
                 WHERE r.document_id=%s AND r.is_deleted=FALSE AND """ + clause,
-                (document_id, statuses),
+                (document_id, *policy_params),
             ).fetchall()
 
     def list_all_document_relations(self, document_id: int) -> list[dict[str, Any]]:
@@ -1322,7 +1537,7 @@ class Database:
             self._retire_orphan_entities(conn)
 
     def statistics(self, project_id: int) -> dict[str, int]:
-        clause, statuses = self._publishable_relation_clause("r")
+        clause, policy_params = self._publishable_relation_clause("r")
         statement = f"""SELECT
             (SELECT COUNT(*) FROM documents WHERE project_id=%s AND is_deleted=FALSE) documents,
             (SELECT COUNT(*) FROM chunks WHERE project_id=%s AND is_deleted=FALSE) chunks,
@@ -1334,12 +1549,12 @@ class Database:
         with self.connection() as conn:
             row = conn.execute(
                 statement,
-                (project_id,project_id,project_id,project_id,statuses,project_id),
+                (project_id,project_id,project_id,project_id,*policy_params,project_id),
             ).fetchone(); return {key:int(value or 0) for key,value in row.items()}
 
     def search_graph_text(self, project_id: int, query: str, limit: int = 20) -> dict[str, list[dict[str, Any]]]:
         pattern = f"%{query}%"
-        clause, statuses = self._publishable_relation_clause()
+        clause, policy_params = self._publishable_relation_clause()
         with self.connection() as conn:
             entities = conn.execute(
                 """SELECT id,name,entity_type,description,aliases,source_count FROM canonical_entities
@@ -1355,7 +1570,7 @@ class Database:
                 AND """ + clause + """
                 AND (s.name ILIKE %s OR t.name ILIKE %s OR r.relation_type ILIKE %s OR r.description ILIKE %s)
                 ORDER BY r.confidence DESC,r.id LIMIT %s""",
-                (project_id,statuses,pattern,pattern,pattern,pattern,limit)
+                (project_id,*policy_params,pattern,pattern,pattern,pattern,limit)
             ).fetchall()
         return {"entities": entities, "relations": relations}
 
@@ -1369,7 +1584,7 @@ class Database:
 
     def get_relations_by_ids(self, project_id: int, ids: list[int]) -> list[dict[str, Any]]:
         if not ids: return []
-        clause, statuses = self._publishable_relation_clause()
+        clause, policy_params = self._publishable_relation_clause()
         with self.connection() as conn:
             return conn.execute(
                 """SELECT r.id,s.name AS source_name,r.relation_type,t.name AS target_name,r.description,r.confidence,
@@ -1378,5 +1593,5 @@ class Database:
                 JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
                 WHERE r.project_id=%s AND r.id=ANY(%s) AND r.is_deleted=FALSE
                 AND d.is_deleted=FALSE AND """ + clause,
-                (project_id,ids,statuses)
+                (project_id,ids,*policy_params)
             ).fetchall()

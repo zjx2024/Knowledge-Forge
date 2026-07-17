@@ -16,6 +16,7 @@ class FakeDatabase:
         self.cancelled_project_jobs = []
         self.jobs = {self.job["id"]: self.job}
         self.soft_delete_calls = 0
+        self.graph_states = []
 
     def get_document(self, document_id):
         return None if self.soft_deleted else self.document
@@ -66,6 +67,22 @@ class FakeDatabase:
     def count_documents(self, project_id):
         return self.remaining_documents
 
+    def set_graph_state(self, project_id, status, **values):
+        self.graph_states.append((project_id, status, values))
+        return {"id": project_id, "graph_status": status, **values}
+
+    def get_project(self, project_id):
+        return {"id": project_id, "project_key": "test"}
+
+    def list_documents(self, project_id):
+        return []
+
+    def count_publishable_relations(self, project_id, document_ids=None):
+        return 0
+
+    def list_pending_indexing_failures(self, project_id, object_type="relation"):
+        return []
+
     def cancel_project_jobs(self, project_id, kinds, reason):
         self.cancelled_project_jobs.append((project_id, kinds, reason))
         return 1
@@ -83,9 +100,19 @@ class FakeGraph:
     def __init__(self):
         self.deleted = []
         self.pruned = []
+        self.calls = []
 
     def delete_document(self, document_id):
         self.deleted.append(document_id)
+
+    def ensure_schema(self):
+        self.calls.append("schema")
+
+    def delete_project(self, project_id):
+        self.calls.append(("purge", project_id))
+
+    def statistics(self, project_id):
+        return {"relations": 0}
 
     def prune_project_entities(self, project_id):
         self.pruned.append(project_id)
@@ -138,7 +165,8 @@ def test_delete_document_cancels_work_and_moves_source_and_process_files(tmp_pat
     assert job_id == "cleanup-job"
     assert service.graph.deleted == []
     service.cleanup_executor.run_all()
-    assert service.graph.deleted == [8]
+    assert service.graph.deleted == []
+    assert service.graph.calls == ["schema", ("purge", 9)]
     assert service.graph.pruned == [9]
     assert service.schemas.activated == [9]
     assert not source.exists()
@@ -193,7 +221,8 @@ def test_delete_returns_before_active_document_lock_is_released(tmp_path, monkey
     assert database.soft_deleted is True
     assert service.graph.deleted == []
     service.cleanup_executor.run_all()
-    assert service.graph.deleted == [8]
+    assert service.graph.deleted == []
+    assert service.graph.calls == ["schema", ("purge", 9)]
 
 
 def test_cancelled_job_is_rejected_before_worker_writes():

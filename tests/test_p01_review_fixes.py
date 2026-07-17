@@ -7,6 +7,7 @@ import psycopg
 from psycopg import sql
 
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_policy import GRAPH_POLICY_VERSION
 from knowledge_forge.relation_verification import PUBLISHABLE_RELATION_STATUSES
 from knowledge_forge.service import KnowledgeForgeService
 
@@ -263,6 +264,7 @@ def test_chunk_relation_audit_chain_rolls_back_on_later_write_failure():
 class GraphRebuildDatabase:
     def __init__(self):
         self.updated = False
+        self.states = []
 
     def get_project(self, project_id):
         return {"id": project_id, "project_key": "p1"}
@@ -275,6 +277,21 @@ class GraphRebuildDatabase:
 
     def update_project(self, project_id, **values):
         self.updated = values.get("graph_status") == "ready"
+
+    def begin_graph_mutation(self, job_id):
+        return {"id": job_id, "project_id": 1, "status": "running"}
+
+    def count_publishable_relations(self, project_id, document_ids=None):
+        return 1
+
+    def list_pending_indexing_failures(self, project_id, object_type="relation"):
+        return []
+
+    def set_graph_state(self, project_id, status, **values):
+        self.states.append((status, values))
+        self.updated = status == "ready" and values.get("current_policy") is True
+        return {"id": project_id, "graph_status": status,
+                "graph_policy_version": GRAPH_POLICY_VERSION if values.get("current_policy") else ""}
 
 
 class GraphRebuildStore:
@@ -297,6 +314,12 @@ class GraphRebuildStore:
         self.edges.add("published-edge")
         return {"entities": 2, "relations": 1}
 
+    def prune_project_entities(self, project_id):
+        self.calls.append("prune")
+
+    def statistics(self, project_id):
+        return {"relations": len(self.edges)}
+
 
 def test_explicit_project_graph_rebuild_purges_stale_edges_before_sync():
     service = object.__new__(KnowledgeForgeService)
@@ -306,7 +329,7 @@ def test_explicit_project_graph_rebuild_purges_stale_edges_before_sync():
 
     service._sync_project_graph("job-1", 1)
 
-    assert service.graph.calls == ["schema", "purge", "document", "relations"]
+    assert service.graph.calls == ["schema", "purge", "document", "relations", "prune"]
     assert service.graph.edges == {"published-edge"}
     assert service.db.updated is True
 

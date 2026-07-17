@@ -180,7 +180,7 @@ def test_supported_relation_with_exact_evidence_is_publishable(monkeypatch):
     assert relation["verification_status"] == "llm_verified"
     assert relation["evidence_text"] == "Alpha produces Beta."
     assert relation["evidence_start"] == 0
-    assert is_publishable_relation(relation["verification_status"])
+    assert is_publishable_relation(relation["verification_status"], relation["metadata"])
 
 
 def test_supported_relation_may_omit_corrected_type(monkeypatch):
@@ -394,6 +394,38 @@ def test_short_ascii_entity_does_not_match_inside_another_word(monkeypatch, name
         monkeypatch, ScriptedVerifier(extracted, []), source=source, verification=False,
     )
     assert result["entities"] == []
+
+
+def test_multiword_ascii_entity_does_not_match_inside_larger_words(monkeypatch):
+    extracted = {
+        "entities": [{"id": "e1", "name": "US Bank", "type": "Organization",
+                      "description": "", "aliases": [], "evidence": "US Bank", "confidence": 0.9}],
+        "relations": [],
+    }
+    result = run_extract(
+        monkeypatch,
+        ScriptedVerifier(extracted, []),
+        source="BUS Banking provides services.",
+        verification=False,
+    )
+    assert result["entities"] == []
+
+
+def test_supported_as_is_relation_replaces_unverified_description(monkeypatch):
+    extracted = extraction([{
+        "source": "e1", "target": "e2", "type": "produces",
+        "description": "Alpha secretly acquired Gamma.",
+        "evidence": "Alpha produces Beta.", "confidence": 0.9,
+    }])
+    result = run_extract(
+        monkeypatch,
+        ScriptedVerifier(extracted, [lambda values: {"decisions": [decision(values[0])]}]),
+    )
+    relation = result["relations"][0]
+    assert relation["verification_status"] == "llm_verified"
+    assert relation["orientation"] == "as_is"
+    assert relation["type"] == "produces"
+    assert relation["description"] == "Alpha produces Beta"
 
 
 @pytest.mark.parametrize(

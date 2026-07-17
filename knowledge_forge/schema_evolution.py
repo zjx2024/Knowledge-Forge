@@ -17,6 +17,7 @@ from .ollama import OllamaClient
 from .relation_verification import (
     LLM_VERIFIED,
     REJECTED,
+    RELATION_VERIFICATION_POLICY_VERSION,
     RELATION_ORIENTATIONS,
     RELATION_VERDICTS,
     RULES_VERIFIED,
@@ -210,7 +211,7 @@ def _surface_spans(content: str, surface: str) -> list[tuple[int, int]]:
     core = r"\s+".join(re.escape(part) for part in parts)
     if not core:
         return []
-    if value.isascii() and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+\-/]*", value):
+    if value.isascii() and re.match(r"[A-Za-z0-9]", value) and re.search(r"[A-Za-z0-9]$", value):
         core = rf"(?<![A-Za-z0-9]){core}(?![A-Za-z0-9])"
     return [(match.start(), match.end()) for match in re.finditer(core, content, re.IGNORECASE)]
 
@@ -1115,6 +1116,10 @@ class SchemaEvolutionService:
         for relation in relations:
             relation.pop("_needs_verification", None)
             relation.pop("_explicit_endpoints", None)
+            relation["metadata"] = {
+                **(relation.get("metadata") if isinstance(relation.get("metadata"), dict) else {}),
+                "verification_policy_version": RELATION_VERIFICATION_POLICY_VERSION,
+            }
             status = relation.get("verification_status") or UNCERTAIN
             if status == LLM_VERIFIED:
                 diagnostics["llm_verified"] += 1
@@ -1124,7 +1129,10 @@ class SchemaEvolutionService:
                 diagnostics["uncertain"] += 1
             elif status == VERIFICATION_FAILED:
                 diagnostics["verifier_failures"] += 1
-            if is_publishable_relation(status):
+            if is_publishable_relation(
+                status,
+                {"verification_policy_version": RELATION_VERIFICATION_POLICY_VERSION},
+            ):
                 diagnostics["published"] += 1
             else:
                 diagnostics["quarantined"] += 1
@@ -1314,10 +1322,6 @@ class SchemaEvolutionService:
             _contains_surface(evidence, str(name)) for name in target_names if name
         ):
             return "supported evidence does not contain both corrected endpoints"
-        changed = (
-            orientation == "reversed"
-            or corrected_type != str(relation.get("type") or "")
-        )
         relation.update({
             "source": source_id,
             "target": target_id,
@@ -1328,9 +1332,8 @@ class SchemaEvolutionService:
             "verification_status": LLM_VERIFIED,
             "verification_reason": reason,
             "orientation": orientation,
+            "description": f"{source['name']} {corrected_type} {target['name']}",
         })
-        if changed:
-            relation["description"] = f"{source['name']} {corrected_type} {target['name']}"
         return ""
 
     def _fail_relation_batch(

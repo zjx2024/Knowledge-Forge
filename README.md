@@ -225,8 +225,9 @@ Edge:   kf_contains, kf_mentions, kf_related
 每个实体和关系必须携带能够在完整原知识块中精确定位的证据文本。实体名称及参与验证的
 别名必须在正文中具有真实来源 span；短 ASCII 名称使用词边界匹配。关系端点、谓词和方向
 由严格 verifier 按知识块批量复核，单纯共现、类型兼容或模型自报高分不会自动发布。
-默认搜索、关系列表、首页统计、关系 ID 回取和 HugeGraph 同步统一只消费
-`rules_verified`、`llm_verified`、`manual_verified`，其他状态保留用于审计但不会发布。
+默认搜索、关系列表、首页统计、关系 ID 回取和 HugeGraph 同步统一只消费人工审核的
+`manual_verified`，以及携带当前验证策略版本的 `rules_verified` / `llm_verified`。
+其他状态和历史策略关系保留用于审计，但不会进入产品查询、关系向量召回或 HugeGraph。
 
 信息量较高但主抽取为空，或已经抽取多个实体却遗漏明显关系的知识块，会额外执行一次
 针对性补抽取。相关行为可通过 `EXTRACTION_GLEANING_*`、
@@ -283,9 +284,15 @@ Knowledge Forge 不依赖 RAGFlow；项目、文档、知识块和向量均由�
 
 ## P0 verifier 策略升级
 
-当前关系验证策略版本为 `relation-verifier-p0-v1`。升级后首次启动会幂等执行数据库迁移：
-缺少该策略版本的历史 `rules_verified` 会降级为 `legacy_unverified`，所有非发布关系的旧
-relation vector 会被停用。数据库迁移不会在启动时静默执行耗时的 HugeGraph 全量重建。
+当前关系验证策略版本为 `relation-verifier-p0-v1`，图发布策略版本为
+`relation-graph-p0-v1`。升级后首次启动会幂等执行数据库迁移：缺少当前策略版本的历史
+`rules_verified` 和 `llm_verified` 会降级为 `legacy_unverified`；非发布关系及没有有效断言
+的孤儿 relation vector 会被停用。关系候选、验证事件和断言组成单个 PostgreSQL
+“关系审计链事务”，这不代表实体、向量和外部图写入具备跨系统事务。
+
+关系断言是权威数据，关系向量是可重建索引。Embedding 写入失败时，系统会写入
+`indexing_failures` 补偿记录，不会降级已经验证的断言；后续项目图重建会重试这些索引。
+数据库迁移不会在启动时静默执行耗时的 HugeGraph 全量重建。
 
 服务升级并启动后，必须为每个已有项目显式触发一次图谱重同步：
 
@@ -293,8 +300,11 @@ relation vector 会被停用。数据库迁移不会在启动时静默执行耗�
 curl -X POST http://127.0.0.1:8011/api/projects/<PROJECT_ID>/graph
 ```
 
-该任务会先清除项目在 HugeGraph 中的旧顶点和边，再从 PostgreSQL 按当前发布白名单重建，
-因此可移除升级前遗留的弱规则边。通过页面任务日志或任务 API 确认任务完成后再开放检索。
+已有非空图在策略版本不匹配时会标记为 `stale`。重建任务依次进入 `rebuilding`，先清除
+项目在 HugeGraph 中的旧贡献，再从 PostgreSQL 按当前发布谓词完整重建，并比较
+PostgreSQL 发布关系数、本次写入数和 HugeGraph 实际关系数。只有三者一致才进入
+`ready` 并写入当前图策略版本；任一阶段失败均进入 `failed`。`stale`、`rebuilding` 和
+`failed` 状态下，服务端会拒绝生成 Hubble URL，直接访问 `/graph/view` 返回 HTTP 409。
 
 ## 验证
 
