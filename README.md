@@ -1,0 +1,291 @@
+# Knowledge Forge
+
+Knowledge Forge 是一个通用、多项目的知识库与知识图谱构建平台。它直接使用
+PostgreSQL、HugeGraph 和 Ollama，不依赖 RAGFlow 运行时。
+
+## 核心能力
+
+- 支持 DOCX、PDF、Markdown、纯文本、XLSX、XLS 和 CSV 上传；解析器与分块策略按文档独立路由。
+- 内置兼容、通用、论文和表格四种分块策略；通用策略保留章节父子结构，论文策略区分摘要、正文和参考文献，表格策略按行重复表头。
+- 文档解析后可在页面逐项查看中间结构块，核对标题、正文、表格、页码、章节层级和标题路径。
+- 构建过程分为结构解析、Chunk 分片与向量索引、实体关系与图谱构建三个阶段；阶段结果落库后，对应查看按钮立即解锁。
+- 多文件上传会按提交顺序逐个处理，前一个文件完成全部三个阶段后再开始下一个文件，避免本地模型并发争用。
+- PDF 默认先检查文本层与版面复杂度；普通文本层使用 PyPDF，扫描件或复杂版面自动回退到 Docling。
+- 扫描 PDF、普通 PDF 内嵌图片和 DOCX 内嵌图片会提取到文件区，经 OCR 与项目视觉 LLM 生成带页码/章节来源的图片知识；这些内容与正文共同参与分块、向量索引、实体关系抽取、跨文档归一和图谱合并。独立 PNG/JPG 暂不作为上传文档类型。
+- 使用内容 SHA-256 在项目内去重，相同文档可进入不同项目。
+- 使用 Ollama Embedding 和 pgvector HNSW 建立向量索引，联合向量相似度和关键词分数检索。
+- 每个项目从通用逻辑 Schema 起步；系统从正文中分层选取语义多样的代表性知识块，LLM 根据证据提出追加类型，系统校验后生成新版本。
+- Schema 建议失败时保留当前版本；用户可手动触发全项目 Schema 重新评估，删除最后一篇文档后自动恢复通用基线 v1。
+- 抽取实体提及和关系断言，并保留项目、文档、章节、知识块、原文证据和字符位置来源。
+- 实体关系抽取采用证据约束主抽取；可疑知识块执行一次针对性补抽取，不确定关系再经过规则校验和一次批量 LLM 复核。
+- 通过名称规范化、别名和向量相似度保守合并多文档实体；不确定时不合并。
+- 使用独立 HugeGraph 物理图 `knowledge_forge`，多个项目通过 `project_id/project_key` 隔离。
+- 任务状态持久化到 PostgreSQL，页面切换或服务重启不会丢失任务记录。
+- 任务面板分别展示结构解析、分块及向量索引、Schema 和基础图数据、逐块抽取实体与关系、HugeGraph 同步五个子任务的独立进度。
+- 文档删除会先立即软删除并取消关联任务，使其马上从项目列表和检索结果中移除；HugeGraph、源文件和过程文件由持久化后台清理任务处理，服务重启后可继续恢复。清理完成后会再次停用该文档的知识块、向量、实体提及和关系贡献，不影响其他文档仍支持的实体。
+
+## 架构与目录
+
+```text
+knowledge-forge/
+├── knowledge_forge/             # 应用模块
+├── KnowledgeFiles/
+│   ├── docs/<项目目录>/          # 源文档
+│   ├── chunks/<项目目录>/        # 章节和知识块过程 JSON
+│   ├── media/<项目目录>/<文档>/   # PDF/DOCX 内嵌图片及视觉分析缓存
+│   └── .trash/                   # 软删除文件
+├── deploy/hugegraph/             # 独立物理图配置
+├── docs/IMPLEMENTATION_PLAN.md   # 架构基线与实施阶段
+├── tests/
+├── AGENTS.md                     # 持续开发约束
+├── .env.example
+├── .env.docker.example
+└── docker-compose.yml
+```
+
+运行时职责：
+
+- PostgreSQL + pgvector：元数据、章节、知识块、HNSW 向量索引、Schema 版本、实体、提及、关系断言和任务。
+- HugeGraph：可遍历的文档、知识块、规范实体和实体关系。
+- Ollama：模型发现、向量生成、逻辑 Schema 评估和结构化图谱抽取。
+
+## 前置条件
+
+1. PostgreSQL 16 + pgvector 可访问；Docker 部署会基于 `postgres:16` 自动构建并启动对应数据库。
+2. Ollama 可访问，至少有一个 LLM 和一个 Embedding 模型。
+3. HugeGraph 1.7 可访问。
+4. Python 3.10 或 Docker Compose。
+
+Docling 用于处理扫描 PDF 或复杂论文版面，默认随项目依赖安装：
+
+```bash
+.venv/bin/pip install -r requirements-docling.txt
+```
+
+Docling 首次处理复杂文档时会下载版面分析和 OCR 模型。Docker Compose 将
+`/root/.cache` 挂载到 `knowledge-forge-docling-cache` 卷，容器重建后可继续复用。
+默认使用 `HF_ENDPOINT=https://hf-mirror.com` 并关闭 Xet 下载通道；可在环境文件中覆盖。
+Docker 默认向 Docling 暴露 NVIDIA GPU。PDF 版面分析、表格识别和 OCR 使用 CUDA，
+批大小默认为 1；开始前会检查可用显存，并将本进程显存上限控制为 GPU 总量的 20%。
+可用显存低于 6144 MiB 或遇到 CUDA OOM 时，会释放 CUDA 缓存并自动用 CPU 重试该文档。
+Word、纯文本和电子表格的原生结构读取属于 I/O 与规则解析，不包含可迁移到 GPU 的模型计算。
+
+```dotenv
+DOCLING_DEVICE=auto
+DOCLING_CUDA_FALLBACK=true
+DOCLING_GPU_MIN_FREE_MB=6144
+DOCLING_GPU_MEMORY_FRACTION=0.20
+DOCLING_BATCH_SIZE=1
+DOCLING_NUM_THREADS=4
+```
+
+默认模型为：
+
+```text
+LLM: qwen3.6:latest
+Embedding: bge-m3:latest
+```
+
+可在新建项目或项目设置中选择 Ollama 已安装的其他模型。项目设置同时保存“项目上下文
+Token 上限”和“单切片 Token 上限”：前者是应用侧请求预算，不会向 Ollama 发送
+`num_ctx`，也不会覆盖容器的 `OLLAMA_CONTEXT_LENGTH`；后者约束该项目后续文档生成的
+每个知识块。页面会根据所选 LLM 和 Embedding 模型动态限制可填最大值。
+
+内嵌图片默认开启 OCR 和视觉理解；可通过以下环境变量调整尺寸过滤与扫描页渲染。视觉
+请求使用项目选定的 LLM，并沿用项目上下文预算。
+
+```dotenv
+IMAGE_ANALYSIS_ENABLED=true
+IMAGE_OCR_ENABLED=true
+IMAGE_MIN_WIDTH=96
+IMAGE_MIN_HEIGHT=96
+IMAGE_MIN_PIXELS=16000
+IMAGE_MAX_DIMENSION=2048
+IMAGE_SCAN_TEXT_THRESHOLD=40
+IMAGE_PDF_RENDER_SCALE=1.7
+```
+
+## 初始化独立 HugeGraph 图
+
+本项目不写入已有的 `hugegraph` 或 `test`，而是使用物理图
+`knowledge_forge`。一台 HugeGraph 服务只需初始化一次，之后所有业务项目共享
+这张物理图并通过项目字段隔离。
+
+如果 HugeGraph 运行在名为 `hugegraph` 的 Docker 容器中：
+
+```bash
+cd /home/kdfy/zjx-projects/knowledge-forge
+sudo ./deploy/init_hugegraph_graph.sh hugegraph hugegraph/hugegraph:latest
+curl http://127.0.0.1:8080/graphs
+```
+
+正常结果应包含：
+
+```json
+{"graphs":["hugegraph","test","knowledge_forge"]}
+```
+
+脚本会复制 `deploy/hugegraph/knowledge_forge.properties`、停止容器、执行
+HugeGraph 官方 `init-store.sh`，然后重新启动容器。不会清空其他物理图。
+
+## 本地开发启动
+
+```bash
+cd /home/kdfy/zjx-projects/knowledge-forge
+cp -n .env.example .env
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python server.py
+```
+
+访问：
+
+```text
+管理页面：http://<SERVICE_HOST>:8011
+文件服务：http://<SERVICE_HOST>:8010
+Hubble 图管理：http://<SERVICE_HOST>:18088
+```
+
+本地开发可先单独启动 Compose 中的 pgvector 数据库：
+
+```bash
+cp -n .env.docker.example .env.docker
+sudo docker compose up -d postgres
+```
+
+应用启动时会创建 `POSTGRES_DB=knowledge_forge`、`vector`/`pg_trgm` 扩展和全部业务表，
+并将历史数组向量自动回填到 pgvector。PostgreSQL 用户需要具有创建扩展和表的权限。
+
+## Docker 启动
+
+```bash
+cp -n .env.docker.example .env.docker
+# 修改 SERVICE_HOST、HTTP_BASE_URL、数据库密码等实际配置
+sudo docker compose up -d --build
+sudo docker compose logs -f knowledge-forge
+```
+
+停止：
+
+```bash
+sudo docker compose down
+```
+
+Compose 使用独立的 `knowledge-forge-postgres` 保存业务数据，通过
+`host.docker.internal` 访问宿主机上的 Ollama 和 HugeGraph；浏览器访问地址仍由
+`SERVICE_HOST/HTTP_BASE_URL` 决定。宿主机可通过 `5433` 端口访问该数据库。
+
+## 文档构建流程
+
+1. 创建项目并选择抽取 LLM、Embedding 模型。
+2. 上传源文档。默认由系统自动选择解析器和分块策略，也可在“解析与分块设置”中手动指定。
+3. 点击“上传解析”。后台按以下阶段执行，并在日志中分别显示：
+   - 阶段一：解析文档结构；完成后可点击文档行中的“结构块”。
+     PDF/DOCX 内嵌图片在本阶段完成提取、OCR 和视觉理解，并形成 `image` 结构块。
+   - 阶段二：生成 Chunk 分片并建立向量索引；完成后可点击“Chunk 分片”。
+   - 阶段三：评估逻辑 Schema、抽取并归一实体/关系、同步 HugeGraph；完成后可点击“查看知识图谱”。
+   批量上传时，每个文件完整走完三个阶段后，才顺序处理下一个文件。
+4. 在“联合检索”中查询知识块、实体和关系，并查看来源文档链接。
+5. 文档入库完成后会自动同步 HugeGraph；点击“查看知识图谱”会进入 Hubble Gremlin
+   分析页，填入当前项目的只读查询并自动执行。结果保留项目全图，并额外展示
+   “源文档 -> 切片 -> 跨文档共享实体”来源路径。该能力使用 `deploy/hubble` 中的定制 Hubble 镜像。
+
+处理配置按文档保存：`requested_parser/requested_chunk_strategy` 记录用户请求，
+`effective_parser/effective_chunk_strategy` 记录实际执行结果，同时保存解析器版本、
+质量报告、路由原因和内容版本。手动选择与文件类型不兼容时会在保存文件前拒绝；
+重新解析仍只替换该文档的章节、知识块、向量和图谱贡献。
+
+## Schema 策略
+
+HugeGraph 物理 Schema 固定为：
+
+```text
+Vertex: KFDocument, KFChunk, KFEntity
+Edge:   kf_contains, kf_mentions, kf_related
+```
+
+领域差异保存在 PostgreSQL `graph_schemas.schema_json` 中。每个项目都有独立、
+可追溯的逻辑 Schema 版本。Schema 评估不会固定读取文档开头：系统先过滤目录、
+封面和过短知识块，再按章节分层，并利用已生成的 Embedding 贪心选择语义多样的
+代表性知识块。代表块分批交给 LLM 发现候选类型，随后进行全局合并；候选必须引用
+真实知识块证据，并通过置信度、证据多样性、重复类型和单次新增数量校验。
+
+已有项目文档可覆盖新文档内容时，系统根据跨文档向量新颖度跳过 Schema LLM 评审，
+减少重复调用。自动演进始终只允许追加实体类型和关系类型，不会自动删除、重命名或
+改变已有类型含义。代表块数量会随有效知识块数和章节数做次线性增长，并受块数、总字符数
+和单块字符数三重上限保护。采样基线与上限、新颖度阈值和证据门槛可通过
+`SCHEMA_SAMPLE_*`、`SCHEMA_REVIEW_*`、`SCHEMA_MAX_*_ADDITIONS` 配置。
+
+项目统计区的“重新评估 Schema”会明确地从基线 v1 出发，使用当前全部有效且已入库
+文档重新生成活动版本，但不会自动重跑既有实体和关系抽取。项目不再包含有效文档时，
+系统会自动激活基线 v1。
+
+## 实体与关系抽取
+
+每个实体和关系必须携带能够在原知识块中精确定位的证据文本。系统先校验实体是否真实
+出现、关系端点是否存在，以及关系类型是否符合活动 Schema 的起止类型约束。高置信且
+证据完整的关系由规则直接通过；其余关系按知识块批量交给 LLM 复核，避免逐候选调用模型。
+
+信息量较高但主抽取为空，或已经抽取多个实体却遗漏明显关系的知识块，会额外执行一次
+针对性补抽取。相关行为可通过 `EXTRACTION_GLEANING_*`、
+`EXTRACTION_VERIFICATION_ENABLED` 和 `EXTRACTION_RULE_ACCEPT_CONFIDENCE` 调整；
+任务日志会显示补抽取、复核通过和拒绝数量。
+
+## 实体归一策略
+
+实体归一按项目隔离，并使用分层候选召回：先按 Unicode 规范名称和规范别名精确匹配；
+未命中时，分别使用 PostgreSQL `pg_trgm` 召回名称及别名候选、使用 pgvector HNSW
+召回身份语义候选。查询实体和历史实体使用相同的“名称、类型、别名、描述”向量文本，
+不把整段 Chunk 上下文混入身份向量。两路候选按实体 ID 合并后，计算字符形态、词形、
+包含关系、缩写、类型、编号/版本冲突和向量分数，再由本地 `bge-reranker-v2-m3`
+交叉编码器重排少量候选。缩写/全称只是名称形态特征之一，不是专用合并规则。
+名称、向量和重排候选数量会根据项目中同类型实体规模按对数级增长，并分别受
+`ENTITY_LEXICAL_MAX_K`、`ENTITY_VECTOR_MAX_K` 和 `ENTITY_RERANKER_MAX_K` 保护。
+
+重排分数表示语义相关度，不直接等同于实体身份概率。自动合并必须同时满足强名称证据、
+类型兼容、无编号冲突和综合阈值；语义相关但身份不确定的候选交给项目 LLM 做最终裁决，
+无可靠候选时创建新实体。这样可覆盖人物、组织、产品、地点、标准、事件等不同领域，
+同时避免把上下级组织、同类产品或地理包含关系误合并。
+
+每次决策都会写入 `entity_resolution_decisions`，保存候选实体、各项分数、决策方式、
+模型和原因。LLM 调用失败或结果不满足接受阈值时默认保留为独立实体，不会冒险合并。
+Top-K、召回阈值、重排器路径和裁决阈值可通过 `ENTITY_*` 环境变量调整。重排器使用
+Transformers 在项目容器内离线推理；Ollama 当前没有 `/api/rerank`，仍只负责 LLM 与
+Embedding。默认模型目录为宿主机 `/home/kdfy/models/bge-reranker-v2-m3`，Compose
+以只读方式挂载，模型缺失、加载失败或 GPU OOM 时自动回退到规则、向量和 LLM 链路。
+
+## 向量存储说明
+
+向量以 pgvector `vector` 保存，并按 Embedding 模型和向量维度自动创建余弦距离
+HNSW 索引。查询先在 PostgreSQL 中执行项目、对象类型、模型和维度过滤及向量召回，
+再结合现有中文关键词评分重排；包含完整查询词的切片会作为关键词候选一并参与排序。
+
+`DOUBLE PRECISION[]` 兼容列暂时保留，用于无损迁移和回滚；实体归一直接通过 pgvector
+Top-K 检索候选，不再将项目全部实体向量加载到 Python 中逐个比较。
+应用启动会自动迁移旧数据，不会删除已有向量。超过 2000 维的模型仍使用 pgvector
+精确检索，不创建 HNSW `vector` 索引。
+
+## 主要数据表
+
+- `projects`、`documents`、`sections`、`chunks`
+- `vector_embeddings`
+- `graph_schemas`
+- `canonical_entities`
+- `entity_mentions`
+- `entity_resolution_decisions`
+- `relation_assertions`
+- `jobs`、`models`、`settings`
+
+Knowledge Forge 不依赖 RAGFlow；项目、文档、知识块和向量均由本项目自己的 PostgreSQL 表管理。
+
+## 验证
+
+```bash
+.venv/bin/python -m py_compile knowledge_forge/*.py server.py
+.venv/bin/python -m pytest -q
+curl http://127.0.0.1:8011/health
+curl http://127.0.0.1:8080/graphs
+```
+
+当前自动化测试的通过数量以本机执行结果为准。Docker 首次构建需要本机已有
+`python:3.10-slim`，或能够访问镜像仓库下载该基础镜像。
