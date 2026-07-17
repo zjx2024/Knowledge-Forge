@@ -24,8 +24,13 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
 def _terms(text: str) -> Counter[str]:
     normalized = re.sub(r"\s+", "", (text or "").lower())
     latin = re.findall(r"[a-z0-9_]{2,}", normalized)
-    chinese = [normalized[index : index + 2] for index in range(max(0, len(normalized) - 1)) if "\u4e00" <= normalized[index] <= "\u9fff"]
-    return Counter(latin + chinese)
+    terms = Counter(latin)
+    terms.update(
+        normalized[index : index + 2]
+        for index in range(max(0, len(normalized) - 1))
+        if "\u4e00" <= normalized[index] <= "\u9fff"
+    )
+    return terms
 
 
 def lexical_similarity(query: str, content: str) -> float:

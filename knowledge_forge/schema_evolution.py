@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+from bisect import bisect_right
 from collections import defaultdict
 from difflib import SequenceMatcher
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 from .config import Config
 from .database import Database
 from .ollama import OllamaClient
+from .observability import gauge, increment
 from .relation_verification import (
     LLM_VERIFIED,
     REJECTED,
@@ -975,17 +977,24 @@ class SchemaEvolutionService:
             for match in re.finditer(r"[^\n。！？.!?]+(?:[。！？.!?]+|$)", content)
             if match.group(0).strip()
         ]
+        sentence_starts = [left for left, _, _ in sentences]
         locations: dict[str, int] = {}
         for entity in entities:
             start = entity.get("evidence_start")
             if start is None:
                 continue
-            sentence_index = next(
-                (index for index, (left, right, _) in enumerate(sentences) if left <= int(start) < right),
-                -1,
-            )
-            if sentence_index >= 0:
+            sentence_index = bisect_right(sentence_starts, int(start)) - 1
+            if (
+                sentence_index >= 0
+                and sentence_index < len(sentences)
+                and sentences[sentence_index][0] <= int(start) < sentences[sentence_index][1]
+            ):
                 locations[entity["id"]] = sentence_index
+        sentence_buckets: dict[int, list[int]] = defaultdict(list)
+        for entity_index, entity in enumerate(entities):
+            sentence_index = locations.get(entity["id"])
+            if sentence_index is not None:
+                sentence_buckets[sentence_index].append(entity_index)
         definitions = logical.get("relation_types") or []
         candidates: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -993,11 +1002,18 @@ class SchemaEvolutionService:
             source_sentence = locations.get(source["id"])
             if source_sentence is None:
                 continue
-            for target in entities:
+            target_indexes = sorted(
+                index
+                for sentence_index in range(source_sentence - 1, source_sentence + 2)
+                for index in sentence_buckets.get(sentence_index, ())
+            )
+            for target_index in target_indexes:
+                increment("relation_pair_checks")
+                target = entities[target_index]
                 if source["id"] == target["id"]:
                     continue
                 target_sentence = locations.get(target["id"])
-                if target_sentence is None or abs(source_sentence - target_sentence) > 1:
+                if target_sentence is None:
                     continue
                 pair = (source["id"], target["id"])
                 if pair in seen:
@@ -1023,6 +1039,11 @@ class SchemaEvolutionService:
                     "allowed_relation_types": allowed,
                     "context": context,
                 })
+        increment("relation_candidates", len(candidates))
+        gauge(
+            "candidate_payload_bytes",
+            len(json.dumps(candidates, ensure_ascii=False).encode("utf-8")),
+        )
         return candidates
 
     def _needs_gleaning(
@@ -1417,9 +1438,16 @@ class SchemaEvolutionService:
             "llm_calls": 1,
             "gleaning_used": False,
         }
-        relation_candidates = self._relation_candidates(
-            content, extraction.get("entities") or [], logical
-        )
+        extracted_entities = extraction.get("entities") or []
+        extracted_relations = extraction.get("relations") or []
+        relation_candidates: list[dict[str, Any]] = []
+        if (
+            Config.extraction_gleaning_enabled
+            and len(extracted_entities) >= 2
+            and not extracted_relations
+            and bool(_RELATION_CUES.search(content))
+        ):
+            relation_candidates = self._relation_candidates(content, extracted_entities, logical)
         diagnostics["relation_candidates"] = len(relation_candidates)
         if self._needs_gleaning(chunk, extraction, relation_candidates):
             try:
