@@ -10,7 +10,7 @@ import re
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 import psycopg
@@ -21,6 +21,7 @@ from .config import Config
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
+    GRAPH_POLICY_HASH,
     GRAPH_POLICY_VERSION,
     GRAPH_READY,
     GRAPH_REBUILDING,
@@ -65,6 +66,9 @@ CREATE TABLE IF NOT EXISTS projects (
     llm_model TEXT, embedding_model TEXT,
     model_max_tokens INTEGER NOT NULL DEFAULT 32768 CHECK (model_max_tokens BETWEEN 1024 AND 1048576),
     chunk_max_tokens INTEGER NOT NULL DEFAULT 512 CHECK (chunk_max_tokens BETWEEN 64 AND 262144),
+    graph_generation BIGINT NOT NULL DEFAULT 0,
+    graph_ready_generation BIGINT NOT NULL DEFAULT 0,
+    graph_policy_hash TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived','failed')),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), is_deleted BOOLEAN NOT NULL DEFAULT FALSE, deleted_at TIMESTAMPTZ
@@ -101,6 +105,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY, kind TEXT NOT NULL, project_id BIGINT REFERENCES projects(id), document_id BIGINT REFERENCES documents(id),
     status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','completed','failed','cancelled')),
     progress INTEGER NOT NULL DEFAULT 0, log JSONB NOT NULL DEFAULT '[]'::jsonb, error_message TEXT,
+    target_generation BIGINT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ
 );
@@ -123,8 +128,9 @@ CREATE TABLE IF NOT EXISTS indexing_failures (
     id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
     document_id BIGINT REFERENCES documents(id), chunk_id BIGINT REFERENCES chunks(id),
     object_type TEXT NOT NULL, object_key TEXT NOT NULL, model_name TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
-    attempts INTEGER NOT NULL DEFAULT 1, last_error TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed','permanent_failed')),
+    attempts INTEGER NOT NULL DEFAULT 1, max_attempts INTEGER NOT NULL DEFAULT 8,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_error TEXT NOT NULL DEFAULT '',
     payload JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ,
     UNIQUE(project_id,object_type,object_key,model_name)
@@ -233,6 +239,9 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_schema_version INTEGER NOT 
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_status TEXT NOT NULL DEFAULT 'empty';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_policy_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_ready_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_policy_hash TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS model_max_tokens INTEGER NOT NULL DEFAULT 32768;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS chunk_max_tokens INTEGER NOT NULL DEFAULT 512;
 ALTER TABLE projects DROP COLUMN IF EXISTS ragflow_dataset_id;
@@ -253,6 +262,20 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS processing_stage TEXT NOT NULL DE
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS structure_ready_at TIMESTAMPTZ;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS chunks_ready_at TIMESTAMPTZ;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS graph_ready_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_generation BIGINT;
+ALTER TABLE indexing_failures ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 8;
+ALTER TABLE indexing_failures ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE indexing_failures DROP CONSTRAINT IF EXISTS indexing_failures_status_check;
+ALTER TABLE indexing_failures ADD CONSTRAINT indexing_failures_status_check
+    CHECK (status IN ('pending','completed','permanent_failed'));
+WITH ranked_graph_jobs AS (
+    SELECT id,ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY created_at,id) AS ordinal
+    FROM jobs WHERE kind='graph_sync' AND status IN ('queued','running')
+)
+UPDATE jobs SET status='cancelled',error_message='由迁移合并的重复图重建任务',completed_at=NOW(),updated_at=NOW()
+WHERE id IN (SELECT id FROM ranked_graph_jobs WHERE ordinal>1);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_active_graph_sync
+    ON jobs(project_id) WHERE kind='graph_sync' AND status IN ('queued','running');
 ALTER TABLE entity_mentions ADD COLUMN IF NOT EXISTS evidence_text TEXT NOT NULL DEFAULT '';
 ALTER TABLE entity_mentions ADD COLUMN IF NOT EXISTS evidence_start INTEGER;
 ALTER TABLE entity_mentions ADD COLUMN IF NOT EXISTS evidence_end INTEGER;
@@ -504,14 +527,17 @@ class Database:
 
         result = conn.execute(
             """UPDATE projects
-               SET graph_status=%s,graph_error=%s,updated_at=NOW()
+               SET graph_status=%s,graph_policy_version='',graph_policy_hash='',
+                   graph_error=%s,updated_at=NOW()
                WHERE is_deleted=FALSE AND graph_status<>%s
-                 AND graph_policy_version<>%s""",
+                 AND (graph_policy_version<>%s OR graph_policy_hash<>%s
+                      OR graph_generation<>graph_ready_generation)""",
             (
                 GRAPH_STALE,
-                "图谱需要按当前关系验证策略重建",
+                "图谱需要按当前策略集合和代次重建",
                 GRAPH_EMPTY,
                 GRAPH_POLICY_VERSION,
+                GRAPH_POLICY_HASH,
             ),
         )
         return max(0, result.rowcount or 0)
@@ -578,7 +604,7 @@ class Database:
     def update_project(self, project_id: int, **values: Any) -> dict[str, Any]:
         allowed = {"llm_model", "embedding_model", "model_max_tokens", "chunk_max_tokens",
                    "schema_status", "active_schema_version", "graph_status",
-                   "graph_policy_version", "graph_error", "metadata", "status"}
+                   "graph_policy_version", "graph_policy_hash", "graph_error", "metadata", "status"}
         fields = [key for key in values if key in allowed]
         if not fields:
             return self.get_project(project_id) or {}
@@ -600,16 +626,92 @@ class Database:
         if status not in {GRAPH_EMPTY, GRAPH_STALE, GRAPH_REBUILDING, GRAPH_READY, GRAPH_FAILED}:
             raise ValueError(f"未知图谱状态: {status}")
         policy_version = GRAPH_POLICY_VERSION if current_policy else ""
+        policy_hash = GRAPH_POLICY_HASH if current_policy else ""
         with self.connection() as conn:
             row = conn.execute(
                 """UPDATE projects SET graph_status=%s,graph_policy_version=%s,
-                   graph_error=%s,updated_at=NOW()
+                   graph_policy_hash=%s,graph_error=%s,
+                   graph_ready_generation=CASE WHEN %s THEN graph_generation ELSE graph_ready_generation END,
+                   updated_at=NOW()
                    WHERE id=%s AND is_deleted=FALSE RETURNING *""",
-                (status, policy_version, error or "", project_id),
+                (status, policy_version, policy_hash, error or "", current_policy, project_id),
             ).fetchone()
             if not row:
                 raise LookupError("项目不存在")
             return row
+
+    def mark_graph_stale(self, project_id: int, reason: str) -> dict[str, Any]:
+        """Atomically advance graph facts and close product graph reads."""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE projects
+                   SET graph_generation=graph_generation+1,graph_status=%s,
+                       graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
+                   WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                (GRAPH_STALE, reason or "图谱事实已更新，等待重建", project_id),
+            ).fetchone()
+            if not row:
+                raise LookupError("项目不存在")
+            return row
+
+    def complete_graph_rebuild(
+        self,
+        project_id: int,
+        target_generation: int,
+        *,
+        policy_hash: str,
+        empty: bool = False,
+    ) -> dict[str, Any] | None:
+        """Publish a rebuild only if its immutable generation is still current."""
+
+        status = GRAPH_EMPTY if empty else GRAPH_READY
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE projects
+                   SET graph_status=%s,graph_policy_version=%s,graph_policy_hash=%s,
+                       graph_ready_generation=%s,graph_error='',updated_at=NOW()
+                   WHERE id=%s AND is_deleted=FALSE AND graph_generation=%s
+                   RETURNING *""",
+                (
+                    status,
+                    GRAPH_POLICY_VERSION,
+                    policy_hash,
+                    target_generation,
+                    project_id,
+                    target_generation,
+                ),
+            ).fetchone()
+
+    def has_pending_ingestions(self, project_id: int, *, exclude_job_id: str = "") -> bool:
+        """Return whether more queued ingestion work can change this project generation."""
+
+        with self.connection() as conn:
+            return bool(conn.execute(
+                """SELECT 1 FROM jobs WHERE project_id=%s AND kind='ingestion'
+                   AND status='queued' AND id<>%s LIMIT 1""",
+                (project_id, exclude_job_id),
+            ).fetchone())
+
+    def list_orphaned_graph_projects(self) -> list[dict[str, Any]]:
+        """Find graph states that need a durable recovery job after restart."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT p.* FROM projects p
+                   WHERE p.is_deleted=FALSE AND p.graph_status IN (%s,%s,%s)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM jobs j WHERE j.project_id=p.id
+                           AND j.kind=ANY(%s) AND j.status IN ('queued','running')
+                     )
+                   ORDER BY p.id""",
+                (
+                    GRAPH_STALE,
+                    GRAPH_REBUILDING,
+                    GRAPH_FAILED,
+                    ["ingestion", "graph_sync", "schema_reassessment", "document_cleanup"],
+                ),
+            ).fetchall()
 
     def create_document(self, values: dict[str, Any]) -> dict[str, Any]:
         columns = ("project_id","doc_hash","original_filename","stored_filename","storage_path","local_path",
@@ -682,6 +784,45 @@ class Database:
             if not row: raise LookupError("文档不存在")
             return row
 
+    def finalize_document_graph_facts(
+        self,
+        document_id: int,
+        *,
+        reason: str,
+        **values: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Commit the indexed document projection and generation advance together."""
+
+        fields = list(values)
+        json_fields = {"metadata", "chunk_config", "parse_quality"}
+        assignments = ",".join(
+            f"{key}={'%s::jsonb' if key in json_fields else '%s'}" for key in fields
+        )
+        params = [
+            self._json(values[key])
+            if key in json_fields and not isinstance(values[key], str)
+            else values[key]
+            for key in fields
+        ]
+        with self.connection() as conn:
+            document = conn.execute(
+                f"""UPDATE documents SET {assignments},updated_at=NOW()
+                    WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                [*params, document_id],
+            ).fetchone()
+            if not document:
+                raise LookupError("文档不存在或已删除")
+            project = conn.execute(
+                """UPDATE projects
+                   SET graph_generation=graph_generation+1,graph_status=%s,
+                       graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
+                   WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                (GRAPH_STALE, reason, document["project_id"]),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            return document, project
+
     def soft_delete_document(self, document_id: int) -> dict[str, Any] | None:
         with self.connection() as conn:
             row = conn.execute(
@@ -696,6 +837,14 @@ class Database:
             conn.execute("UPDATE relation_assertions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             conn.execute("UPDATE relation_candidates SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
             self._retire_orphan_entities(conn)
+            if row:
+                conn.execute(
+                    """UPDATE projects
+                       SET graph_generation=graph_generation+1,graph_status=%s,
+                           graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
+                       WHERE id=%s AND is_deleted=FALSE""",
+                    (GRAPH_STALE, "项目文档已删除，图谱正在重新收敛", row["project_id"]),
+                )
             return row
 
     def replace_document_content(self, document_id: int, sections: list[dict[str, Any]], chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -833,17 +982,40 @@ class Database:
         """Persist a retryable derived-index failure without changing source truth."""
 
         with self.connection() as conn:
+            existing = conn.execute(
+                """SELECT attempts,max_attempts FROM indexing_failures
+                   WHERE project_id=%s AND object_type=%s AND object_key=%s AND model_name=%s
+                   FOR UPDATE""",
+                (
+                    values["project_id"], values["object_type"], str(values["object_key"]),
+                    values["model_name"],
+                ),
+            ).fetchone()
+            max_attempts = int(
+                values.get("max_attempts")
+                or (existing or {}).get("max_attempts")
+                or Config.indexing_retry_max_attempts
+            )
+            attempts = int((existing or {}).get("attempts") or 0) + 1
+            status = "permanent_failed" if attempts >= max_attempts else "pending"
+            delay_seconds = min(
+                86400,
+                Config.indexing_retry_base_seconds * (2 ** max(0, attempts - 1)),
+            )
+            next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
             return conn.execute(
                 """INSERT INTO indexing_failures(project_id,document_id,chunk_id,object_type,
-                   object_key,model_name,last_error,payload)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   object_key,model_name,status,attempts,max_attempts,next_attempt_at,last_error,payload)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                    ON CONFLICT(project_id,object_type,object_key,model_name) DO UPDATE SET
-                   document_id=EXCLUDED.document_id,chunk_id=EXCLUDED.chunk_id,status='pending',
-                   attempts=indexing_failures.attempts+1,last_error=EXCLUDED.last_error,
+                   document_id=EXCLUDED.document_id,chunk_id=EXCLUDED.chunk_id,status=EXCLUDED.status,
+                   attempts=EXCLUDED.attempts,max_attempts=EXCLUDED.max_attempts,
+                   next_attempt_at=EXCLUDED.next_attempt_at,last_error=EXCLUDED.last_error,
                    payload=EXCLUDED.payload,completed_at=NULL,updated_at=NOW() RETURNING *""",
                 (
                     values["project_id"], values.get("document_id"), values.get("chunk_id"),
                     values["object_type"], str(values["object_key"]), values["model_name"],
+                    status, attempts, max_attempts, next_attempt_at,
                     values.get("last_error") or "", self._json(values.get("payload")),
                 ),
             ).fetchone()
@@ -860,14 +1032,32 @@ class Database:
             )
 
     def list_pending_indexing_failures(
-        self, project_id: int, object_type: str = "relation",
+        self,
+        project_id: int,
+        object_type: str = "relation",
+        *,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        page_size = max(1, min(limit or Config.indexing_retry_batch_size, 1000))
         with self.connection() as conn:
             return conn.execute(
                 """SELECT * FROM indexing_failures WHERE project_id=%s AND object_type=%s
-                   AND status='pending' ORDER BY updated_at,id""",
-                (project_id, object_type),
+                   AND status='pending' AND next_attempt_at<=NOW()
+                   ORDER BY next_attempt_at,id LIMIT %s""",
+                (project_id, object_type, page_size),
             ).fetchall()
+
+    def cleanup_indexing_failures(self) -> int:
+        """Bound completed/permanent outbox history by the configured retention."""
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=Config.indexing_failure_retention_days)
+        with self.connection() as conn:
+            result = conn.execute(
+                """DELETE FROM indexing_failures
+                   WHERE status IN ('completed','permanent_failed') AND updated_at<%s""",
+                (cutoff,),
+            )
+            return max(0, result.rowcount or 0)
 
     def list_embeddings(self, project_id: int, object_type: str, model_name: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -947,27 +1137,43 @@ class Database:
             return conn.execute("INSERT INTO jobs(id,kind,project_id,document_id) VALUES(%s,%s,%s,%s) RETURNING *", (job_id,kind,project_id,document_id)).fetchone()
 
     def create_graph_rebuild_job(self, project_id: int) -> dict[str, Any]:
-        """Queue a rebuild and atomically close graph access before returning."""
+        """Queue or coalesce one rebuild at the project's current generation."""
 
         job_id = uuid.uuid4().hex
         with self.connection() as conn:
             project = conn.execute(
-                "SELECT id FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                "SELECT id,graph_generation FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
                 (project_id,),
             ).fetchone()
             if not project:
                 raise LookupError("项目不存在")
+            target_generation = int(project.get("graph_generation") or 0)
+            active_rebuild = conn.execute(
+                """SELECT id,status,target_generation FROM jobs WHERE project_id=%s AND kind='graph_sync'
+                   AND status IN ('queued','running') ORDER BY created_at LIMIT 1 FOR UPDATE""",
+                (project_id,),
+            ).fetchone()
+            if active_rebuild:
+                if active_rebuild.get("status") == "running":
+                    return {**active_rebuild, "_coalesced": True}
+                row = conn.execute(
+                    """UPDATE jobs SET target_generation=%s,updated_at=NOW()
+                       WHERE id=%s RETURNING *""",
+                    (target_generation, active_rebuild["id"]),
+                ).fetchone()
+                return {**row, "_coalesced": True}
             active = conn.execute(
                 """SELECT id FROM jobs WHERE project_id=%s
                    AND kind=ANY(%s) AND status IN ('queued','running') LIMIT 1""",
-                (project_id, ["ingestion", "graph_sync", "schema_reassessment", "document_cleanup"]),
+                (project_id, ["ingestion", "schema_reassessment", "document_cleanup"]),
             ).fetchone()
             if active:
                 raise ValueError("当前项目已有会修改图谱的任务正在执行")
             job = conn.execute(
-                """INSERT INTO jobs(id,kind,project_id) VALUES(%s,'graph_sync',%s)
+                """INSERT INTO jobs(id,kind,project_id,target_generation)
+                   VALUES(%s,'graph_sync',%s,%s)
                    RETURNING *""",
-                (job_id, project_id),
+                (job_id, project_id, target_generation),
             ).fetchone()
             conn.execute(
                 """UPDATE projects SET graph_status=%s,graph_policy_version='',graph_error='',

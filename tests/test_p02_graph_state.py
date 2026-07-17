@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 from knowledge_forge.database import Database, SCHEMA_SQL
 from knowledge_forge.graph_policy import (
     GRAPH_FAILED,
+    GRAPH_POLICY_HASH,
     GRAPH_POLICY_VERSION,
     GRAPH_READY,
     GRAPH_REBUILDING,
@@ -106,7 +107,7 @@ def test_old_nonempty_graphs_are_marked_stale_but_empty_projects_are_excluded():
     assert "graph_status<>%s" in statement
     assert "graph_policy_version<>%s" in statement
     assert params[0] == GRAPH_STALE
-    assert params[-2:] == ("empty", GRAPH_POLICY_VERSION)
+    assert params[-3:] == ("empty", GRAPH_POLICY_VERSION, GRAPH_POLICY_HASH)
 
 
 def test_direct_graph_view_returns_409_for_noncurrent_graph(monkeypatch):
@@ -138,12 +139,15 @@ class RebuildSubmissionConnection:
     def execute(self, statement, params=None):
         text = str(statement)
         self.calls.append((text, tuple(params or ())))
-        if "SELECT id FROM projects" in text:
-            return Rows(one={"id": 7})
-        if "SELECT id FROM jobs" in text:
+        if "SELECT id,graph_generation FROM projects" in text:
+            return Rows(one={"id": 7, "graph_generation": 3})
+        if "SELECT id,status,target_generation FROM jobs" in text or "SELECT id FROM jobs" in text:
             return Rows(one=None)
         if "INSERT INTO jobs" in text:
-            return Rows(one={"id": params[0], "project_id": 7, "status": "queued"})
+            return Rows(one={
+                "id": params[0], "project_id": 7, "status": "queued",
+                "target_generation": params[2],
+            })
         if "UPDATE projects" in text:
             return Rows(rowcount=1)
         raise AssertionError(text)
@@ -154,6 +158,7 @@ def test_graph_rebuild_submission_atomically_enters_rebuilding():
     job = database_with_connection(connection).create_graph_rebuild_job(7)
 
     assert job["project_id"] == 7
+    assert job["target_generation"] == 3
     update = next(call for call in connection.calls if "UPDATE projects" in call[0])
     assert update[1] == (GRAPH_REBUILDING, 7)
 

@@ -25,6 +25,7 @@ from .entity_resolution import EntityResolver
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
+    GRAPH_POLICY_HASH,
     GRAPH_POLICY_VERSION,
     GRAPH_READY,
     GRAPH_REBUILDING,
@@ -116,6 +117,20 @@ class KnowledgeForgeService:
             else:
                 self.db.update_job(job_id, status="failed", progress=100,
                                    log="任务缺少恢复所需参数", error="任务无法恢复")
+        if hasattr(self.db, "list_orphaned_graph_projects"):
+            for project in self.db.list_orphaned_graph_projects():
+                try:
+                    job = self.db.create_graph_rebuild_job(int(project["id"]))
+                    if not job.get("_coalesced"):
+                        self.executor.submit(
+                            self._sync_project_graph, str(job["id"]), int(project["id"]),
+                        )
+                    recovered += 1
+                except ValueError:
+                    # A recovered mutating job already owns this project's next generation.
+                    continue
+        if hasattr(self.db, "cleanup_indexing_failures"):
+            self.db.cleanup_indexing_failures()
         return recovered
 
     @staticmethod
@@ -317,7 +332,8 @@ class KnowledgeForgeService:
     def submit_graph_build(self, project_id: int) -> str:
         if not self.db.get_project(project_id): raise LookupError("项目不存在")
         job = self.db.create_graph_rebuild_job(project_id)
-        self.executor.submit(self._sync_project_graph, job["id"], project_id)
+        if not job.get("_coalesced"):
+            self.executor.submit(self._sync_project_graph, job["id"], project_id)
         return str(job["id"])
 
     def submit_schema_reassessment(self, project_id: int) -> str:
@@ -823,9 +839,74 @@ class KnowledgeForgeService:
                 self._assert_ingestion_active(job_id, document_id)
                 self.db.retire_orphan_entities()
             self._assert_ingestion_active(job_id, document_id)
-            graph_report = self._rebuild_project_graph(
-                int(project["id"]), include_document_id=document_id,
+            document_values = {
+                "status": "indexed",
+                "indexed_at": datetime.now(timezone.utc),
+                "error_message": None,
+                "processing_stage": "completed",
+                "graph_ready_at": None,
+                "content_version": int(document.get("content_version") or 0) + 1,
+                "metadata": {
+                    **process_metadata,
+                    "section_count": len(sections),
+                    "chunk_count": len(chunks),
+                    "effective_parser": plan.effective_parser,
+                    "effective_strategy": plan.effective_strategy,
+                    "schema_version": schema_record["version"],
+                    "entity_mentions": total_mentions,
+                    "relations": total_relations,
+                    "extraction_errors": extraction_errors,
+                    "gleaning_chunks": gleaning_chunks,
+                    "verified_relations": verified_relations,
+                    "rejected_relations": rejected_relations,
+                    "relation_verification": verification_totals,
+                },
+            }
+            if hasattr(self.db, "finalize_document_graph_facts"):
+                _, graph_project = self.db.finalize_document_graph_facts(
+                    document_id,
+                    reason="文档事实已更新，等待当前代次图谱重建",
+                    **document_values,
+                )
+            else:
+                self.db.update_document(document_id, **document_values)
+                if hasattr(self.db, "mark_graph_stale"):
+                    graph_project = self.db.mark_graph_stale(
+                        int(project["id"]), "文档事实已更新，等待当前代次图谱重建",
+                    )
+                else:
+                    graph_project = self.db.set_graph_state(
+                        int(project["id"]), GRAPH_STALE,
+                        error="文档事实已更新，等待当前代次图谱重建",
+                    )
+            target_generation = int(graph_project.get("graph_generation") or 0)
+            graph_report = self._rebuild_at_quiescence(
+                int(project["id"]), job_id, target_generation,
             )
+            if graph_report is None:
+                self._job_subtask(
+                    job_id,
+                    "graph_sync",
+                    subtask_status="completed",
+                    subtask_progress=100,
+                    detail="已合并到批次最终重建",
+                    progress=96,
+                    log="检测到同项目后续文档，跳过本次全量清图并合并到批次最终重建",
+                )
+                self._job(
+                    job_id,
+                    "completed",
+                    100,
+                    "文档知识库入库完成；知识图谱将在当前批次静默点统一重建",
+                    stage="completed",
+                    graph_ready=False,
+                    graph_rebuild_coalesced=True,
+                    target_generation=target_generation,
+                    extraction_errors=extraction_errors,
+                    relation_verification=verification_totals,
+                    published_to_hugegraph=0,
+                )
+                return
             self._assert_ingestion_active(job_id, document_id)
             graph_ready_at = datetime.now(timezone.utc)
             self._job_subtask(
@@ -836,16 +917,11 @@ class KnowledgeForgeService:
             )
             with self._document_lock(document_id):
                 self._assert_ingestion_active(job_id, document_id)
-                self.db.update_document(document_id, status="indexed", indexed_at=datetime.now(timezone.utc), error_message=None,
-                    processing_stage="completed", graph_ready_at=graph_ready_at,
-                    content_version=int(document.get("content_version") or 0) + 1,
-                    metadata={**process_metadata, "section_count": len(sections), "chunk_count": len(chunks),
-                              "effective_parser": plan.effective_parser, "effective_strategy": plan.effective_strategy,
-                              "schema_version": schema_record["version"], "entity_mentions": total_mentions,
-                              "relations": total_relations, "extraction_errors": extraction_errors,
-                              "gleaning_chunks": gleaning_chunks, "verified_relations": verified_relations,
-                              "rejected_relations": rejected_relations,
-                              "relation_verification": verification_totals})
+                self.db.update_document(
+                    document_id,
+                    processing_stage="completed",
+                    graph_ready_at=graph_ready_at,
+                )
             completion = "文档知识库与知识图谱入库完成"
             if extraction_errors:
                 completion += f"；{extraction_errors} 个知识块的图谱抽取已降级"
@@ -902,23 +978,57 @@ class KnowledgeForgeService:
                                metadata={"stage": "failed"})
 
     def _rebuild_project_graph(
-        self, project_id: int, *, include_document_id: int | None = None,
+        self,
+        project_id: int,
+        *,
+        include_document_id: int | None = None,
+        target_generation: int | None = None,
     ) -> dict[str, int]:
         """Purge and deterministically rebuild one project graph, then verify counts."""
 
         with self._graph_lock(project_id):
             return self._rebuild_project_graph_locked(
-                project_id, include_document_id=include_document_id,
+                project_id,
+                include_document_id=include_document_id,
+                target_generation=target_generation,
             )
 
+    def _rebuild_at_quiescence(
+        self,
+        project_id: int,
+        job_id: str,
+        target_generation: int,
+    ) -> dict[str, int] | None:
+        """Coalesce a queued ingestion burst into its final generation rebuild."""
+
+        if (
+            hasattr(self.db, "has_pending_ingestions")
+            and self.db.has_pending_ingestions(project_id, exclude_job_id=job_id)
+        ):
+            return None
+        return self._rebuild_project_graph(
+            project_id, target_generation=target_generation,
+        )
+
     def _rebuild_project_graph_locked(
-        self, project_id: int, *, include_document_id: int | None = None,
+        self,
+        project_id: int,
+        *,
+        include_document_id: int | None = None,
+        target_generation: int | None = None,
     ) -> dict[str, int]:
         """Execute a rebuild while the process-local project graph lock is held."""
 
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
+        fixed_generation = int(
+            target_generation
+            if target_generation is not None
+            else project.get("graph_generation") or 0
+        )
+        if int(project.get("graph_generation") or 0) != fixed_generation:
+            raise RuntimeError("图谱重建目标代次已过期")
         self._retry_relation_indexing_failures(project)
         documents = [
             item for item in self.db.list_documents(project_id)
@@ -931,11 +1041,16 @@ class KnowledgeForgeService:
         written_entities = 0
         for document in documents:
             chunks = self.db.list_document_chunks(int(document["id"]))
-            self.graph.replace_document(project, document, chunks)
+            writer = getattr(self.graph, "write_document_snapshot", None)
+            if writer:
+                writer(project, document, chunks)
+            else:
+                self.graph.replace_document(project, document, chunks)
             report = self.graph.sync_document_assertions(project, document)
             written_relations += int(report.get("relations") or 0)
             written_entities += int(report.get("entities") or 0)
-        self.graph.prune_project_entities(project_id)
+        if documents:
+            self.graph.prune_project_entities(project_id)
         expected_relations = self.db.count_publishable_relations(project_id, document_ids)
         graph_stats = self.graph.statistics(project_id)
         graph_relations = int(graph_stats.get("relations") or 0)
@@ -945,9 +1060,28 @@ class KnowledgeForgeService:
                 f"PostgreSQL={expected_relations}, written={written_relations}, HugeGraph={graph_relations}"
             )
         if not documents:
-            self.db.set_graph_state(project_id, GRAPH_EMPTY)
+            if hasattr(self.db, "complete_graph_rebuild"):
+                completed = self.db.complete_graph_rebuild(
+                    project_id,
+                    fixed_generation,
+                    policy_hash=GRAPH_POLICY_HASH,
+                    empty=True,
+                )
+                if not completed:
+                    raise RuntimeError("图谱重建完成时目标代次已过期")
+            else:
+                self.db.set_graph_state(project_id, GRAPH_EMPTY)
             return {"documents": 0, "entities": 0, "relations": 0}
-        self.db.set_graph_state(project_id, GRAPH_READY, current_policy=True)
+        if hasattr(self.db, "complete_graph_rebuild"):
+            completed = self.db.complete_graph_rebuild(
+                project_id,
+                fixed_generation,
+                policy_hash=GRAPH_POLICY_HASH,
+            )
+            if not completed:
+                raise RuntimeError("图谱重建完成时目标代次已过期")
+        else:
+            self.db.set_graph_state(project_id, GRAPH_READY, current_policy=True)
         return {
             "documents": len(documents),
             "entities": written_entities,
@@ -1013,9 +1147,16 @@ class KnowledgeForgeService:
     @recorded_job("graph_rebuild")
     def _sync_project_graph(self, job_id: str, project_id: int) -> None:
         try:
-            self.db.begin_graph_mutation(job_id)
+            job = self.db.begin_graph_mutation(job_id)
+            target_generation = int(
+                job.get("target_generation")
+                if job.get("target_generation") is not None
+                else (self.db.get_project(project_id) or {}).get("graph_generation") or 0
+            )
             self._job(job_id, progress=5, log="开始按当前验证策略重建项目知识图谱")
-            report = self._rebuild_project_graph(project_id)
+            report = self._rebuild_project_graph(
+                project_id, target_generation=target_generation,
+            )
             self._job(
                 job_id, "completed", 100,
                 f"项目图谱同步完成，共处理 {report['documents']} 个文档、{report['relations']} 条关系",
@@ -1023,11 +1164,25 @@ class KnowledgeForgeService:
             )
         except Exception as exc:
             LOGGER.exception("Project graph sync failed: %s", project_id)
+            stale_generation = "过期" in str(exc)
             try:
-                self.db.set_graph_state(project_id, GRAPH_FAILED, error=str(exc))
+                self.db.set_graph_state(
+                    project_id,
+                    GRAPH_STALE if stale_generation else GRAPH_FAILED,
+                    error=str(exc),
+                )
             except LookupError:
                 pass
             self.db.update_job(job_id, status="failed", progress=100, log=str(exc), error=str(exc))
+            if stale_generation:
+                try:
+                    next_job = self.db.create_graph_rebuild_job(project_id)
+                    if not next_job.get("_coalesced"):
+                        self.executor.submit(
+                            self._sync_project_graph, str(next_job["id"]), project_id,
+                        )
+                except (LookupError, ValueError):
+                    LOGGER.info("A newer project mutation already owns graph recovery: %s", project_id)
 
     def _reassess_project_schema(self, job_id: str, project_id: int) -> None:
         self._job(

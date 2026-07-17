@@ -167,7 +167,7 @@ def test_delete_document_cancels_work_and_moves_source_and_process_files(tmp_pat
     service.cleanup_executor.run_all()
     assert service.graph.deleted == []
     assert service.graph.calls == ["schema", ("purge", 9)]
-    assert service.graph.pruned == [9]
+    assert service.graph.pruned == []
     assert service.schemas.activated == [9]
     assert not source.exists()
     assert not process.exists()

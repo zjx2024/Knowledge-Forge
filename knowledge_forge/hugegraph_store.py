@@ -175,9 +175,29 @@ class HugeGraphStore:
             page = next_page
 
     def replace_document(self, project: dict[str, Any], document: dict[str, Any], chunks: list[dict[str, Any]]) -> dict[str, int]:
-        self.ensure_schema(); graph = self.client().graph()
+        self.ensure_schema()
+        graph = self.client().graph()
+        self._purge_document_graph(graph, int(document["id"]), keep_document=True)
+        return self._write_document_snapshot(graph, project, document, chunks)
+
+    def write_document_snapshot(
+        self,
+        project: dict[str, Any],
+        document: dict[str, Any],
+        chunks: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Write into an already-purged full rebuild without schema/purge repetition."""
+
+        return self._write_document_snapshot(self.client().graph(), project, document, chunks)
+
+    def _write_document_snapshot(
+        self,
+        graph,
+        project: dict[str, Any],
+        document: dict[str, Any],
+        chunks: list[dict[str, Any]],
+    ) -> dict[str, int]:
         project_id, document_id = int(project["id"]), int(document["id"])
-        self._purge_document_graph(graph, document_id, keep_document=True)
         common = {"kf_project_id": project_id, "kf_project_key": project["project_key"], "kf_updated_at": self._now()}
         doc_vertex_id = self.document_vertex_id(project_id, document_id)
         self._upsert_vertex(graph, "KFDocument", doc_vertex_id, {**common, "kf_doc_id": document_id,
