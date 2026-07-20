@@ -142,6 +142,8 @@ class KnowledgeForgeService:
                     continue
         if hasattr(self.db, "cleanup_indexing_failures"):
             self.db.cleanup_indexing_failures()
+        if hasattr(self.db, "cleanup_audit_metrics"):
+            self.db.cleanup_audit_metrics()
         return recovered
 
     @staticmethod

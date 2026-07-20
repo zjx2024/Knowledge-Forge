@@ -1,7 +1,7 @@
 # Layout-aware parser for scanned or complex PDF/DOCX documents.
-# CUDA wheels retain CPU execution for automatic OOM fallback.
---extra-index-url https://download.pytorch.org/whl/cu128
+# CPU is the portable default; use requirements-docling-gpu.txt for CUDA.
+--extra-index-url https://download.pytorch.org/whl/cpu
 -r requirements.txt
-torch==2.7.1+cu128
-torchvision==0.22.1+cu128
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
 docling>=2.0.0

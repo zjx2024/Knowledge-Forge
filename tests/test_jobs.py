@@ -40,20 +40,17 @@ def test_latest_active_job_ignores_completed_jobs_and_prefers_running():
     assert database.cursor.params == [7, "ingestion"]
 
 
-def test_project_parser_defaults_are_removed_by_schema_migration():
-    assert "DROP COLUMN IF EXISTS default_parser" in SCHEMA_SQL
-    assert "DROP COLUMN IF EXISTS default_chunk_strategy" in SCHEMA_SQL
+def test_project_parser_defaults_are_not_reintroduced_or_destructively_dropped():
+    assert "DROP COLUMN IF EXISTS default_parser" not in SCHEMA_SQL
+    assert "DROP COLUMN IF EXISTS default_chunk_strategy" not in SCHEMA_SQL
     assert "ADD COLUMN IF NOT EXISTS default_parser" not in SCHEMA_SQL
     assert "ADD COLUMN IF NOT EXISTS default_chunk_strategy" not in SCHEMA_SQL
 
 
-def test_project_token_settings_and_ragflow_cleanup_are_migrated():
+def test_project_token_settings_are_additive_and_legacy_cleanup_is_explicit():
     assert "model_max_tokens INTEGER NOT NULL DEFAULT 32768" in SCHEMA_SQL
     assert "chunk_max_tokens INTEGER NOT NULL DEFAULT 512" in SCHEMA_SQL
-    assert "DROP COLUMN IF EXISTS ragflow_dataset_id" in SCHEMA_SQL
-    assert "DROP COLUMN IF EXISTS ragflow_document_id" in SCHEMA_SQL
-    assert "DROP COLUMN IF EXISTS ragflow_chunk_id" in SCHEMA_SQL
-    assert "DROP COLUMN IF EXISTS ragflow_task_id" in SCHEMA_SQL
+    assert "DROP COLUMN" not in SCHEMA_SQL.upper()
 
 
 def test_document_pipeline_stages_are_persisted_and_backfilled():

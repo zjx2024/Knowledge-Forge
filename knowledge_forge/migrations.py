@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 
 import psycopg
 
@@ -18,6 +18,8 @@ class Migration:
     version: str
     description: str
     sql: str
+    startup_safe: bool = False
+    transactional: bool = True
 
     @property
     def checksum(self) -> str:
@@ -1002,6 +1004,24 @@ CREATE TRIGGER trg_graph_content_manifests_immutable
 """
 
 
+INDEXING_FAILURE_STATUS_SQL = r"""
+DO $$
+DECLARE definition TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO definition
+    FROM pg_constraint
+    WHERE conrelid='indexing_failures'::regclass
+      AND conname='indexing_failures_status_check';
+    IF definition IS NOT NULL AND position('permanent_failed' IN definition)=0 THEN
+        ALTER TABLE indexing_failures DROP CONSTRAINT indexing_failures_status_check;
+        ALTER TABLE indexing_failures ADD CONSTRAINT indexing_failures_status_check
+            CHECK (status IN ('pending','completed','permanent_failed'));
+    END IF;
+END;
+$$;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1033,6 +1053,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Isolate graph ownership and persist leased generation manifests",
         sql=GRAPH_NAMESPACE_MANIFEST_SQL,
     ),
+    Migration(
+        version="0007_indexing_failure_status",
+        description="Safely extend the indexing failure terminal-state constraint",
+        sql=INDEXING_FAILURE_STATUS_SQL,
+        startup_safe=True,
+    ),
 )
 
 
@@ -1049,24 +1075,55 @@ class MigrationRunner:
                version TEXT PRIMARY KEY,description TEXT NOT NULL,checksum TEXT NOT NULL,
                status TEXT NOT NULL CHECK(status IN ('applying','applied','failed')),
                duration_ms BIGINT NOT NULL DEFAULT 0,error_message TEXT NOT NULL DEFAULT '',
+               execution_mode TEXT NOT NULL DEFAULT 'transactional',
+               progress JSONB NOT NULL DEFAULT '{}'::jsonb,
                applied_at TIMESTAMPTZ,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"""
         )
+        conn.execute(
+            "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS "
+            "execution_mode TEXT NOT NULL DEFAULT 'transactional'"
+        )
+        conn.execute(
+            "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS "
+            "progress JSONB NOT NULL DEFAULT '{}'::jsonb"
+        )
+
+    @staticmethod
+    def _table_exists(conn: psycopg.Connection) -> bool:
+        row = conn.execute(
+            "SELECT to_regclass('schema_migrations') AS table_name"
+        ).fetchone()
+        return bool(row and row.get("table_name"))
+
+    def plan(self, conn: psycopg.Connection) -> list[dict[str, str]]:
+        """Return the immutable migration plan without issuing any write."""
+
+        rows = []
+        if self._table_exists(conn):
+            rows = conn.execute(
+                "SELECT version,checksum,status FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        recorded = {str(row["version"]): row for row in rows}
+        plan: list[dict[str, str]] = []
+        for migration in self.migrations:
+            row = recorded.get(migration.version)
+            if row and row["checksum"] != migration.checksum:
+                raise RuntimeError(
+                    f"Migration checksum mismatch for {migration.version}: "
+                    f"database={row['checksum']} code={migration.checksum}"
+                )
+            plan.append({
+                "version": migration.version,
+                "description": migration.description,
+                "checksum": migration.checksum,
+                "status": str((row or {}).get("status") or "pending"),
+                "startup_safe": "true" if migration.startup_safe else "false",
+                "execution_mode": "transactional" if migration.transactional else "nontransactional",
+            })
+        return plan
 
     def status(self, conn: psycopg.Connection) -> list[dict[str, str]]:
-        self.ensure_table(conn)
-        applied = {
-            row["version"]: row
-            for row in conn.execute("SELECT * FROM schema_migrations ORDER BY version").fetchall()
-        }
-        return [
-            {
-                "version": item.version,
-                "description": item.description,
-                "checksum": item.checksum,
-                "status": str((applied.get(item.version) or {}).get("status") or "pending"),
-            }
-            for item in self.migrations
-        ]
+        return self.plan(conn)
 
     def is_applied(self, conn: psycopg.Connection, version: str) -> bool:
         """Return whether an exact immutable migration is already committed."""
@@ -1088,41 +1145,127 @@ class MigrationRunner:
             )
         return True
 
-    def apply(self, conn: psycopg.Connection) -> list[str]:
-        self.ensure_table(conn)
-        conn.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK_ID,))
+    def apply(
+        self,
+        conn: psycopg.Connection,
+        *,
+        startup_safe_only: bool = False,
+    ) -> list[str]:
+        """Apply migrations with a session lock and durable per-step status.
+
+        Every transactional migration is committed independently.  A failed
+        migration is rolled back, recorded as failed in a fresh transaction,
+        and may be resumed by a later invocation.
+        """
+
+        conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK_ID,))
+        conn.commit()
         applied: list[str] = []
-        for migration in self.migrations:
-            row = conn.execute(
-                "SELECT checksum,status FROM schema_migrations WHERE version=%s FOR UPDATE",
-                (migration.version,),
-            ).fetchone()
-            if row:
-                if row["checksum"] != migration.checksum:
-                    raise RuntimeError(
-                        f"Migration checksum mismatch for {migration.version}: "
-                        f"database={row['checksum']} code={migration.checksum}"
-                    )
-                if row["status"] == "applied":
+        try:
+            self.ensure_table(conn)
+            conn.commit()
+            for migration in self.migrations:
+                row = conn.execute(
+                    "SELECT checksum,status FROM schema_migrations WHERE version=%s FOR UPDATE",
+                    (migration.version,),
+                ).fetchone()
+                if row:
+                    if row["checksum"] != migration.checksum:
+                        raise RuntimeError(
+                            f"Migration checksum mismatch for {migration.version}: "
+                            f"database={row['checksum']} code={migration.checksum}"
+                        )
+                    if row["status"] == "applied":
+                        conn.commit()
+                        continue
+                if startup_safe_only and not migration.startup_safe:
+                    conn.rollback()
                     continue
-            started = time.monotonic()
-            conn.execute(
-                """INSERT INTO schema_migrations(version,description,checksum,status)
-                   VALUES(%s,%s,%s,'applying')
-                   ON CONFLICT(version) DO UPDATE SET status='applying',error_message='',updated_at=NOW()""",
-                (migration.version, migration.description, migration.checksum),
-            )
-            try:
-                conn.execute(migration.sql)
-            except Exception as exc:
-                # PostgreSQL aborts the surrounding transaction; the caller receives the
-                # original error and no partial migration can be committed.
-                raise RuntimeError(f"Migration {migration.version} failed: {exc}") from exc
-            duration_ms = int((time.monotonic() - started) * 1000)
-            conn.execute(
-                """UPDATE schema_migrations SET status='applied',duration_ms=%s,
-                   applied_at=NOW(),updated_at=NOW() WHERE version=%s""",
-                (duration_ms, migration.version),
-            )
-            applied.append(migration.version)
+                started = time.monotonic()
+                mode = "transactional" if migration.transactional else "nontransactional"
+                conn.execute(
+                    """INSERT INTO schema_migrations(
+                           version,description,checksum,status,execution_mode,progress)
+                       VALUES(%s,%s,%s,'applying',%s,'{}'::jsonb)
+                       ON CONFLICT(version) DO UPDATE SET
+                           description=EXCLUDED.description,status='applying',
+                           error_message='',execution_mode=EXCLUDED.execution_mode,
+                           updated_at=NOW()""",
+                    (migration.version, migration.description, migration.checksum, mode),
+                )
+                conn.commit()
+                try:
+                    if migration.transactional:
+                        conn.execute(migration.sql)
+                    else:
+                        previous_autocommit = conn.autocommit
+                        conn.autocommit = True
+                        try:
+                            conn.execute(migration.sql)
+                        finally:
+                            conn.autocommit = previous_autocommit
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    conn.execute(
+                        """UPDATE schema_migrations SET status='applied',duration_ms=%s,
+                           error_message='',progress='{"complete":true}'::jsonb,
+                           applied_at=NOW(),updated_at=NOW() WHERE version=%s""",
+                        (duration_ms, migration.version),
+                    )
+                    conn.commit()
+                    applied.append(migration.version)
+                except Exception as exc:
+                    conn.rollback()
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    conn.execute(
+                        """UPDATE schema_migrations SET status='failed',duration_ms=%s,
+                           error_message=%s,updated_at=NOW() WHERE version=%s""",
+                        (duration_ms, str(exc)[:2000], migration.version),
+                    )
+                    conn.commit()
+                    raise RuntimeError(f"Migration {migration.version} failed: {exc}") from exc
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (MIGRATION_LOCK_ID,))
+            conn.commit()
         return applied
+
+    @staticmethod
+    def run_batched_backfill(
+        conn: psycopg.Connection,
+        *,
+        version: str,
+        fetch_batch: Callable[[psycopg.Connection, int], list[object]],
+        apply_batch: Callable[[psycopg.Connection, list[object]], None],
+        batch_size: int = 500,
+    ) -> int:
+        """Run a bounded, resumable backfill and persist monotonic progress."""
+
+        row = conn.execute(
+            "SELECT progress FROM schema_migrations WHERE version=%s FOR UPDATE",
+            (version,),
+        ).fetchone()
+        if not row:
+            raise RuntimeError(f"Backfill migration state is missing: {version}")
+        progress = row.get("progress") or {}
+        total = max(0, int(progress.get("processed") or 0))
+        conn.commit()
+        while True:
+            rows = list(fetch_batch(conn, max(1, int(batch_size))))
+            if not rows:
+                break
+            apply_batch(conn, rows)
+            total += len(rows)
+            conn.execute(
+                """UPDATE schema_migrations
+                   SET progress=jsonb_build_object('processed',%s),updated_at=NOW()
+                   WHERE version=%s""",
+                (total, version),
+            )
+            conn.commit()
+        conn.execute(
+            """UPDATE schema_migrations
+               SET progress=jsonb_build_object('processed',%s,'complete',TRUE),updated_at=NOW()
+               WHERE version=%s""",
+            (total, version),
+        )
+        conn.commit()
+        return total

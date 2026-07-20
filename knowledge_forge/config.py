@@ -29,16 +29,20 @@ _load_dotenv()
 
 
 class Config:
+    runtime_mode = os.getenv("RUNTIME_MODE", "development").strip().lower()
     service_host = os.getenv("SERVICE_HOST", "127.0.0.1")
-    upload_host = os.getenv("UPLOAD_HOST", "0.0.0.0")
+    upload_host = os.getenv("UPLOAD_HOST", "127.0.0.1")
     upload_port = int(os.getenv("UPLOAD_PORT", "8011"))
     http_base_url = os.getenv("HTTP_BASE_URL", f"http://{service_host}:8010")
+    allow_unsafe_public_bind = os.getenv("ALLOW_UNSAFE_PUBLIC_BIND", "false").lower() == "true"
+    public_bind_approved = os.getenv("PUBLIC_BIND_APPROVED", "false").lower() == "true"
+    authentication_enabled = os.getenv("AUTHENTICATION_ENABLED", "false").lower() == "true"
 
     postgres = {
         "host": os.getenv("POSTGRES_HOST", service_host),
         "port": int(os.getenv("POSTGRES_PORT", "5432")),
         "user": os.getenv("POSTGRES_USER", "postgres"),
-        "password": os.getenv("POSTGRES_PASSWORD", "change-me"),
+        "password": os.getenv("POSTGRES_PASSWORD", ""),
         "dbname": os.getenv("POSTGRES_DB", "knowledge_forge"),
         "connect_timeout": int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5")),
     }
@@ -73,8 +77,9 @@ class Config:
     hugegraph_host = os.getenv("HUGEGRAPH_HOST", service_host)
     hugegraph_port = int(os.getenv("HUGEGRAPH_PORT", "8080"))
     hugegraph_graph = os.getenv("HUGEGRAPH_GRAPH", "knowledge_forge")
-    hugegraph_user = os.getenv("HUGEGRAPH_USER", "admin")
-    hugegraph_password = os.getenv("HUGEGRAPH_PASSWORD", os.getenv("HUGEGRAPH_PWD", "admin"))
+    hugegraph_auth_enabled = os.getenv("HUGEGRAPH_AUTH_ENABLED", "false").lower() == "true"
+    hugegraph_user = os.getenv("HUGEGRAPH_USER", "")
+    hugegraph_password = os.getenv("HUGEGRAPH_PASSWORD", os.getenv("HUGEGRAPH_PWD", ""))
     hugegraph_timeout = int(os.getenv("HUGEGRAPH_TIMEOUT", "30"))
     hugegraph_page_size = max(1, min(1000, int(os.getenv("HUGEGRAPH_PAGE_SIZE", "500"))))
     graph_lease_seconds = max(30, int(os.getenv("GRAPH_LEASE_SECONDS", "900")))
@@ -97,6 +102,10 @@ class Config:
         "INDEXING_FAILURE_CLEANUP_ENABLED", "false",
     ).lower() == "true"
     indexing_failure_retention_days = max(1, int(os.getenv("INDEXING_FAILURE_RETENTION_DAYS", "30")))
+    audit_redaction_enabled = os.getenv("AUDIT_REDACTION_ENABLED", "true").lower() == "true"
+    audit_retention_days = max(1, int(os.getenv("AUDIT_RETENTION_DAYS", "90")))
+    audit_max_rows = max(1000, int(os.getenv("AUDIT_MAX_ROWS", "100000")))
+    audit_cleanup_enabled = os.getenv("AUDIT_CLEANUP_ENABLED", "true").lower() == "true"
     entity_merge_threshold = float(os.getenv("ENTITY_MERGE_THRESHOLD", "0.90"))
     entity_lexical_top_k = int(os.getenv("ENTITY_LEXICAL_TOP_K", "10"))
     entity_vector_top_k = int(os.getenv("ENTITY_VECTOR_TOP_K", "20"))

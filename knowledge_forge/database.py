@@ -44,6 +44,7 @@ from .relation_verification import (
 from .observability import InstrumentedConnection, current_metrics, increment
 from .policy import POLICY_AXES, normalize_policy_set
 from .migrations import MigrationRunner
+from .audit import redact_audit_payload
 
 
 LOGGER = logging.getLogger(__name__)
@@ -457,11 +458,6 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_policy_hash TEXT NOT NULL DE
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_policy_hash TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS model_max_tokens INTEGER NOT NULL DEFAULT 32768;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS chunk_max_tokens INTEGER NOT NULL DEFAULT 512;
-ALTER TABLE projects DROP COLUMN IF EXISTS ragflow_dataset_id;
-ALTER TABLE projects DROP COLUMN IF EXISTS ragflow_dataset_name;
-ALTER TABLE projects DROP COLUMN IF EXISTS default_parser;
-ALTER TABLE projects DROP COLUMN IF EXISTS default_chunk_strategy;
-ALTER TABLE documents DROP COLUMN IF EXISTS ragflow_document_id;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS requested_parser TEXT NOT NULL DEFAULT 'auto';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS requested_chunk_strategy TEXT NOT NULL DEFAULT 'auto';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS effective_parser TEXT;
@@ -478,9 +474,6 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS graph_ready_at TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_generation BIGINT;
 ALTER TABLE indexing_failures ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 8;
 ALTER TABLE indexing_failures ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE indexing_failures DROP CONSTRAINT IF EXISTS indexing_failures_status_check;
-ALTER TABLE indexing_failures ADD CONSTRAINT indexing_failures_status_check
-    CHECK (status IN ('pending','completed','permanent_failed'));
 WITH ranked_graph_jobs AS (
     SELECT id,ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY created_at,id) AS ordinal
     FROM jobs WHERE kind='graph_sync' AND status IN ('queued','running')
@@ -656,8 +649,6 @@ UPDATE documents d SET processing_stage=CASE
     WHEN d.structure_ready_at IS NOT NULL THEN 'structure_ready'
     ELSE 'uploaded' END
 WHERE d.processing_stage='uploaded' OR d.processing_stage IS NULL;
-ALTER TABLE chunks DROP COLUMN IF EXISTS ragflow_chunk_id;
-ALTER TABLE IF EXISTS graph_jobs DROP COLUMN IF EXISTS ragflow_task_id;
 """
 
 
@@ -684,12 +675,21 @@ class Database:
             self._enable_vector_extensions(conn)
             migrations = MigrationRunner()
             migrations.ensure_table(conn)
+            fresh_install = not bool(conn.execute(
+                "SELECT to_regclass('projects') AS table_name"
+            ).fetchone()["table_name"])
             revision_schema_applied = migrations.is_applied(
                 conn, "0001_document_content_revisions",
             )
             if not revision_schema_applied:
                 conn.execute(SCHEMA_SQL)
-            migrations.apply(conn)
+                conn.commit()
+            migrations.apply(conn, startup_safe_only=not fresh_install)
+            if not migrations.is_applied(conn, "0001_document_content_revisions"):
+                raise RuntimeError(
+                    "检测到待执行的重迁移；请先运行 "
+                    "`.venv/bin/python scripts/manage_migrations.py apply`，再启动服务"
+                )
             conn.execute(
                 "ALTER TABLE IF EXISTS canonical_entities "
                 "ADD COLUMN IF NOT EXISTS normalized_aliases TEXT[] NOT NULL DEFAULT '{}'"
@@ -881,6 +881,13 @@ class Database:
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps({} if value is None else value, ensure_ascii=False)
+
+    @staticmethod
+    def _audit_json(value: Any) -> str:
+        payload = {} if value is None else value
+        if Config.audit_redaction_enabled:
+            payload = redact_audit_payload(payload)
+        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
     def _canonical_json(value: Any) -> str:
@@ -2045,6 +2052,25 @@ class Database:
             )
             return max(0, result.rowcount or 0)
 
+    def cleanup_audit_metrics(self) -> int:
+        """Apply configured time and capacity bounds to redacted metric audits."""
+
+        if not Config.audit_cleanup_enabled:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=Config.audit_retention_days)
+        with self.connection() as conn:
+            expired = conn.execute(
+                "DELETE FROM operation_metrics WHERE created_at<%s", (cutoff,),
+            ).rowcount or 0
+            overflow = conn.execute(
+                """DELETE FROM operation_metrics WHERE id IN (
+                       SELECT id FROM operation_metrics ORDER BY created_at DESC,id DESC
+                       OFFSET %s
+                   )""",
+                (Config.audit_max_rows,),
+            ).rowcount or 0
+            return max(0, int(expired)) + max(0, int(overflow))
+
     def list_embeddings(self, project_id: int, object_type: str, model_name: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
             return conn.execute(
@@ -2898,8 +2924,8 @@ class Database:
                     values["candidate_id"], values["project_id"], values["document_id"], values["chunk_id"],
                     values["attempt"], values.get("model_name") or "", values.get("prompt_version") or "",
                     int(values.get("schema_version") or 1), values.get("ingestion_run_id") or "",
-                    self._json(values.get("request_json")),
-                    self._json(values.get("raw_response")) if values.get("raw_response") is not None else None,
+                    self._audit_json(values.get("request_json")),
+                    self._audit_json(values.get("raw_response")) if values.get("raw_response") is not None else None,
                     values.get("verdict") or None, values.get("reason") or "",
                     values.get("error_category") or "",
                     values.get("batch_id"),
@@ -2934,8 +2960,8 @@ class Database:
                 digest, values["project_id"], values["document_id"], values["chunk_id"],
                 values["attempt"], values.get("model_name") or "",
                 values.get("prompt_version") or "", int(values.get("schema_version") or 1),
-                values.get("ingestion_run_id") or "", self._json(values.get("request_json")),
-                self._json(values.get("raw_response"))
+                values.get("ingestion_run_id") or "", self._audit_json(values.get("request_json")),
+                self._audit_json(values.get("raw_response"))
                 if values.get("raw_response") is not None else None,
             ),
         )

@@ -8,7 +8,7 @@ services:
     env_file:
       - .env.docker
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - knowledge-forge-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -18,13 +18,20 @@ services:
       retries: 20
 
   knowledge-forge:
-    build: .
+    build:
+      context: .
+      args:
+        CONSTRAINTS_FILE: constraints-gpu.txt
+        DOCLING_REQUIREMENTS: requirements-docling-gpu.txt
     image: knowledge-forge:latest
     container_name: knowledge-forge
     restart: unless-stopped
     env_file:
       - .env.docker
     environment:
+      RUNTIME_MODE: "development"
+      UPLOAD_HOST: "0.0.0.0"
+      ALLOW_UNSAFE_PUBLIC_BIND: "true"
       HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
@@ -33,11 +40,11 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8011:8011"
-      - "8010:8010"
+      - "127.0.0.1:8011:8011"
+      - "127.0.0.1:8010:8010"
     volumes:
       - ./KnowledgeFiles:/app/KnowledgeFiles
-      - knowledge-forge-docling-cache:/root/.cache
+      - knowledge-forge-docling-cache:/home/knowledgeforge/.cache
       - ${ENTITY_RERANKER_HOST_PATH:-/home/kdfy/models/bge-reranker-v2-m3}:/models/entity-reranker:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

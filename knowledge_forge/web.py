@@ -19,10 +19,11 @@ from .config import Config
 from .chunking import CHUNK_STRATEGY_OPTIONS, PARSER_OPTIONS, docling_available, validate_processing_request
 from .graph_policy import GraphNotReadyError, is_current_graph
 from .service import KnowledgeForgeService
+from .runtime_safety import validate_runtime_config
 
 
 LOGGER = logging.getLogger(__name__)
-SERVICE = KnowledgeForgeService()
+SERVICE: KnowledgeForgeService | None = None
 
 
 def _esc(value: object) -> str:
@@ -388,7 +389,12 @@ class FilesHandler(BaseHTTPRequestHandler):
 
 
 def serve() -> None:
+    global SERVICE
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+    for warning in validate_runtime_config(Config):
+        LOGGER.warning("RUNTIME SAFETY: %s", warning)
+    if SERVICE is None:
+        SERVICE = KnowledgeForgeService()
     SERVICE.bootstrap()
     recovered = SERVICE.recover_interrupted_jobs()
     if recovered:
