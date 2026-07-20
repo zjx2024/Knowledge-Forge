@@ -855,6 +855,18 @@ class SchemaEvolutionService:
                 "evidence_text": evidence,
                 "evidence_start": start,
                 "evidence_end": end,
+                "mention_start": name_spans[0][0],
+                "mention_end": name_spans[0][1],
+                "alias_spans": [
+                    {
+                        "surface": alias,
+                        "start": alias_span[0],
+                        "end": alias_span[1],
+                        "confidence": coerce_confidence(raw.get("confidence"), 0.5),
+                    }
+                    for alias in aliases
+                    for alias_span in _surface_spans(content, alias)[:1]
+                ],
             }
             entities.append(entity)
             local_entities[local_id] = entity
@@ -1498,9 +1510,13 @@ class SchemaEvolutionService:
         extraction["_verification_events"] = verification_events
         extraction["_diagnostics"] = diagnostics
         for entity in extraction.get("entities") or []:
-            for key in ("evidence_start", "evidence_end"):
+            for key in ("evidence_start", "evidence_end", "mention_start", "mention_end"):
                 if entity.get(key) is not None:
                     entity[key] = int(entity[key]) + body_start
+            for alias in entity.get("alias_spans") or []:
+                for key in ("start", "end"):
+                    if alias.get(key) is not None:
+                        alias[key] = int(alias[key]) + body_start
         for relation in extraction.get("relations") or []:
             for record in (relation, relation.get("_original_candidate") or {}):
                 for key in ("evidence_start", "evidence_end"):

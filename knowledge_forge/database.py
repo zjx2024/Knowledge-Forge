@@ -761,6 +761,20 @@ class Database:
             raise ValueError("Embedding 向量不能为空且必须全部为有限数值")
         return "[" + ",".join(format(value, ".12g") for value in vector) + "]"
 
+    @staticmethod
+    def _column_exists(conn: psycopg.Connection, table: str, column: str) -> bool:
+        if not isinstance(conn, psycopg.Connection):
+            return False
+        row = conn.execute(
+            """SELECT EXISTS(
+                 SELECT 1 FROM pg_attribute
+                 WHERE attrelid=to_regclass(%s) AND attname=%s
+                   AND attnum>0 AND NOT attisdropped
+               ) AS present""",
+            (table, column),
+        ).fetchone()
+        return bool(row and row.get("present"))
+
     @classmethod
     def _reset_hnsw_cache_for_tests(cls) -> None:
         with cls._hnsw_cache_lock:
@@ -1665,58 +1679,73 @@ class Database:
         candidate_limit = max(limit, min(Config.pgvector_max_candidates, limit * Config.pgvector_candidate_multiplier))
         pattern = f"%{query}%"
         vector_type = sql.SQL("vector({})").format(sql.Literal(dimension))
-        relation_filter = ""
-        relation_policy_params: list[Any] = []
-        if object_type == "relation":
-            relation_clause, relation_policy_params = self._publishable_relation_clause("r")
-            relation_filter = (
-                " AND EXISTS (SELECT 1 FROM relation_assertions r "
-                "WHERE r.project_id=v0.project_id AND r.id::text=v0.object_key "
-                "AND r.revision_id IS NOT DISTINCT FROM v0.revision_id "
-                "AND r.is_deleted=FALSE AND " + relation_clause + ")"
-            )
-        active_filter = (
-            " AND (v0.document_id IS NULL OR EXISTS (SELECT 1 FROM documents active_document "
-            "WHERE active_document.id=v0.document_id AND active_document.is_deleted=FALSE "
-            "AND active_document.active_revision_id=v0.revision_id))"
-        )
-        statement = sql.SQL(
-            """WITH vector_hits AS (
-                SELECT id FROM vector_embeddings v0
-                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {} {}
-                ORDER BY embedding_vector::{} <=> %s::{}
-                LIMIT %s
-            ), lexical_hits AS (
-                SELECT id FROM vector_embeddings v0
-                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {} {}
-                  AND content ILIKE %s
-                ORDER BY length(content),id LIMIT %s
-            ), candidates AS (
-                SELECT id FROM vector_hits UNION SELECT id FROM lexical_hits
-            )
-            SELECT v.id,v.project_id,v.document_id,v.chunk_id,v.object_type,v.object_key,v.content,
-                   v.content_hash,v.model_name,v.dimension,v.metadata,v.created_at,v.updated_at,
-                   d.original_filename,d.storage_path,s.title AS section_title,
-                   GREATEST(0.0,1.0-(v.embedding_vector::{} <=> %s::{})) AS dense_score
-            FROM candidates hit JOIN vector_embeddings v ON v.id=hit.id
-            LEFT JOIN documents d ON d.id=v.document_id
-            LEFT JOIN chunks c ON c.id=v.chunk_id LEFT JOIN sections s ON s.id=c.section_id
-            WHERE (d.id IS NULL OR (d.is_deleted=FALSE AND d.active_revision_id=v.revision_id))
-            ORDER BY v.embedding_vector::{} <=> %s::{}
-            LIMIT %s"""
-        ).format(
-            sql.SQL(relation_filter), sql.SQL(active_filter), vector_type, vector_type,
-            sql.SQL(relation_filter), sql.SQL(active_filter), vector_type, vector_type,
-            vector_type, vector_type,
-        )
-        params = (
-            project_id,object_type,model_name,dimension,*relation_policy_params,
-            vector_literal,candidate_limit,
-            project_id,object_type,model_name,dimension,*relation_policy_params,
-            pattern,candidate_limit,
-            vector_literal,vector_literal,candidate_limit,
-        )
         with self.connection() as conn:
+            revisioned = all((
+                self._column_exists(conn, "vector_embeddings", "revision_id"),
+                self._column_exists(conn, "relation_assertions", "revision_id"),
+                self._column_exists(conn, "documents", "active_revision_id"),
+            ))
+            relation_filter = ""
+            relation_policy_params: list[Any] = []
+            if object_type == "relation":
+                relation_clause, relation_policy_params = self._publishable_relation_clause("r")
+                revision_join = (
+                    "AND r.revision_id IS NOT DISTINCT FROM v0.revision_id "
+                    if revisioned else ""
+                )
+                relation_filter = (
+                    " AND EXISTS (SELECT 1 FROM relation_assertions r "
+                    "WHERE r.project_id=v0.project_id AND r.id::text=v0.object_key "
+                    + revision_join + "AND r.is_deleted=FALSE AND " + relation_clause + ")"
+                )
+            active_filter = (
+                " AND (v0.document_id IS NULL OR EXISTS (SELECT 1 FROM documents active_document "
+                "WHERE active_document.id=v0.document_id AND active_document.is_deleted=FALSE "
+                "AND active_document.active_revision_id=v0.revision_id))"
+                if revisioned else
+                " AND (v0.document_id IS NULL OR EXISTS (SELECT 1 FROM documents active_document "
+                "WHERE active_document.id=v0.document_id AND active_document.is_deleted=FALSE))"
+            )
+            final_active_filter = (
+                "(d.id IS NULL OR (d.is_deleted=FALSE AND d.active_revision_id=v.revision_id))"
+                if revisioned else "(d.id IS NULL OR d.is_deleted=FALSE)"
+            )
+            statement = sql.SQL(
+                """WITH vector_hits AS (
+                    SELECT id FROM vector_embeddings v0
+                    WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {} {}
+                    ORDER BY embedding_vector::{} <=> %s::{}
+                    LIMIT %s
+                ), lexical_hits AS (
+                    SELECT id FROM vector_embeddings v0
+                    WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {} {}
+                      AND content ILIKE %s
+                    ORDER BY length(content),id LIMIT %s
+                ), candidates AS (
+                    SELECT id FROM vector_hits UNION SELECT id FROM lexical_hits
+                )
+                SELECT v.id,v.project_id,v.document_id,v.chunk_id,v.object_type,v.object_key,v.content,
+                       v.content_hash,v.model_name,v.dimension,v.metadata,v.created_at,v.updated_at,
+                       d.original_filename,d.storage_path,s.title AS section_title,
+                       GREATEST(0.0,1.0-(v.embedding_vector::{} <=> %s::{})) AS dense_score
+                FROM candidates hit JOIN vector_embeddings v ON v.id=hit.id
+                LEFT JOIN documents d ON d.id=v.document_id
+                LEFT JOIN chunks c ON c.id=v.chunk_id LEFT JOIN sections s ON s.id=c.section_id
+                WHERE {}
+                ORDER BY v.embedding_vector::{} <=> %s::{}
+                LIMIT %s"""
+            ).format(
+                sql.SQL(relation_filter), sql.SQL(active_filter), vector_type, vector_type,
+                sql.SQL(relation_filter), sql.SQL(active_filter), vector_type, vector_type,
+                sql.SQL(final_active_filter), vector_type, vector_type,
+            )
+            params = (
+                project_id,object_type,model_name,dimension,*relation_policy_params,
+                vector_literal,candidate_limit,
+                project_id,object_type,model_name,dimension,*relation_policy_params,
+                pattern,candidate_limit,
+                vector_literal,vector_literal,candidate_limit,
+            )
             conn.execute("SELECT set_config('hnsw.ef_search',%s,TRUE)", (str(Config.pgvector_hnsw_ef_search),))
             return conn.execute(statement, params).fetchall()
 
@@ -2685,10 +2714,15 @@ class Database:
     def _add_relation_assertion(
         self, conn: psycopg.Connection, values: dict[str, Any],
     ) -> dict[str, Any]:
+        conflict_target = (
+            "(revision_id,relation_key)"
+            if self._column_exists(conn, "relation_assertions", "revision_id")
+            else "(project_id,relation_key)"
+        )
         row = conn.execute(
-                """INSERT INTO relation_assertions(project_id,document_id,chunk_id,source_entity_id,target_entity_id,relation_key,relation_type,description,confidence,extraction_version,ingestion_run_id,evidence_text,evidence_start,evidence_end,verification_status,metadata)
+                f"""INSERT INTO relation_assertions(project_id,document_id,chunk_id,source_entity_id,target_entity_id,relation_key,relation_type,description,confidence,extraction_version,ingestion_run_id,evidence_text,evidence_start,evidence_end,verification_status,metadata)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                ON CONFLICT(revision_id,relation_key) DO UPDATE SET document_id=EXCLUDED.document_id,
+                ON CONFLICT{conflict_target} DO UPDATE SET document_id=EXCLUDED.document_id,
                 chunk_id=EXCLUDED.chunk_id,source_entity_id=EXCLUDED.source_entity_id,
                 target_entity_id=EXCLUDED.target_entity_id,relation_type=EXCLUDED.relation_type,description=EXCLUDED.description,
                 confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
@@ -3445,8 +3479,24 @@ class Database:
         policy_hash: str,
         generation: int,
     ) -> None:
+        revisioned = all((
+            Database._column_exists(conn, "documents", "active_revision_id"),
+            Database._column_exists(conn, "relation_assertions", "revision_id"),
+            Database._column_exists(conn, "mention_relation_assertions", "revision_id"),
+            Database._column_exists(conn, "entity_mentions", "revision_id"),
+        ))
+        active_revision_join = (
+            "AND active_document.active_revision_id=r.revision_id" if revisioned else ""
+        )
+        fact_revision_filter = "AND fact.revision_id=r.revision_id" if revisioned else ""
+        source_revision_filter = (
+            "AND source_mention.revision_id=r.revision_id" if revisioned else ""
+        )
+        target_revision_filter = (
+            "AND target_mention.revision_id=r.revision_id" if revisioned else ""
+        )
         conn.execute(
-            """INSERT INTO canonical_relation_projections(
+            f"""INSERT INTO canonical_relation_projections(
                project_id,assertion_id,source_entity_id,target_entity_id,
                assignment_generation,policy_hash,publishable,quarantine_reason)
                SELECT r.project_id,r.id,
@@ -3467,19 +3517,19 @@ class Database:
                FROM relation_assertions r
                JOIN documents active_document
                  ON active_document.id=r.document_id
-                AND active_document.active_revision_id=r.revision_id
+                {active_revision_join}
                 AND active_document.is_deleted=FALSE
                LEFT JOIN LATERAL (
                    SELECT fact.source_mention_key,fact.target_mention_key
                    FROM mention_relation_assertions fact
                    WHERE fact.project_id=r.project_id AND fact.canonical_assertion_id=r.id
-                     AND fact.revision_id=r.revision_id
+                     {fact_revision_filter}
                    ORDER BY fact.created_at DESC,fact.id DESC LIMIT 1
                ) mention_fact ON TRUE
                LEFT JOIN entity_mentions source_mention
                 ON source_mention.project_id=r.project_id
                 AND source_mention.mention_key=mention_fact.source_mention_key
-                AND source_mention.revision_id=r.revision_id
+                {source_revision_filter}
                 AND source_mention.is_deleted=FALSE
                LEFT JOIN entity_assignments source_assignment
                  ON source_assignment.project_id=r.project_id
@@ -3488,7 +3538,7 @@ class Database:
                LEFT JOIN entity_mentions target_mention
                 ON target_mention.project_id=r.project_id
                 AND target_mention.mention_key=mention_fact.target_mention_key
-                AND target_mention.revision_id=r.revision_id
+                {target_revision_filter}
                 AND target_mention.is_deleted=FALSE
                LEFT JOIN entity_assignments target_assignment
                  ON target_assignment.project_id=r.project_id
@@ -3523,13 +3573,13 @@ class Database:
         if not definitions:
             return
         rows = conn.execute(
-            """SELECT projection.assertion_id,r.relation_type,
+            f"""SELECT projection.assertion_id,r.relation_type,
                       source.entity_type AS source_type,target.entity_type AS target_type
                FROM canonical_relation_projections projection
                JOIN relation_assertions r ON r.id=projection.assertion_id
                JOIN documents active_document
                  ON active_document.id=r.document_id
-                AND active_document.active_revision_id=r.revision_id
+                {active_revision_join}
                 AND active_document.is_deleted=FALSE
                JOIN canonical_entities source ON source.id=projection.source_entity_id
                JOIN canonical_entities target ON target.id=projection.target_entity_id
@@ -3569,29 +3619,44 @@ class Database:
         ids = sorted({int(value) for value in entity_ids})
         if not ids:
             return
+        revisioned = all((
+            Database._column_exists(conn, "documents", "active_revision_id"),
+            Database._column_exists(conn, "canonical_entity_documents", "revision_id"),
+            Database._column_exists(conn, "entity_mentions", "revision_id"),
+        ))
+        active_projection_filter = (
+            "AND document.active_revision_id=source.revision_id" if revisioned else ""
+        )
+        active_mention_filter = (
+            "AND document.active_revision_id=mention.revision_id" if revisioned else ""
+        )
+        conflict_target = (
+            "(revision_id,canonical_entity_id)"
+            if revisioned else "(canonical_entity_id,document_id)"
+        )
         conn.execute(
-            """UPDATE canonical_entity_documents source
+            f"""UPDATE canonical_entity_documents source
                SET is_deleted=TRUE,updated_at=NOW()
                FROM documents document
                WHERE source.project_id=%s AND source.canonical_entity_id=ANY(%s)
                  AND document.id=source.document_id
-                 AND document.active_revision_id=source.revision_id
+                 {active_projection_filter}
                  AND document.is_deleted=FALSE""",
             (project_id, ids),
         )
         conn.execute(
-            """INSERT INTO canonical_entity_documents(
+            f"""INSERT INTO canonical_entity_documents(
                    project_id,canonical_entity_id,document_id)
                SELECT assignment.project_id,assignment.canonical_entity_id,mention.document_id
                FROM entity_assignments assignment
                JOIN entity_mentions mention ON mention.id=assignment.mention_id
                JOIN documents document ON document.id=mention.document_id
-                 AND document.active_revision_id=mention.revision_id
+                 {active_mention_filter}
                WHERE assignment.project_id=%s AND assignment.active=TRUE
                  AND assignment.canonical_entity_id=ANY(%s)
                  AND mention.is_deleted=FALSE AND document.is_deleted=FALSE
                GROUP BY assignment.project_id,assignment.canonical_entity_id,mention.document_id
-               ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE SET
+               ON CONFLICT{conflict_target} DO UPDATE SET
                project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
             (project_id, ids),
         )
@@ -3608,6 +3673,13 @@ class Database:
         ids = sorted({int(value) for value in entity_ids})
         if not ids:
             return
+        revisioned = all((
+            Database._column_exists(conn, "documents", "active_revision_id"),
+            Database._column_exists(conn, "entity_mentions", "revision_id"),
+        ))
+        active_mention_filter = (
+            "AND document.active_revision_id=mention.revision_id" if revisioned else ""
+        )
         conn.execute(
             """UPDATE canonical_entity_aliases SET active=FALSE,updated_at=NOW()
                WHERE project_id=%s AND canonical_entity_id=ANY(%s)
@@ -3615,7 +3687,7 @@ class Database:
             (project_id, ids),
         )
         conn.execute(
-            """INSERT INTO canonical_entity_aliases(
+            f"""INSERT INTO canonical_entity_aliases(
                    project_id,canonical_entity_id,entity_type,alias,normalized_alias,
                    alias_kind,active,evidence,policy_version)
                SELECT DISTINCT ON (assignment.canonical_entity_id,mention.normalized_name)
@@ -3625,7 +3697,7 @@ class Database:
                FROM entity_assignments assignment
                JOIN entity_mentions mention ON mention.id=assignment.mention_id
                JOIN documents document ON document.id=mention.document_id
-                 AND document.active_revision_id=mention.revision_id
+                 {active_mention_filter}
                  AND document.is_deleted=FALSE
                JOIN canonical_entities entity ON entity.id=assignment.canonical_entity_id
                WHERE assignment.project_id=%s AND assignment.active=TRUE
@@ -3690,6 +3762,24 @@ class Database:
             project_id, "merge", f"{source_entity_id}:{target_entity_id}",
         )
         with self.connection() as conn:
+            revisioned = all((
+                self._column_exists(conn, "documents", "active_revision_id"),
+                self._column_exists(conn, "entity_mentions", "revision_id"),
+                self._column_exists(conn, "canonical_entity_documents", "revision_id"),
+            ))
+            active_mention_filter = (
+                "AND d.active_revision_id=m.revision_id" if revisioned else ""
+            )
+            active_assignment_filter = (
+                "AND document.active_revision_id=mention.revision_id" if revisioned else ""
+            )
+            active_projection_filter = (
+                "AND document.active_revision_id=source.revision_id" if revisioned else ""
+            )
+            projection_conflict_target = (
+                "(revision_id,canonical_entity_id)"
+                if revisioned else "(canonical_entity_id,document_id)"
+            )
             entities = conn.execute(
                 """SELECT * FROM canonical_entities
                    WHERE project_id=%s AND id=ANY(%s) FOR UPDATE""",
@@ -3706,33 +3796,33 @@ class Database:
             if blocked:
                 raise ValueError("实体存在有效 cannot-link，禁止合并")
             conn.execute(
-                """INSERT INTO entity_assignments(
+                f"""INSERT INTO entity_assignments(
                    project_id,mention_id,canonical_entity_id,assignment_generation,
                    policy_version,reason,active)
                    SELECT m.project_id,m.id,m.canonical_entity_id,1,%s,'legacy assignment',TRUE
                    FROM entity_mentions m
                    JOIN documents d ON d.id=m.document_id
-                     AND d.active_revision_id=m.revision_id AND d.is_deleted=FALSE
+                     {active_mention_filter} AND d.is_deleted=FALSE
                    WHERE m.project_id=%s AND m.is_deleted=FALSE
                    ON CONFLICT(project_id,mention_id) WHERE active=TRUE DO NOTHING""",
                 (policy_version, project_id),
             )
             assignments = conn.execute(
-                """SELECT assignment.id,assignment.mention_id,assignment.canonical_entity_id,
+                f"""SELECT assignment.id,assignment.mention_id,assignment.canonical_entity_id,
                           assignment.assignment_generation
                    FROM entity_assignments assignment
                    JOIN entity_mentions mention ON mention.id=assignment.mention_id
                    JOIN documents document ON document.id=mention.document_id
-                     AND document.active_revision_id=mention.revision_id
+                     {active_assignment_filter}
                      AND document.is_deleted=FALSE
                    WHERE assignment.project_id=%s AND assignment.canonical_entity_id=%s
                      AND assignment.active=TRUE ORDER BY assignment.mention_id FOR UPDATE""",
                 (project_id, source_entity_id),
             ).fetchall()
             source_documents = conn.execute(
-                """SELECT source.document_id FROM canonical_entity_documents source
+                f"""SELECT source.document_id FROM canonical_entity_documents source
                    JOIN documents document ON document.id=source.document_id
-                     AND document.active_revision_id=source.revision_id
+                     {active_projection_filter}
                      AND document.is_deleted=FALSE
                    WHERE source.project_id=%s AND source.canonical_entity_id=%s
                      AND source.is_deleted=FALSE ORDER BY source.document_id""",
@@ -3777,26 +3867,26 @@ class Database:
                 (project_id, source_entity_id, target_entity_id, event_id),
             )
             conn.execute(
-                """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
+                f"""INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
                    SELECT project_id,%s,document_id FROM canonical_entity_documents
                    WHERE project_id=%s AND canonical_entity_id=%s AND is_deleted=FALSE
                      AND EXISTS(
                          SELECT 1 FROM documents document
                          WHERE document.id=canonical_entity_documents.document_id
-                           AND document.active_revision_id=canonical_entity_documents.revision_id
+                           {active_projection_filter.replace('source.', 'canonical_entity_documents.')}
                            AND document.is_deleted=FALSE
                      )
-                   ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE
+                   ON CONFLICT{projection_conflict_target} DO UPDATE
                    SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
                 (target_entity_id, project_id, source_entity_id),
             )
             conn.execute(
-                """UPDATE canonical_entity_documents source
+                f"""UPDATE canonical_entity_documents source
                    SET is_deleted=TRUE,updated_at=NOW()
                    FROM documents document
                    WHERE source.project_id=%s AND source.canonical_entity_id=%s
                      AND document.id=source.document_id
-                     AND document.active_revision_id=source.revision_id
+                     {active_projection_filter}
                      AND document.is_deleted=FALSE""",
                 (project_id, source_entity_id),
             )
@@ -3855,6 +3945,17 @@ class Database:
 
         undo_id = self._resolution_event_id(project_id, "undo", event_id)
         with self.connection() as conn:
+            revisioned = all((
+                self._column_exists(conn, "documents", "active_revision_id"),
+                self._column_exists(conn, "entity_mentions", "revision_id"),
+                self._column_exists(conn, "canonical_entity_documents", "revision_id"),
+            ))
+            active_mention_filter = (
+                "AND document.active_revision_id=mention.revision_id" if revisioned else ""
+            )
+            active_projection_filter = (
+                "AND document.active_revision_id=source.revision_id" if revisioned else ""
+            )
             event = conn.execute(
                 """SELECT * FROM entity_resolution_events
                    WHERE id=%s AND project_id=%s FOR UPDATE""",
@@ -3868,10 +3969,10 @@ class Database:
             assignment_ids = [int(item["id"]) for item in (event.get("before_state") or {}).get("assignments", [])]
             if assignment_ids:
                 current_count = int(conn.execute(
-                    """SELECT COUNT(*) AS count FROM entity_assignments assignment
+                    f"""SELECT COUNT(*) AS count FROM entity_assignments assignment
                        JOIN entity_mentions mention ON mention.id=assignment.mention_id
                        JOIN documents document ON document.id=mention.document_id
-                         AND document.active_revision_id=mention.revision_id
+                         {active_mention_filter}
                          AND document.is_deleted=FALSE
                        WHERE assignment.id=ANY(%s)""",
                     (assignment_ids,),
@@ -3901,13 +4002,13 @@ class Database:
             ]
             if document_ids:
                 conn.execute(
-                    """UPDATE canonical_entity_documents source
+                    f"""UPDATE canonical_entity_documents source
                        SET is_deleted=FALSE,updated_at=NOW()
                        FROM documents document
                        WHERE source.project_id=%s AND source.canonical_entity_id=%s
                          AND source.document_id=ANY(%s)
                          AND document.id=source.document_id
-                         AND document.active_revision_id=source.revision_id
+                         {active_projection_filter}
                          AND document.is_deleted=FALSE""",
                     (project_id, source_id, document_ids),
                 )
@@ -3969,14 +4070,21 @@ class Database:
             project_id, "split", f"{source_entity_id}:{target_entity_id}:{selected}",
         )
         with self.connection() as conn:
+            revisioned = all((
+                self._column_exists(conn, "documents", "active_revision_id"),
+                self._column_exists(conn, "entity_mentions", "revision_id"),
+            ))
+            active_mention_filter = (
+                "AND document.active_revision_id=mention.revision_id" if revisioned else ""
+            )
             rows = conn.execute(
-                """SELECT a.id,a.project_id,a.mention_id,a.canonical_entity_id,
+                f"""SELECT a.id,a.project_id,a.mention_id,a.canonical_entity_id,
                           a.assignment_generation,a.policy_version,a.event_id,a.reason,
                           a.active,a.metadata
                    FROM entity_assignments a
                    JOIN entity_mentions mention ON mention.id=a.mention_id
                    JOIN documents document ON document.id=mention.document_id
-                     AND document.active_revision_id=mention.revision_id
+                     {active_mention_filter}
                      AND document.is_deleted=FALSE
                    WHERE a.project_id=%s AND a.mention_id=ANY(%s)
                      AND a.canonical_entity_id=%s AND a.active=TRUE
@@ -4042,23 +4150,599 @@ class Database:
         policy_set: dict[str, Any],
         document_order: list[int],
         snapshot_id: str | None = None,
+        *,
+        input_fingerprint: str = "",
+        model_name: str = "",
+        embedding_model: str = "",
+        config_hash: str = "",
+        code_version: str = "",
     ) -> dict[str, Any]:
         with self.connection() as conn:
-            conn.execute(
-                "DELETE FROM entity_shadow_assignments WHERE namespace_id=%s", (namespace_id,),
-            )
-            conn.execute(
-                "DELETE FROM entity_shadow_canonicals WHERE namespace_id=%s", (namespace_id,),
-            )
+            existing = conn.execute(
+                "SELECT * FROM entity_shadow_namespaces WHERE id=%s FOR UPDATE",
+                (namespace_id,),
+            ).fetchone()
+            if existing:
+                if (
+                    input_fingerprint
+                    and existing.get("input_fingerprint")
+                    and existing["input_fingerprint"] != input_fingerprint
+                ):
+                    raise RuntimeError("entity shadow namespace 输入指纹冲突")
+                return existing
             return conn.execute(
                 """INSERT INTO entity_shadow_namespaces(
-                   id,project_id,snapshot_id,policy_set,status,document_order)
-                   VALUES(%s,%s,%s,%s::jsonb,'building',%s)
-                   ON CONFLICT(id) DO UPDATE SET policy_set=EXCLUDED.policy_set,
-                   status='building',document_order=EXCLUDED.document_order,metrics='{}'::jsonb,
-                   error_message='',completed_at=NULL RETURNING *""",
-                (namespace_id, project_id, snapshot_id, self._json(policy_set), document_order),
+                   id,project_id,snapshot_id,policy_set,status,document_order,
+                   input_fingerprint,model_name,embedding_model,config_hash,code_version)
+                   VALUES(%s,%s,%s,%s::jsonb,'building',%s,%s,%s,%s,%s,%s)
+                   RETURNING *""",
+                (
+                    namespace_id, project_id, snapshot_id, self._json(policy_set),
+                    document_order, input_fingerprint, model_name, embedding_model,
+                    config_hash, code_version,
+                ),
             ).fetchone()
+
+    def get_entity_shadow_namespace(self, namespace_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM entity_shadow_namespaces WHERE id=%s", (namespace_id,),
+            ).fetchone()
+
+    def seed_entity_shadow_work_items(
+        self,
+        namespace_id: str,
+        items: list[dict[str, Any]],
+        *,
+        max_attempts: int = 3,
+    ) -> int:
+        with self.connection() as conn:
+            for item in items:
+                conn.execute(
+                    """INSERT INTO entity_shadow_work_items(
+                       id,namespace_id,revision_id,project_id,document_id,chunk_id,
+                       input_fingerprint,status,max_attempts)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,'pending',%s)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        item["id"], namespace_id, item["revision_id"],
+                        item["project_id"], item["document_id"], item["chunk_id"],
+                        item["input_fingerprint"], max(1, min(20, max_attempts)),
+                    ),
+                )
+            count = int(conn.execute(
+                "SELECT COUNT(*) AS count FROM entity_shadow_work_items WHERE namespace_id=%s",
+                (namespace_id,),
+            ).fetchone()["count"])
+            conn.execute(
+                """UPDATE entity_shadow_namespaces SET expected_work_items=%s
+                   WHERE id=%s""",
+                (count, namespace_id),
+            )
+            return count
+
+    def claim_entity_shadow_work(
+        self,
+        namespace_id: str,
+        worker_id: str,
+        *,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        lease_token = uuid.uuid4().hex
+        with self.connection() as conn:
+            return conn.execute(
+                """WITH candidate AS (
+                       SELECT id FROM entity_shadow_work_items
+                       WHERE namespace_id=%s AND attempt<max_attempts AND (
+                         status IN ('pending','retryable_failed')
+                         OR (status='leased' AND lease_expires_at<NOW())
+                       )
+                       ORDER BY document_id,chunk_id,id FOR UPDATE SKIP LOCKED LIMIT 1
+                   )
+                   UPDATE entity_shadow_work_items work SET
+                     status='leased',attempt=work.attempt+1,lease_owner=%s,lease_token=%s,
+                     lease_expires_at=NOW()+(%s*INTERVAL '1 second'),updated_at=NOW(),
+                     error_message=''
+                   FROM candidate WHERE work.id=candidate.id RETURNING work.*""",
+                (namespace_id, worker_id, lease_token, max(30, int(lease_seconds))),
+            ).fetchone()
+
+    def complete_entity_shadow_work(
+        self,
+        work_id: str,
+        lease_token: str,
+        output: dict[str, Any],
+        output_hash: str,
+    ) -> bool:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE entity_shadow_work_items SET status='completed',output_json=%s::jsonb,
+                   output_hash=%s,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+                   completed_at=NOW(),updated_at=NOW()
+                   WHERE id=%s AND status='leased' AND lease_token=%s RETURNING id""",
+                (self._json(output), output_hash, work_id, lease_token),
+            ).fetchone()
+            return bool(row)
+
+    def fail_entity_shadow_work(
+        self,
+        work_id: str,
+        lease_token: str,
+        error: str,
+    ) -> str:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE entity_shadow_work_items SET
+                   status=CASE WHEN attempt>=max_attempts THEN 'terminal_failed'
+                               ELSE 'retryable_failed' END,
+                   error_message=%s,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+                   updated_at=NOW()
+                   WHERE id=%s AND status='leased' AND lease_token=%s
+                   RETURNING status""",
+                (error[:4000], work_id, lease_token),
+            ).fetchone()
+            return str((row or {}).get("status") or "stale")
+
+    def persist_entity_shadow_extraction(
+        self,
+        namespace_id: str,
+        *,
+        project_id: int,
+        document_id: int,
+        revision_id: str,
+        chunk_id: int,
+        mentions: list[dict[str, Any]],
+        type_assertions: list[dict[str, Any]],
+        rejected: list[dict[str, Any]],
+    ) -> None:
+        with self.connection() as conn:
+            for item in mentions:
+                conn.execute(
+                    """INSERT INTO entity_shadow_mentions(
+                       namespace_id,mention_key,project_id,document_id,revision_id,chunk_id,
+                       surface,normalized_surface,evidence_text,evidence_start,evidence_end,
+                       confidence,extraction_policy_version,filter_decision,filter_reason,provenance)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'accepted','',%s::jsonb)
+                       ON CONFLICT(namespace_id,mention_key) DO NOTHING""",
+                    (
+                        namespace_id, item["mention_id"], project_id, document_id,
+                        revision_id, chunk_id, item["surface"], item["normalized_surface"],
+                        item.get("evidence") or item["surface"], int(item["start"]),
+                        int(item["end"]), float(item["confidence"]),
+                        item["extraction_policy_version"], self._json(item.get("provenance")),
+                    ),
+                )
+            for item in type_assertions:
+                conn.execute(
+                    """INSERT INTO entity_shadow_type_assertions(
+                       namespace_id,mention_key,entity_type,confidence,evidence_text,
+                       policy_version,source,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        namespace_id, item["mention_id"], item["entity_type"],
+                        float(item["confidence"]), item["evidence"],
+                        item["policy_version"], item.get("source") or "model",
+                        self._json(item.get("metadata")),
+                    ),
+                )
+            for item in rejected:
+                conn.execute(
+                    """INSERT INTO entity_shadow_filter_decisions(
+                       namespace_id,revision_id,document_id,chunk_id,decision,reason,
+                       raw_entity,policy_version)
+                       VALUES(%s,%s,%s,%s,'rejected',%s,%s::jsonb,%s)
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        namespace_id, revision_id, document_id, chunk_id,
+                        item["reason"], self._json(item.get("raw") or {}),
+                        str(item.get("policy_version") or "entity-extraction-p2-shadow-v1"),
+                    ),
+                )
+
+    def list_entity_shadow_mentions(
+        self, namespace_id: str, *, chunk_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clause = "" if chunk_id is None else " AND mention.chunk_id=%s"
+        params: tuple[Any, ...] = (namespace_id,) if chunk_id is None else (namespace_id, chunk_id)
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT mention.*,assertion.entity_type,assertion.confidence AS type_confidence,
+                   assertion.source AS type_source
+                   FROM entity_shadow_mentions mention
+                   LEFT JOIN LATERAL (
+                     SELECT * FROM entity_shadow_type_assertions item
+                     WHERE item.namespace_id=mention.namespace_id
+                       AND item.mention_key=mention.mention_key
+                     ORDER BY item.confidence DESC,item.entity_type LIMIT 1
+                   ) assertion ON TRUE
+                   WHERE mention.namespace_id=%s""" + clause
+                + " ORDER BY mention.document_id,mention.chunk_id,mention.evidence_start,mention.mention_key",
+                params,
+            ).fetchall()
+
+    def find_exact_entity_shadow_candidates(
+        self, namespace_id: str, normalized_alias: str, limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT canonical.*,1.0 AS lexical_score
+                   FROM entity_shadow_aliases alias
+                   JOIN entity_shadow_canonicals canonical
+                     ON canonical.namespace_id=alias.namespace_id
+                    AND canonical.canonical_key=alias.canonical_key
+                   WHERE alias.namespace_id=%s AND alias.normalized_alias=%s
+                   ORDER BY canonical.canonical_key LIMIT %s""",
+                (namespace_id, normalized_alias, max(1, min(10, limit))),
+            ).fetchall()
+
+    def find_entity_shadow_canonical(
+        self, namespace_id: str, canonical_key: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM entity_shadow_canonicals
+                   WHERE namespace_id=%s AND canonical_key=%s""",
+                (namespace_id, canonical_key),
+            ).fetchone()
+
+    def search_entity_shadow_name_candidates(
+        self, namespace_id: str, normalized_alias: str, limit: int,
+    ) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT canonical.*,MAX(similarity(alias.normalized_alias,%s)) AS lexical_score
+                   FROM entity_shadow_aliases alias
+                   JOIN entity_shadow_canonicals canonical
+                     ON canonical.namespace_id=alias.namespace_id
+                    AND canonical.canonical_key=alias.canonical_key
+                   WHERE alias.namespace_id=%s AND alias.normalized_alias %% %s
+                   GROUP BY canonical.namespace_id,canonical.canonical_key
+                   ORDER BY lexical_score DESC,canonical.canonical_key LIMIT %s""",
+                (normalized_alias, namespace_id, normalized_alias, max(1, min(50, limit))),
+            ).fetchall()
+
+    def _ensure_entity_shadow_hnsw_index(
+        self, conn: psycopg.Connection, model_name: str, dimension: int,
+    ) -> None:
+        if dimension <= 0 or dimension > Config.pgvector_hnsw_max_dimensions:
+            raise RuntimeError(
+                f"shadow embedding 维度 {dimension} 无可用 HNSW，按策略拒绝退化为全表扫描"
+            )
+        suffix = hashlib.sha256(f"shadow|{model_name}|{dimension}".encode()).hexdigest()[:12]
+        statement = sql.SQL(
+            """CREATE INDEX IF NOT EXISTS {} ON entity_shadow_embeddings
+               USING hnsw ((embedding_vector::vector({})) vector_cosine_ops)
+               WITH (m={},ef_construction={}) WHERE model_name={} AND dimension={}"""
+        ).format(
+            sql.Identifier(f"idx_entity_shadow_hnsw_{suffix}"),
+            sql.Literal(dimension), sql.Literal(Config.pgvector_hnsw_m),
+            sql.Literal(Config.pgvector_hnsw_ef_construction),
+            sql.Literal(model_name), sql.Literal(dimension),
+        )
+        conn.execute(statement)
+
+    def search_entity_shadow_vector_candidates(
+        self,
+        namespace_id: str,
+        model_name: str,
+        query_vector: list[float],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        vector_literal = self._vector_literal(query_vector)
+        dimension = len(query_vector)
+        vector_type = sql.SQL("vector({})").format(sql.Literal(dimension))
+        statement = sql.SQL(
+            """SELECT canonical.*,
+               GREATEST(0.0,1.0-(embedding.embedding_vector::{} <=> %s::{})) AS vector_score
+               FROM entity_shadow_embeddings embedding
+               JOIN entity_shadow_canonicals canonical
+                 ON canonical.namespace_id=embedding.namespace_id
+                AND canonical.canonical_key=embedding.canonical_key
+               WHERE embedding.namespace_id=%s AND embedding.model_name=%s
+                 AND embedding.dimension=%s
+               ORDER BY embedding.embedding_vector::{} <=> %s::{} LIMIT %s"""
+        ).format(vector_type, vector_type, vector_type, vector_type)
+        with self.connection() as conn:
+            self._ensure_entity_shadow_hnsw_index(conn, model_name, dimension)
+            conn.execute("SELECT set_config('hnsw.iterative_scan','relaxed_order',TRUE)")
+            return conn.execute(
+                statement,
+                (
+                    vector_literal, namespace_id, model_name, dimension,
+                    vector_literal, max(1, min(100, limit)),
+                ),
+            ).fetchall()
+
+    def persist_entity_shadow_candidates(self, rows: list[dict[str, Any]]) -> None:
+        with self.connection() as conn:
+            for item in rows:
+                scores = item.get("scores") or {}
+                conn.execute(
+                    """INSERT INTO entity_shadow_candidates(
+                       namespace_id,mention_key,canonical_key,stage,rank,cap,
+                       lexical_score,vector_score,reranker_score,combined_score,
+                       filter_reason,decision,reason,policy_version,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(namespace_id,mention_key,canonical_key,stage) DO UPDATE SET
+                       rank=EXCLUDED.rank,cap=EXCLUDED.cap,lexical_score=EXCLUDED.lexical_score,
+                       vector_score=EXCLUDED.vector_score,reranker_score=EXCLUDED.reranker_score,
+                       combined_score=EXCLUDED.combined_score,filter_reason=EXCLUDED.filter_reason,
+                       decision=EXCLUDED.decision,reason=EXCLUDED.reason,metadata=EXCLUDED.metadata""",
+                    (
+                        item["namespace_id"], item["mention_key"], item["canonical_key"],
+                        item["stage"], int(item["rank"]), int(item["cap"]),
+                        float(scores.get("lexical") or 0), float(scores.get("vector") or 0),
+                        float(scores.get("reranker") or 0), float(scores.get("combined") or 0),
+                        item.get("filter_reason") or "", item.get("decision") or "",
+                        item.get("reason") or "", item["policy_version"],
+                        self._json(item.get("metadata")),
+                    ),
+                )
+
+    def upsert_entity_shadow_canonical(
+        self,
+        namespace_id: str,
+        canonical: dict[str, Any],
+        mention: dict[str, Any],
+        *,
+        aliases: list[dict[str, Any]],
+        embedding_model: str,
+        embedding: list[float] | None,
+        decision: str,
+        reason: str,
+        scores: dict[str, Any],
+        config_hash: str,
+    ) -> dict[str, Any]:
+        canonical_key = str(canonical["canonical_key"])
+        with self.connection() as conn:
+            existing_assignment = conn.execute(
+                """SELECT canonical_key FROM entity_shadow_assignments
+                   WHERE namespace_id=%s AND mention_key=%s""",
+                (namespace_id, mention["mention_id"]),
+            ).fetchone()
+            row = conn.execute(
+                """INSERT INTO entity_shadow_canonicals(
+                   namespace_id,canonical_key,name,normalized_name,primary_type,aliases,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(namespace_id,canonical_key) DO UPDATE SET
+                   aliases=(SELECT ARRAY(SELECT DISTINCT unnest(
+                     entity_shadow_canonicals.aliases||EXCLUDED.aliases))),
+                   metadata=entity_shadow_canonicals.metadata||EXCLUDED.metadata
+                   RETURNING *""",
+                (
+                    namespace_id, canonical_key, canonical["name"], canonical["normalized_name"],
+                    canonical.get("primary_type") or "GenericEntity",
+                    canonical.get("aliases") or [], self._json(canonical.get("metadata")),
+                ),
+            ).fetchone()
+            alias_rows = [{
+                "surface": mention["surface"],
+                "normalized_surface": mention["normalized_surface"],
+                "start": mention["start"], "end": mention["end"],
+                "confidence": mention.get("confidence") or 0.5,
+                "kind": "mention",
+            }, *aliases]
+            for alias in alias_rows:
+                if not alias.get("normalized_surface"):
+                    continue
+                conn.execute(
+                    """INSERT INTO entity_shadow_aliases(
+                       namespace_id,canonical_key,mention_key,alias,normalized_alias,
+                       alias_kind,evidence_start,evidence_end,confidence,policy_version,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT DO NOTHING""",
+                    (
+                        namespace_id, canonical_key, mention["mention_id"], alias["surface"],
+                        alias["normalized_surface"], alias.get("kind") or "observed",
+                        alias.get("start"), alias.get("end"), float(alias.get("confidence") or 0.5),
+                        mention["policy_version"], self._json(alias.get("metadata")),
+                    ),
+                )
+            if embedding is not None:
+                self._ensure_entity_shadow_hnsw_index(conn, embedding_model, len(embedding))
+                vector_literal = self._vector_literal(embedding)
+                content_hash = hashlib.sha256(
+                    f"{canonical['name']}|{canonical.get('primary_type') or ''}".encode()
+                ).hexdigest()
+                conn.execute(
+                    """INSERT INTO entity_shadow_embeddings(
+                       namespace_id,canonical_key,model_name,embedding,embedding_vector,
+                       dimension,content_hash,policy_version,metadata)
+                       VALUES(%s,%s,%s,%s,%s::vector,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(namespace_id,canonical_key,model_name) DO UPDATE SET
+                       embedding=EXCLUDED.embedding,embedding_vector=EXCLUDED.embedding_vector,
+                       dimension=EXCLUDED.dimension,content_hash=EXCLUDED.content_hash,
+                       metadata=EXCLUDED.metadata""",
+                    (
+                        namespace_id, canonical_key, embedding_model, embedding, vector_literal,
+                        len(embedding), content_hash, mention["policy_version"],
+                        self._json({"config_hash": config_hash}),
+                    ),
+                )
+            conn.execute(
+                """INSERT INTO entity_shadow_assignments(
+                   namespace_id,mention_key,canonical_key,document_id,chunk_id,revision_id,
+                   entity_type,policy_version,decision,reason,scores,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+                   ON CONFLICT(namespace_id,mention_key) DO UPDATE SET
+                   canonical_key=EXCLUDED.canonical_key,entity_type=EXCLUDED.entity_type,
+                   policy_version=EXCLUDED.policy_version,decision=EXCLUDED.decision,
+                   reason=EXCLUDED.reason,scores=EXCLUDED.scores,metadata=EXCLUDED.metadata""",
+                (
+                    namespace_id, mention["mention_id"], canonical_key,
+                    int(mention["document_id"]), int(mention["chunk_id"]), mention["revision_id"],
+                    mention.get("entity_type") or "GenericEntity", mention["policy_version"],
+                    decision, reason, self._json(scores),
+                    self._json({
+                        "evidence_start": mention["start"], "evidence_end": mention["end"],
+                        "type_source": mention.get("type_source") or "model",
+                    }),
+                ),
+            )
+            old_canonical_key = (
+                str(existing_assignment["canonical_key"]) if existing_assignment else ""
+            )
+            if not old_canonical_key:
+                row = conn.execute(
+                    """UPDATE entity_shadow_canonicals SET source_count=source_count+1
+                       WHERE namespace_id=%s AND canonical_key=%s RETURNING *""",
+                    (namespace_id, canonical_key),
+                ).fetchone()
+            elif old_canonical_key != canonical_key:
+                conn.execute(
+                    """UPDATE entity_shadow_canonicals
+                       SET source_count=GREATEST(0,source_count-1)
+                       WHERE namespace_id=%s AND canonical_key=%s""",
+                    (namespace_id, old_canonical_key),
+                )
+                row = conn.execute(
+                    """UPDATE entity_shadow_canonicals SET source_count=source_count+1
+                       WHERE namespace_id=%s AND canonical_key=%s RETURNING *""",
+                    (namespace_id, canonical_key),
+                ).fetchone()
+            event_id = "shadow_event_" + hashlib.sha256(
+                f"{namespace_id}|{mention['mention_id']}|{decision}|{canonical_key}".encode()
+            ).hexdigest()
+            conn.execute(
+                """INSERT INTO entity_shadow_events(
+                   id,namespace_id,event_type,mention_key,target_canonical_key,after_state,
+                   reason,scores,model_name,config_hash,policy_version,provenance)
+                   VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(id) DO NOTHING""",
+                (
+                    event_id, namespace_id,
+                    (
+                        "new" if decision == "new_canonical"
+                        else "uncertain" if decision.startswith("uncertain_")
+                        else "assign"
+                    ),
+                    mention["mention_id"], canonical_key,
+                    self._json({"canonical_key": canonical_key}), reason, self._json(scores),
+                    mention.get("model_name") or "", config_hash, mention["policy_version"],
+                    self._json({
+                        "document_id": mention["document_id"], "revision_id": mention["revision_id"],
+                        "chunk_id": mention["chunk_id"], "span": [mention["start"], mention["end"]],
+                    }),
+                ),
+            )
+            return row
+
+    def list_entity_shadow_cannot_links(self, namespace_id: str) -> set[frozenset[str]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT left_key,right_key FROM entity_shadow_cannot_links
+                   WHERE namespace_id=%s AND hard=TRUE""",
+                (namespace_id,),
+            ).fetchall()
+            return {frozenset((str(item["left_key"]), str(item["right_key"]))) for item in rows}
+
+    def list_entity_shadow_must_links(self, namespace_id: str) -> dict[str, str]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT mention_key,canonical_key FROM entity_shadow_must_links
+                   WHERE namespace_id=%s AND hard=TRUE
+                   ORDER BY mention_key,canonical_key""",
+                (namespace_id,),
+            ).fetchall()
+            result: dict[str, str] = {}
+            for item in rows:
+                mention_key = str(item["mention_key"])
+                canonical_key = str(item["canonical_key"])
+                if mention_key in result and result[mention_key] != canonical_key:
+                    raise RuntimeError("同一 mention 存在冲突的 hard must-link")
+                result[mention_key] = canonical_key
+            return result
+
+    def finalize_entity_shadow_namespace(
+        self, namespace_id: str, *, metrics: dict[str, Any], artifact_hash: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            counts = conn.execute(
+                """SELECT COUNT(*) AS expected,
+                   COUNT(*) FILTER(WHERE status='completed') AS completed,
+                   COUNT(*) FILTER(WHERE status='terminal_failed') AS failed,
+                   COUNT(*) FILTER(WHERE status NOT IN ('completed','terminal_failed')) AS pending
+                   FROM entity_shadow_work_items WHERE namespace_id=%s""",
+                (namespace_id,),
+            ).fetchone()
+            status = "ready" if not int(counts["failed"]) and not int(counts["pending"]) else "failed"
+            row = conn.execute(
+                """UPDATE entity_shadow_namespaces SET status=%s,metrics=%s::jsonb,
+                   artifact_hash=%s,expected_work_items=%s,completed_work_items=%s,
+                   failed_work_items=%s,snapshot_complete=%s,error_message=%s,
+                   completed_at=CASE WHEN %s THEN NOW() ELSE NULL END
+                   WHERE id=%s RETURNING *""",
+                (
+                    status, self._json(metrics), artifact_hash, int(counts["expected"]),
+                    int(counts["completed"]), int(counts["failed"]), status == "ready",
+                    "" if status == "ready" else "entity shadow work 未全部成功",
+                    status == "ready", namespace_id,
+                ),
+            ).fetchone()
+            if status != "ready":
+                raise RuntimeError("entity shadow snapshot 不完整，不能标记 ready")
+            return row
+
+    def persist_entity_shadow_relation_endpoints(
+        self, namespace_id: str, rows: list[dict[str, Any]],
+    ) -> None:
+        with self.connection() as conn:
+            for item in rows:
+                conn.execute(
+                    """INSERT INTO entity_shadow_relation_endpoints(
+                       namespace_id,relation_key,document_id,revision_id,chunk_id,
+                       source_mention_key,target_mention_key,source_canonical_key,
+                       target_canonical_key,relation_type,evidence_text,evidence_start,
+                       evidence_end,policy_version,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(namespace_id,relation_key) DO UPDATE SET
+                       source_mention_key=EXCLUDED.source_mention_key,
+                       target_mention_key=EXCLUDED.target_mention_key,
+                       source_canonical_key=EXCLUDED.source_canonical_key,
+                       target_canonical_key=EXCLUDED.target_canonical_key,
+                       relation_type=EXCLUDED.relation_type,
+                       evidence_text=EXCLUDED.evidence_text,
+                       evidence_start=EXCLUDED.evidence_start,
+                       evidence_end=EXCLUDED.evidence_end,
+                       policy_version=EXCLUDED.policy_version,
+                       metadata=EXCLUDED.metadata""",
+                    (
+                        namespace_id, item["relation_key"], item["document_id"],
+                        item["revision_id"], item["chunk_id"], item["source_mention_key"],
+                        item["target_mention_key"], item["source_canonical_key"],
+                        item["target_canonical_key"], item["relation_type"],
+                        item.get("evidence_text") or "", item.get("evidence_start"),
+                        item.get("evidence_end"), item["policy_version"],
+                        self._json(item.get("metadata")),
+                    ),
+                )
+
+    def load_entity_shadow_snapshot(self, namespace_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            namespace = conn.execute(
+                "SELECT * FROM entity_shadow_namespaces WHERE id=%s", (namespace_id,),
+            ).fetchone()
+            if not namespace:
+                raise LookupError("entity shadow namespace 不存在")
+            canonicals = conn.execute(
+                """SELECT * FROM entity_shadow_canonicals WHERE namespace_id=%s
+                   ORDER BY canonical_key""", (namespace_id,),
+            ).fetchall()
+            assignments = conn.execute(
+                """SELECT * FROM entity_shadow_assignments WHERE namespace_id=%s
+                   ORDER BY mention_key""", (namespace_id,),
+            ).fetchall()
+            endpoints = conn.execute(
+                """SELECT * FROM entity_shadow_relation_endpoints WHERE namespace_id=%s
+                   ORDER BY relation_key""", (namespace_id,),
+            ).fetchall()
+            return {
+                "namespace": namespace,
+                "canonicals": canonicals,
+                "assignments": assignments,
+                "relation_endpoints": endpoints,
+            }
 
     def persist_entity_shadow_snapshot(
         self,
@@ -4260,22 +4944,29 @@ class Database:
     ) -> None:
         ids = sorted({int(value) for value in (entity_ids or [])})
         id_filter = " AND e.id=ANY(%s)" if ids else ""
+        revisioned = all((
+            Database._column_exists(conn, "documents", "active_revision_id"),
+            Database._column_exists(conn, "canonical_entity_documents", "revision_id"),
+        ))
+        active_projection_filter = (
+            "AND document.active_revision_id=source.revision_id" if revisioned else ""
+        )
         params: list[Any] = [project_id]
         if ids:
             params.append(ids)
         conn.execute(
-            """UPDATE canonical_entities e
+            f"""UPDATE canonical_entities e
                SET source_count=(
                        SELECT COUNT(*) FROM canonical_entity_documents source
                        JOIN documents document ON document.id=source.document_id
-                         AND document.active_revision_id=source.revision_id
+                         {active_projection_filter}
                        WHERE source.project_id=e.project_id AND document.is_deleted=FALSE
                          AND source.canonical_entity_id=e.id AND source.is_deleted=FALSE
                    ),
                    is_deleted=NOT EXISTS(
                        SELECT 1 FROM canonical_entity_documents source
                        JOIN documents document ON document.id=source.document_id
-                         AND document.active_revision_id=source.revision_id
+                         {active_projection_filter}
                        WHERE source.project_id=e.project_id AND document.is_deleted=FALSE
                          AND source.canonical_entity_id=e.id AND source.is_deleted=FALSE
                    ),

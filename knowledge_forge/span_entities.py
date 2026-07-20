@@ -92,9 +92,12 @@ class SpanFirstEntityExtractor:
         result = SpanExtractionResult()
         seen: set[str] = set()
         for raw in raw_entities:
-            surface = str(raw.get("evidence_text") or raw.get("surface") or "")
+            surface = str(raw.get("surface") or raw.get("name") or "")
             span = self._exact_span(
-                content, surface, raw.get("evidence_start"), raw.get("evidence_end"),
+                content,
+                surface,
+                raw.get("mention_start", raw.get("evidence_start")),
+                raw.get("mention_end", raw.get("evidence_end")),
             )
             if span is None:
                 result.rejected.append({"raw": dict(raw), "reason": "invalid_exact_span"})
@@ -115,7 +118,7 @@ class SpanFirstEntityExtractor:
                 normalized_surface=normalize_name(surface),
                 start=left,
                 end=right,
-                evidence=surface,
+                evidence=str(raw.get("evidence_text") or surface),
                 confidence=confidence,
                 extraction_policy_version=self.policy_version,
             )

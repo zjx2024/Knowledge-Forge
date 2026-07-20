@@ -50,3 +50,20 @@ def test_alias_requires_its_own_exact_span():
         }], chunk_metadata={},
     )
     assert [item.surface for item in result.aliases] == ["IBM"]
+
+
+def test_mention_span_is_independent_from_sentence_evidence_span():
+    content = "IBM announced a product."
+    extractor = SpanFirstEntityExtractor("entity-extraction-p2-shadow-v1")
+    result = extractor.normalize(
+        project_scope="p", document_key="d", chunk_key="c", content=content,
+        raw_entities=[{
+            "name": "IBM", "type": "Organization",
+            "mention_start": 0, "mention_end": 3,
+            "evidence_text": content, "evidence_start": 0, "evidence_end": len(content),
+        }],
+        chunk_metadata={},
+    )
+    assert result.mentions[0].surface == "IBM"
+    assert (result.mentions[0].start, result.mentions[0].end) == (0, 3)
+    assert result.mentions[0].evidence == content

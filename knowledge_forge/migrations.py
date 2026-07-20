@@ -507,6 +507,267 @@ CREATE TRIGGER trg_shadow_work_revision BEFORE INSERT OR UPDATE ON relation_shad
 """
 
 
+ENTITY_SHADOW_PIPELINE_SQL = r"""
+ALTER TABLE entity_shadow_namespaces ADD COLUMN input_fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_namespaces ADD COLUMN artifact_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_namespaces ADD COLUMN expected_work_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE entity_shadow_namespaces ADD COLUMN completed_work_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE entity_shadow_namespaces ADD COLUMN failed_work_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE entity_shadow_namespaces ADD COLUMN snapshot_complete BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE entity_shadow_namespaces ADD COLUMN model_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_namespaces ADD COLUMN embedding_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_namespaces ADD COLUMN config_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_namespaces ADD COLUMN code_version TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE entity_shadow_assignments ADD COLUMN decision TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_assignments ADD COLUMN reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE entity_shadow_assignments ADD COLUMN scores JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE entity_shadow_canonicals ADD COLUMN source_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE entity_shadow_canonicals ADD COLUMN generation BIGINT NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS entity_shadow_work_items (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    revision_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    chunk_id BIGINT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending','leased','completed','retryable_failed','terminal_failed'
+    )),
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 20),
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    output_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    output_hash TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(namespace_id,chunk_id),
+    FOREIGN KEY(revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_work_claim
+    ON entity_shadow_work_items(namespace_id,status,updated_at,id);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_mentions (
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    mention_key TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    revision_id TEXT NOT NULL,
+    chunk_id BIGINT NOT NULL,
+    surface TEXT NOT NULL,
+    normalized_surface TEXT NOT NULL,
+    evidence_text TEXT NOT NULL,
+    evidence_start INTEGER NOT NULL,
+    evidence_end INTEGER NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL,
+    extraction_policy_version TEXT NOT NULL,
+    filter_decision TEXT NOT NULL DEFAULT 'accepted',
+    filter_reason TEXT NOT NULL DEFAULT '',
+    provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,mention_key),
+    CHECK(evidence_start>=0 AND evidence_end>evidence_start),
+    FOREIGN KEY(revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_mentions_chunk
+    ON entity_shadow_mentions(namespace_id,chunk_id,evidence_start,mention_key);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_filter_decisions (
+    id BIGSERIAL PRIMARY KEY,
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    revision_id TEXT NOT NULL,
+    document_id BIGINT NOT NULL,
+    chunk_id BIGINT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    raw_entity JSONB NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(namespace_id,chunk_id,reason,raw_entity),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_type_assertions (
+    namespace_id TEXT NOT NULL,
+    mention_key TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL,
+    evidence_text TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    source TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,mention_key,entity_type,policy_version,source),
+    FOREIGN KEY(namespace_id,mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key)
+);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_aliases (
+    namespace_id TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    mention_key TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    alias_kind TEXT NOT NULL,
+    evidence_start INTEGER,
+    evidence_end INTEGER,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,canonical_key,mention_key,normalized_alias,alias_kind),
+    FOREIGN KEY(namespace_id,canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key),
+    FOREIGN KEY(namespace_id,mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_alias_exact
+    ON entity_shadow_aliases(namespace_id,normalized_alias);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_alias_trgm ON entity_shadow_aliases
+    USING gin(normalized_alias gin_trgm_ops);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_candidates (
+    namespace_id TEXT NOT NULL,
+    mention_key TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    cap INTEGER NOT NULL,
+    lexical_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    vector_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    reranker_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    combined_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    filter_reason TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,mention_key,canonical_key,stage),
+    FOREIGN KEY(namespace_id,mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key),
+    FOREIGN KEY(namespace_id,canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_candidates_rank
+    ON entity_shadow_candidates(namespace_id,mention_key,stage,rank);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_embeddings (
+    namespace_id TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    embedding DOUBLE PRECISION[] NOT NULL,
+    embedding_vector vector NOT NULL,
+    dimension INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,canonical_key,model_name),
+    FOREIGN KEY(namespace_id,canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_embedding_scope
+    ON entity_shadow_embeddings(namespace_id,model_name,dimension);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_cannot_links (
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    left_key TEXT NOT NULL,
+    right_key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    hard BOOLEAN NOT NULL DEFAULT TRUE,
+    policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,left_key,right_key),
+    CHECK(left_key<right_key)
+);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_must_links (
+    namespace_id TEXT NOT NULL,
+    mention_key TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    hard BOOLEAN NOT NULL DEFAULT TRUE,
+    policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,mention_key,canonical_key),
+    FOREIGN KEY(namespace_id,mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key),
+    FOREIGN KEY(namespace_id,canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_must_link_mention
+    ON entity_shadow_must_links(namespace_id,mention_key) WHERE hard=TRUE;
+
+CREATE TABLE IF NOT EXISTS entity_shadow_events (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    event_type TEXT NOT NULL CHECK(event_type IN (
+        'assign','new','merge','split','undo','cannot_link','uncertain'
+    )),
+    mention_key TEXT,
+    source_canonical_key TEXT,
+    target_canonical_key TEXT,
+    before_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    after_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reason TEXT NOT NULL,
+    scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reversible BOOLEAN NOT NULL DEFAULT TRUE,
+    reversed_by_event_id TEXT,
+    model_name TEXT NOT NULL DEFAULT '',
+    config_hash TEXT NOT NULL DEFAULT '',
+    policy_version TEXT NOT NULL,
+    provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_events_namespace
+    ON entity_shadow_events(namespace_id,created_at,id);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_relation_endpoints (
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    relation_key TEXT NOT NULL,
+    document_id BIGINT NOT NULL,
+    revision_id TEXT NOT NULL,
+    chunk_id BIGINT NOT NULL,
+    source_mention_key TEXT NOT NULL,
+    target_mention_key TEXT NOT NULL,
+    source_canonical_key TEXT NOT NULL,
+    target_canonical_key TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    evidence_text TEXT NOT NULL DEFAULT '',
+    evidence_start INTEGER,
+    evidence_end INTEGER,
+    policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,relation_key),
+    FOREIGN KEY(namespace_id,source_mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key),
+    FOREIGN KEY(namespace_id,target_mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key),
+    FOREIGN KEY(namespace_id,source_canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key),
+    FOREIGN KEY(namespace_id,target_canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_relation_chunk
+    ON entity_shadow_relation_endpoints(namespace_id,chunk_id,relation_key);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -517,6 +778,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0002_relation_shadow_work_queue",
         description="Persist exact resumable relation shadow work and attempt lineage",
         sql=RELATION_SHADOW_QUEUE_SQL,
+    ),
+    Migration(
+        version="0003_entity_shadow_pipeline",
+        description="Persist independent span-first entity shadow treatment and audit lineage",
+        sql=ENTITY_SHADOW_PIPELINE_SQL,
     ),
 )
 

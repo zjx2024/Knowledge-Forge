@@ -22,7 +22,7 @@ from .chunking import ProcessingResult, build_processing_result, parse_document_
 from .config import Config
 from .database import Database
 from .entity_resolution import EntityResolver
-from .entity_shadow import EntityShadowState
+from .entity_shadow import DatabaseShadowStore, ShadowEntityResolver, ShadowModelGateway
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
@@ -44,6 +44,7 @@ from .policy import POLICY_AXES, P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW
 from .quality import evaluate_release_gate, validate_gold_manifest
 from .relation_pipeline import VersionedRelationPipeline
 from .schema_evolution import SchemaEvolutionService
+from .span_entities import SpanFirstEntityExtractor
 from .vector_store import VectorStore
 
 
@@ -477,7 +478,7 @@ class KnowledgeForgeService:
         return failures
 
     def build_entity_shadow_namespace(self, project_id: int, snapshot_id: str = "") -> dict[str, Any]:
-        """Replay indexed documents in stable order into an isolated P2 entity namespace."""
+        """Build an independent span-first P2 treatment from active raw chunks."""
 
         project = self.db.get_project(project_id)
         if not project:
@@ -487,56 +488,358 @@ class KnowledgeForgeService:
             if item.get("status") == "indexed" and not item.get("is_deleted")
         ]
         documents.sort(key=lambda item: int(item["id"]))
-        material = "|".join((
-            str(project_id), snapshot_id or "live",
-            *(str(item["id"]) for item in documents),
-            P2_ENTITY_SHADOW_POLICY_SET["entity_resolution_policy_version"],
-        ))
-        namespace_id = "entity_shadow_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
-        self.db.create_entity_shadow_namespace(
-            project_id, namespace_id, dict(P2_ENTITY_SHADOW_POLICY_SET),
-            [int(item["id"]) for item in documents], snapshot_id or None,
-        )
-        state = EntityShadowState(
-            namespace=namespace_id,
-            policy_version=P2_ENTITY_SHADOW_POLICY_SET["entity_resolution_policy_version"],
-        )
-        mention_payloads: list[dict[str, Any]] = []
+        active_schema = self.db.get_active_schema(project_id)
+        if not active_schema:
+            raise RuntimeError("项目没有 active Schema，无法构建 entity treatment")
+        chunks: list[dict[str, Any]] = []
         for document in documents:
-            for mention in sorted(
-                self.db.list_document_mentions(int(document["id"])),
-                key=lambda item: (int(item.get("chunk_id") or 0), int(item["id"])),
-            ):
-                mention_payloads.append({
-                    "mention_id": mention.get("mention_key") or f"legacy_mention_{mention['id']}",
-                    "surface": mention.get("evidence_text") or mention["mention_text"],
-                    "normalized_surface": mention["normalized_name"],
-                    "entity_type": mention["entity_type"],
-                    "aliases": (mention.get("metadata") or {}).get("accepted_aliases") or [],
-                    "document_id": int(document["id"]),
-                    "chunk_id": int(mention["chunk_id"]),
-                })
-        state.replay(mention_payloads)
-        snapshot = state.snapshot()
-        payload_by_mention = {item["mention_id"]: item for item in mention_payloads}
-        for assignment in snapshot["assignments"]:
-            assignment.update(payload_by_mention[assignment["mention_id"]])
-        self.db.persist_entity_shadow_snapshot(
-            namespace_id, snapshot["canonicals"], snapshot["assignments"],
-            metrics={
-                "documents": len(documents), "mentions": len(mention_payloads),
-                "canonicals": len(snapshot["canonicals"]),
-                "duplicate_canonical_rate": None,
-                "canonical_compression_rate": (
-                    0.0 if not mention_payloads
-                    else max(
-                        0.0,
-                        1.0 - (len(snapshot["canonicals"]) / len(mention_payloads)),
-                    )
-                ),
-            },
+            chunks.extend(self.db.list_document_chunks(int(document["id"])))
+        chunks.sort(key=lambda item: (
+            int(item["document_id"]), int(item.get("chunk_index") or 0), int(item["id"]),
+        ))
+        policy_set = dict(P2_ENTITY_SHADOW_POLICY_SET)
+        llm_model = str(project.get("llm_model") or Config.default_llm_model)
+        embedding_model = str(project.get("embedding_model") or Config.default_embedding_model)
+        frozen_inputs = [{
+            "document_id": int(document["id"]),
+            "revision_id": str(document.get("active_revision_id") or ""),
+            "content_hash": str(document.get("doc_hash") or ""),
+        } for document in documents]
+        frozen_chunks = [{
+            "chunk_id": int(chunk["id"]),
+            "document_id": int(chunk["document_id"]),
+            "revision_id": str(chunk.get("revision_id") or ""),
+            "content_hash": str(chunk.get("content_hash") or ""),
+        } for chunk in chunks]
+        config_payload = {
+            "policy_set": policy_set,
+            "llm_model": llm_model,
+            "embedding_model": embedding_model,
+            "model_max_tokens": int(project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS),
+            "lexical_cap": min(Config.entity_lexical_max_k, Config.entity_lexical_top_k),
+            "vector_cap": min(Config.entity_vector_max_k, Config.entity_vector_top_k),
+            "reranker_cap": Config.entity_reranker_max_k,
+        }
+        config_hash = hashlib.sha256(
+            json.dumps(config_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        input_payload = {
+            "project_id": project_id,
+            "snapshot_id": snapshot_id or "live",
+            "documents": frozen_inputs,
+            "chunks": frozen_chunks,
+            "config_hash": config_hash,
+        }
+        input_fingerprint = hashlib.sha256(
+            json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        namespace_id = "entity_shadow_" + hashlib.sha256(
+            f"{snapshot_id or 'live'}|{input_fingerprint}".encode("utf-8")
+        ).hexdigest()
+        namespace = self.db.create_entity_shadow_namespace(
+            project_id, namespace_id, policy_set,
+            [int(item["id"]) for item in documents], snapshot_id or None,
+            input_fingerprint=input_fingerprint,
+            model_name=llm_model,
+            embedding_model=embedding_model,
+            config_hash=config_hash,
+            code_version="entity-shadow-prelive-v1",
         )
-        return {"namespace_id": namespace_id, **snapshot}
+        if namespace.get("snapshot_complete") and namespace.get("status") == "ready":
+            return {"namespace_id": namespace_id, **self.db.load_entity_shadow_snapshot(namespace_id)}
+
+        work_items = []
+        chunk_by_id = {int(item["id"]): item for item in chunks}
+        for chunk in chunks:
+            chunk_fingerprint = hashlib.sha256(
+                "|".join((
+                    namespace_id, str(chunk["id"]), str(chunk.get("revision_id") or ""),
+                    str(chunk.get("content_hash") or ""),
+                )).encode("utf-8")
+            ).hexdigest()
+            work_items.append({
+                "id": "entity_shadow_work_" + chunk_fingerprint,
+                "project_id": project_id,
+                "document_id": int(chunk["document_id"]),
+                "revision_id": str(chunk.get("revision_id") or ""),
+                "chunk_id": int(chunk["id"]),
+                "input_fingerprint": chunk_fingerprint,
+            })
+        self.db.seed_entity_shadow_work_items(namespace_id, work_items)
+        extractor = SpanFirstEntityExtractor(policy_set["entity_extraction_policy_version"])
+        store = DatabaseShadowStore(self.db)
+        model_gateway = ShadowModelGateway(
+            self.ollama,
+            llm_model=llm_model,
+            context_budget_tokens=int(
+                project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS
+            ),
+        )
+
+        def rerank(mention: dict[str, Any], candidates: list[dict[str, Any]]) -> list[float]:
+            return self.resolver.reranker.score(
+                {
+                    "name": mention["surface"],
+                    "type": mention.get("entity_type") or "GenericEntity",
+                    "description": mention.get("evidence") or "",
+                    "aliases": mention.get("aliases") or [],
+                },
+                [{
+                    **candidate,
+                    "entity_type": candidate.get("primary_type") or "GenericEntity",
+                } for candidate in candidates],
+            )
+
+        resolver = ShadowEntityResolver(
+            namespace=namespace_id,
+            policy_version=policy_set["entity_resolution_policy_version"],
+            store=store,
+            models=model_gateway,
+            reranker=rerank,
+            must_links=self.db.list_entity_shadow_must_links(namespace_id),
+            cannot_links=self.db.list_entity_shadow_cannot_links(namespace_id),
+            lexical_cap=config_payload["lexical_cap"],
+            vector_cap=config_payload["vector_cap"],
+            reranker_cap=config_payload["reranker_cap"],
+            auto_merge_threshold=Config.entity_merge_threshold,
+            review_threshold=Config.entity_llm_review_threshold,
+        )
+        worker_id = f"entity-shadow:{uuid.uuid4().hex}"
+        while True:
+            work = self.db.claim_entity_shadow_work(namespace_id, worker_id)
+            if not work:
+                break
+            chunk = chunk_by_id.get(int(work["chunk_id"]))
+            if not chunk:
+                self.db.fail_entity_shadow_work(
+                    str(work["id"]), str(work["lease_token"]), "active Chunk 不存在",
+                )
+                continue
+            try:
+                extraction = self.schemas.extract_chunk(project, active_schema, chunk)
+                normalized = extractor.normalize(
+                    project_scope=str(project.get("project_key") or project_id),
+                    document_key=str(chunk.get("revision_id") or chunk["document_id"]),
+                    chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
+                    content=str(chunk.get("content") or ""),
+                    raw_entities=extraction.get("entities") or [],
+                    chunk_metadata=self._metadata(chunk.get("metadata")),
+                )
+                mention_rows = [{
+                    **asdict(item),
+                    "provenance": {
+                        "input_fingerprint": work["input_fingerprint"],
+                        "model_name": llm_model,
+                        "config_hash": config_hash,
+                        "code_version": "entity-shadow-prelive-v1",
+                    },
+                } for item in normalized.mentions]
+                assertion_rows = [asdict(item) for item in normalized.type_assertions]
+                rejected_rows = [{
+                    **item,
+                    "policy_version": policy_set["entity_extraction_policy_version"],
+                } for item in normalized.rejected]
+                self.db.persist_entity_shadow_extraction(
+                    namespace_id,
+                    project_id=project_id,
+                    document_id=int(chunk["document_id"]),
+                    revision_id=str(chunk["revision_id"]),
+                    chunk_id=int(chunk["id"]),
+                    mentions=mention_rows,
+                    type_assertions=assertion_rows,
+                    rejected=rejected_rows,
+                )
+                alias_by_mention: dict[str, list[dict[str, Any]]] = {}
+                for alias in normalized.aliases:
+                    alias_by_mention.setdefault(alias.mention_id, []).append({
+                        **asdict(alias), "kind": "verified_alias",
+                    })
+                type_by_mention = {item.mention_id: item for item in normalized.type_assertions}
+                raw_id_by_span = {
+                    (
+                        str(item.get("name") or ""),
+                        int(item["mention_start"]) if item.get("mention_start") is not None else -1,
+                        int(item["mention_end"]) if item.get("mention_end") is not None else -1,
+                    ): str(item.get("id") or "")
+                    for item in extraction.get("entities") or []
+                }
+                raw_to_mention: dict[str, str] = {}
+                canonical_by_mention: dict[str, str] = {}
+                prepared_mentions: list[tuple[Any, Any, dict[str, Any]]] = []
+                for item in normalized.mentions:
+                    type_assertion = type_by_mention[item.mention_id]
+                    mention = {
+                        "mention_id": item.mention_id,
+                        "surface": item.surface,
+                        "normalized_surface": item.normalized_surface,
+                        "entity_type": type_assertion.entity_type,
+                        "evidence": item.evidence,
+                        "confidence": item.confidence,
+                        "document_id": int(chunk["document_id"]),
+                        "revision_id": str(chunk["revision_id"]),
+                        "chunk_id": int(chunk["id"]),
+                        "start": item.start,
+                        "end": item.end,
+                        "policy_version": policy_set["entity_resolution_policy_version"],
+                        "type_source": type_assertion.source,
+                        "model_name": llm_model,
+                        "aliases": [
+                            alias["normalized_surface"]
+                            for alias in alias_by_mention.get(item.mention_id, [])
+                        ],
+                    }
+                    prepared_mentions.append((item, type_assertion, mention))
+
+                exact_results: dict[str, dict[str, Any]] = {}
+                unresolved: list[dict[str, Any]] = []
+                for _, _, mention in prepared_mentions:
+                    exact_result = resolver.try_exact(mention)
+                    if exact_result is None:
+                        unresolved.append(mention)
+                    else:
+                        exact_results[str(mention["mention_id"])] = exact_result
+                embedded: dict[str, list[float]] = {}
+                if unresolved:
+                    vectors = model_gateway.embed(
+                        [resolver.identity_text(mention) for mention in unresolved],
+                        embedding_model,
+                    )
+                    if len(vectors) != len(unresolved):
+                        raise RuntimeError("entity shadow embedding 批次返回数量不匹配")
+                    embedded = {
+                        str(mention["mention_id"]): vector
+                        for mention, vector in zip(unresolved, vectors)
+                    }
+
+                for item, type_assertion, mention in prepared_mentions:
+                    mention_id = str(mention["mention_id"])
+                    result = exact_results.get(mention_id)
+                    if result is None:
+                        # Earlier mentions in this chunk may have installed an exact alias.
+                        result = resolver.try_exact(mention)
+                    if result is None:
+                        result = resolver.resolve_with_embedding(
+                            mention,
+                            embedding_model=embedding_model,
+                            embedding=embedded[mention_id],
+                        )
+                    existing = next((
+                        candidate for candidate in result.get("candidates") or []
+                        if str(candidate["canonical_key"]) == result["canonical_key"]
+                    ), None)
+                    canonical = {
+                        "canonical_key": result["canonical_key"],
+                        "name": str((existing or {}).get("name") or item.surface),
+                        "normalized_name": str(
+                            (existing or {}).get("normalized_name") or item.normalized_surface
+                        ),
+                        "primary_type": str(
+                            (existing or {}).get("primary_type") or type_assertion.entity_type
+                        ),
+                        "aliases": sorted({
+                            item.normalized_surface,
+                            *((existing or {}).get("aliases") or []),
+                            *mention["aliases"],
+                        }),
+                        "metadata": {
+                            "type_assertion": asdict(type_assertion),
+                            "identity_type_decoupled": True,
+                        },
+                    }
+                    self.db.upsert_entity_shadow_canonical(
+                        namespace_id, canonical, mention,
+                        aliases=alias_by_mention.get(item.mention_id, []),
+                        embedding_model=embedding_model,
+                        embedding=result.get("embedding"),
+                        decision=result["decision"], reason=result["reason"],
+                        scores=result.get("scores") or {}, config_hash=config_hash,
+                    )
+                    canonical_by_mention[item.mention_id] = result["canonical_key"]
+                    raw_id = raw_id_by_span.get((item.surface, item.start, item.end))
+                    if raw_id:
+                        raw_to_mention[raw_id] = item.mention_id
+
+                endpoint_rows = []
+                for ordinal, relation in enumerate(extraction.get("relations") or []):
+                    source_mention = raw_to_mention.get(str(relation.get("source") or ""))
+                    target_mention = raw_to_mention.get(str(relation.get("target") or ""))
+                    if not source_mention or not target_mention:
+                        continue
+                    source_canonical = canonical_by_mention[source_mention]
+                    target_canonical = canonical_by_mention[target_mention]
+                    if source_canonical == target_canonical:
+                        continue
+                    endpoint_rows.append({
+                        "relation_key": str(relation.get("candidate_id") or hashlib.sha256(
+                            f"{work['id']}|{ordinal}|{source_mention}|{target_mention}".encode()
+                        ).hexdigest()),
+                        "document_id": int(chunk["document_id"]),
+                        "revision_id": str(chunk["revision_id"]),
+                        "chunk_id": int(chunk["id"]),
+                        "source_mention_key": source_mention,
+                        "target_mention_key": target_mention,
+                        "source_canonical_key": source_canonical,
+                        "target_canonical_key": target_canonical,
+                        "relation_type": str(relation.get("type") or "related_to"),
+                        "evidence_text": str(relation.get("evidence_text") or ""),
+                        "evidence_start": relation.get("evidence_start"),
+                        "evidence_end": relation.get("evidence_end"),
+                        "policy_version": policy_set["relation_candidate_policy_version"],
+                        "metadata": {
+                            "verification_status": relation.get("verification_status") or "uncertain",
+                            "same_entity_snapshot": namespace_id,
+                        },
+                    })
+                self.db.persist_entity_shadow_relation_endpoints(namespace_id, endpoint_rows)
+                output = {
+                    "mentions": len(normalized.mentions),
+                    "rejected": len(normalized.rejected),
+                    "relation_endpoints": len(endpoint_rows),
+                }
+                output_hash = hashlib.sha256(
+                    json.dumps(output, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                if not self.db.complete_entity_shadow_work(
+                    str(work["id"]), str(work["lease_token"]), output, output_hash,
+                ):
+                    raise RuntimeError("entity shadow work lease 已失效")
+            except Exception as exc:
+                self.db.fail_entity_shadow_work(
+                    str(work["id"]), str(work["lease_token"]), str(exc),
+                )
+
+        persisted = self.db.load_entity_shadow_snapshot(namespace_id)
+        mention_count = len(self.db.list_entity_shadow_mentions(namespace_id))
+        canonical_count = len(persisted["canonicals"])
+        artifact_payload = {
+            "namespace_id": namespace_id,
+            "input_fingerprint": input_fingerprint,
+            "canonicals": [str(item["canonical_key"]) for item in persisted["canonicals"]],
+            "assignments": [{
+                "mention_key": str(item["mention_key"]),
+                "canonical_key": str(item["canonical_key"]),
+            } for item in persisted["assignments"]],
+            "relation_endpoints": [str(item["relation_key"]) for item in persisted["relation_endpoints"]],
+        }
+        artifact_hash = hashlib.sha256(
+            json.dumps(artifact_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        metrics = {
+            "documents": len(documents),
+            "chunks": len(chunks),
+            "mentions": mention_count,
+            "canonicals": canonical_count,
+            "relation_endpoints": len(persisted["relation_endpoints"]),
+            "duplicate_canonical_rate": None,
+            "canonical_compression_rate": (
+                0.0 if not mention_count
+                else max(0.0, 1.0 - (canonical_count / mention_count))
+            ),
+        }
+        self.db.finalize_entity_shadow_namespace(
+            namespace_id, metrics=metrics, artifact_hash=artifact_hash,
+        )
+        return {"namespace_id": namespace_id, **self.db.load_entity_shadow_snapshot(namespace_id)}
 
     def evaluate_policy_snapshot_gate(
         self,

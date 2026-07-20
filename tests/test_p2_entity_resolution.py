@@ -50,3 +50,28 @@ def test_cross_type_exact_is_bounded_review_not_automatic_merge():
         "mention_id": "m2", "canonical_id": snapshot["canonicals"][0]["id"],
         "reason": "cross_type_exact_alias",
     }]
+
+
+def test_shadow_merge_split_and_undo_are_versioned_and_reversible():
+    state = EntityShadowState(namespace="ns", policy_version="v")
+    state.replay([
+        {"mention_id": "m1", "surface": "Acme", "entity_type": "Organization"},
+        {"mention_id": "m2", "surface": "ACME Corp", "entity_type": "Organization"},
+        {"mention_id": "m3", "surface": "Acme Holdings", "entity_type": "Organization"},
+    ])
+    original = state.snapshot()
+    ids = [item["id"] for item in original["canonicals"]]
+    merge_event = state.merge(ids[0], ids[1], "manual Gold correction")
+    merged = state.snapshot()
+    assert len(merged["canonicals"]) == 2
+    target = next(item for item in merged["canonicals"] if len(item["mention_ids"]) == 2)
+    split_event = state.split(target["id"], [target["mention_ids"][0]], "homonym")
+    assert len(state.snapshot()["canonicals"]) == 3
+    state.undo(split_event, "review reverted split")
+    assert len(state.snapshot()["canonicals"]) == 2
+    state.undo(merge_event, "review reverted merge")
+    restored = state.snapshot()
+    assert restored["canonicals"] == original["canonicals"]
+    assert [item["event_type"] for item in restored["events"]] == [
+        "merge", "split", "undo", "undo",
+    ]
