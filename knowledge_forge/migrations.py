@@ -932,6 +932,76 @@ CREATE TRIGGER trg_policy_activation_gates_immutable BEFORE UPDATE OR DELETE ON 
 """
 
 
+GRAPH_NAMESPACE_MANIFEST_SQL = r"""
+ALTER TABLE projects ADD COLUMN graph_namespace_id TEXT DEFAULT gen_random_uuid()::text;
+UPDATE projects
+SET graph_namespace_id=(
+    substr(md5(random()::text||clock_timestamp()::text||id::text),1,8)||'-'||
+    substr(md5(random()::text||clock_timestamp()::text||id::text),1,4)||'-4'||
+    substr(md5(random()::text||clock_timestamp()::text||id::text),1,3)||'-a'||
+    substr(md5(random()::text||clock_timestamp()::text||id::text),1,3)||'-'||
+    substr(md5(random()::text||clock_timestamp()::text||id::text),1,12)
+)
+WHERE graph_namespace_id IS NULL;
+ALTER TABLE projects ALTER COLUMN graph_namespace_id SET NOT NULL;
+ALTER TABLE projects ADD CONSTRAINT uq_projects_graph_namespace UNIQUE(graph_namespace_id);
+ALTER TABLE projects ADD CONSTRAINT uq_projects_id_graph_namespace
+    UNIQUE(id,graph_namespace_id);
+
+UPDATE projects SET graph_generation=graph_generation+1,graph_status='stale',
+    graph_policy_version='',graph_policy_hash='',graph_error='graph namespace migration requires rebuild'
+WHERE graph_status<>'empty';
+
+CREATE TABLE graph_leases (
+    id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    namespace_id TEXT NOT NULL,
+    graph_generation BIGINT NOT NULL,
+    owner TEXT NOT NULL,
+    lease_token TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('active','released','expired','superseded')),
+    attempt INTEGER NOT NULL CHECK(attempt>0),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    released_at TIMESTAMPTZ,
+    FOREIGN KEY(project_id,namespace_id) REFERENCES projects(id,graph_namespace_id)
+);
+CREATE UNIQUE INDEX uq_graph_lease_active_generation
+    ON graph_leases(project_id,namespace_id,graph_generation) WHERE status='active';
+CREATE INDEX idx_graph_lease_recovery
+    ON graph_leases(status,expires_at,project_id,graph_generation);
+
+CREATE TABLE graph_content_manifests (
+    id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    namespace_id TEXT NOT NULL,
+    graph_generation BIGINT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('expected','writer','actual')),
+    protocol TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    lease_token TEXT NOT NULL REFERENCES graph_leases(lease_token),
+    fact_count BIGINT NOT NULL CHECK(fact_count>=0),
+    content_digest TEXT NOT NULL,
+    manifest JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY(project_id,namespace_id) REFERENCES projects(id,graph_namespace_id),
+    UNIQUE(project_id,namespace_id,graph_generation,lease_token,role)
+);
+CREATE INDEX idx_graph_manifests_generation
+    ON graph_content_manifests(project_id,namespace_id,graph_generation,lease_token,role);
+
+CREATE FUNCTION kf_reject_graph_manifest_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'graph content manifests are immutable' USING ERRCODE='55000';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_graph_content_manifests_immutable
+    BEFORE UPDATE OR DELETE ON graph_content_manifests
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_graph_manifest_mutation();
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -957,6 +1027,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0005_release_gate_artifacts",
         description="Bind append-only Gold and evaluation facts to frozen snapshot artifacts",
         sql=RELEASE_GATE_ARTIFACTS_SQL,
+    ),
+    Migration(
+        version="0006_graph_namespace_manifest",
+        description="Isolate graph ownership and persist leased generation manifests",
+        sql=GRAPH_NAMESPACE_MANIFEST_SQL,
     ),
 )
 

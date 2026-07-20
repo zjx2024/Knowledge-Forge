@@ -9,6 +9,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import (
     GRAPH_FAILED,
     GRAPH_POLICY_HASH,
@@ -168,6 +169,10 @@ class LifecycleDatabase:
         self.project = {
             "id": 7,
             "project_key": "project-7",
+            "graph_namespace_id": str(uuid.UUID(int=7)),
+            "graph_generation": 0,
+            "graph_ready_generation": 0,
+            "active_schema_version": 1,
             "embedding_model": "embed",
             "graph_status": GRAPH_STALE,
             "graph_policy_version": "",
@@ -180,6 +185,8 @@ class LifecycleDatabase:
         self.expected_relations = expected_relations
         self.jobs = {"job-1": {"id": "job-1", "project_id": 7, "status": "queued"}}
         self.state_history = []
+        self.lease = None
+        self.manifests = {}
 
     def get_project(self, project_id):
         return dict(self.project) if project_id == 7 else None
@@ -218,6 +225,38 @@ class LifecycleDatabase:
     def list_pending_indexing_failures(self, project_id, object_type="relation"):
         return []
 
+    def list_blocking_indexing_failures(self, project_id, graph_generation):
+        return []
+
+    def acquire_graph_lease(self, project_id, namespace_id, generation, owner, **kwargs):
+        self.lease = {"id": "lease-id", "lease_token": uuid.uuid4().hex}
+        return dict(self.lease)
+
+    def assert_graph_lease(self, project_id, namespace_id, generation, lease_token):
+        return bool(self.lease and lease_token == self.lease["lease_token"])
+
+    def heartbeat_graph_lease(self, lease_id, lease_token, **kwargs):
+        return self.assert_graph_lease(7, self.project["graph_namespace_id"], 0, lease_token)
+
+    def release_graph_lease(self, lease_id, lease_token):
+        return True
+
+    def persist_graph_manifest(self, project_id, namespace_id, generation, role, lease_token, manifest):
+        self.manifests[role] = manifest
+        return manifest
+
+    def complete_graph_rebuild(self, project_id, generation, **kwargs):
+        if generation != self.project["graph_generation"]:
+            return None
+        self.project.update({
+            "graph_status": GRAPH_READY,
+            "graph_ready_generation": generation,
+            "graph_policy_version": GRAPH_POLICY_VERSION,
+            "graph_policy_hash": kwargs["policy_hash"],
+            "graph_error": "",
+        })
+        return dict(self.project)
+
 
 class LifecycleGraph:
     def __init__(self, fail_at=""):
@@ -228,25 +267,41 @@ class LifecycleGraph:
     def ensure_schema(self):
         return None
 
-    def delete_project(self, project_id):
+    @staticmethod
+    def _manifest(project, mutation):
+        return build_graph_manifest(
+            [], namespace_id=mutation.namespace_id, project_id=project["id"],
+            graph_generation=mutation.generation, policy_hash=mutation.policy_hash,
+        )
+
+    def expected_manifest(self, project, documents, *, mutation):
+        return self._manifest(project, mutation)
+
+    def writer_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def actual_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def delete_project(self, project, *, mutation):
         self.edges.clear()
         self.document_writes = 0
         if self.fail_at == "purge":
             raise RuntimeError("purge failed")
 
-    def replace_document(self, project, document, chunks):
+    def write_document_snapshot(self, project, document, chunks, *, mutation):
         self.document_writes += 1
         if self.fail_at == "after_first_document" and self.document_writes == 2:
             raise RuntimeError("second document failed")
 
-    def sync_document_assertions(self, project, document):
+    def sync_document_assertions(self, project, document, *, mutation):
         self.edges.add(int(document["id"]))
         return {"entities": 2, "relations": 1}
 
-    def prune_project_entities(self, project_id):
+    def prune_project_entities(self, project, *, mutation):
         return 0
 
-    def statistics(self, project_id):
+    def statistics(self, project):
         count = len(self.edges)
         if self.fail_at == "final_check":
             count += 1

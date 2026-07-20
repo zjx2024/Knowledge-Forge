@@ -21,6 +21,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from .config import Config
+from .graph_manifest import GRAPH_MANIFEST_PROTOCOL
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
@@ -1029,9 +1030,13 @@ class Database:
     def create_project(self, name: str, description: str, llm_model: str | None, embedding_model: str | None) -> dict[str, Any]:
         with self.connection() as conn:
             row = conn.execute(
-                """INSERT INTO projects(project_key,name,description,llm_model,embedding_model)
-                VALUES(%s,%s,%s,%s,%s) RETURNING *""",
-                (f"pending-{uuid.uuid4().hex}", name, description, llm_model, embedding_model),
+                """INSERT INTO projects(
+                   project_key,name,description,llm_model,embedding_model,graph_namespace_id)
+                VALUES(%s,%s,%s,%s,%s,%s) RETURNING *""",
+                (
+                    f"pending-{uuid.uuid4().hex}", name, description, llm_model,
+                    embedding_model, str(uuid.uuid4()),
+                ),
             ).fetchone()
             key = self.project_key(int(row["id"]), name)
             return conn.execute("UPDATE projects SET project_key=%s,updated_at=NOW() WHERE id=%s RETURNING *", (key, row["id"])).fetchone()
@@ -1104,18 +1109,44 @@ class Database:
         target_generation: int,
         *,
         policy_hash: str,
+        namespace_id: str,
+        lease_token: str,
+        manifest_digest: str,
         empty: bool = False,
     ) -> dict[str, Any] | None:
         """Publish a rebuild only if its immutable generation is still current."""
 
         status = GRAPH_EMPTY if empty else GRAPH_READY
         with self.connection() as conn:
+            lease = conn.execute(
+                """SELECT id FROM graph_leases
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
+                     AND lease_token=%s AND status='active' AND expires_at>NOW()
+                   FOR UPDATE""",
+                (project_id, namespace_id, target_generation, lease_token),
+            ).fetchone()
+            if not lease:
+                return None
+            manifests = conn.execute(
+                """SELECT role,content_digest,protocol,policy_hash FROM graph_content_manifests
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
+                     AND lease_token=%s ORDER BY role""",
+                (project_id, namespace_id, target_generation, lease_token),
+            ).fetchall()
+            if (
+                {row["role"] for row in manifests} != {"expected", "writer", "actual"}
+                or any(row["content_digest"] != manifest_digest for row in manifests)
+                or any(row["policy_hash"] != policy_hash for row in manifests)
+                or any(row["protocol"] != GRAPH_MANIFEST_PROTOCOL for row in manifests)
+            ):
+                return None
             return conn.execute(
                 """UPDATE projects
                    SET graph_status=%s,graph_policy_version=%s,graph_policy_hash=%s,
                        active_policy_hash=%s,
                        graph_ready_generation=%s,graph_error='',updated_at=NOW()
                    WHERE id=%s AND is_deleted=FALSE AND graph_generation=%s
+                     AND graph_namespace_id=%s
                    RETURNING *""",
                 (
                     status,
@@ -1125,6 +1156,134 @@ class Database:
                     target_generation,
                     project_id,
                     target_generation,
+                    namespace_id,
+                ),
+            ).fetchone()
+
+    def acquire_graph_lease(
+        self, project_id: int, namespace_id: str, graph_generation: int,
+        owner: str, *, ttl_seconds: int = 300,
+    ) -> dict[str, Any]:
+        """Acquire one cross-process generation lease in a short transaction."""
+
+        lease_token = uuid.uuid4().hex
+        lease_id = uuid.uuid4().hex
+        with self.connection() as conn:
+            project = conn.execute(
+                """SELECT graph_namespace_id,graph_generation FROM projects
+                   WHERE id=%s AND is_deleted=FALSE FOR UPDATE""", (project_id,),
+            ).fetchone()
+            if not project or str(project["graph_namespace_id"]) != str(namespace_id):
+                raise RuntimeError("graph lease namespace does not own project")
+            if int(project["graph_generation"]) != int(graph_generation):
+                raise RuntimeError("graph lease generation is stale")
+            conn.execute(
+                """UPDATE graph_leases SET status='superseded',released_at=NOW()
+                   WHERE project_id=%s AND namespace_id=%s AND status='active'
+                     AND graph_generation<%s""",
+                (project_id, namespace_id, graph_generation),
+            )
+            active = conn.execute(
+                """SELECT id,expires_at FROM graph_leases
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
+                     AND status='active' FOR UPDATE""",
+                (project_id, namespace_id, graph_generation),
+            ).fetchone()
+            if active and active["expires_at"] > datetime.now(timezone.utc):
+                raise RuntimeError("graph lease is already owned by another worker")
+            if active:
+                conn.execute(
+                    "UPDATE graph_leases SET status='expired',released_at=NOW() WHERE id=%s",
+                    (active["id"],),
+                )
+            attempt = conn.execute(
+                """SELECT COALESCE(MAX(attempt),0)+1 AS attempt FROM graph_leases
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s""",
+                (project_id, namespace_id, graph_generation),
+            ).fetchone()["attempt"]
+            return conn.execute(
+                """INSERT INTO graph_leases(
+                   id,project_id,namespace_id,graph_generation,owner,lease_token,status,
+                   attempt,expires_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,'active',%s,NOW()+(%s*INTERVAL '1 second'))
+                   RETURNING *""",
+                (
+                    lease_id, project_id, namespace_id, graph_generation, owner,
+                    lease_token, attempt, max(10, int(ttl_seconds)),
+                ),
+            ).fetchone()
+
+    def assert_graph_lease(
+        self, project_id: int, namespace_id: str, graph_generation: int, lease_token: str,
+    ) -> bool:
+        with self.connection() as conn:
+            return bool(conn.execute(
+                """SELECT 1 FROM graph_leases
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
+                     AND lease_token=%s AND status='active' AND expires_at>NOW()""",
+                (project_id, namespace_id, graph_generation, lease_token),
+            ).fetchone())
+
+    def heartbeat_graph_lease(self, lease_id: str, lease_token: str, *, ttl_seconds: int = 300) -> bool:
+        with self.connection() as conn:
+            return bool(conn.execute(
+                """UPDATE graph_leases SET heartbeat_at=NOW(),
+                   expires_at=NOW()+(%s*INTERVAL '1 second')
+                   WHERE id=%s AND lease_token=%s AND status='active' AND expires_at>NOW()
+                   RETURNING id""",
+                (max(10, int(ttl_seconds)), lease_id, lease_token),
+            ).fetchone())
+
+    def release_graph_lease(self, lease_id: str, lease_token: str) -> bool:
+        with self.connection() as conn:
+            return bool(conn.execute(
+                """UPDATE graph_leases SET status='released',released_at=NOW()
+                   WHERE id=%s AND lease_token=%s AND status='active' RETURNING id""",
+                (lease_id, lease_token),
+            ).fetchone())
+
+    def persist_graph_manifest(
+        self, project_id: int, namespace_id: str, graph_generation: int,
+        role: str, lease_token: str, manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        if role not in {"expected", "writer", "actual"}:
+            raise ValueError("unknown graph manifest role")
+        if (
+            manifest.get("protocol") != GRAPH_MANIFEST_PROTOCOL
+            or str(manifest.get("namespace_id") or "") != str(namespace_id)
+            or int(manifest.get("project_id") or 0) != int(project_id)
+            or int(manifest.get("graph_generation", -1)) != int(graph_generation)
+            or not str(manifest.get("policy_hash") or "")
+        ):
+            raise ValueError("graph manifest scope or protocol mismatch")
+        with self.connection() as conn:
+            lease = conn.execute(
+                """SELECT 1 FROM graph_leases
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
+                     AND lease_token=%s AND status='active' AND expires_at>NOW()""",
+                (project_id, namespace_id, graph_generation, lease_token),
+            ).fetchone()
+            if not lease:
+                raise RuntimeError("graph manifest requires the active generation lease")
+            existing = conn.execute(
+                """SELECT * FROM graph_content_manifests
+                   WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
+                     AND lease_token=%s AND role=%s""",
+                (project_id, namespace_id, graph_generation, lease_token, role),
+            ).fetchone()
+            if existing:
+                if existing["content_digest"] != manifest["content_digest"]:
+                    raise RuntimeError("immutable graph manifest conflict")
+                return existing
+            return conn.execute(
+                """INSERT INTO graph_content_manifests(
+                   id,project_id,namespace_id,graph_generation,role,protocol,policy_hash,
+                   lease_token,fact_count,content_digest,manifest)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    uuid.uuid4().hex, project_id, namespace_id, graph_generation, role,
+                    manifest["protocol"], manifest["policy_hash"], lease_token,
+                    manifest["fact_count"], manifest["content_digest"], self._json(manifest),
                 ),
             ).fetchone()
 

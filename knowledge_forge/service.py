@@ -37,6 +37,8 @@ from .graph_policy import (
     project_graph_policy_hash,
 )
 from .hugegraph_store import HugeGraphStore
+from .graph_manifest import compare_graph_manifests
+from .graph_safety import GraphMutationContext
 from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
@@ -1242,17 +1244,19 @@ class KnowledgeForgeService:
         return {"project": project, "rollout": rollout}
 
     @staticmethod
-    def _project_provenance_gremlin(project_id: int) -> str:
+    def _project_provenance_gremlin(project_id: int, namespace_id: str) -> str:
         """Show the project graph plus document paths through shared entities."""
         project_id = int(project_id)
+        namespace = json.dumps(str(uuid.UUID(str(namespace_id))))
+        scoped = f'.has("kf_namespace_id",{namespace}).has("kf_project_id",{project_id})'
         return (
-            f'g.V().has("kf_project_id",{project_id}).union('
-            f'__.bothE().has("kf_project_id",{project_id}).dedup().otherV().limit(300),'
+            f'g.V(){scoped}.union('
+            f'__.bothE(){scoped}.dedup().otherV().limit(300),'
             '__.hasLabel("KFEntity")'
-            f'.where(__.inE("kf_mentions").has("kf_project_id",{project_id})'
+            f'.where(__.inE("kf_mentions"){scoped}'
             '.values("kf_doc_id").dedup().count().is(gte(2)))'
-            f'.inE("kf_mentions").has("kf_project_id",{project_id}).outV()'
-            f'.inE("kf_contains").has("kf_project_id",{project_id}).outV().limit(200)'
+            f'.inE("kf_mentions"){scoped}.outV()'
+            f'.inE("kf_contains"){scoped}.outV().limit(200)'
             ').path().limit(500)'
         )
 
@@ -1302,7 +1306,9 @@ class KnowledgeForgeService:
         if not connection:
             raise RuntimeError(f"Hubble 中没有可用的 {Config.hugegraph_graph} 图连接")
 
-        gremlin = self._project_provenance_gremlin(project_id)
+        gremlin = self._project_provenance_gremlin(
+            project_id, str(project["graph_namespace_id"]),
+        )
         return (
             f"{base_url}/graph-management/{int(connection['id'])}/data-analyze"
             f"?gremlin={quote(gremlin, safe='')}"
@@ -2242,69 +2248,107 @@ class KnowledgeForgeService:
             raise RuntimeError("图谱重建目标代次已过期")
         self._retry_entity_indexing_failures(project)
         self._retry_relation_indexing_failures(project)
-        if hasattr(self.db, "list_blocking_indexing_failures"):
+        blocking = self.db.list_blocking_indexing_failures(project_id, fixed_generation)
+        if blocking:
+            raise RuntimeError(
+                f"图谱代次 {fixed_generation} 仍有 {len(blocking)} 个派生索引待修复"
+            )
+        namespace = str(project.get("graph_namespace_id") or "")
+        policy_hash = project_graph_policy_hash(project)
+        owner = f"graph-rebuild:{uuid.uuid4().hex}"
+        lease = self.db.acquire_graph_lease(
+            project_id, namespace, fixed_generation, owner,
+            ttl_seconds=Config.graph_lease_seconds,
+        )
+        mutation = GraphMutationContext(
+            namespace_id=namespace, project_id=project_id, generation=fixed_generation,
+            policy_hash=policy_hash, lease_token=str(lease["lease_token"]),
+        )
+
+        def heartbeat() -> None:
+            if not self.db.heartbeat_graph_lease(
+                str(lease["id"]), mutation.lease_token,
+                ttl_seconds=Config.graph_lease_seconds,
+            ):
+                raise RuntimeError("graph lease 已失效")
+
+        try:
+            documents = [
+                item for item in self.db.list_documents(project_id)
+                if item["status"] == "indexed" or int(item["id"]) == include_document_id
+            ]
+            document_ids = [int(item["id"]) for item in documents]
+            expected_manifest = self.graph.expected_manifest(
+                project, documents, mutation=mutation,
+            )
+            self.db.persist_graph_manifest(
+                project_id, namespace, fixed_generation, "expected",
+                mutation.lease_token, expected_manifest,
+            )
+            heartbeat()
+            self.graph.ensure_schema()
+            self.graph.delete_project(project, mutation=mutation)
+            written_relations = 0
+            written_entities = 0
+            for document in documents:
+                heartbeat()
+                chunks = self.db.list_document_chunks(int(document["id"]))
+                self.graph.write_document_snapshot(
+                    project, document, chunks, mutation=mutation,
+                )
+                report = self.graph.sync_document_assertions(
+                    project, document, mutation=mutation,
+                )
+                written_relations += int(report.get("relations") or 0)
+                written_entities += int(report.get("entities") or 0)
+                heartbeat()
+            if documents:
+                self.graph.prune_project_entities(project, mutation=mutation)
+            expected_relations = self.db.count_publishable_relations(project_id, document_ids)
+            graph_stats = self.graph.statistics(project)
+            graph_relations = int(graph_stats.get("relations") or 0)
+            if written_relations != expected_relations or graph_relations != expected_relations:
+                raise RuntimeError(
+                    "图谱关系一致性检查失败："
+                    f"PostgreSQL={expected_relations}, written={written_relations}, "
+                    f"HugeGraph={graph_relations}"
+                )
+            writer_manifest = self.graph.writer_manifest(project, mutation=mutation)
+            actual_manifest = self.graph.actual_manifest(project, mutation=mutation)
+            comparison = compare_graph_manifests(
+                expected_manifest, writer_manifest, actual_manifest,
+            )
+            self.db.persist_graph_manifest(
+                project_id, namespace, fixed_generation, "writer",
+                mutation.lease_token, writer_manifest,
+            )
+            self.db.persist_graph_manifest(
+                project_id, namespace, fixed_generation, "actual",
+                mutation.lease_token, actual_manifest,
+            )
+            if not comparison["complete"]:
+                raise RuntimeError(
+                    "图谱内容 manifest 不一致：" + ",".join(comparison["reasons"])
+                )
+            heartbeat()
             blocking = self.db.list_blocking_indexing_failures(project_id, fixed_generation)
             if blocking:
                 raise RuntimeError(
                     f"图谱代次 {fixed_generation} 仍有 {len(blocking)} 个派生索引待修复"
                 )
-        documents = [
-            item for item in self.db.list_documents(project_id)
-            if item["status"] == "indexed" or int(item["id"]) == include_document_id
-        ]
-        document_ids = [int(item["id"]) for item in documents]
-        self.graph.ensure_schema()
-        self.graph.delete_project(project_id)
-        written_relations = 0
-        written_entities = 0
-        for document in documents:
-            chunks = self.db.list_document_chunks(int(document["id"]))
-            writer = getattr(self.graph, "write_document_snapshot", None)
-            if writer:
-                writer(project, document, chunks)
-            else:
-                self.graph.replace_document(project, document, chunks)
-            report = self.graph.sync_document_assertions(project, document)
-            written_relations += int(report.get("relations") or 0)
-            written_entities += int(report.get("entities") or 0)
-        if documents:
-            self.graph.prune_project_entities(project_id)
-        expected_relations = self.db.count_publishable_relations(project_id, document_ids)
-        graph_stats = self.graph.statistics(project_id)
-        graph_relations = int(graph_stats.get("relations") or 0)
-        if written_relations != expected_relations or graph_relations != expected_relations:
-            raise RuntimeError(
-                "图谱关系一致性检查失败："
-                f"PostgreSQL={expected_relations}, written={written_relations}, HugeGraph={graph_relations}"
-            )
-        if not documents:
-            if hasattr(self.db, "complete_graph_rebuild"):
-                completed = self.db.complete_graph_rebuild(
-                    project_id,
-                    fixed_generation,
-                    policy_hash=project_graph_policy_hash(project),
-                    empty=True,
-                )
-                if not completed:
-                    raise RuntimeError("图谱重建完成时目标代次已过期")
-            else:
-                self.db.set_graph_state(project_id, GRAPH_EMPTY)
-            return {"documents": 0, "entities": 0, "relations": 0}
-        if hasattr(self.db, "complete_graph_rebuild"):
             completed = self.db.complete_graph_rebuild(
-                project_id,
-                fixed_generation,
-                policy_hash=project_graph_policy_hash(project),
+                project_id, fixed_generation, policy_hash=policy_hash,
+                namespace_id=namespace, lease_token=mutation.lease_token,
+                manifest_digest=expected_manifest["content_digest"], empty=not documents,
             )
             if not completed:
-                raise RuntimeError("图谱重建完成时目标代次已过期")
-        else:
-            self.db.set_graph_state(project_id, GRAPH_READY, current_policy=True)
-        return {
-            "documents": len(documents),
-            "entities": written_entities,
-            "relations": graph_relations,
-        }
+                raise RuntimeError("图谱重建完成时 generation、lease 或 manifest 已过期")
+            return {
+                "documents": len(documents), "entities": written_entities,
+                "relations": graph_relations,
+            }
+        finally:
+            self.db.release_graph_lease(str(lease["id"]), mutation.lease_token)
 
     def _retry_entity_indexing_failures(self, project: dict[str, Any]) -> int:
         """Retry assignment-derived entity vectors before graph readiness checks."""

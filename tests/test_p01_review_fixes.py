@@ -7,6 +7,7 @@ import psycopg
 from psycopg import sql
 
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import GRAPH_POLICY_VERSION
 from knowledge_forge.relation_verification import PUBLISHABLE_RELATION_STATUSES
 from knowledge_forge.service import KnowledgeForgeService
@@ -265,9 +266,15 @@ class GraphRebuildDatabase:
     def __init__(self):
         self.updated = False
         self.states = []
+        self.namespace = str(uuid.UUID(int=1))
+        self.lease = None
 
     def get_project(self, project_id):
-        return {"id": project_id, "project_key": "p1"}
+        return {
+            "id": project_id, "project_key": "p1",
+            "graph_namespace_id": self.namespace, "graph_generation": 0,
+            "active_schema_version": 1,
+        }
 
     def list_documents(self, project_id):
         return [{"id": 2, "status": "indexed", "original_filename": "a.txt"}]
@@ -287,6 +294,29 @@ class GraphRebuildDatabase:
     def list_pending_indexing_failures(self, project_id, object_type="relation"):
         return []
 
+    def list_blocking_indexing_failures(self, project_id, graph_generation):
+        return []
+
+    def acquire_graph_lease(self, project_id, namespace_id, generation, owner, **kwargs):
+        self.lease = {"id": "lease-id", "lease_token": uuid.uuid4().hex}
+        return dict(self.lease)
+
+    def heartbeat_graph_lease(self, lease_id, lease_token, **kwargs):
+        return bool(self.lease and lease_token == self.lease["lease_token"])
+
+    def release_graph_lease(self, lease_id, lease_token):
+        return True
+
+    def persist_graph_manifest(self, project_id, namespace_id, generation, role, lease_token, manifest):
+        return manifest
+
+    def complete_graph_rebuild(self, project_id, generation, **kwargs):
+        self.updated = True
+        return self.get_project(project_id)
+
+    def update_job(self, job_id, **kwargs):
+        return {"id": job_id, **kwargs}
+
     def set_graph_state(self, project_id, status, **values):
         self.states.append((status, values))
         self.updated = status == "ready" and values.get("current_policy") is True
@@ -302,22 +332,38 @@ class GraphRebuildStore:
     def ensure_schema(self):
         self.calls.append("schema")
 
-    def delete_project(self, project_id):
+    @staticmethod
+    def _manifest(project, mutation):
+        return build_graph_manifest(
+            [], namespace_id=mutation.namespace_id, project_id=project["id"],
+            graph_generation=mutation.generation, policy_hash=mutation.policy_hash,
+        )
+
+    def expected_manifest(self, project, documents, *, mutation):
+        return self._manifest(project, mutation)
+
+    def writer_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def actual_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def delete_project(self, project, *, mutation):
         self.calls.append("purge")
         self.edges.clear()
 
-    def replace_document(self, project, document, chunks):
+    def write_document_snapshot(self, project, document, chunks, *, mutation):
         self.calls.append("document")
 
-    def sync_document_assertions(self, project, document):
+    def sync_document_assertions(self, project, document, *, mutation):
         self.calls.append("relations")
         self.edges.add("published-edge")
         return {"entities": 2, "relations": 1}
 
-    def prune_project_entities(self, project_id):
+    def prune_project_entities(self, project, *, mutation):
         self.calls.append("prune")
 
-    def statistics(self, project_id):
+    def statistics(self, project):
         return {"relations": len(self.edges)}
 
 

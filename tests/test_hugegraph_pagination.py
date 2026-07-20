@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from knowledge_forge.config import Config
 from knowledge_forge.hugegraph_store import HugeGraphStore
 
@@ -51,9 +53,8 @@ class RepeatedCursorGraph:
         return [SimpleNamespace(id=f"e{self.calls}")], "same-page"
 
 
-def test_hugegraph_iterator_stops_on_repeated_cursor():
+def test_hugegraph_iterator_fails_closed_on_repeated_cursor():
     graph = RepeatedCursorGraph()
-    edges = list(HugeGraphStore._iter_edges(graph, label="kf_related", properties={}))
-
-    assert [item.id for item in edges] == ["e1", "e2"]
+    with pytest.raises(RuntimeError, match="repeated cursor"):
+        list(HugeGraphStore._iter_edges(graph, label="kf_related", properties={}))
     assert graph.calls == 2

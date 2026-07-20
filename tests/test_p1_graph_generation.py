@@ -1,7 +1,9 @@
 import threading
 from contextlib import contextmanager
+import uuid
 
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import (
     GRAPH_POLICY_HASH,
     GRAPH_READY,
@@ -37,11 +39,15 @@ class GenerationDatabase:
         self.project = {
             "id": 7,
             "project_key": "p7",
+            "graph_namespace_id": str(uuid.UUID(int=7)),
             "graph_generation": generation,
             "graph_status": GRAPH_STALE,
+            "active_schema_version": 1,
         }
         self.pending = pending
         self.completed = []
+        self.lease = None
+        self.manifests = {}
 
     def get_project(self, project_id):
         return dict(self.project)
@@ -60,6 +66,26 @@ class GenerationDatabase:
 
     def list_pending_indexing_failures(self, project_id, object_type="relation", **kwargs):
         return []
+
+    def list_blocking_indexing_failures(self, project_id, graph_generation):
+        return []
+
+    def acquire_graph_lease(self, project_id, namespace_id, generation, owner, **kwargs):
+        self.lease = {"id": "lease-id", "lease_token": "lease-token"}
+        return dict(self.lease)
+
+    def assert_graph_lease(self, project_id, namespace_id, generation, lease_token):
+        return bool(self.lease and lease_token == self.lease["lease_token"])
+
+    def heartbeat_graph_lease(self, lease_id, lease_token, **kwargs):
+        return self.assert_graph_lease(7, self.project["graph_namespace_id"], 4, lease_token)
+
+    def release_graph_lease(self, lease_id, lease_token):
+        return True
+
+    def persist_graph_manifest(self, project_id, namespace_id, generation, role, lease_token, manifest):
+        self.manifests[role] = manifest
+        return manifest
 
     def complete_graph_rebuild(self, project_id, target_generation, **kwargs):
         if self.project["graph_generation"] != target_generation:
@@ -82,22 +108,38 @@ class GenerationGraph:
     def ensure_schema(self):
         self.calls.append("schema")
 
-    def delete_project(self, project_id):
-        self.calls.append(("purge", project_id))
+    @staticmethod
+    def _manifest(project, mutation):
+        return build_graph_manifest(
+            [], namespace_id=mutation.namespace_id, project_id=project["id"],
+            graph_generation=mutation.generation, policy_hash=mutation.policy_hash,
+        )
 
-    def write_document_snapshot(self, project, document, chunks):
+    def expected_manifest(self, project, documents, *, mutation):
+        return self._manifest(project, mutation)
+
+    def writer_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def actual_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def delete_project(self, project, *, mutation):
+        self.calls.append(("purge", project["id"]))
+
+    def write_document_snapshot(self, project, document, chunks, *, mutation):
         self.calls.append(("write", document["id"]))
         return {"documents": 1, "chunks": len(chunks)}
 
-    def sync_document_assertions(self, project, document):
+    def sync_document_assertions(self, project, document, *, mutation):
         self.calls.append(("relations", document["id"]))
         return {"entities": 1, "relations": 1}
 
-    def prune_project_entities(self, project_id):
-        self.calls.append(("prune", project_id))
+    def prune_project_entities(self, project, *, mutation):
+        self.calls.append(("prune", project["id"]))
 
-    def statistics(self, project_id):
-        self.calls.append(("count", project_id))
+    def statistics(self, project):
+        self.calls.append(("count", project["id"]))
         return {"relations": 2}
 
 
@@ -127,9 +169,9 @@ def test_generation_change_during_rebuild_never_becomes_ready():
     service = generation_service()
     original = service.graph.statistics
 
-    def mutate(project_id):
+    def mutate(project):
         service.db.project["graph_generation"] = 5
-        return original(project_id)
+        return original(project)
 
     service.graph.statistics = mutate
     try:

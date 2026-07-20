@@ -77,6 +77,7 @@ class Config:
     hugegraph_password = os.getenv("HUGEGRAPH_PASSWORD", os.getenv("HUGEGRAPH_PWD", "admin"))
     hugegraph_timeout = int(os.getenv("HUGEGRAPH_TIMEOUT", "30"))
     hugegraph_page_size = max(1, min(1000, int(os.getenv("HUGEGRAPH_PAGE_SIZE", "500"))))
+    graph_lease_seconds = max(30, int(os.getenv("GRAPH_LEASE_SECONDS", "900")))
     hugegraph_hubble_url = os.getenv("HUGEGRAPH_HUBBLE_URL", f"http://{service_host}:18088")
     hugegraph_hubble_graph_host = os.getenv("HUGEGRAPH_HUBBLE_GRAPH_HOST", service_host)
 
