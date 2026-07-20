@@ -2075,6 +2075,54 @@ class Database:
                 WHERE document_id=%s AND status IN ('queued','running') FOR UPDATE""",
                 (document_id,),
             ).fetchall()
+
+    def list_revision_chunks(self, document_id: int, revision_id: str) -> list[dict[str, Any]]:
+        """Read an immutable historical revision without consulting the active pointer."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT c.*,s.title AS section_title
+                   FROM chunks c LEFT JOIN sections s
+                     ON s.id=c.section_id AND s.revision_id=c.revision_id
+                   WHERE c.document_id=%s AND c.revision_id=%s AND c.is_deleted=FALSE
+                   ORDER BY c.chunk_index,c.id""",
+                (document_id, revision_id),
+            ).fetchall()
+
+    def get_revision_chunk(self, chunk_id: int, revision_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT c.*,s.title AS section_title
+                   FROM chunks c LEFT JOIN sections s
+                     ON s.id=c.section_id AND s.revision_id=c.revision_id
+                   WHERE c.id=%s AND c.revision_id=%s AND c.is_deleted=FALSE""",
+                (chunk_id, revision_id),
+            ).fetchone()
+
+    def list_control_entities_for_chunk(
+        self, chunk_id: int, revision_id: str,
+    ) -> list[dict[str, Any]]:
+        """Load frozen control mentions for relation-only treatment endpoints."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT id,mention_text AS name,entity_type,description AS evidence,
+                          metadata,confidence
+                   FROM entity_mentions
+                   WHERE chunk_id=%s AND revision_id=%s AND is_deleted=FALSE
+                   ORDER BY id""",
+                (chunk_id, revision_id),
+            ).fetchall()
+
+    def get_entity_shadow_namespace_for_snapshot(
+        self, snapshot_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM entity_shadow_namespaces
+                   WHERE snapshot_id=%s ORDER BY created_at DESC LIMIT 1""",
+                (snapshot_id,),
+            ).fetchone()
             for row in rows:
                 logs = [*list(row.get("log") or []), reason]
                 metadata = {
@@ -2152,6 +2200,13 @@ class Database:
 
     def get_active_schema(self, project_id: int) -> dict[str, Any] | None:
         with self.connection() as conn: return conn.execute("SELECT * FROM graph_schemas WHERE project_id=%s AND status='active'", (project_id,)).fetchone()
+
+    def get_schema_version(self, project_id: int, version: int) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM graph_schemas WHERE project_id=%s AND version=%s",
+                (project_id, version),
+            ).fetchone()
 
     def create_schema_version(self, project_id: int, schema_json: dict[str, Any], report: dict[str, Any], document_ids: list[int], created_by: str = "llm") -> dict[str, Any]:
         with self.connection() as conn:
@@ -3119,9 +3174,17 @@ class Database:
         *,
         expected_documents: int,
         snapshot_manifest: dict[str, Any] | None = None,
+        snapshot_id: str | None = None,
+        mode: str = "relation_only",
+        manifest_hash: str = "",
+        expected_items: int = 0,
+        pilot: bool = True,
+        created_by: str = "system",
     ) -> dict[str, Any]:
         normalized = normalize_policy_set(policy_set)
-        snapshot_id = uuid.uuid4().hex
+        snapshot_id = snapshot_id or uuid.uuid4().hex
+        if mode not in {"relation_only", "end_to_end"}:
+            raise ValueError("未知 policy snapshot mode")
         with self.connection() as conn:
             project = conn.execute(
                 """SELECT graph_generation,active_schema_version
@@ -3146,15 +3209,28 @@ class Database:
                     f"策略快照文档数与当前 indexed 文档不一致: expected={expected_documents}, "
                     f"actual={actual_documents}"
                 )
+            existing = conn.execute(
+                "SELECT * FROM policy_snapshots WHERE id=%s FOR UPDATE", (snapshot_id,),
+            ).fetchone()
+            if existing:
+                if (
+                    existing.get("manifest_hash") != manifest_hash
+                    or existing.get("snapshot_manifest") != (snapshot_manifest or {})
+                ):
+                    raise ValueError("同一 snapshot_id 对应的不可变 manifest 已改变")
+                return existing
             row = conn.execute(
                 """INSERT INTO policy_snapshots(
                    id,project_id,policy_set,policy_hash,status,source_generation,
-                   expected_documents,snapshot_manifest)
-                   VALUES(%s,%s,%s::jsonb,%s,'building',%s,%s,%s::jsonb) RETURNING *""",
+                   expected_documents,snapshot_manifest,mode,manifest_hash,expected_items,
+                   pilot,created_by)
+                   VALUES(%s,%s,%s::jsonb,%s,'building',%s,%s,%s::jsonb,%s,%s,%s,%s,%s)
+                   RETURNING *""",
                 (
                     snapshot_id, project_id, self._json(normalized), policy_hash,
                     int(project.get("graph_generation") or 0), actual_documents,
-                    self._json(snapshot_manifest),
+                    self._json(snapshot_manifest), mode, manifest_hash, int(expected_items),
+                    bool(pilot), created_by,
                 ),
             ).fetchone()
             for document in documents:
@@ -3164,6 +3240,267 @@ class Database:
                     (snapshot_id, document["id"], document["active_revision_id"]),
                 )
             return row
+
+    def list_policy_snapshot_inputs(self, project_id: int) -> list[dict[str, Any]]:
+        """Return the ordered active revision universe used to freeze a snapshot."""
+
+        with self.connection() as conn:
+            documents = conn.execute(
+                """SELECT d.id AS document_id,d.active_revision_id AS revision_id,
+                          r.content_hash
+                   FROM documents d
+                   JOIN document_content_revisions r
+                     ON r.revision_id=d.active_revision_id AND r.document_id=d.id
+                   WHERE d.project_id=%s AND d.status='indexed' AND d.is_deleted=FALSE
+                   ORDER BY d.id""",
+                (project_id,),
+            ).fetchall()
+            for document in documents:
+                document["chunks"] = conn.execute(
+                    """SELECT id AS chunk_id,content_hash FROM chunks
+                       WHERE document_id=%s AND revision_id=%s AND is_deleted=FALSE
+                       ORDER BY id""",
+                    (document["document_id"], document["revision_id"]),
+                ).fetchall()
+            return documents
+
+    def seed_policy_snapshot_work_items(
+        self, snapshot_id: str, items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Insert the exact deterministic work universe; conflicting input fails closed."""
+
+        with self.connection() as conn:
+            snapshot = conn.execute(
+                "SELECT project_id,expected_items FROM policy_snapshots WHERE id=%s FOR UPDATE",
+                (snapshot_id,),
+            ).fetchone()
+            if not snapshot:
+                raise LookupError("策略快照不存在")
+            if int(snapshot["expected_items"]) != len(items):
+                raise ValueError("策略快照 expected_items 与待写 work universe 不一致")
+            for item in items:
+                if int(item["project_id"]) != int(snapshot["project_id"]):
+                    raise ValueError("策略快照 work item 项目不一致")
+                existing = conn.execute(
+                    "SELECT input_hash FROM policy_snapshot_work_items WHERE id=%s",
+                    (item["id"],),
+                ).fetchone()
+                if existing and existing["input_hash"] != item["input_hash"]:
+                    raise ValueError("policy snapshot work item input hash 冲突")
+                conn.execute(
+                    """INSERT INTO policy_snapshot_work_items(
+                       id,snapshot_id,phase,phase_order,project_id,document_id,revision_id,
+                       chunk_id,input_hash,max_attempts)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        item["id"], snapshot_id, item["phase"], item["phase_order"],
+                        item["project_id"], item.get("document_id"), item.get("revision_id"),
+                        item.get("chunk_id"), item["input_hash"],
+                        int(item.get("max_attempts") or 3),
+                    ),
+                )
+            rows = conn.execute(
+                "SELECT * FROM policy_snapshot_work_items WHERE snapshot_id=%s ORDER BY phase_order,id",
+                (snapshot_id,),
+            ).fetchall()
+            if len(rows) != len(items):
+                raise ValueError("策略快照 work universe 不完整或包含冲突")
+            return rows
+
+    def claim_policy_snapshot_work(
+        self, snapshot_id: str, owner: str, *, lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        lease_token = uuid.uuid4().hex
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))
+        with self.connection() as conn:
+            row = conn.execute(
+                """WITH candidate AS (
+                       SELECT work.id FROM policy_snapshot_work_items work
+                       JOIN policy_snapshots snapshot ON snapshot.id=work.snapshot_id
+                       WHERE work.snapshot_id=%s AND snapshot.status='building'
+                         AND snapshot.cancel_requested=FALSE
+                         AND work.attempt<work.max_attempts
+                         AND (
+                           (work.status IN ('pending','retryable_failed') AND work.next_attempt_at<=NOW())
+                           OR (work.status='leased' AND work.lease_expires_at<NOW())
+                         )
+                         AND NOT EXISTS (
+                           SELECT 1 FROM policy_snapshot_work_items previous
+                           WHERE previous.snapshot_id=work.snapshot_id
+                             AND previous.phase_order<work.phase_order
+                             AND previous.status<>'completed'
+                         )
+                       ORDER BY work.phase_order,work.id
+                       FOR UPDATE OF work SKIP LOCKED LIMIT 1
+                   )
+                   UPDATE policy_snapshot_work_items work
+                   SET status='leased',attempt=attempt+1,lease_owner=%s,lease_token=%s,
+                       lease_expires_at=%s,error_message='',updated_at=NOW()
+                   FROM candidate WHERE work.id=candidate.id RETURNING work.*""",
+                (snapshot_id, owner, lease_token, expires_at),
+            ).fetchone()
+            return row
+
+    def heartbeat_policy_snapshot_work(
+        self, work_id: str, lease_token: str, *, lease_seconds: int = 300,
+    ) -> bool:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(1, lease_seconds))
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE policy_snapshot_work_items SET lease_expires_at=%s,updated_at=NOW()
+                   WHERE id=%s AND lease_token=%s AND status='leased'
+                     AND lease_expires_at>NOW() RETURNING id""",
+                (expires_at, work_id, lease_token),
+            ).fetchone()
+            return bool(row)
+
+    def settle_policy_snapshot_work(
+        self,
+        work_id: str,
+        lease_token: str,
+        *,
+        artifact: dict[str, Any] | None,
+        error_message: str = "",
+        retry_delay_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """CAS one leased item and append exactly one immutable artifact."""
+
+        artifact_hash = (
+            hashlib.sha256(self._canonical_json(artifact).encode("utf-8")).hexdigest()
+            if artifact is not None else ""
+        )
+        with self.connection() as conn:
+            work = conn.execute(
+                "SELECT * FROM policy_snapshot_work_items WHERE id=%s FOR UPDATE", (work_id,),
+            ).fetchone()
+            if not work:
+                raise LookupError("策略快照 work item 不存在")
+            existing = conn.execute(
+                "SELECT * FROM policy_snapshot_artifacts WHERE work_id=%s", (work_id,),
+            ).fetchone()
+            if existing:
+                if existing["content_hash"] != artifact_hash:
+                    raise RuntimeError("immutable artifact hash conflict")
+                return work
+            if work["status"] != "leased" or work["lease_token"] != lease_token:
+                raise RuntimeError("stale policy snapshot lease")
+            if not work["lease_expires_at"] or work["lease_expires_at"] <= datetime.now(timezone.utc):
+                raise RuntimeError("expired policy snapshot lease")
+            if error_message:
+                terminal = int(work["attempt"]) >= int(work["max_attempts"])
+                status = "terminal_failed" if terminal else "retryable_failed"
+                return conn.execute(
+                    """UPDATE policy_snapshot_work_items
+                       SET status=%s,error_message=%s,lease_owner=NULL,lease_token=NULL,
+                           lease_expires_at=NULL,next_attempt_at=NOW()+(%s*INTERVAL '1 second'),
+                           updated_at=NOW(),completed_at=CASE WHEN %s THEN NOW() ELSE NULL END
+                       WHERE id=%s RETURNING *""",
+                    (status, error_message[:2000], max(0, retry_delay_seconds), terminal, work_id),
+                ).fetchone()
+            if artifact is None:
+                raise ValueError("成功 work item 必须提供 artifact")
+            conn.execute(
+                """INSERT INTO policy_snapshot_artifacts(
+                   snapshot_id,artifact_key,work_id,kind,project_id,document_id,revision_id,
+                   chunk_id,content_hash,payload)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                (
+                    work["snapshot_id"], work_id, work_id, work["phase"], work["project_id"],
+                    work.get("document_id"), work.get("revision_id"), work.get("chunk_id"),
+                    artifact_hash, self._json(artifact),
+                ),
+            )
+            return conn.execute(
+                """UPDATE policy_snapshot_work_items
+                   SET status='completed',accepted_artifact_hash=%s,lease_owner=NULL,
+                       lease_token=NULL,lease_expires_at=NULL,completed_at=NOW(),updated_at=NOW()
+                   WHERE id=%s RETURNING *""",
+                (artifact_hash, work_id),
+            ).fetchone()
+
+    def finalize_policy_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            snapshot = conn.execute(
+                "SELECT * FROM policy_snapshots WHERE id=%s FOR UPDATE", (snapshot_id,),
+            ).fetchone()
+            if not snapshot:
+                raise LookupError("策略快照不存在")
+            counts = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          COUNT(*) FILTER(WHERE status='completed') AS completed,
+                          COUNT(*) FILTER(WHERE status='terminal_failed') AS failed,
+                          COUNT(*) FILTER(WHERE status IN ('pending','leased','retryable_failed')) AS open
+                   FROM policy_snapshot_work_items WHERE snapshot_id=%s""",
+                (snapshot_id,),
+            ).fetchone()
+            artifacts = conn.execute(
+                """SELECT artifact_key,content_hash FROM policy_snapshot_artifacts
+                   WHERE snapshot_id=%s ORDER BY artifact_key""",
+                (snapshot_id,),
+            ).fetchall()
+            expected = int(snapshot["expected_items"])
+            if (
+                int(counts["total"]) != expected
+                or int(counts["completed"]) != expected
+                or int(counts["failed"]) or int(counts["open"])
+                or len(artifacts) != expected
+            ):
+                raise ValueError("策略快照 item/artifact universe 尚未精确完成")
+            root_hash = hashlib.sha256(
+                self._canonical_json([
+                    [item["artifact_key"], item["content_hash"]] for item in artifacts
+                ]).encode("utf-8")
+            ).hexdigest()
+            return conn.execute(
+                """UPDATE policy_snapshots SET status='ready',completed_items=%s,
+                   failed_items=0,artifact_root_hash=%s,completed_at=NOW()
+                   WHERE id=%s AND status='building' RETURNING *""",
+                (expected, root_hash, snapshot_id),
+            ).fetchone() or snapshot
+
+    def request_policy_snapshot_cancel(self, snapshot_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            snapshot = conn.execute(
+                """UPDATE policy_snapshots SET cancel_requested=TRUE,status='cancelled',
+                   error_message='cancelled by operator',completed_at=NOW()
+                   WHERE id=%s AND status='building' RETURNING *""",
+                (snapshot_id,),
+            ).fetchone()
+            if not snapshot:
+                snapshot = conn.execute(
+                    "SELECT * FROM policy_snapshots WHERE id=%s", (snapshot_id,),
+                ).fetchone()
+            if not snapshot:
+                raise LookupError("策略快照不存在")
+            conn.execute(
+                """UPDATE policy_snapshot_work_items SET status='cancelled',lease_owner=NULL,
+                   lease_token=NULL,lease_expires_at=NULL,completed_at=NOW(),updated_at=NOW()
+                   WHERE snapshot_id=%s AND status IN ('pending','leased','retryable_failed')""",
+                (snapshot_id,),
+            )
+            return snapshot
+
+    def policy_snapshot_status(self, snapshot_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            snapshot = conn.execute(
+                "SELECT * FROM policy_snapshots WHERE id=%s", (snapshot_id,),
+            ).fetchone()
+            if not snapshot:
+                raise LookupError("策略快照不存在")
+            return {
+                "snapshot": snapshot,
+                "work_items": conn.execute(
+                    """SELECT * FROM policy_snapshot_work_items
+                       WHERE snapshot_id=%s ORDER BY phase_order,id""",
+                    (snapshot_id,),
+                ).fetchall(),
+                "artifacts": conn.execute(
+                    """SELECT * FROM policy_snapshot_artifacts
+                       WHERE snapshot_id=%s ORDER BY artifact_key""",
+                    (snapshot_id,),
+                ).fetchall(),
+            }
 
     def complete_policy_snapshot_document(
         self,

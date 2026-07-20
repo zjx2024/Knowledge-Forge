@@ -477,23 +477,64 @@ class KnowledgeForgeService:
                 LOGGER.warning("Relation embedding refresh deferred for %s: %s", object_key, exc)
         return failures
 
-    def build_entity_shadow_namespace(self, project_id: int, snapshot_id: str = "") -> dict[str, Any]:
+    def build_entity_shadow_namespace(
+        self,
+        project_id: int,
+        snapshot_id: str = "",
+        *,
+        snapshot_manifest: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Build an independent span-first P2 treatment from active raw chunks."""
 
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
-        documents = [
-            item for item in self.db.list_documents(project_id)
-            if item.get("status") == "indexed" and not item.get("is_deleted")
-        ]
+        frozen_manifest_documents = list((snapshot_manifest or {}).get("documents") or [])
+        if frozen_manifest_documents:
+            documents = []
+            chunks = []
+            for frozen in frozen_manifest_documents:
+                document = self.db.get_document(int(frozen["document_id"]))
+                if not document or int(document["project_id"]) != int(project_id):
+                    raise RuntimeError("snapshot 冻结文档已不存在或项目不匹配")
+                document = {
+                    **document,
+                    "active_revision_id": str(frozen["revision_id"]),
+                    "doc_hash": str(frozen["content_hash"]),
+                }
+                documents.append(document)
+                expected_chunks = {
+                    int(item["chunk_id"]): str(item["content_hash"])
+                    for item in frozen.get("chunks") or []
+                }
+                revision_chunks = self.db.list_revision_chunks(
+                    int(document["id"]), str(frozen["revision_id"]),
+                )
+                actual = {int(item["id"]): item for item in revision_chunks}
+                if set(actual) != set(expected_chunks):
+                    raise RuntimeError("snapshot 冻结 Chunk 集合与不可变修订不一致")
+                for chunk_id, expected_hash in expected_chunks.items():
+                    if str(actual[chunk_id].get("content_hash") or "") != expected_hash:
+                        raise RuntimeError("snapshot 冻结 Chunk content hash 已改变")
+                    chunks.append(actual[chunk_id])
+        else:
+            documents = [
+                item for item in self.db.list_documents(project_id)
+                if item.get("status") == "indexed" and not item.get("is_deleted")
+            ]
+            chunks = []
+            for document in documents:
+                chunks.extend(self.db.list_document_chunks(int(document["id"])))
         documents.sort(key=lambda item: int(item["id"]))
-        active_schema = self.db.get_active_schema(project_id)
+        schema_version = int(
+            ((snapshot_manifest or {}).get("project") or {}).get("schema_version") or 0
+        )
+        active_schema = (
+            self.db.get_schema_version(project_id, schema_version)
+            if schema_version else self.db.get_active_schema(project_id)
+        )
         if not active_schema:
-            raise RuntimeError("项目没有 active Schema，无法构建 entity treatment")
-        chunks: list[dict[str, Any]] = []
-        for document in documents:
-            chunks.extend(self.db.list_document_chunks(int(document["id"])))
+            raise RuntimeError("snapshot 冻结 Schema 不存在，无法构建 entity treatment")
         chunks.sort(key=lambda item: (
             int(item["document_id"]), int(item.get("chunk_index") or 0), int(item["id"]),
         ))
@@ -840,6 +881,91 @@ class KnowledgeForgeService:
             namespace_id, metrics=metrics, artifact_hash=artifact_hash,
         )
         return {"namespace_id": namespace_id, **self.db.load_entity_shadow_snapshot(namespace_id)}
+
+    def process_policy_snapshot_work(
+        self, snapshot: dict[str, Any], work: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one frozen shadow work item without publishing product facts."""
+
+        manifest = self._metadata(snapshot.get("snapshot_manifest"))
+        if str(manifest.get("manifest_hash") or "") != str(snapshot.get("manifest_hash") or ""):
+            raise RuntimeError("policy snapshot manifest hash 不匹配")
+        project_id = int(snapshot["project_id"])
+        phase = str(work["phase"])
+        if phase == "entity":
+            result = self.build_entity_shadow_namespace(
+                project_id, str(snapshot["id"]), snapshot_manifest=manifest,
+            )
+            namespace = result["namespace"]
+            if namespace.get("status") != "ready" or not namespace.get("snapshot_complete"):
+                raise RuntimeError("entity shadow namespace 尚未完整收敛")
+            return {
+                "namespace_id": result["namespace_id"],
+                "artifact_hash": str(namespace.get("artifact_hash") or ""),
+                "metrics": namespace.get("metrics") or {},
+            }
+
+        chunk_id = int(work.get("chunk_id") or 0)
+        revision_id = str(work.get("revision_id") or "")
+        chunk = self.db.get_revision_chunk(chunk_id, revision_id)
+        if not chunk:
+            raise RuntimeError("snapshot frozen Chunk 不存在")
+        expected_hash = next((
+            str(item["content_hash"])
+            for document in manifest.get("documents") or []
+            if int(document["document_id"]) == int(work["document_id"])
+            and str(document["revision_id"]) == revision_id
+            for item in document.get("chunks") or []
+            if int(item["chunk_id"]) == chunk_id
+        ), "")
+        if not expected_hash or str(chunk.get("content_hash") or "") != expected_hash:
+            raise RuntimeError("snapshot frozen Chunk hash 不一致")
+        if phase == "control":
+            return {
+                "document_id": int(work["document_id"]),
+                "revision_id": revision_id,
+                "chunk_id": chunk_id,
+                "content_hash": expected_hash,
+            }
+        if phase != "relation":
+            raise ValueError(f"未知 policy snapshot phase: {phase}")
+
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        schema_version = int((manifest.get("project") or {}).get("schema_version") or 1)
+        schema_record = self.db.get_schema_version(project_id, schema_version)
+        if not schema_record:
+            raise RuntimeError("snapshot frozen Schema 不存在")
+        if str(snapshot.get("mode")) == "end_to_end":
+            namespace = self.db.get_entity_shadow_namespace_for_snapshot(str(snapshot["id"]))
+            if not namespace or namespace.get("status") != "ready":
+                raise RuntimeError("relation treatment 缺少完整 entity shadow endpoint")
+            mentions = self.db.list_entity_shadow_mentions(str(namespace["id"]), chunk_id=chunk_id)
+            entities = [{
+                "id": str(item["mention_key"]),
+                "name": str(item["surface"]),
+                "type": str(item.get("entity_type") or "GenericEntity"),
+                "evidence": str(item.get("evidence_text") or item["surface"]),
+                "mention_start": int(item["evidence_start"]),
+                "mention_end": int(item["evidence_end"]),
+            } for item in mentions]
+        else:
+            entities = []
+            for item in self.db.list_control_entities_for_chunk(chunk_id, revision_id):
+                metadata = self._metadata(item.get("metadata"))
+                entities.append({
+                    "id": str(item["id"]),
+                    "name": str(item["name"]),
+                    "type": str(item.get("entity_type") or "GenericEntity"),
+                    "evidence": str(item.get("evidence") or item["name"]),
+                    "mention_start": metadata.get("mention_start"),
+                    "mention_end": metadata.get("mention_end"),
+                })
+        return self._run_relation_shadow(
+            str(snapshot["id"]), project, int(work["document_id"]), chunk,
+            {"entities": entities}, schema_record, raise_on_failure=True,
+        )
 
     def evaluate_policy_snapshot_gate(
         self,
@@ -1597,7 +1723,9 @@ class KnowledgeForgeService:
         chunk: dict[str, Any],
         extraction: dict[str, Any],
         schema_record: dict[str, Any],
-    ) -> None:
+        *,
+        raise_on_failure: bool = False,
+    ) -> dict[str, Any]:
         """Run P1 relation treatment in isolation; never fail or mutate the control path."""
 
         schema_version = int(schema_record.get("version") or 1)
@@ -1805,7 +1933,7 @@ class KnowledgeForgeService:
                     1 for item in decisions if item.get("status") == "classified"
                 ),
             }
-            self.db.finish_relation_shadow_run(
+            finished = self.db.finish_relation_shadow_run(
                 run_id,
                 candidates=candidates,
                 decisions=decisions,
@@ -1816,6 +1944,12 @@ class KnowledgeForgeService:
                     else "one or more relation work items failed closed"
                 ),
             )
+            return {
+                "run_id": run_id,
+                "status": final_status,
+                "artifact_hash": str(finished.get("artifact_hash") or ""),
+                "metrics": metrics,
+            }
         except Exception as exc:
             LOGGER.warning("Relation shadow failed without affecting control: %s", exc)
             if started:
@@ -1827,6 +1961,14 @@ class KnowledgeForgeService:
                     )
                 except Exception:
                     LOGGER.exception("Unable to persist isolated relation shadow failure")
+            if raise_on_failure:
+                raise
+            return {
+                "run_id": run_id,
+                "status": "failed",
+                "artifact_hash": "",
+                "metrics": {"shadow_exception": type(exc).__name__},
+            }
 
     def _rebuild_project_graph(
         self,

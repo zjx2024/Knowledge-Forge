@@ -74,7 +74,9 @@ def test_entity_shadow_pipeline_reads_active_chunks_not_formal_mentions():
 
 
 def test_entity_shadow_migration_persists_independent_audit_and_work_state():
-    sql = MIGRATIONS[-1].sql
+    sql = next(
+        item.sql for item in MIGRATIONS if item.version == "0003_entity_shadow_pipeline"
+    )
     for table in (
         "entity_shadow_work_items",
         "entity_shadow_mentions",

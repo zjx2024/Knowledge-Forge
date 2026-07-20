@@ -258,6 +258,7 @@ def test_bootstrap_is_restart_safe_after_revision_migration():
             {"version": "0001_document_content_revisions", "count": 1},
             {"version": "0002_relation_shadow_work_queue", "count": 1},
             {"version": "0003_entity_shadow_pipeline", "count": 1},
+            {"version": "0004_policy_snapshot_orchestrator", "count": 1},
         ]
         assert conn.execute(
             "SELECT to_regclass('uq_chunks_revision_key') AS index_name"

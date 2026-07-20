@@ -768,6 +768,98 @@ CREATE INDEX IF NOT EXISTS idx_entity_shadow_relation_chunk
 """
 
 
+POLICY_SNAPSHOT_ORCHESTRATOR_SQL = r"""
+ALTER TABLE policy_snapshots ADD COLUMN mode TEXT NOT NULL DEFAULT 'relation_only'
+    CHECK(mode IN ('relation_only','end_to_end'));
+ALTER TABLE policy_snapshots ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE policy_snapshots ADD COLUMN artifact_root_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE policy_snapshots ADD COLUMN expected_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE policy_snapshots ADD COLUMN completed_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE policy_snapshots ADD COLUMN failed_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE policy_snapshots ADD COLUMN cancel_requested BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE policy_snapshots ADD COLUMN pilot BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE policy_snapshots ADD COLUMN created_by TEXT NOT NULL DEFAULT 'system';
+
+DO $$
+DECLARE constraint_name TEXT;
+BEGIN
+    SELECT conname INTO constraint_name
+    FROM pg_constraint
+    WHERE conrelid='policy_snapshots'::regclass
+      AND contype='c'
+      AND pg_get_constraintdef(oid) LIKE '%status%building%ready%';
+    IF constraint_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE policy_snapshots DROP CONSTRAINT %I',constraint_name);
+    END IF;
+END $$;
+ALTER TABLE policy_snapshots ADD CONSTRAINT ck_policy_snapshot_status
+    CHECK(status IN ('building','ready','active','failed','rolled_back','cancelled'));
+CREATE UNIQUE INDEX uq_policy_snapshot_manifest
+    ON policy_snapshots(project_id,manifest_hash) WHERE manifest_hash<>'';
+
+CREATE TABLE policy_snapshot_work_items (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES policy_snapshots(id),
+    phase TEXT NOT NULL CHECK(phase IN ('control','entity','relation')),
+    phase_order INTEGER NOT NULL,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT,
+    revision_id TEXT,
+    chunk_id BIGINT,
+    input_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(
+        status IN ('pending','leased','retryable_failed','completed','terminal_failed','cancelled')
+    ),
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 20),
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    accepted_artifact_hash TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(snapshot_id,phase,document_id,revision_id,chunk_id),
+    FOREIGN KEY(revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX idx_policy_snapshot_work_claim
+    ON policy_snapshot_work_items(snapshot_id,phase_order,status,next_attempt_at,lease_expires_at,id);
+
+CREATE TABLE policy_snapshot_artifacts (
+    snapshot_id TEXT NOT NULL REFERENCES policy_snapshots(id),
+    artifact_key TEXT NOT NULL,
+    work_id TEXT NOT NULL UNIQUE REFERENCES policy_snapshot_work_items(id),
+    kind TEXT NOT NULL,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT,
+    revision_id TEXT,
+    chunk_id BIGINT,
+    content_hash TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(snapshot_id,artifact_key),
+    FOREIGN KEY(revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX idx_policy_snapshot_artifact_scope
+    ON policy_snapshot_artifacts(snapshot_id,kind,document_id,chunk_id);
+
+CREATE FUNCTION kf_reject_policy_snapshot_artifact_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'policy snapshot artifacts are immutable' USING ERRCODE='55000';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_policy_snapshot_artifacts_immutable
+    BEFORE UPDATE OR DELETE ON policy_snapshot_artifacts
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_policy_snapshot_artifact_mutation();
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -783,6 +875,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0003_entity_shadow_pipeline",
         description="Persist independent span-first entity shadow treatment and audit lineage",
         sql=ENTITY_SHADOW_PIPELINE_SQL,
+    ),
+    Migration(
+        version="0004_policy_snapshot_orchestrator",
+        description="Persist immutable resumable policy snapshot work and artifacts",
+        sql=POLICY_SNAPSHOT_ORCHESTRATOR_SQL,
     ),
 )
 
