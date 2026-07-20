@@ -860,6 +860,78 @@ CREATE TRIGGER trg_policy_snapshot_artifacts_immutable
 """
 
 
+RELEASE_GATE_ARTIFACTS_SQL = r"""
+CREATE TABLE gold_manifests (
+    id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    dataset TEXT NOT NULL,
+    dataset_version TEXT NOT NULL,
+    level TEXT NOT NULL CHECK(level IN ('pilot','release')),
+    manifest_hash TEXT NOT NULL UNIQUE,
+    annotations_hash TEXT NOT NULL,
+    manifest JSONB NOT NULL,
+    validation_report JSONB NOT NULL,
+    trusted_approval JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(project_id,dataset,dataset_version)
+);
+
+CREATE TABLE gold_manifest_items (
+    gold_manifest_id TEXT NOT NULL REFERENCES gold_manifests(id),
+    item_id TEXT NOT NULL,
+    split TEXT NOT NULL CHECK(split IN ('dev','holdout')),
+    content_hash TEXT NOT NULL,
+    item_hash TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(gold_manifest_id,item_id)
+);
+
+ALTER TABLE quality_evaluation_runs
+    ADD COLUMN gold_manifest_id TEXT REFERENCES gold_manifests(id),
+    ADD COLUMN evaluator_version TEXT NOT NULL DEFAULT 'legacy-untrusted',
+    ADD COLUMN artifact_root_hash TEXT NOT NULL DEFAULT '',
+    ADD COLUMN gold_manifest_hash TEXT NOT NULL DEFAULT '',
+    ADD COLUMN gold_items_hash TEXT NOT NULL DEFAULT '',
+    ADD COLUMN report_hash TEXT NOT NULL DEFAULT '',
+    ADD COLUMN item_hashes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN release_level TEXT NOT NULL DEFAULT 'pilot'
+        CHECK(release_level IN ('pilot','release')),
+    ADD COLUMN evaluation_attempt INTEGER NOT NULL DEFAULT 1 CHECK(evaluation_attempt>0);
+
+CREATE TABLE quality_evaluation_items (
+    evaluation_run_id TEXT NOT NULL REFERENCES quality_evaluation_runs(id),
+    item_id TEXT NOT NULL,
+    artifact_hash TEXT NOT NULL,
+    result_hash TEXT NOT NULL,
+    result JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(evaluation_run_id,item_id)
+);
+
+ALTER TABLE policy_activation_gates DROP CONSTRAINT IF EXISTS policy_activation_gates_project_id_snapshot_id_key;
+CREATE UNIQUE INDEX uq_policy_activation_gate_evaluation
+    ON policy_activation_gates(evaluation_run_id);
+
+CREATE FUNCTION kf_reject_quality_fact_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'quality and Gold facts are append-only' USING ERRCODE='55000';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_gold_manifests_immutable BEFORE UPDATE OR DELETE ON gold_manifests
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_quality_fact_mutation();
+CREATE TRIGGER trg_gold_manifest_items_immutable BEFORE UPDATE OR DELETE ON gold_manifest_items
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_quality_fact_mutation();
+CREATE TRIGGER trg_quality_evaluation_runs_immutable BEFORE UPDATE OR DELETE ON quality_evaluation_runs
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_quality_fact_mutation();
+CREATE TRIGGER trg_quality_evaluation_items_immutable BEFORE UPDATE OR DELETE ON quality_evaluation_items
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_quality_fact_mutation();
+CREATE TRIGGER trg_policy_activation_gates_immutable BEFORE UPDATE OR DELETE ON policy_activation_gates
+    FOR EACH ROW EXECUTE FUNCTION kf_reject_quality_fact_mutation();
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -880,6 +952,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0004_policy_snapshot_orchestrator",
         description="Persist immutable resumable policy snapshot work and artifacts",
         sql=POLICY_SNAPSHOT_ORCHESTRATOR_SQL,
+    ),
+    Migration(
+        version="0005_release_gate_artifacts",
+        description="Bind append-only Gold and evaluation facts to frozen snapshot artifacts",
+        sql=RELEASE_GATE_ARTIFACTS_SQL,
     ),
 )
 

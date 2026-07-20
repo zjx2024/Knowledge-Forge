@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -11,6 +12,27 @@ from typing import Any, Iterable
 
 class GoldManifestError(ValueError):
     """The annotation manifest cannot be used for the requested gate."""
+
+
+RELEASE_GOLD_MINIMUMS = {
+    "items": 200,
+    "domains": 2,
+    "entity_mentions": 500,
+    "must_links": 150,
+    "cannot_links": 150,
+    "positive_relations": 200,
+    "hard_negatives": 300,
+}
+
+
+def canonical_json(value: Any) -> str:
+    """Serialize an immutable evaluation fact identically across processes."""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def canonical_digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def _prf(true_positive: int, predicted: int, gold: int) -> dict[str, float | int]:
@@ -32,9 +54,14 @@ def validate_gold_manifest(
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
         raise GoldManifestError("manifest items must be a non-empty array")
+    level = str(manifest.get("level") or ("pilot" if manifest.get("pilot", True) else "release"))
+    if level not in {"pilot", "release"}:
+        raise GoldManifestError("manifest level must be pilot or release")
     seen_ids: dict[str, str] = {}
     seen_hashes: dict[str, str] = {}
-    production_valid = True
+    seen_documents: dict[str, str] = {}
+    seen_chunks: dict[tuple[str, str, str], str] = {}
+    production_reasons: list[str] = []
     root = Path(bundle_root) if bundle_root else None
     for item in items:
         item_id = str(item.get("id") or "")
@@ -46,7 +73,19 @@ def validate_gold_manifest(
             raise GoldManifestError("dev/holdout overlap detected by item id")
         if digest in seen_hashes and seen_hashes[digest] != split:
             raise GoldManifestError("dev/holdout overlap detected by content hash")
+        document_id = str(item.get("document_id") or "")
+        revision_id = str(item.get("revision_id") or "")
+        chunk_id = str(item.get("chunk_id") or "")
+        if document_id and document_id in seen_documents and seen_documents[document_id] != split:
+            raise GoldManifestError("dev/holdout overlap detected by document id")
+        chunk_key = (document_id, revision_id, chunk_id)
+        if all(chunk_key) and chunk_key in seen_chunks and seen_chunks[chunk_key] != split:
+            raise GoldManifestError("dev/holdout overlap detected by chunk lineage")
         seen_ids[item_id], seen_hashes[digest] = split, split
+        if document_id:
+            seen_documents[document_id] = split
+        if all(chunk_key):
+            seen_chunks[chunk_key] = split
         if root and item.get("path"):
             path = root / str(item["path"])
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -55,26 +94,129 @@ def validate_gold_manifest(
         human = str(item.get("label_source") or "").lower() in {
             "human", "human_reviewed", "independent_human",
         }
-        production_valid &= bool(human and item.get("reviewer") and item.get("reviewed_at"))
+        reviewers = item.get("reviewers") or ([item["reviewer"]] if item.get("reviewer") else [])
+        reviewers = {str(value).strip() for value in reviewers if str(value).strip()}
+        adjudicated = bool(item.get("adjudication") and item.get("adjudicated_at"))
+        if not human:
+            production_reasons.append(f"{item_id}:non_human_label")
+        if len(reviewers) < 2 and not adjudicated:
+            production_reasons.append(f"{item_id}:independent_review")
+        if not item.get("reviewed_at"):
+            production_reasons.append(f"{item_id}:reviewed_at")
+    holdout_items = sum(item.get("split") == "holdout" for item in items)
+    if not holdout_items:
+        production_reasons.append("empty_holdout")
+    for field in ("schema_compatibility", "policy_compatibility", "calibration_universe_version"):
+        if not manifest.get(field):
+            production_reasons.append(f"missing_{field}")
+    approval = manifest.get("trusted_approval") or {}
+    if (
+        str(approval.get("method") or "") not in {"trusted_signature", "approval_service"}
+        or not approval.get("approval_id") or not approval.get("approved_at")
+        or len(set(approval.get("signers") or [])) < 2
+    ):
+        production_reasons.append("trusted_approval")
+    label_counts = manifest.get("label_counts") or {}
+    observed = {
+        "items": len(items),
+        "domains": len({str(item.get("domain") or "") for item in items if item.get("domain")}),
+        **{key: int(label_counts.get(key) or 0) for key in RELEASE_GOLD_MINIMUMS if key not in {"items", "domains"}},
+    }
+    for key, minimum in RELEASE_GOLD_MINIMUMS.items():
+        if observed[key] < minimum:
+            production_reasons.append(f"minimum_{key}")
+    production_valid = level == "release" and not production_reasons
     result = {
         "engineering_valid": True,
         "production_valid": bool(production_valid),
+        "level": level,
+        "production_reasons": sorted(set(production_reasons)),
+        "manifest_hash": canonical_digest(manifest),
         "items": len(items),
         "dev_items": sum(item.get("split") == "dev" for item in items),
-        "holdout_items": sum(item.get("split") == "holdout" for item in items),
+        "holdout_items": holdout_items,
+        "observed_minimums": observed,
     }
     if require_production and not result["production_valid"]:
         raise GoldManifestError("production gate requires independently reviewed human gold")
     return result
 
 
-def _span_key(item: dict[str, Any]) -> tuple[Any, int, int]:
-    return item.get("document_id"), int(item["start"]), int(item["end"])
+def validate_gold_annotations(
+    manifest: dict[str, Any], annotations: list[dict[str, Any]],
+    manifest_report: dict[str, Any] | None = None, *, require_production: bool = False,
+) -> dict[str, Any]:
+    """Validate release minimums from frozen labels instead of caller claims."""
+
+    report = dict(manifest_report or validate_gold_manifest(manifest))
+    manifest_items = {str(item["id"]): item for item in manifest.get("items") or []}
+    annotation_items = {str(item.get("item_id") or ""): item for item in annotations}
+    if set(manifest_items) != set(annotation_items) or "" in annotation_items:
+        raise GoldManifestError("Gold manifest and annotation universes differ")
+
+    observed = {
+        "items": len(annotations),
+        "domains": len({
+            str(item.get("domain") or "") for item in manifest_items.values()
+            if item.get("domain")
+        }),
+        "entity_mentions": sum(len(item.get("mentions") or []) for item in annotations),
+        "must_links": sum(len(item.get("must_links") or []) for item in annotations),
+        "cannot_links": sum(len(item.get("cannot_links") or []) for item in annotations),
+        "positive_relations": sum(len(item.get("relations") or []) for item in annotations),
+        "hard_negatives": sum(
+            len(item.get("hard_negatives") or [])
+            + sum(int(value.get("label") or 0) == 0 for value in item.get("calibration") or [])
+            for item in annotations
+        ),
+    }
+    reasons = set(report.get("production_reasons") or [])
+    declared = manifest.get("label_counts") or {}
+    if report.get("level") == "release" and not declared:
+        reasons.add("missing_label_counts")
+    for key in RELEASE_GOLD_MINIMUMS:
+        if key in {"items", "domains"}:
+            continue
+        if key in declared and int(declared.get(key) or 0) != observed[key]:
+            reasons.add(f"label_count_mismatch_{key}")
+    for key, minimum in RELEASE_GOLD_MINIMUMS.items():
+        if observed[key] < minimum:
+            reasons.add(f"minimum_{key}")
+
+    for item_id, annotation in annotation_items.items():
+        source = str(
+            annotation.get("label_source")
+            or manifest_items[item_id].get("label_source") or ""
+        ).lower()
+        if source not in {"human", "human_reviewed", "independent_human"}:
+            reasons.add(f"{item_id}:non_human_annotation")
+
+    report.update({
+        "observed_minimums": observed,
+        "production_reasons": sorted(reasons),
+        "production_valid": report.get("level") == "release" and not reasons,
+        "annotations_hash": canonical_digest(
+            sorted(annotations, key=lambda item: str(item.get("item_id") or ""))
+        ),
+    })
+    if require_production and not report["production_valid"]:
+        raise GoldManifestError("production gate requires complete independently reviewed Gold labels")
+    return report
+
+
+def _span_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        item.get("document_id"), item.get("revision_id") or item.get("content_hash"),
+        item.get("chunk_id"), int(item["start"]), int(item["end"]),
+    )
 
 
 def _overlaps(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return (
         left.get("document_id") == right.get("document_id")
+        and (left.get("revision_id") or left.get("content_hash"))
+        == (right.get("revision_id") or right.get("content_hash"))
+        and left.get("chunk_id") == right.get("chunk_id")
         and max(int(left["start"]), int(right["start"]))
         < min(int(left["end"]), int(right["end"]))
     )
@@ -120,31 +262,73 @@ def _positive_pairs(assignments: dict[str, str]) -> set[tuple[str, str]]:
 
 
 def pairwise_clustering_metrics(gold: dict[str, str], predicted: dict[str, str]) -> dict[str, Any]:
-    mentions = set(gold) & set(predicted)
-    gold_pairs = _positive_pairs({key: gold[key] for key in mentions})
-    predicted_pairs = _positive_pairs({key: predicted[key] for key in mentions})
-    return _prf(len(gold_pairs & predicted_pairs), len(predicted_pairs), len(gold_pairs))
+    """Detection-aware pairwise score over the augmented mention universe."""
+
+    gold_mentions, predicted_mentions = set(gold), set(predicted)
+    universe = gold_mentions | predicted_mentions
+    augmented_gold = {
+        mention: gold.get(mention, f"__spurious_gold__:{mention}") for mention in universe
+    }
+    augmented_predicted = {
+        mention: predicted.get(mention, f"__missing_prediction__:{mention}") for mention in universe
+    }
+    gold_pairs = _positive_pairs(augmented_gold)
+    predicted_pairs = _positive_pairs(augmented_predicted)
+    missed = len(gold_mentions - predicted_mentions)
+    spurious = len(predicted_mentions - gold_mentions)
+    report = _prf(
+        len(gold_pairs & predicted_pairs), len(predicted_pairs) + spurious,
+        len(gold_pairs) + missed,
+    )
+    matched = gold_mentions & predicted_mentions
+    matched_gold = _positive_pairs({key: gold[key] for key in matched})
+    matched_predicted = _positive_pairs({key: predicted[key] for key in matched})
+    report.update({
+        "universe_mentions": len(universe), "matched_mentions": len(matched),
+        "missed_mentions": missed, "spurious_mentions": spurious,
+        "matched_only": _prf(
+            len(matched_gold & matched_predicted), len(matched_predicted), len(matched_gold),
+        ),
+    })
+    return report
 
 
 def b3_metrics(gold: dict[str, str], predicted: dict[str, str]) -> dict[str, Any]:
-    mentions = sorted(set(gold) & set(predicted))
+    gold_mentions, predicted_mentions = set(gold), set(predicted)
+    mentions = sorted(gold_mentions | predicted_mentions)
     if not mentions:
-        return {"mentions": 0, "precision": 1.0, "recall": 1.0, "f1": 1.0}
+        return {"mentions": 0, "universe_mentions": 0, "precision": 1.0, "recall": 1.0, "f1": 1.0}
     gold_groups: dict[str, set[str]] = defaultdict(set)
     predicted_groups: dict[str, set[str]] = defaultdict(set)
     for mention in mentions:
-        gold_groups[gold[mention]].add(mention)
-        predicted_groups[predicted[mention]].add(mention)
+        gold_groups[gold.get(mention, f"__spurious_gold__:{mention}")].add(mention)
+        predicted_groups[predicted.get(mention, f"__missing_prediction__:{mention}")].add(mention)
     precision = sum(
-        len(gold_groups[gold[m]] & predicted_groups[predicted[m]]) / len(predicted_groups[predicted[m]])
+        0.0 if m not in gold_mentions else
+        len(gold_groups[gold[m]] & predicted_groups[predicted.get(m, f"__missing_prediction__:{m}")])
+        / len(predicted_groups[predicted.get(m, f"__missing_prediction__:{m}")])
         for m in mentions
     ) / len(mentions)
     recall = sum(
-        len(gold_groups[gold[m]] & predicted_groups[predicted[m]]) / len(gold_groups[gold[m]])
+        0.0 if m not in predicted_mentions else
+        len(gold_groups[gold.get(m, f"__spurious_gold__:{m}")] & predicted_groups[predicted[m]])
+        / len(gold_groups[gold.get(m, f"__spurious_gold__:{m}")])
         for m in mentions
     ) / len(mentions)
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {"mentions": len(mentions), "precision": precision, "recall": recall, "f1": f1}
+    matched = gold_mentions & predicted_mentions
+    matched_only = b3_metrics(
+        {key: gold[key] for key in matched}, {key: predicted[key] for key in matched},
+    ) if matched != set(mentions) else None
+    return {
+        "mentions": len(mentions), "universe_mentions": len(mentions),
+        "matched_mentions": len(matched), "missed_mentions": len(gold_mentions - predicted_mentions),
+        "spurious_mentions": len(predicted_mentions - gold_mentions),
+        "precision": precision, "recall": recall, "f1": f1,
+        "matched_only": matched_only or {
+            "mentions": len(mentions), "precision": precision, "recall": recall, "f1": f1,
+        },
+    }
 
 
 def candidate_recall(gold_links: Iterable[tuple[str, str]], candidates: Iterable[tuple[str, str]]) -> dict[str, Any]:
@@ -156,9 +340,16 @@ def candidate_recall(gold_links: Iterable[tuple[str, str]], candidates: Iterable
 
 def _relation_key(item: dict[str, Any]) -> tuple[Any, ...]:
     return (
-        item.get("source"), item.get("predicate"), item.get("target"),
-        item.get("direction") or "forward", int(item.get("evidence_start") or 0),
-        int(item.get("evidence_end") or 0),
+        item.get("document_id"), item.get("revision_id") or item.get("content_hash"),
+        item.get("chunk_id"),
+        item.get("subject_mention_id") or item.get("source_mention_id") or item.get("source"),
+        item.get("subject_canonical_id") or item.get("source_canonical_id") or item.get("source"),
+        item.get("predicate"),
+        item.get("object_mention_id") or item.get("target_mention_id") or item.get("target"),
+        item.get("object_canonical_id") or item.get("target_canonical_id") or item.get("target"),
+        item.get("direction") or "forward", item.get("evidence_text") or item.get("evidence") or "",
+        item.get("evidence_start"), item.get("evidence_end"),
+        item.get("snapshot_id"), item.get("policy_hash") or item.get("policy_version"),
     )
 
 
@@ -171,6 +362,9 @@ def evaluate_relations(gold: list[dict[str, Any]], predicted: list[dict[str, Any
     return {
         "strict": _prf(len(gold_keys & predicted_keys), len(predicted_keys), len(gold_keys)),
         "evidence_coverage": precise_evidence / len(predicted) if predicted else 1.0,
+        "evidence_exactness": (
+            len(gold_keys & predicted_keys) / precise_evidence if precise_evidence else float(not gold_keys)
+        ),
     }
 
 

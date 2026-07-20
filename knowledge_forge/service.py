@@ -41,7 +41,8 @@ from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
 from .policy import POLICY_AXES, P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW_POLICY_SET
-from .quality import evaluate_release_gate, validate_gold_manifest
+from .quality import canonical_digest
+from .release_gate import ALLOWED_EVALUATOR_VERSIONS, evaluate_frozen_bundle
 from .relation_pipeline import VersionedRelationPipeline
 from .schema_evolution import SchemaEvolutionService
 from .span_entities import SpanFirstEntityExtractor
@@ -962,59 +963,272 @@ class KnowledgeForgeService:
                     "mention_start": metadata.get("mention_start"),
                     "mention_end": metadata.get("mention_end"),
                 })
-        return self._run_relation_shadow(
+        treatment_run = self._run_relation_shadow(
             str(snapshot["id"]), project, int(work["document_id"]), chunk,
             {"entities": entities}, schema_record, raise_on_failure=True,
         )
+        control_rows = self.db.list_control_entities_for_chunk(chunk_id, revision_id)
 
-    def evaluate_policy_snapshot_gate(
+        def control_mention(item: dict[str, Any]) -> dict[str, Any]:
+            metadata = self._metadata(item.get("metadata"))
+            return {
+                "mention_id": str(item["id"]), "document_id": int(item["document_id"]),
+                "revision_id": str(item["revision_id"]), "content_hash": expected_hash,
+                "chunk_id": int(item["chunk_id"]),
+                "start": metadata.get("mention_start"), "end": metadata.get("mention_end"),
+                "type": str(item.get("entity_type") or "GenericEntity"),
+                "canonical_id": str(item.get("canonical_entity_id") or item["id"]),
+            }
+
+        control_mentions = [control_mention(item) for item in control_rows]
+        if str(snapshot.get("mode")) == "end_to_end":
+            shadow_state = self.db.load_entity_shadow_snapshot(str(namespace["id"]))
+            canonical_by_mention = {
+                str(item["mention_key"]): str(item["canonical_key"])
+                for item in shadow_state.get("assignments") or []
+            }
+            treatment_mentions = [{
+                "mention_id": str(item["mention_key"]),
+                "document_id": int(item["document_id"]),
+                "revision_id": str(item["revision_id"]), "content_hash": expected_hash,
+                "chunk_id": int(item["chunk_id"]), "start": int(item["evidence_start"]),
+                "end": int(item["evidence_end"]),
+                "type": str(item.get("entity_type") or "GenericEntity"),
+                "canonical_id": canonical_by_mention.get(
+                    str(item["mention_key"]), str(item["mention_key"]),
+                ),
+            } for item in mentions]
+        else:
+            treatment_mentions = list(control_mentions)
+            canonical_by_mention = {
+                str(item["mention_id"]): str(item["canonical_id"])
+                for item in treatment_mentions
+            }
+
+        def relation_fact(
+            item: dict[str, Any], *, treatment: bool,
+            candidate: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            metadata = self._metadata(item.get("metadata"))
+            source_mention = str(
+                (candidate or {}).get("source_mention_id")
+                or metadata.get("source_mention_id") or item.get("source_entity_id") or ""
+            )
+            target_mention = str(
+                (candidate or {}).get("target_mention_id")
+                or metadata.get("target_mention_id") or item.get("target_entity_id") or ""
+            )
+            return {
+                "document_id": int(work["document_id"]), "revision_id": revision_id,
+                "content_hash": expected_hash, "chunk_id": chunk_id,
+                "subject_mention_id": source_mention,
+                "subject_canonical_id": (
+                    canonical_by_mention.get(source_mention, source_mention) if treatment
+                    else str(item.get("source_entity_id") or source_mention)
+                ),
+                "predicate": str(item.get("predicate") or item.get("relation_type") or ""),
+                "object_mention_id": target_mention,
+                "object_canonical_id": (
+                    canonical_by_mention.get(target_mention, target_mention) if treatment
+                    else str(item.get("target_entity_id") or target_mention)
+                ),
+                "direction": str(item.get("direction") or metadata.get("direction") or "forward"),
+                "evidence_text": str(item.get("evidence") or item.get("evidence_text") or ""),
+                "evidence_start": item.get("evidence_start"),
+                "evidence_end": item.get("evidence_end"),
+                "snapshot_id": str(snapshot["id"]),
+                "policy_hash": str(
+                    snapshot.get("policy_hash") if treatment
+                    else manifest.get("control_policy_hash") or project.get("active_policy_hash") or "control"
+                ),
+                "confidence": float(item.get("confidence") or 0.0),
+            }
+
+        control_relations = [
+            relation_fact(item, treatment=False)
+            for item in self.db.list_control_relations_for_chunk(chunk_id, revision_id)
+        ]
+        candidates = {
+            str(item["candidate_id"]): item for item in treatment_run.get("candidates") or []
+        }
+        treatment_relations = [
+            relation_fact(
+                item, treatment=True, candidate=candidates.get(str(item.get("candidate_id") or "")),
+            ) for item in treatment_run.get("decisions") or []
+            if str(item.get("predicate") or "").upper() != "NO_RELATION"
+        ]
+        item_id = f"{int(work['document_id'])}:{revision_id}:{chunk_id}"
+        evaluation_item = {
+            "item_id": item_id,
+            "control": {
+                "mentions": control_mentions, "relations": control_relations,
+                "candidates": control_relations, "calibration": [],
+                "cost": {"tokens": 0, "model_calls": 0},
+            },
+            "treatment": {
+                "mentions": treatment_mentions, "relations": treatment_relations,
+                "candidates": [relation_fact(
+                    {"predicate": "", "evidence": ""}, treatment=True, candidate=item,
+                ) for item in candidates.values()],
+                "calibration": [],
+                "cost": {
+                    "tokens": int((treatment_run.get("metrics") or {}).get("input_tokens") or 0)
+                    + int((treatment_run.get("metrics") or {}).get("output_tokens") or 0),
+                    "model_calls": int((treatment_run.get("metrics") or {}).get("model_calls") or 0),
+                },
+            },
+        }
+        evaluation_item["item_hash"] = canonical_digest(evaluation_item)
+        return {**treatment_run, "evaluation_item": evaluation_item}
+
+    def evaluate_policy_snapshot_artifacts(
         self,
         project_id: int,
         snapshot_id: str,
         *,
-        manifest: dict[str, Any],
-        control_metrics: dict[str, float],
-        treatment_metrics: dict[str, float],
-        approved_by: str | None = None,
+        gold_manifest: dict[str, Any],
+        gold_items: list[dict[str, Any]],
+        evaluator_version: str = "quality-v2",
     ) -> dict[str, Any]:
-        """Persist an auditable gate; model-only labels can never approve production."""
+        """Compute and append an evaluation from frozen artifact item facts only."""
 
+        status = self.db.policy_snapshot_status(snapshot_id)
+        snapshot = status["snapshot"]
+        if int(snapshot["project_id"]) != int(project_id):
+            raise ValueError("evaluation project 与 snapshot 不一致")
+        evaluation_items = []
+        for artifact in status["artifacts"]:
+            payload = self._metadata(artifact.get("payload"))
+            item = payload.get("evaluation_item")
+            if isinstance(item, dict):
+                evaluation_items.append(item)
+        if not evaluation_items:
+            raise RuntimeError("snapshot 未生成受信 evaluator 所需 evaluation_item")
+        bundle_snapshot = {
+            **snapshot,
+            "expected_items": len(evaluation_items),
+            "completed_items": len(evaluation_items),
+            "artifact_root_hash": canonical_digest(sorted(
+                [[str(item["item_id"]), str(item["item_hash"])] for item in evaluation_items]
+            )),
+        }
+        evaluation = evaluate_frozen_bundle(
+            snapshot_bundle={"snapshot": bundle_snapshot, "items": evaluation_items},
+            gold_manifest=gold_manifest, gold_items=gold_items,
+            evaluator_version=evaluator_version,
+        )
+        manifest_report = evaluation["manifest_report"]
+        gold = self.db.persist_gold_manifest(
+            project_id, gold_manifest, gold_items, manifest_report,
+        )
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
-        manifest_report = validate_gold_manifest(manifest, require_production=False)
-        gate_report = evaluate_release_gate(
-            control=control_metrics, treatment=treatment_metrics,
-            manifest=manifest_report,
-        )
-        evaluation = self.db.create_quality_evaluation_run({
-            "project_id": project_id,
-            "snapshot_id": snapshot_id,
+        row = self.db.create_quality_evaluation_run({
+            "project_id": project_id, "snapshot_id": snapshot_id,
             "control_policy_hash": str(project.get("active_policy_hash") or "control"),
-            "treatment_policy_hash": snapshot_id,
-            "dataset": manifest["dataset"],
-            "dataset_version": manifest["version"],
-            "split": "combined",
-            "manifest": manifest,
-            "manifest_valid": manifest_report["production_valid"],
-            "metrics": {"control": control_metrics, "treatment": treatment_metrics},
-            "denominators": manifest_report,
-            "cost_metrics": {
-                "control": control_metrics.get("cost"),
-                "treatment": treatment_metrics.get("cost"),
+            "treatment_policy_hash": str(snapshot.get("policy_hash") or snapshot_id),
+            "dataset": gold_manifest["dataset"], "dataset_version": gold_manifest["version"],
+            "split": "combined", "manifest": gold_manifest,
+            "manifest_valid": bool(manifest_report["production_valid"]),
+            "metrics": evaluation["report"],
+            "denominators": {
+                "manifest": manifest_report,
+                "control": evaluation["report"]["control"]["denominators"],
+                "treatment": evaluation["report"]["treatment"]["denominators"],
             },
-            "status": "completed",
+            "cost_metrics": {
+                "control": evaluation["report"]["control"]["cost"],
+                "treatment": evaluation["report"]["treatment"]["cost"],
+            },
+            "status": "completed", "gold_manifest_id": gold["id"],
+            "evaluator_version": evaluator_version,
+            "artifact_root_hash": str(snapshot.get("artifact_root_hash") or ""),
+            "gold_manifest_hash": evaluation["gold_manifest_hash"],
+            "gold_items_hash": evaluation["gold_items_hash"],
+            "report_hash": evaluation["report_hash"],
+            "item_hashes": evaluation["item_hashes"],
+            "release_level": manifest_report["level"],
+            "evaluation_items": [{
+                "item_id": item["item_id"], "artifact_hash": item["item_hash"],
+                "result": {"control": item["control"], "treatment": item["treatment"]},
+            } for item in evaluation_items],
         })
-        gate = self.db.upsert_policy_activation_gate({
-            "project_id": project_id,
-            "snapshot_id": snapshot_id,
-            "evaluation_run_id": evaluation["id"],
-            "manifest_valid": gate_report["manifest_valid"],
+        return {"evaluation": row, "report": evaluation["report"]}
+
+    def evaluate_policy_snapshot_gate(
+        self, evaluation_run_id: str, *, approved_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Derive a gate from one immutable evaluation id; caller metrics are impossible."""
+
+        evaluation = self.db.get_quality_evaluation_run(evaluation_run_id)
+        if not evaluation:
+            raise LookupError("evaluation_run 不存在")
+        if evaluation["status"] != "completed":
+            raise RuntimeError("evaluation_run 未完成")
+        if evaluation["evaluator_version"] not in ALLOWED_EVALUATOR_VERSIONS:
+            raise RuntimeError("evaluator version 不在允许列表")
+        if evaluation["release_level"] != evaluation["current_gold_level"]:
+            raise RuntimeError("Gold release level 已变化，门禁 fail closed")
+        if (
+            evaluation["snapshot_status"] != "ready"
+            or int(evaluation["snapshot_failed_items"] or 0)
+            or int(evaluation["snapshot_expected_items"] or 0)
+            != int(evaluation["snapshot_completed_items"] or 0)
+        ):
+            raise RuntimeError("snapshot artifact 不完整")
+        checks = {
+            "artifact root": (
+                evaluation["artifact_root_hash"], evaluation["current_artifact_root_hash"]
+            ),
+            "Gold manifest": (
+                evaluation["gold_manifest_hash"], evaluation["current_gold_manifest_hash"]
+            ),
+            "Gold manifest payload": (
+                evaluation["gold_manifest_hash"], evaluation["recomputed_gold_manifest_hash"]
+            ),
+            "Gold annotations": (
+                evaluation["gold_items_hash"], evaluation["current_gold_items_hash"]
+            ),
+            "Gold annotation payloads": (
+                evaluation["gold_items_hash"], evaluation["recomputed_gold_items_hash"]
+            ),
+            "evaluation report": (
+                evaluation["report_hash"], canonical_digest(evaluation["metrics"])
+            ),
+        }
+        for label, (recorded, actual) in checks.items():
+            if not recorded or recorded != actual:
+                raise RuntimeError(f"{label} hash 不一致，门禁 fail closed")
+        if list(evaluation.get("item_hashes") or []) != list(
+            evaluation.get("current_evaluation_item_hashes") or []
+        ) or not evaluation.get("evaluation_item_results_valid"):
+            raise RuntimeError("evaluation item facts 不完整或 hash 不一致，门禁 fail closed")
+        report = dict((evaluation.get("metrics") or {}).get("gate") or {})
+        if not report:
+            raise RuntimeError("evaluation report 缺少 gate 事实")
+        production_approved = bool(report.get("production_approved"))
+        failed_gates = list(report.get("failed_gates") or [])
+        if production_approved and not approved_by:
+            production_approved = False
+            failed_gates.append("operator_approval")
+        gate_report = {
+            **report, "production_approved": production_approved,
+            "status": "production_approved" if production_approved else "engineering_complete",
+            "failed_gates": sorted(set(failed_gates)),
+            "evaluation_run_id": evaluation_run_id,
+            "report_hash": evaluation["report_hash"],
+        }
+        gate = self.db.create_policy_activation_gate({
+            "project_id": evaluation["project_id"],
+            "snapshot_id": evaluation["snapshot_id"],
+            "evaluation_run_id": evaluation_run_id,
+            "manifest_valid": bool(evaluation["manifest_valid"]),
             "engineering_complete": True,
-            "production_approved": gate_report["production_approved"],
+            "production_approved": production_approved,
             "failed_gates": gate_report["failed_gates"],
             "gate_report": gate_report,
-            "approved_by": approved_by if gate_report["production_approved"] else None,
+            "approved_by": approved_by if production_approved else None,
         })
         return {"evaluation": evaluation, "gate": gate, "report": gate_report}
 
@@ -1949,6 +2163,8 @@ class KnowledgeForgeService:
                 "status": final_status,
                 "artifact_hash": str(finished.get("artifact_hash") or ""),
                 "metrics": metrics,
+                "candidates": candidates,
+                "decisions": decisions,
             }
         except Exception as exc:
             LOGGER.warning("Relation shadow failed without affecting control: %s", exc)
@@ -1968,6 +2184,8 @@ class KnowledgeForgeService:
                 "status": "failed",
                 "artifact_hash": "",
                 "metrics": {"shadow_exception": type(exc).__name__},
+                "candidates": [],
+                "decisions": [],
             }
 
     def _rebuild_project_graph(

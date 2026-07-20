@@ -2106,12 +2106,32 @@ class Database:
 
         with self.connection() as conn:
             return conn.execute(
-                """SELECT id,mention_text AS name,entity_type,description AS evidence,
+                """SELECT id,canonical_entity_id,document_id,revision_id,chunk_id,
+                          mention_text AS name,entity_type,description AS evidence,
                           metadata,confidence
                    FROM entity_mentions
                    WHERE chunk_id=%s AND revision_id=%s AND is_deleted=FALSE
                    ORDER BY id""",
                 (chunk_id, revision_id),
+            ).fetchall()
+
+    def list_control_relations_for_chunk(
+        self, chunk_id: int, revision_id: str,
+    ) -> list[dict[str, Any]]:
+        """Load frozen publishable control relations without consulting an active pointer."""
+
+        clause, policy_params = self._publishable_relation_clause("relation")
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT relation.* FROM relation_assertions relation
+                   LEFT JOIN canonical_relation_projections projection
+                     ON projection.project_id=relation.project_id
+                    AND projection.assertion_id=relation.id
+                   WHERE relation.chunk_id=%s AND relation.revision_id=%s
+                     AND relation.is_deleted=FALSE
+                     AND COALESCE(projection.publishable,TRUE)=TRUE
+                     AND """ + clause + " ORDER BY relation.id",
+                (chunk_id, revision_id, *policy_params),
             ).fetchall()
 
     def get_entity_shadow_namespace_for_snapshot(
@@ -3635,16 +3655,87 @@ class Database:
             )
             return row
 
+    def persist_gold_manifest(
+        self,
+        project_id: int,
+        manifest: dict[str, Any],
+        annotations: list[dict[str, Any]],
+        validation_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one frozen Gold bundle; an idempotent retry must be byte-equivalent."""
+
+        manifest_hash = hashlib.sha256(self._canonical_json(manifest).encode("utf-8")).hexdigest()
+        annotations_sorted = sorted(annotations, key=lambda item: str(item.get("item_id") or ""))
+        annotations_hash = hashlib.sha256(
+            self._canonical_json(annotations_sorted).encode("utf-8")
+        ).hexdigest()
+        manifest_id = f"gold_{manifest_hash[:40]}"
+        manifest_items = {str(item["id"]): item for item in manifest.get("items") or []}
+        if set(manifest_items) != {str(item.get("item_id") or "") for item in annotations_sorted}:
+            raise ValueError("Gold manifest 与 annotation item universe 不一致")
+        with self.connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM gold_manifests WHERE id=%s", (manifest_id,),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["manifest_hash"] != manifest_hash
+                    or existing["annotations_hash"] != annotations_hash
+                ):
+                    raise RuntimeError("immutable Gold hash conflict")
+                return existing
+            row = conn.execute(
+                """INSERT INTO gold_manifests(
+                   id,project_id,dataset,dataset_version,level,manifest_hash,
+                   annotations_hash,manifest,validation_report,trusted_approval)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb)
+                   RETURNING *""",
+                (
+                    manifest_id, project_id, manifest["dataset"], manifest["version"],
+                    validation_report.get("level") or "pilot", manifest_hash,
+                    annotations_hash, self._json(manifest), self._json(validation_report),
+                    self._json(manifest.get("trusted_approval")),
+                ),
+            ).fetchone()
+            for annotation in annotations_sorted:
+                item_id = str(annotation["item_id"])
+                item = manifest_items[item_id]
+                item_hash = hashlib.sha256(
+                    self._canonical_json(annotation).encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    """INSERT INTO gold_manifest_items(
+                       gold_manifest_id,item_id,split,content_hash,item_hash,payload)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb)""",
+                    (
+                        manifest_id, item_id, item["split"], item["content_sha256"],
+                        item_hash, self._json(annotation),
+                    ),
+                )
+            return row
+
     def create_quality_evaluation_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Append a trusted evaluator result and its item-level content hashes."""
+
         run_id = str(values.get("id") or uuid.uuid4().hex)
         with self.connection() as conn:
-            return conn.execute(
+            existing = conn.execute(
+                "SELECT * FROM quality_evaluation_runs WHERE id=%s", (run_id,),
+            ).fetchone()
+            if existing:
+                if existing.get("report_hash") != values.get("report_hash"):
+                    raise RuntimeError("immutable evaluation hash conflict")
+                return existing
+            row = conn.execute(
                 """INSERT INTO quality_evaluation_runs(
                    id,project_id,snapshot_id,control_policy_hash,treatment_policy_hash,
                    dataset,dataset_version,split,manifest,manifest_valid,metrics,denominators,
-                   cost_metrics,status,error_message,completed_at)
+                   cost_metrics,status,error_message,completed_at,gold_manifest_id,
+                   evaluator_version,artifact_root_hash,gold_manifest_hash,gold_items_hash,
+                   report_hash,item_hashes,release_level,evaluation_attempt)
                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,%s::jsonb,
-                          %s::jsonb,%s,%s,CASE WHEN %s='running' THEN NULL ELSE NOW() END)
+                          %s::jsonb,%s,%s,CASE WHEN %s='running' THEN NULL ELSE NOW() END,
+                          %s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)
                    RETURNING *""",
                 (
                     run_id, values["project_id"], values.get("snapshot_id"),
@@ -3654,12 +3745,89 @@ class Database:
                     self._json(values.get("metrics")), self._json(values.get("denominators")),
                     self._json(values.get("cost_metrics")), values.get("status") or "completed",
                     values.get("error_message") or "", values.get("status") or "completed",
+                    values.get("gold_manifest_id"), values.get("evaluator_version") or "quality-v2",
+                    values.get("artifact_root_hash") or "", values.get("gold_manifest_hash") or "",
+                    values.get("gold_items_hash") or "", values.get("report_hash") or "",
+                    self._json(values.get("item_hashes") or []),
+                    values.get("release_level") or "pilot",
+                    int(values.get("evaluation_attempt") or 1),
                 ),
             ).fetchone()
+            for item in values.get("evaluation_items") or []:
+                result = item.get("result") or {}
+                result_hash = hashlib.sha256(
+                    self._canonical_json(result).encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    """INSERT INTO quality_evaluation_items(
+                       evaluation_run_id,item_id,artifact_hash,result_hash,result)
+                       VALUES(%s,%s,%s,%s,%s::jsonb)""",
+                    (
+                        run_id, item["item_id"], item["artifact_hash"], result_hash,
+                        self._json(result),
+                    ),
+                )
+            return row
 
-    def upsert_policy_activation_gate(self, values: dict[str, Any]) -> dict[str, Any]:
+    def get_quality_evaluation_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT evaluation.*,snapshot.status AS snapshot_status,
+                          snapshot.manifest_hash AS current_snapshot_manifest_hash,
+                          snapshot.artifact_root_hash AS current_artifact_root_hash,
+                          snapshot.expected_items AS snapshot_expected_items,
+                          snapshot.completed_items AS snapshot_completed_items,
+                          snapshot.failed_items AS snapshot_failed_items,
+                          gold.manifest_hash AS current_gold_manifest_hash,
+                          gold.annotations_hash AS current_gold_items_hash,
+                          gold.manifest AS current_gold_manifest,
+                          gold.level AS current_gold_level,
+                          gold.validation_report AS current_gold_validation_report
+                   FROM quality_evaluation_runs evaluation
+                   JOIN policy_snapshots snapshot ON snapshot.id=evaluation.snapshot_id
+                   JOIN gold_manifests gold ON gold.id=evaluation.gold_manifest_id
+                   WHERE evaluation.id=%s""",
+                (run_id,),
+            ).fetchone()
+            if row:
+                row["evaluation_items"] = conn.execute(
+                    """SELECT * FROM quality_evaluation_items
+                       WHERE evaluation_run_id=%s ORDER BY item_id""",
+                    (run_id,),
+                ).fetchall()
+                gold_items = conn.execute(
+                    """SELECT payload FROM gold_manifest_items
+                       WHERE gold_manifest_id=%s ORDER BY item_id""",
+                    (row["gold_manifest_id"],),
+                ).fetchall()
+                row["recomputed_gold_manifest_hash"] = hashlib.sha256(
+                    self._canonical_json(row["current_gold_manifest"]).encode("utf-8")
+                ).hexdigest()
+                row["recomputed_gold_items_hash"] = hashlib.sha256(
+                    self._canonical_json([item["payload"] for item in gold_items]).encode("utf-8")
+                ).hexdigest()
+                row["current_evaluation_item_hashes"] = [
+                    str(item["artifact_hash"]) for item in row["evaluation_items"]
+                ]
+                row["evaluation_item_results_valid"] = all(
+                    hashlib.sha256(
+                        self._canonical_json(item["result"]).encode("utf-8")
+                    ).hexdigest() == item["result_hash"]
+                    for item in row["evaluation_items"]
+                )
+            return row
+
+    def create_policy_activation_gate(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Append one gate decision. Existing gate facts can never be overwritten."""
+
         gate_id = str(values.get("id") or uuid.uuid4().hex)
         with self.connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM policy_activation_gates WHERE evaluation_run_id=%s",
+                (values["evaluation_run_id"],),
+            ).fetchone()
+            if existing:
+                return existing
             return conn.execute(
                 """INSERT INTO policy_activation_gates(
                    id,project_id,snapshot_id,evaluation_run_id,manifest_valid,
@@ -3667,13 +3835,6 @@ class Database:
                    approved_by,approved_at)
                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,
                           CASE WHEN %s THEN NOW() ELSE NULL END)
-                   ON CONFLICT(project_id,snapshot_id) DO UPDATE SET
-                   evaluation_run_id=EXCLUDED.evaluation_run_id,
-                   manifest_valid=EXCLUDED.manifest_valid,
-                   engineering_complete=EXCLUDED.engineering_complete,
-                   production_approved=EXCLUDED.production_approved,
-                   failed_gates=EXCLUDED.failed_gates,gate_report=EXCLUDED.gate_report,
-                   approved_by=EXCLUDED.approved_by,approved_at=EXCLUDED.approved_at
                    RETURNING *""",
                 (
                     gate_id, values["project_id"], values["snapshot_id"],
