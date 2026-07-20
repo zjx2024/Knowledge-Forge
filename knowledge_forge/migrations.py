@@ -419,11 +419,104 @@ CREATE TRIGGER trg_entity_shadow_assignment_revision BEFORE INSERT OR UPDATE ON 
 """
 
 
+RELATION_SHADOW_QUEUE_SQL = r"""
+ALTER TABLE relation_shadow_runs DROP CONSTRAINT IF EXISTS relation_shadow_runs_status_check;
+ALTER TABLE relation_shadow_runs ADD CONSTRAINT relation_shadow_runs_status_check
+    CHECK(status IN ('running','completed','failed','deferred','terminal_failed','quarantined'));
+ALTER TABLE relation_shadow_runs ADD COLUMN input_fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_shadow_runs ADD COLUMN artifact_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_shadow_runs ADD COLUMN expected_work_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE relation_shadow_runs ADD COLUMN completed_work_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE relation_shadow_runs ADD COLUMN failed_work_items INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE relation_shadow_runs ADD COLUMN snapshot_complete BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE relation_shadow_decisions ADD COLUMN chunk_id BIGINT;
+ALTER TABLE relation_shadow_decisions ADD COLUMN evidence_start INTEGER;
+ALTER TABLE relation_shadow_decisions ADD COLUMN evidence_end INTEGER;
+ALTER TABLE relation_shadow_decisions ADD COLUMN evidence_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_shadow_decisions ADD COLUMN source_mention_start INTEGER;
+ALTER TABLE relation_shadow_decisions ADD COLUMN source_mention_end INTEGER;
+ALTER TABLE relation_shadow_decisions ADD COLUMN target_mention_start INTEGER;
+ALTER TABLE relation_shadow_decisions ADD COLUMN target_mention_end INTEGER;
+ALTER TABLE relation_shadow_decisions ADD COLUMN policy_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_shadow_decisions ADD COLUMN model_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_shadow_decisions ADD COLUMN config_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE relation_shadow_decisions ADD COLUMN accepted_attempt_id TEXT;
+ALTER TABLE relation_shadow_decisions ADD COLUMN output_hash TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS relation_shadow_work_items (
+    id TEXT PRIMARY KEY,
+    shadow_run_id TEXT NOT NULL,
+    revision_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    chunk_id BIGINT NOT NULL,
+    batch_id TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    candidate_ids JSONB NOT NULL,
+    request_json JSONB NOT NULL,
+    estimated_input_tokens INTEGER NOT NULL,
+    max_output_tokens INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending','leased','completed','retryable_failed','terminal_failed','quarantined'
+    )),
+    lease_owner TEXT,
+    lease_token TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts BETWEEN 1 AND 20),
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    accepted_attempt_id TEXT,
+    accepted_output_hash TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(shadow_run_id,batch_id),
+    FOREIGN KEY(shadow_run_id,revision_id) REFERENCES relation_shadow_runs(id,revision_id),
+    FOREIGN KEY(revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,revision_id) REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_relation_shadow_work_lease
+    ON relation_shadow_work_items(status,next_attempt_at,lease_expires_at,created_at);
+CREATE INDEX IF NOT EXISTS idx_relation_shadow_work_run
+    ON relation_shadow_work_items(shadow_run_id,status,batch_id);
+
+CREATE TABLE IF NOT EXISTS relation_shadow_attempts (
+    id TEXT PRIMARY KEY,
+    work_item_id TEXT NOT NULL REFERENCES relation_shadow_work_items(id),
+    attempt_no INTEGER NOT NULL,
+    lease_token TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'leased','accepted','superseded','retryable_failed','terminal_failed'
+    )),
+    output_json JSONB,
+    output_hash TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(work_item_id,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_relation_shadow_attempt_work
+    ON relation_shadow_attempts(work_item_id,attempt_no);
+
+DROP TRIGGER IF EXISTS trg_shadow_work_revision ON relation_shadow_work_items;
+CREATE TRIGGER trg_shadow_work_revision BEFORE INSERT OR UPDATE ON relation_shadow_work_items
+    FOR EACH ROW EXECUTE FUNCTION kf_guard_revision_write('chunk');
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
         description="Version document content and preserve immutable ingestion lineage",
         sql=REVISION_SCHEMA_SQL,
+    ),
+    Migration(
+        version="0002_relation_shadow_work_queue",
+        description="Persist exact resumable relation shadow work and attempt lineage",
+        sql=RELATION_SHADOW_QUEUE_SQL,
     ),
 )
 

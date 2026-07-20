@@ -868,6 +868,15 @@ class Database:
         return json.dumps({} if value is None else value, ensure_ascii=False)
 
     @staticmethod
+    def _canonical_json(value: Any) -> str:
+        return json.dumps(
+            {} if value is None else value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
     def _publishable_relation_clause(alias: str = "r") -> tuple[str, list[Any]]:
         """Return the fail-closed product predicate and its parameters."""
 
@@ -2762,19 +2771,218 @@ class Database:
 
         policy_set = normalize_policy_set(values["policy_set"])
         with self.connection() as conn:
-            return conn.execute(
+            row = conn.execute(
                 """INSERT INTO relation_shadow_runs(
-                   id,project_id,document_id,chunk_id,control_policy_hash,treatment_policy_hash,policy_set)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)
-                   ON CONFLICT(id) DO UPDATE SET error_message='',status='running',
-                   policy_set=EXCLUDED.policy_set,metadata='{}'::jsonb,completed_at=NULL
+                   id,project_id,document_id,chunk_id,control_policy_hash,treatment_policy_hash,
+                   policy_set,input_fingerprint)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                   ON CONFLICT(id) DO UPDATE SET policy_set=EXCLUDED.policy_set
+                   WHERE relation_shadow_runs.input_fingerprint IN ('',EXCLUDED.input_fingerprint)
                    RETURNING *""",
                 (
                     values["id"], values["project_id"], values["document_id"], values["chunk_id"],
                     values["control_policy_hash"], values["treatment_policy_hash"],
-                    self._json(policy_set),
+                    self._json(policy_set), values.get("input_fingerprint") or "",
                 ),
             ).fetchone()
+            if row:
+                return row
+            existing = conn.execute(
+                "SELECT * FROM relation_shadow_runs WHERE id=%s", (values["id"],),
+            ).fetchone()
+            if existing and existing.get("input_fingerprint") != values.get("input_fingerprint", ""):
+                raise ValueError("relation shadow run input fingerprint mismatch")
+            if not existing:
+                raise RuntimeError("relation shadow run could not be started")
+            return existing
+
+    def prepare_relation_shadow_work(
+        self,
+        run_id: str,
+        work_items: list[dict[str, Any]],
+        *,
+        quarantined: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Idempotently persist deterministic batches before any model call."""
+
+        values = [*work_items, *(quarantined or [])]
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM relation_shadow_runs WHERE id=%s FOR UPDATE", (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("relation shadow run 不存在")
+            for item in values:
+                conn.execute(
+                    """INSERT INTO relation_shadow_work_items(
+                       id,shadow_run_id,revision_id,project_id,document_id,chunk_id,batch_id,
+                       input_fingerprint,candidate_ids,request_json,estimated_input_tokens,
+                       max_output_tokens,status,max_attempts,error_message)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)
+                       ON CONFLICT(shadow_run_id,batch_id) DO NOTHING""",
+                    (
+                        item["id"], run_id, item["revision_id"], item["project_id"],
+                        item["document_id"], item["chunk_id"], item["batch_id"],
+                        item["input_fingerprint"], self._json(item.get("candidate_ids") or []),
+                        self._json(item.get("request_json") or {}),
+                        int(item.get("estimated_input_tokens") or 0),
+                        int(item.get("max_output_tokens") or 0),
+                        item.get("status") or "pending", int(item.get("max_attempts") or 3),
+                        item.get("error_message") or "",
+                    ),
+                )
+                existing = conn.execute(
+                    """SELECT input_fingerprint FROM relation_shadow_work_items
+                       WHERE shadow_run_id=%s AND batch_id=%s""",
+                    (run_id, item["batch_id"]),
+                ).fetchone()
+                if not existing or existing["input_fingerprint"] != item["input_fingerprint"]:
+                    raise ValueError("relation shadow work item fingerprint mismatch")
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM relation_shadow_work_items WHERE shadow_run_id=%s",
+                (run_id,),
+            ).fetchone()["count"]
+            conn.execute(
+                """UPDATE relation_shadow_runs SET expected_work_items=%s,
+                   snapshot_complete=FALSE WHERE id=%s""",
+                (count, run_id),
+            )
+            return conn.execute(
+                """SELECT * FROM relation_shadow_work_items
+                   WHERE shadow_run_id=%s ORDER BY batch_id""",
+                (run_id,),
+            ).fetchall()
+
+    def lease_relation_shadow_work(
+        self,
+        run_id: str,
+        owner: str,
+        *,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        """Lease one recoverable item without holding a transaction during model I/O."""
+
+        token = uuid.uuid4().hex
+        expires = datetime.now(timezone.utc) + timedelta(seconds=max(10, lease_seconds))
+        with self.connection() as conn:
+            leased = conn.execute(
+                """WITH candidate AS (
+                       SELECT id FROM relation_shadow_work_items
+                       WHERE shadow_run_id=%s AND (
+                           (status IN ('pending','retryable_failed') AND next_attempt_at<=NOW())
+                           OR (status='leased' AND lease_expires_at<NOW())
+                       )
+                       ORDER BY created_at,batch_id FOR UPDATE SKIP LOCKED LIMIT 1
+                   )
+                   UPDATE relation_shadow_work_items item SET status='leased',lease_owner=%s,
+                       lease_token=%s,lease_expires_at=%s,attempt=item.attempt+1,updated_at=NOW()
+                   FROM candidate WHERE item.id=candidate.id RETURNING item.*""",
+                (run_id, owner, token, expires),
+            ).fetchone()
+            if not leased:
+                return None
+            attempt_id = "relattempt_" + hashlib.sha256(
+                f"{leased['id']}|{leased['attempt']}|{token}".encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                """INSERT INTO relation_shadow_attempts(
+                   id,work_item_id,attempt_no,lease_token,status,started_at)
+                   VALUES(%s,%s,%s,%s,'leased',NOW())
+                   ON CONFLICT(work_item_id,attempt_no) DO NOTHING""",
+                (attempt_id, leased["id"], int(leased["attempt"]), token),
+            )
+            return leased
+
+    def settle_relation_shadow_work(
+        self,
+        work_item_id: str,
+        lease_token: str,
+        *,
+        output: dict[str, Any] | None = None,
+        error_message: str = "",
+        retry_delay_seconds: int = 0,
+    ) -> dict[str, Any]:
+        """Persist every attempt; first valid terminal CAS owns the work item."""
+
+        output_json = output if output is not None else None
+        output_text = self._canonical_json(output_json) if output_json is not None else ""
+        output_hash = hashlib.sha256(output_text.encode("utf-8")).hexdigest() if output_text else ""
+        with self.connection() as conn:
+            item = conn.execute(
+                "SELECT * FROM relation_shadow_work_items WHERE id=%s FOR UPDATE",
+                (work_item_id,),
+            ).fetchone()
+            if not item:
+                raise LookupError("relation shadow work item 不存在")
+            attempt = conn.execute(
+                """SELECT * FROM relation_shadow_attempts
+                   WHERE work_item_id=%s AND lease_token=%s FOR UPDATE""",
+                (work_item_id, lease_token),
+            ).fetchone()
+            if not attempt:
+                raise ValueError("relation shadow attempt lease token 不存在")
+            attempt_no = int(attempt["attempt_no"])
+            attempt_id = str(attempt["id"])
+            owns_lease = item["status"] == "leased" and item["lease_token"] == lease_token
+            if output_json is not None and owns_lease:
+                attempt_status = "accepted"
+                terminal_status = "completed"
+            elif output_json is not None:
+                attempt_status = "superseded"
+                terminal_status = None
+            elif owns_lease and attempt_no < int(item["max_attempts"]):
+                attempt_status = "retryable_failed"
+                terminal_status = "retryable_failed"
+            elif owns_lease:
+                attempt_status = "terminal_failed"
+                terminal_status = "terminal_failed"
+            else:
+                attempt_status = "superseded"
+                terminal_status = None
+            if attempt["status"] == "leased":
+                conn.execute(
+                    """UPDATE relation_shadow_attempts SET status=%s,output_json=%s::jsonb,
+                       output_hash=%s,error_message=%s,completed_at=NOW()
+                       WHERE id=%s AND status='leased'""",
+                    (
+                        attempt_status, output_text or None, output_hash,
+                        error_message or "", attempt_id,
+                    ),
+                )
+            if terminal_status == "completed":
+                conn.execute(
+                    """UPDATE relation_shadow_work_items SET status='completed',
+                       accepted_attempt_id=%s,accepted_output_hash=%s,error_message='',
+                       lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+                       completed_at=NOW(),updated_at=NOW() WHERE id=%s""",
+                    (attempt_id, output_hash, work_item_id),
+                )
+            elif terminal_status:
+                next_attempt = datetime.now(timezone.utc) + timedelta(
+                    seconds=max(0, retry_delay_seconds)
+                )
+                conn.execute(
+                    """UPDATE relation_shadow_work_items SET status=%s,error_message=%s,
+                       next_attempt_at=%s,lease_owner=NULL,lease_token=NULL,
+                       lease_expires_at=NULL,completed_at=CASE WHEN %s='terminal_failed'
+                       THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=%s""",
+                    (terminal_status, error_message or "", next_attempt, terminal_status, work_item_id),
+                )
+            return conn.execute(
+                "SELECT * FROM relation_shadow_work_items WHERE id=%s", (work_item_id,),
+            ).fetchone()
+
+    def list_relation_shadow_work(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT item.*,attempt.output_json,attempt.output_hash,
+                   GREATEST(0,EXTRACT(EPOCH FROM
+                       (attempt.completed_at-attempt.started_at))*1000) AS accepted_latency_ms
+                   FROM relation_shadow_work_items item
+                   LEFT JOIN relation_shadow_attempts attempt ON attempt.id=item.accepted_attempt_id
+                   WHERE item.shadow_run_id=%s ORDER BY item.batch_id""",
+                (run_id,),
+            ).fetchall()
 
     def finish_relation_shadow_run(
         self,
@@ -2788,7 +2996,7 @@ class Database:
     ) -> dict[str, Any]:
         """Atomically persist treatment-only decisions and final run counters."""
 
-        if status not in {"completed", "failed", "deferred"}:
+        if status not in {"completed", "failed", "deferred", "terminal_failed", "quarantined"}:
             raise ValueError(f"非法 shadow 状态: {status}")
         candidate_map = {str(item["candidate_id"]): item for item in candidates}
         if any(str(item.get("candidate_id") or "") not in candidate_map for item in decisions):
@@ -2799,31 +3007,71 @@ class Database:
                 conn.execute(
                     """INSERT INTO relation_shadow_decisions(
                        shadow_run_id,candidate_id,source_mention_id,target_mention_id,allowed_predicates,
-                       predicate,direction,evidence,reason,status,request_batch_id,metadata)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       predicate,direction,evidence,reason,status,request_batch_id,metadata,
+                       chunk_id,evidence_start,evidence_end,evidence_hash,source_mention_start,
+                       source_mention_end,target_mention_start,target_mention_end,policy_version,
+                       model_name,config_hash,accepted_attempt_id,output_hash)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,
+                              %s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT(shadow_run_id,candidate_id) DO UPDATE SET
                        predicate=EXCLUDED.predicate,direction=EXCLUDED.direction,evidence=EXCLUDED.evidence,
                        reason=EXCLUDED.reason,status=EXCLUDED.status,
-                       request_batch_id=EXCLUDED.request_batch_id,metadata=EXCLUDED.metadata""",
+                       request_batch_id=EXCLUDED.request_batch_id,metadata=EXCLUDED.metadata,
+                       evidence_start=EXCLUDED.evidence_start,evidence_end=EXCLUDED.evidence_end,
+                       evidence_hash=EXCLUDED.evidence_hash,accepted_attempt_id=EXCLUDED.accepted_attempt_id,
+                       output_hash=EXCLUDED.output_hash""",
                     (
                         run_id, decision["candidate_id"], candidate["source_mention_id"],
                         candidate["target_mention_id"], candidate.get("allowed_predicates") or [],
                         decision["predicate"], decision["direction"], decision.get("evidence") or "",
                         decision.get("reason") or "", decision.get("status") or "classified",
                         decision.get("request_batch_id"), self._json(decision.get("metadata")),
+                        candidate.get("chunk_id"), decision.get("evidence_start"),
+                        decision.get("evidence_end"), decision.get("evidence_hash") or "",
+                        candidate.get("source_start_char"), candidate.get("source_end_char"),
+                        candidate.get("target_start_char"), candidate.get("target_end_char"),
+                        decision.get("policy_version") or "", decision.get("model_name") or "",
+                        decision.get("config_hash") or "", decision.get("accepted_attempt_id"),
+                        decision.get("output_hash") or "",
                     ),
                 )
+            work_counts = conn.execute(
+                """SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER(WHERE status='completed') AS completed,
+                   COUNT(*) FILTER(WHERE status IN ('terminal_failed','quarantined')) AS failed,
+                   COUNT(*) FILTER(WHERE status IN ('pending','leased','retryable_failed')) AS open
+                   FROM relation_shadow_work_items WHERE shadow_run_id=%s""",
+                (run_id,),
+            ).fetchone()
+            if status == "completed" and int(work_counts["open"] or 0) > 0:
+                raise ValueError("relation shadow 仍有未完成 work item，不能标记 completed")
+            if status == "completed" and int(work_counts["failed"] or 0) > 0:
+                raise ValueError("relation shadow 存在 failed work item，不能标记 completed")
+            terminal_hashes = [
+                row["accepted_output_hash"] or f"{row['status']}:{row['id']}"
+                for row in conn.execute(
+                    """SELECT id,status,accepted_output_hash FROM relation_shadow_work_items
+                       WHERE shadow_run_id=%s ORDER BY id""",
+                    (run_id,),
+                ).fetchall()
+            ]
+            artifact_hash = hashlib.sha256(
+                self._canonical_json(terminal_hashes).encode("utf-8")
+            ).hexdigest()
             row = conn.execute(
                 """UPDATE relation_shadow_runs SET status=%s,raw_pairs=%s,blocked_pairs=%s,
                    admitted_candidates=%s,classified=%s,deferred=%s,model_calls=%s,
                    input_tokens=%s,output_tokens=%s,error_message=%s,metadata=%s::jsonb,
-                   completed_at=NOW() WHERE id=%s RETURNING *""",
+                   completed_work_items=%s,failed_work_items=%s,snapshot_complete=%s,
+                   artifact_hash=%s,completed_at=NOW() WHERE id=%s RETURNING *""",
                 (
                     status, int(metrics.get("raw_pairs") or 0), int(metrics.get("blocked_pairs") or 0),
                     int(metrics.get("admitted_candidates") or 0), int(metrics.get("classified") or 0),
                     int(metrics.get("deferred") or 0), int(metrics.get("model_calls") or 0),
                     int(metrics.get("input_tokens") or 0), int(metrics.get("output_tokens") or 0),
-                    error_message or "", self._json(metrics), run_id,
+                    error_message or "", self._json(metrics), int(work_counts["completed"] or 0),
+                    int(work_counts["failed"] or 0), int(work_counts["open"] or 0) == 0,
+                    artifact_hash, run_id,
                 ),
             ).fetchone()
             if not row:

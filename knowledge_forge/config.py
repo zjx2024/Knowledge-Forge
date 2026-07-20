@@ -179,6 +179,15 @@ class Config:
     relation_classifier_max_candidates = max(
         1, int(os.getenv("RELATION_CLASSIFIER_MAX_CANDIDATES", "32")),
     )
+    relation_shadow_max_attempts = max(
+        1, min(20, int(os.getenv("RELATION_SHADOW_MAX_ATTEMPTS", "3"))),
+    )
+    relation_shadow_lease_seconds = max(
+        10, int(os.getenv("RELATION_SHADOW_LEASE_SECONDS", "300")),
+    )
+    relation_shadow_retry_delay_seconds = max(
+        0, int(os.getenv("RELATION_SHADOW_RETRY_DELAY_SECONDS", "0")),
+    )
     relation_classifier_gleaning_window = max(
         1, min(3, int(os.getenv("RELATION_CLASSIFIER_GLEANING_WINDOW", "2"))),
     )

@@ -17,7 +17,6 @@ from .policy import normalize_policy_set
 
 NO_RELATION = "NO_RELATION"
 ALLOWED_DIRECTIONS = frozenset({"as_is", "reversed", "symmetric"})
-_SENTENCE_RE = re.compile(r"[^。！？!?\.\n]+[。！？!?\.]?|[^\n]+$")
 _RELATION_CUE = re.compile(
     r"\b(?:uses?|causes?|contains?|includes?|supports?|owns?|produces?|located|part of|"
     r"depends?|relates?|works? for|is a)\b|导致|使用|包含|属于|位于|支持|依赖|生产|关联",
@@ -43,6 +42,12 @@ class RelationCandidate:
     context_id: str
     sentence_start: int
     sentence_end: int
+    context_start_char: int
+    context_end_char: int
+    source_start_char: int
+    source_end_char: int
+    target_start_char: int
+    target_end_char: int
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,9 @@ class RelationDecision:
     predicate: str
     direction: str
     evidence: str
+    evidence_start: int | None
+    evidence_end: int | None
+    evidence_hash: str
     reason: str
 
 
@@ -88,13 +96,75 @@ class ShadowClassificationResult:
     error: str = ""
 
 
+@dataclass
+class PreparedRelationShadow:
+    plan: RelationPlan
+    batches: list[RelationBatch]
+    metrics: dict[str, int]
+
+
+_CLOSING_PUNCTUATION = frozenset('"\'”’）)]】》')
+_ABBREVIATION_RE = re.compile(
+    r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e|[A-Z])\.$",
+    re.IGNORECASE,
+)
+_INITIALISM_RE = re.compile(r"(?:[A-Za-z]\.){2,}$")
+
+
+def _period_is_boundary(content: str, index: int) -> bool:
+    previous = content[index - 1] if index else ""
+    following = content[index + 1] if index + 1 < len(content) else ""
+    if following == ".":
+        return False
+    if previous == ".":
+        return following != "."
+    if previous.isdigit() and following.isdigit():
+        return False
+    if previous.isalnum() and following.isalnum():
+        return False
+    token_start = index
+    while token_start and not content[token_start - 1].isspace():
+        token_start -= 1
+    prefix = content[token_start:index + 1]
+    if _ABBREVIATION_RE.fullmatch(prefix) or _INITIALISM_RE.fullmatch(prefix):
+        return False
+    return True
+
+
 def _sentences(content: str) -> list[tuple[int, int, str]]:
-    return [(match.start(), match.end(), match.group(0)) for match in _SENTENCE_RE.finditer(content)]
+    """Split sentences while preserving exact half-open source offsets."""
+
+    result: list[tuple[int, int, str]] = []
+    start = 0
+    index = 0
+    length = len(content)
+    while index < length:
+        value = content[index]
+        boundary = value in "。！？!?\n"
+        if value == ".":
+            boundary = _period_is_boundary(content, index)
+        elif value == "…":
+            boundary = index + 1 >= length or content[index + 1] != "…"
+        if not boundary:
+            index += 1
+            continue
+        end = index + 1
+        while end < length and content[end] in _CLOSING_PUNCTUATION:
+            end += 1
+        while end < length and content[end].isspace() and content[end] != "\n":
+            end += 1
+        if end > start:
+            result.append((start, end, content[start:end]))
+        start = end
+        index = end
+    if start < length:
+        result.append((start, length, content[start:]))
+    return result
 
 
 def _sentence_index(sentences: list[tuple[int, int, str]], offset: int) -> int | None:
     for index, (start, end, _) in enumerate(sentences):
-        if start <= offset < end or (offset == end and start < end):
+        if start <= offset < end:
             return index
     return None
 
@@ -240,6 +310,12 @@ class VersionedRelationPipeline:
                     context_id=f"ctx-{context_start}-{context_end}",
                     sentence_start=context_start,
                     sentence_end=context_end,
+                    context_start_char=sentences[context_start][0],
+                    context_end_char=sentences[context_end][1],
+                    source_start_char=int(source["evidence_start"]),
+                    source_end_char=int(source["evidence_end"]),
+                    target_start_char=int(target["evidence_start"]),
+                    target_end_char=int(target["evidence_end"]),
                 ))
         increment("relation_raw_pairs", raw_pairs)
         increment("relation_pair_checks", pair_checks)
@@ -258,6 +334,9 @@ class VersionedRelationPipeline:
             "allowed_predicates": list(candidate.allowed_predicates),
             "allowed_directions": list(candidate.allowed_directions),
             "context_id": candidate.context_id,
+            "context_span": [candidate.context_start_char, candidate.context_end_char],
+            "source_span": [candidate.source_start_char, candidate.source_end_char],
+            "target_span": [candidate.target_start_char, candidate.target_end_char],
         }
 
     def build_batches(
@@ -274,26 +353,41 @@ class VersionedRelationPipeline:
             plan.deferred.extend({"candidate_id": item.candidate_id, "reason": "no_candidate_budget"}
                                  for item in plan.candidates)
             return []
-        entities: dict[str, dict[str, str]] = {}
-        for item in plan.candidates:
-            entities.setdefault(item.source_mention_id, {
-                "id": item.source_mention_id, "name": item.source_name, "type": item.source_type,
-            })
-            entities.setdefault(item.target_mention_id, {
-                "id": item.target_mention_id, "name": item.target_name, "type": item.target_type,
-            })
         fixed = {
             "policy": plan.policy_set["relation_classifier_policy_version"],
-            "source_context": {"context_id": "source", "text": content},
-            "entities": list(entities.values()),
             "relation_schema": _relation_types(logical_schema),
         }
         batches: list[RelationBatch] = []
         pending: list[RelationCandidate] = []
 
         def render(values: Iterable[RelationCandidate]) -> str:
+            selected = list(values)
+            entities: dict[str, dict[str, str]] = {}
+            contexts: dict[str, dict[str, Any]] = {}
+            for item in selected:
+                entities.setdefault(item.source_mention_id, {
+                    "id": item.source_mention_id,
+                    "name": item.source_name,
+                    "type": item.source_type,
+                })
+                entities.setdefault(item.target_mention_id, {
+                    "id": item.target_mention_id,
+                    "name": item.target_name,
+                    "type": item.target_type,
+                })
+                contexts.setdefault(item.context_id, {
+                    "context_id": item.context_id,
+                    "start": item.context_start_char,
+                    "end": item.context_end_char,
+                    "text": content[item.context_start_char:item.context_end_char],
+                })
             return json.dumps(
-                {**fixed, "candidates": [self._candidate_payload(item) for item in values]},
+                {
+                    **fixed,
+                    "source_contexts": list(contexts.values()),
+                    "entities": list(entities.values()),
+                    "candidates": [self._candidate_payload(item) for item in selected],
+                },
                 ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             )
 
@@ -376,9 +470,35 @@ class VersionedRelationPipeline:
                     raise RelationBatchValidationError("positive evidence must be an exact source quote")
                 if candidate.source_name not in evidence or candidate.target_name not in evidence:
                     raise RelationBatchValidationError("positive evidence must contain both endpoints")
+                raw_start, raw_end = raw.get("evidence_start"), raw.get("evidence_end")
+                if raw_start is None or raw_end is None:
+                    occurrences = [match.start() for match in re.finditer(re.escape(evidence), content)]
+                    if len(occurrences) != 1:
+                        raise RelationBatchValidationError(
+                            "positive evidence occurrence is ambiguous; exact offsets are required"
+                        )
+                    evidence_start = occurrences[0]
+                    evidence_end = evidence_start + len(evidence)
+                else:
+                    evidence_start, evidence_end = int(raw_start), int(raw_end)
+                    if (
+                        evidence_start < 0
+                        or evidence_end <= evidence_start
+                        or evidence_end > len(content)
+                        or content[evidence_start:evidence_end] != evidence
+                    ):
+                        raise RelationBatchValidationError(
+                            "positive evidence must match the exact source span"
+                        )
+                evidence_hash = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+            else:
+                evidence_start = evidence_end = None
+                evidence_hash = ""
             result.append(RelationDecision(
                 candidate_id=candidate.candidate_id, predicate=predicate,
-                direction=direction, evidence=evidence, reason=reason,
+                direction=direction, evidence=evidence,
+                evidence_start=evidence_start, evidence_end=evidence_end,
+                evidence_hash=evidence_hash, reason=reason,
             ))
         return result
 
@@ -472,6 +592,8 @@ class VersionedRelationPipeline:
                             "predicate": {"type": "string"},
                             "direction": {"type": "string"},
                             "evidence": {"type": "string"},
+                            "evidence_start": {"type": ["integer", "null"]},
+                            "evidence_end": {"type": ["integer", "null"]},
                             "reason": {"type": "string"},
                         },
                         "required": ["candidate_id", "predicate", "direction", "evidence", "reason"],
@@ -489,7 +611,7 @@ class VersionedRelationPipeline:
                 raw = classifier.json_chat(
                     model=model,
                     system=(
-                        "Classify every admitted relation candidate from SOURCE_CONTEXT only. "
+                        "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
                         "Return exactly one decision per candidate_id. Use an allowed predicate only when "
                         "an exact quote proves endpoints, meaning and direction; otherwise return NO_RELATION."
                     ),
@@ -532,6 +654,146 @@ class VersionedRelationPipeline:
             status="completed", plan=plan, decisions=decisions,
             batches=batch_audit, metrics=metrics,
         )
+
+    def prepare_shadow(
+        self,
+        *,
+        context_budget_tokens: int,
+        project_scope: str,
+        chunk_key: str,
+        content: str,
+        entities: list[dict[str, Any]],
+        logical_schema: Mapping[str, Any],
+    ) -> PreparedRelationShadow:
+        """Create deterministic, bounded work without performing model I/O."""
+
+        plan = self.plan(
+            project_scope=project_scope, chunk_key=chunk_key, content=content,
+            entities=entities, logical_schema=logical_schema,
+        )
+        uncovered = self.uncovered_cue_windows(content, plan.candidates)
+        if uncovered and Config.relation_classifier_gleaning_window > 1:
+            expanded = self.plan(
+                project_scope=project_scope, chunk_key=chunk_key, content=content,
+                entities=entities, logical_schema=logical_schema,
+                sentence_window=Config.relation_classifier_gleaning_window,
+            )
+            known = {item.candidate_id for item in plan.candidates}
+            uncovered_indexes = {int(item["sentence_index"]) for item in uncovered}
+            additions = [
+                item for item in expanded.candidates
+                if item.candidate_id not in known
+                and any(index in uncovered_indexes for index in range(
+                    item.sentence_start, item.sentence_end + 1,
+                ))
+            ]
+            if additions:
+                plan.candidates.extend(additions)
+                plan.blocked_pairs = max(0, plan.raw_pairs - len(plan.candidates))
+                plan.gleaning_passes = 1
+        output_reserve = min(
+            max(128, Config.relation_classifier_output_reserve),
+            max(128, int(context_budget_tokens) // 3),
+        )
+        candidate_budget = max(
+            0,
+            int(context_budget_tokens) - output_reserve - Config.relation_classifier_safety_margin,
+        )
+        batches = self.build_batches(
+            plan,
+            content=content,
+            logical_schema=logical_schema,
+            candidate_budget_tokens=candidate_budget,
+            output_token_reserve=output_reserve,
+            max_candidates_per_batch=Config.relation_classifier_max_candidates,
+        )
+        return PreparedRelationShadow(
+            plan=plan,
+            batches=batches,
+            metrics={
+                "raw_pairs": plan.raw_pairs,
+                "blocked_pairs": plan.blocked_pairs,
+                "admitted_candidates": plan.admitted_count,
+                "classified": 0,
+                "deferred": len(plan.deferred),
+                "model_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "uncovered_cue_windows": len(
+                    self.uncovered_cue_windows(content, plan.candidates)
+                ),
+                "gleaning_passes": plan.gleaning_passes,
+            },
+        )
+
+    def classify_prepared_batch(
+        self,
+        *,
+        classifier: Any,
+        model: str,
+        context_budget_tokens: int,
+        batch: RelationBatch,
+        candidates: list[RelationCandidate],
+        content: str,
+        logical_schema: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Classify exactly one persisted work item and strictly verify completeness."""
+
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "candidate_id": {"type": "string"},
+                            "predicate": {"type": "string"},
+                            "direction": {"type": "string"},
+                            "evidence": {"type": "string"},
+                            "evidence_start": {"type": ["integer", "null"]},
+                            "evidence_end": {"type": ["integer", "null"]},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "candidate_id", "predicate", "direction", "evidence", "reason",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["decisions"],
+            "additionalProperties": False,
+        }
+        raw = classifier.json_chat(
+            model=model,
+            system=(
+                "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
+                "Return exactly one decision per candidate_id. Use an allowed predicate only when "
+                "an exact quote proves endpoints, meaning and direction; otherwise return NO_RELATION. "
+                "When evidence text occurs more than once, return its exact half-open character offsets."
+            ),
+            prompt=batch.prompt,
+            schema=response_schema,
+            temperature=0,
+            context_budget_tokens=context_budget_tokens,
+            max_output_tokens=batch.output_token_reserve,
+            safety_margin_tokens=Config.relation_classifier_safety_margin,
+        )
+        validated = self.validate_decisions(
+            candidates,
+            raw.get("decisions") if isinstance(raw, dict) else None,
+            content=content,
+            logical_schema=logical_schema,
+        )
+        return [
+            {
+                **asdict(item),
+                "status": "negative" if item.predicate == NO_RELATION else "classified",
+                "request_batch_id": batch.batch_id,
+            }
+            for item in validated
+        ], raw
 
     @staticmethod
     def uncovered_cue_windows(

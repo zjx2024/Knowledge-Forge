@@ -67,9 +67,9 @@ def test_revisioned_reingestion_preserves_audit_and_rejects_stale_workers():
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
+    database = _database_for_dsn(dsn)
+    database.bootstrap()
     with psycopg.connect(dsn, row_factory=dict_row) as setup:
-        setup.execute(SCHEMA_SQL)
-        MigrationRunner().apply(setup)
         project_id = int(setup.execute(
             "INSERT INTO projects(project_key,name) VALUES('readiness','Readiness') RETURNING id"
         ).fetchone()["id"])
@@ -79,8 +79,6 @@ def test_revisioned_reingestion_preserves_audit_and_rejects_stale_workers():
                VALUES(%s,'hash','a.txt','a.txt','/a','/a',1) RETURNING id""",
             (project_id,),
         ).fetchone()["id"])
-
-    database = Database()
 
     @contextmanager
     def connection():
@@ -253,9 +251,13 @@ def test_bootstrap_is_restart_safe_after_revision_migration():
     database.bootstrap()
     with database.connection() as conn:
         rows = conn.execute(
-            "SELECT version,COUNT(*) AS count FROM schema_migrations GROUP BY version"
+            """SELECT version,COUNT(*) AS count FROM schema_migrations
+               GROUP BY version ORDER BY version"""
         ).fetchall()
-        assert rows == [{"version": "0001_document_content_revisions", "count": 1}]
+        assert rows == [
+            {"version": "0001_document_content_revisions", "count": 1},
+            {"version": "0002_relation_shadow_work_queue", "count": 1},
+        ]
         assert conn.execute(
             "SELECT to_regclass('uq_chunks_revision_key') AS index_name"
         ).fetchone()["index_name"] == "uq_chunks_revision_key"
@@ -318,7 +320,8 @@ def test_revision_lineage_guards_cover_all_document_fact_tables():
         "relation_assertions", "canonical_relation_projections", "relation_candidates",
         "mention_relation_assertions", "relation_verification_batches",
         "relation_verification_events", "relation_shadow_runs",
-        "relation_shadow_decisions", "entity_shadow_assignments",
+        "relation_shadow_decisions", "relation_shadow_work_items",
+        "entity_shadow_assignments",
     }
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         guarded = {
@@ -343,7 +346,8 @@ def test_revision_lineage_guards_cover_all_document_fact_tables():
             "entity_resolution_decisions", "entity_type_assertions",
             "relation_assertions", "relation_candidates", "mention_relation_assertions",
             "relation_verification_batches", "relation_verification_events",
-            "relation_shadow_runs", "policy_snapshot_documents",
+            "relation_shadow_runs", "relation_shadow_work_items",
+            "policy_snapshot_documents",
         } <= lineage_tables
 
 

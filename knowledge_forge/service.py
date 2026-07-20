@@ -1307,8 +1307,42 @@ class KnowledgeForgeService:
                 "safety_margin": Config.relation_classifier_safety_margin,
             },
         )
+        revision_id = str(chunk.get("revision_id") or "")
+        if not revision_id:
+            raise ValueError("relation shadow 必须绑定不可变 revision_id")
+        context_budget = int(
+            project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS
+        )
+        prepared = self.relation_shadow.prepare_shadow(
+            context_budget_tokens=context_budget,
+            project_scope=f"{project.get('project_key') or project['id']}:{revision_id}",
+            chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
+            content=str(chunk.get("content") or ""),
+            entities=list(extraction.get("entities") or []),
+            logical_schema=schema_record.get("schema_json") or {},
+        )
+        candidates = [
+            {**asdict(item), "chunk_id": int(chunk["id"])}
+            for item in prepared.plan.candidates
+        ]
+        candidate_map = {item["candidate_id"]: item for item in candidates}
+        input_payload = {
+            "revision_id": revision_id,
+            "chunk_id": int(chunk["id"]),
+            "chunk_hash": hashlib.sha256(
+                str(chunk.get("content") or "").encode("utf-8")
+            ).hexdigest(),
+            "schema_version": schema_version,
+            "treatment_hash": treatment_hash,
+            "candidate_ids": sorted(candidate_map),
+        }
+        input_fingerprint = hashlib.sha256(
+            json.dumps(
+                input_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         run_material = (
-            f"{ingestion_run_id}|{project['id']}|{document_id}|{chunk['id']}|{treatment_hash}"
+            f"{project['id']}|{document_id}|{revision_id}|{chunk['id']}|{treatment_hash}"
         )
         run_id = "relshadow_" + hashlib.sha256(run_material.encode("utf-8")).hexdigest()
         started = False
@@ -1321,30 +1355,163 @@ class KnowledgeForgeService:
                 "control_policy_hash": GRAPH_POLICY_HASH,
                 "treatment_policy_hash": treatment_hash,
                 "policy_set": P1_RELATION_SHADOW_POLICY_SET,
+                "input_fingerprint": input_fingerprint,
             })
             started = True
-            result = self.relation_shadow.classify_shadow(
-                classifier=self.ollama,
-                model=project.get("llm_model") or Config.default_llm_model,
-                context_budget_tokens=int(
-                    project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS
-                ),
-                project_scope=(
-                    f"{project.get('project_key') or project['id']}:{chunk.get('revision_id') or 'legacy'}"
-                ),
-                chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
-                content=str(chunk.get("content") or ""),
-                entities=list(extraction.get("entities") or []),
-                logical_schema=schema_record.get("schema_json") or {},
+            work_items = []
+            for batch in prepared.batches:
+                fingerprint = hashlib.sha256(
+                    f"{input_fingerprint}|{batch.batch_id}".encode("utf-8")
+                ).hexdigest()
+                work_items.append({
+                    "id": "relwork_" + fingerprint,
+                    "revision_id": revision_id,
+                    "project_id": int(project["id"]),
+                    "document_id": document_id,
+                    "chunk_id": int(chunk["id"]),
+                    "batch_id": batch.batch_id,
+                    "input_fingerprint": fingerprint,
+                    "candidate_ids": list(batch.candidate_ids),
+                    "request_json": {
+                        "prompt": batch.prompt,
+                        "candidates": [candidate_map[value] for value in batch.candidate_ids],
+                    },
+                    "estimated_input_tokens": batch.estimated_input_tokens,
+                    "max_output_tokens": batch.output_token_reserve,
+                    "max_attempts": Config.relation_shadow_max_attempts,
+                })
+            quarantined = []
+            for item in prepared.plan.deferred:
+                candidate_id = str(item["candidate_id"])
+                fingerprint = hashlib.sha256(
+                    f"{input_fingerprint}|quarantined|{candidate_id}".encode("utf-8")
+                ).hexdigest()
+                quarantined.append({
+                    "id": "relwork_" + fingerprint,
+                    "revision_id": revision_id,
+                    "project_id": int(project["id"]),
+                    "document_id": document_id,
+                    "chunk_id": int(chunk["id"]),
+                    "batch_id": f"quarantined:{candidate_id}",
+                    "input_fingerprint": fingerprint,
+                    "candidate_ids": [candidate_id],
+                    "request_json": {
+                        "candidates": [candidate_map[candidate_id]],
+                        "reason": item.get("reason") or "deferred",
+                    },
+                    "estimated_input_tokens": 0,
+                    "max_output_tokens": 0,
+                    "status": "quarantined",
+                    "max_attempts": Config.relation_shadow_max_attempts,
+                    "error_message": item.get("reason") or "candidate deferred",
+                })
+            self.db.prepare_relation_shadow_work(
+                run_id, work_items, quarantined=quarantined,
             )
-            candidates = [asdict(item) for item in result.plan.candidates]
+
+            batch_map = {item.batch_id: item for item in prepared.batches}
+            candidate_objects = {
+                item.candidate_id: item for item in prepared.plan.candidates
+            }
+            owner = f"{ingestion_run_id}:{threading.get_ident()}"
+            while True:
+                leased = self.db.lease_relation_shadow_work(
+                    run_id, owner, lease_seconds=Config.relation_shadow_lease_seconds,
+                )
+                if not leased:
+                    break
+                batch = batch_map[str(leased["batch_id"])]
+                selected = [
+                    candidate_objects[str(candidate_id)]
+                    for candidate_id in list(leased.get("candidate_ids") or [])
+                ]
+                try:
+                    decisions, raw = self.relation_shadow.classify_prepared_batch(
+                        classifier=self.ollama,
+                        model=project.get("llm_model") or Config.default_llm_model,
+                        context_budget_tokens=context_budget,
+                        batch=batch,
+                        candidates=selected,
+                        content=str(chunk.get("content") or ""),
+                        logical_schema=schema_record.get("schema_json") or {},
+                    )
+                    self.db.settle_relation_shadow_work(
+                        str(leased["id"]), str(leased["lease_token"]),
+                        output={"decisions": decisions, "raw": raw},
+                    )
+                except Exception as exc:
+                    self.db.settle_relation_shadow_work(
+                        str(leased["id"]), str(leased["lease_token"]),
+                        error_message=str(exc)[:2000],
+                        retry_delay_seconds=Config.relation_shadow_retry_delay_seconds,
+                    )
+
+            persisted_work = self.db.list_relation_shadow_work(run_id)
+            open_items = [
+                item for item in persisted_work
+                if item["status"] in {"pending", "leased", "retryable_failed"}
+            ]
+            if open_items:
+                raise RuntimeError("relation shadow work queue 尚未收敛")
+            decisions: list[dict[str, Any]] = []
+            output_tokens = 0
+            for item in persisted_work:
+                output = item.get("output_json") or {}
+                if isinstance(output, str):
+                    output = json.loads(output)
+                for decision in output.get("decisions") or []:
+                    decisions.append({
+                        **decision,
+                        "policy_version": P1_RELATION_SHADOW_POLICY_SET[
+                            "relation_classifier_policy_version"
+                        ],
+                        "model_name": project.get("llm_model") or Config.default_llm_model,
+                        "config_hash": treatment_hash,
+                        "accepted_attempt_id": item.get("accepted_attempt_id"),
+                        "output_hash": item.get("accepted_output_hash") or "",
+                    })
+                output_tokens += len(json.dumps(output, ensure_ascii=False)) // 4
+            failed_items = [
+                item for item in persisted_work
+                if item["status"] in {"terminal_failed", "quarantined"}
+            ]
+            final_status = "completed"
+            if any(item["status"] == "terminal_failed" for item in failed_items):
+                final_status = "terminal_failed"
+            elif failed_items:
+                final_status = "quarantined"
+            metrics = {
+                **prepared.metrics,
+                "classified": len(decisions),
+                "model_calls": sum(int(item.get("attempt") or 0) for item in persisted_work),
+                "input_tokens": sum(
+                    int(item.get("estimated_input_tokens") or 0)
+                    * int(item.get("attempt") or 0)
+                    for item in persisted_work
+                ),
+                "output_tokens": output_tokens,
+                "latency_ms": sum(
+                    float(item.get("accepted_latency_ms") or 0) for item in persisted_work
+                ),
+                "retried": sum(
+                    max(0, int(item.get("attempt") or 0) - 1) for item in persisted_work
+                ),
+                "failed": len(failed_items),
+                "published": 0,
+                "verified": sum(
+                    1 for item in decisions if item.get("status") == "classified"
+                ),
+            }
             self.db.finish_relation_shadow_run(
                 run_id,
                 candidates=candidates,
-                decisions=result.decisions,
-                metrics={**result.metrics, "batches": result.batches},
-                status=result.status,
-                error_message=result.error,
+                decisions=decisions,
+                metrics=metrics,
+                status=final_status,
+                error_message=(
+                    "" if not failed_items
+                    else "one or more relation work items failed closed"
+                ),
             )
         except Exception as exc:
             LOGGER.warning("Relation shadow failed without affecting control: %s", exc)
