@@ -260,7 +260,8 @@ class EntityResolver:
                 prompt=json.dumps(payload, ensure_ascii=False),
                 schema=schema,
                 temperature=0,
-                max_tokens=session.model_max_tokens,
+                context_budget_tokens=session.model_max_tokens,
+                max_output_tokens=Config.entity_review_max_output_tokens,
             )
         except Exception as exc:
             return None, f"LLM review failed: {exc}", 0.0

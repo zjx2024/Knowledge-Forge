@@ -1,6 +1,15 @@
 import base64
 
-from knowledge_forge.ollama import OllamaClient
+from knowledge_forge.ollama import EffectiveModelContext, OllamaClient
+
+
+def ready(client, monkeypatch, *, context=32768):
+    monkeypatch.setattr(
+        client,
+        "effective_model_context",
+        lambda model: EffectiveModelContext(model, context, context, "test", "runner"),
+    )
+    return client
 
 
 def test_parse_json_preserves_array_for_domain_normalization():
@@ -23,7 +32,10 @@ def test_json_chat_retries_an_invalid_model_response(monkeypatch):
             return None
 
         def json(self):
-            return {"message": {"content": self.content}}
+            return {
+                "message": {"content": self.content}, "done": True,
+                "done_reason": "stop", "prompt_eval_count": 20, "eval_count": 10,
+            }
 
     responses = iter([Response("没有结构化结果"), Response('{"entities": [], "relations": []}')])
     calls = []
@@ -33,7 +45,7 @@ def test_json_chat_retries_an_invalid_model_response(monkeypatch):
         return next(responses)
 
     monkeypatch.setattr("knowledge_forge.ollama.requests.post", fake_post)
-    result = OllamaClient("http://ollama.test").json_chat(
+    result = ready(OllamaClient("http://ollama.test"), monkeypatch).json_chat(
         model="test", system="system", prompt="prompt", schema={"type": "object"}
     )
 
@@ -48,7 +60,10 @@ def test_json_chat_keeps_project_limit_out_of_ollama_runner_options(monkeypatch)
             return None
 
         def json(self):
-            return {"message": {"content": '{"ok": true}'}}
+            return {
+                "message": {"content": '{"ok": true}'}, "done": True,
+                "done_reason": "stop", "prompt_eval_count": 20, "eval_count": 4,
+            }
 
     calls = []
     monkeypatch.setattr(
@@ -56,8 +71,9 @@ def test_json_chat_keeps_project_limit_out_of_ollama_runner_options(monkeypatch)
         lambda url, json, timeout: calls.append(json) or Response(),
     )
 
-    OllamaClient("http://ollama.test").json_chat(
-        model="test", system="system", prompt="prompt", max_tokens=32768
+    ready(OllamaClient("http://ollama.test"), monkeypatch).json_chat(
+        model="test", system="system", prompt="prompt",
+        context_budget_tokens=32768, max_output_tokens=512,
     )
 
     assert "num_ctx" not in calls[0]["options"]
@@ -71,14 +87,16 @@ def test_json_chat_rejects_input_over_project_context_budget(monkeypatch):
     )
 
     try:
-        OllamaClient("http://ollama.test").json_chat(
+        ready(OllamaClient("http://ollama.test"), monkeypatch, context=8).json_chat(
             model="test",
             system="system",
             prompt="很长的项目输入" * 20,
-            max_tokens=8,
+            context_budget_tokens=8,
+            max_output_tokens=1,
+            safety_margin_tokens=0,
         )
     except ValueError as exc:
-        assert "超过项目上下文上限" in str(exc)
+        assert "token budget exceeded" in str(exc)
     else:
         raise AssertionError("expected project context validation to fail")
     assert calls == []
@@ -90,7 +108,10 @@ def test_json_chat_sends_embedded_images_without_changing_runner_context(monkeyp
             return None
 
         def json(self):
-            return {"message": {"content": '{"description": "diagram"}'}}
+            return {
+                "message": {"content": '{"description": "diagram"}'}, "done": True,
+                "done_reason": "stop", "prompt_eval_count": 20, "eval_count": 4,
+            }
 
     calls = []
     monkeypatch.setattr(
@@ -98,12 +119,13 @@ def test_json_chat_sends_embedded_images_without_changing_runner_context(monkeyp
         lambda url, json, timeout: calls.append(json) or Response(),
     )
     image = b"a small image payload"
-    OllamaClient("http://ollama.test").json_chat(
+    ready(OllamaClient("http://ollama.test"), monkeypatch).json_chat(
         model="vision",
         system="system",
         prompt="prompt",
         images=[image],
-        max_tokens=32768,
+        context_budget_tokens=32768,
+        max_output_tokens=512,
     )
 
     assert calls[0]["messages"][1]["images"] == [base64.b64encode(image).decode("ascii")]

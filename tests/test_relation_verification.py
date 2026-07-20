@@ -99,6 +99,9 @@ def test_empty_verifier_response_retries_then_marks_missing(monkeypatch):
     assert result["_diagnostics"]["retry_count"] == 1
     assert result["_diagnostics"]["missing_decisions"] == 1
     assert len(result["_verification_events"]) == 2
+    assert all(call["context_budget_tokens"] == 32768 for call in ollama.calls)
+    assert all("max_output_tokens" in call for call in ollama.calls)
+    assert all("max_tokens" not in call for call in ollama.calls)
 
 
 def test_only_missing_candidate_is_retried_and_remains_quarantined(monkeypatch):

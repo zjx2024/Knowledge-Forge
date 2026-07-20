@@ -499,7 +499,8 @@ class SchemaEvolutionService:
                     system=system,
                     prompt=f"Current schema:\n{current_json}\n\nRepresentative excerpts:\n{self._format_samples(batch)}",
                     schema=SCHEMA_REVIEW_FORMAT,
-                    max_tokens=int(project.get("model_max_tokens") or 32768),
+                    context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                    max_output_tokens=Config.schema_review_max_output_tokens,
                 )
                 batches.append(self._candidate_payload(value))
             except Exception as exc:
@@ -531,7 +532,8 @@ class SchemaEvolutionService:
                     f"Candidate batches:\n{json.dumps(candidates, ensure_ascii=False)}"
                 ),
                 schema=SCHEMA_REVIEW_FORMAT,
-                max_tokens=int(project.get("model_max_tokens") or 32768),
+                context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                max_output_tokens=Config.schema_review_max_output_tokens,
             ))
         except Exception as exc:
             LOGGER.warning("Schema candidate consolidation failed; using batch candidates: %s", exc)
@@ -1204,7 +1206,8 @@ class SchemaEvolutionService:
                 ),
                 schema=RELATION_VERIFICATION_FORMAT,
                 temperature=0,
-                max_tokens=int(project.get("model_max_tokens") or 32768),
+                context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                max_output_tokens=Config.relation_review_max_output_tokens,
             )
         except Exception as exc:
             LOGGER.warning("Relation verifier failed closed: %s", exc)
@@ -1430,7 +1433,8 @@ class SchemaEvolutionService:
                 f"{json.dumps(metadata_context, ensure_ascii=False)}\n\nSource text:\n{content}"
             ),
             schema=EXTRACTION_FORMAT,
-            max_tokens=int(project.get("model_max_tokens") or 32768),
+            context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+            max_output_tokens=Config.extraction_max_output_tokens,
         )
         extraction = self._sanitize_extraction(primary, content, logical)
         diagnostics = {
@@ -1465,7 +1469,8 @@ class SchemaEvolutionService:
                         f"{json.dumps(relation_candidates, ensure_ascii=False)}"
                     ),
                     schema=EXTRACTION_FORMAT,
-                    max_tokens=int(project.get("model_max_tokens") or 32768),
+                    context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                    max_output_tokens=Config.extraction_max_output_tokens,
                 )
                 supplement = self._sanitize_extraction(supplement_raw, content, logical)
                 supplement_diagnostics = supplement.pop("_diagnostics", {})

@@ -91,6 +91,31 @@ Token 上限”和“单切片 Token 上限”：前者是应用侧请求预算�
 `num_ctx`，也不会覆盖容器的 `OLLAMA_CONTEXT_LENGTH`；后者约束该项目后续文档生成的
 每个知识块。页面会根据所选 LLM 和 Embedding 模型动态限制可填最大值。
 
+Ollama 请求使用显式、互不混用的预算。所有数值单位均为 token：
+
+```dotenv
+# runner 尚未加载或 /api/ps 不可用时的保守有效上下文；必须大于 0
+OLLAMA_EFFECTIVE_CONTEXT_FALLBACK_TOKENS=8192
+# 未提供项目预算时的应用侧总上下文预算；不会映射为 options.num_ctx
+OLLAMA_DEFAULT_CONTEXT_BUDGET_TOKENS=8192
+# 默认输出上限，精确映射为 options.num_predict
+OLLAMA_DEFAULT_MAX_OUTPUT_TOKENS=2048
+# Prompt 模板、JSON Schema 和估算误差预留；允许 0，建议至少 128
+OLLAMA_SAFETY_MARGIN_TOKENS=256
+# 估算 token 少于实际 prompt_eval_count 时允许的绝对和相对误差
+OLLAMA_TOKEN_VARIANCE_ABSOLUTE_TOKENS=128
+OLLAMA_TOKEN_VARIANCE_RATIO=0.50
+# /api/show 与 /api/ps 能力结果缓存秒数；0 表示每次重新读取
+OLLAMA_CONTEXT_CACHE_SECONDS=60
+# 每张输入图片的保守 token 估算
+OLLAMA_IMAGE_TOKEN_ESTIMATE=1024
+```
+
+应用通过 `/api/show` 读取模型声明上限，通过 `/api/ps` 读取已加载 runner 的实际
+`context_length`，请求准入按两者和项目预算的最小值判断。准入条件为“估算输入 +
+最大输出 + 安全预留不超过有效上下文”。响应若为 `done_reason=length`、未完成，或
+`prompt_eval_count` 明显超过估算值，会失败关闭，不使用可能被截断的 JSON。
+
 内嵌图片默认开启 OCR 和视觉理解；可通过以下环境变量调整尺寸过滤与扫描页渲染。视觉
 请求使用项目选定的 LLM，并沿用项目上下文预算。
 

@@ -359,7 +359,8 @@ class DocumentMediaService:
                 ),
                 schema=IMAGE_ANALYSIS_SCHEMA,
                 temperature=0,
-                max_tokens=int(project.get("model_max_tokens") or 32768),
+                context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                max_output_tokens=Config.image_analysis_max_output_tokens,
                 images=[asset.data],
             )
             analysis.update({key: visual.get(key, analysis[key]) for key in analysis})

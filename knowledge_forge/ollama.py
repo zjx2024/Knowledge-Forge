@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import logging
 import math
 import re
 import time
-from typing import Any, Iterable
+from dataclasses import asdict, dataclass
+from typing import Any, Iterable, Protocol
 
 import requests
 
@@ -15,10 +18,71 @@ from .config import Config
 from .observability import current_metrics, increment
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+class OllamaBudgetError(ValueError):
+    """The rendered request cannot fit the verified application budget."""
+
+
+class OllamaProtocolError(RuntimeError):
+    """Ollama returned an incomplete, truncated, or diagnostically unsafe result."""
+
+
+class TokenEstimator(Protocol):
+    name: str
+
+    def estimate(self, text: str) -> int: ...
+
+
+class ConservativeTokenEstimator:
+    """Replaceable tokenizer-free fallback for mixed CJK and ASCII text."""
+
+    name = "conservative-cjk-ascii-v1"
+
+    def estimate(self, text: str) -> int:
+        cjk = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
+        return max(1, cjk + math.ceil(max(0, len(text) - cjk) / 4))
+
+
+@dataclass(frozen=True)
+class EffectiveModelContext:
+    model: str
+    model_context_tokens: int
+    effective_context_tokens: int
+    digest: str
+    source: str
+
+
+@dataclass(frozen=True)
+class OllamaCallDiagnostics:
+    model: str
+    digest: str
+    context_source: str
+    effective_context_tokens: int
+    context_budget_tokens: int
+    max_output_tokens: int
+    safety_margin_tokens: int
+    estimated_input_tokens: int
+    prompt_eval_count: int
+    output_eval_count: int
+    rendered_message_hash: str
+    estimator: str
+
+
 class OllamaClient:
-    def __init__(self, base_url: str = "", timeout: int | None = None):
+    def __init__(
+        self,
+        base_url: str = "",
+        timeout: int | None = None,
+        *,
+        token_estimator: TokenEstimator | None = None,
+    ):
         self.base_url = (base_url or Config.ollama_base_url).rstrip("/")
         self.timeout = timeout or Config.ollama_timeout
+        self.token_estimator = token_estimator or ConservativeTokenEstimator()
+        self.last_call_diagnostics: OllamaCallDiagnostics | None = None
+        self._context_cache: dict[str, tuple[float, EffectiveModelContext]] = {}
 
     def models(self) -> list[dict[str, Any]]:
         increment("ollama_logical_calls")
@@ -43,9 +107,56 @@ class OllamaClient:
         ]
         return {
             "context_length": max(context_lengths, default=8192),
+            "digest": str(payload.get("digest") or ""),
             "capabilities": payload.get("capabilities") or [],
             "details": payload.get("details") or {},
         }
+
+    def effective_model_context(self, model: str) -> EffectiveModelContext:
+        """Return the runner context when loaded, otherwise an explicit safe fallback."""
+
+        now = time.monotonic()
+        cached = self._context_cache.get(model)
+        if cached and cached[0] > now:
+            return cached[1]
+        info = self.model_info(model)
+        model_context = max(1, int(info.get("context_length") or 0))
+        digest = str(info.get("digest") or "")
+        effective = min(model_context, max(1, Config.ollama_effective_context_fallback))
+        source = "configured_fallback"
+        try:
+            increment("ollama_logical_calls")
+            response = self._request(
+                "get", f"{self.base_url}/api/ps", timeout=min(self.timeout, 30)
+            )
+            response.raise_for_status()
+            for runner in response.json().get("models") or []:
+                runner_name = str(runner.get("name") or runner.get("model") or "")
+                if not self._same_model(model, runner_name):
+                    continue
+                runner_context = int(runner.get("context_length") or 0)
+                if runner_context > 0:
+                    effective = min(model_context, runner_context)
+                    source = "runner"
+                digest = str(runner.get("digest") or digest)
+                break
+        except Exception as exc:
+            LOGGER.warning(
+                "Ollama runner context unavailable; using configured fallback model=%s error=%s",
+                model,
+                type(exc).__name__,
+            )
+        result = EffectiveModelContext(
+            model=model,
+            model_context_tokens=model_context,
+            effective_context_tokens=effective,
+            digest=digest,
+            source=source,
+        )
+        self._context_cache[model] = (
+            now + max(0, Config.ollama_context_cache_seconds), result,
+        )
+        return result
 
     def embed(self, texts: Iterable[str], model: str) -> list[list[float]]:
         values = [str(item) for item in texts]
@@ -85,12 +196,24 @@ class OllamaClient:
         prompt: str,
         schema: dict[str, Any] | None = None,
         temperature: float = 0.1,
-        max_tokens: int | None = None,
+        context_budget_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+        safety_margin_tokens: int | None = None,
         images: Iterable[bytes] | None = None,
     ) -> dict[str, Any]:
         increment("ollama_logical_calls")
-        increment("estimated_prompt_tokens", self._estimate_tokens("\n".join((system, prompt))))
-        self._validate_project_context_budget(system, prompt, schema, max_tokens)
+        context_budget = int(
+            context_budget_tokens or Config.ollama_default_context_budget
+        )
+        output_budget = int(max_output_tokens or Config.ollama_default_max_output)
+        safety_margin = int(
+            Config.ollama_default_safety_margin
+            if safety_margin_tokens is None else safety_margin_tokens
+        )
+        if min(context_budget, output_budget) <= 0 or safety_margin < 0:
+            raise OllamaBudgetError("Ollama token budgets must be positive")
+        runtime = self.effective_model_context(model)
+        verified_context = min(context_budget, runtime.effective_context_tokens)
         user_message: dict[str, Any] = {"role": "user", "content": prompt}
         encoded_images = [base64.b64encode(value).decode("ascii") for value in (images or [])]
         if encoded_images:
@@ -104,6 +227,7 @@ class OllamaClient:
             "keep_alive": Config.ollama_keep_alive,
             "options": {
                 "temperature": temperature,
+                "num_predict": output_budget,
             },
             "format": schema or "json",
         }
@@ -111,11 +235,39 @@ class OllamaClient:
         for attempt in range(2):
             if attempt:
                 increment("http_retry_count")
+            estimate, rendered_hash = self._admit_request(
+                body,
+                verified_context_tokens=verified_context,
+                max_output_tokens=output_budget,
+                safety_margin_tokens=safety_margin,
+                image_count=len(encoded_images),
+            )
+            increment("estimated_prompt_tokens", estimate)
             response = self._request(
                 "post", f"{self.base_url}/api/chat", json=body, timeout=self.timeout
             )
             response.raise_for_status()
-            content = str((response.json().get("message") or {}).get("content") or "").strip()
+            payload = response.json()
+            self._validate_response_protocol(payload, estimate)
+            prompt_eval_count = int(payload.get("prompt_eval_count") or 0)
+            self.last_call_diagnostics = OllamaCallDiagnostics(
+                model=model,
+                digest=runtime.digest,
+                context_source=runtime.source,
+                effective_context_tokens=runtime.effective_context_tokens,
+                context_budget_tokens=context_budget,
+                max_output_tokens=output_budget,
+                safety_margin_tokens=safety_margin,
+                estimated_input_tokens=estimate,
+                prompt_eval_count=prompt_eval_count,
+                output_eval_count=int(payload.get("eval_count") or 0),
+                rendered_message_hash=rendered_hash,
+                estimator=self.token_estimator.name,
+            )
+            LOGGER.info("Ollama request diagnostics: %s", json.dumps(
+                asdict(self.last_call_diagnostics), ensure_ascii=True, sort_keys=True,
+            ))
+            content = str((payload.get("message") or {}).get("content") or "").strip()
             try:
                 return self._parse_json(content)
             except (RuntimeError, json.JSONDecodeError) as exc:
@@ -131,6 +283,7 @@ class OllamaClient:
                 })
                 body["options"] = {
                     "temperature": 0,
+                    "num_predict": output_budget,
                 }
         raise RuntimeError(f"Ollama JSON response invalid after retry: {parse_error}")
 
@@ -153,35 +306,61 @@ class OllamaClient:
             if metrics is not None:
                 metrics.duration("ollama_http", (time.perf_counter() - started) * 1000)
 
-    @classmethod
-    def _validate_project_context_budget(
-        cls,
-        system: str,
-        prompt: str,
-        schema: dict[str, Any] | None,
-        max_tokens: int | None,
-    ) -> None:
-        """Enforce the project budget without changing Ollama's runner context.
+    def _admit_request(
+        self,
+        body: dict[str, Any],
+        *,
+        verified_context_tokens: int,
+        max_output_tokens: int,
+        safety_margin_tokens: int,
+        image_count: int,
+    ) -> tuple[int, str]:
+        rendered = json.dumps({
+            "messages": body.get("messages") or [],
+            "format": body.get("format") or "json",
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        estimated = self.token_estimator.estimate(rendered)
+        estimated += max(0, image_count) * max(0, Config.ollama_image_token_estimate)
+        required = estimated + max_output_tokens + safety_margin_tokens
+        if required > verified_context_tokens:
+            raise OllamaBudgetError(
+                "Ollama token budget exceeded before HTTP: "
+                f"estimated_input={estimated}, max_output={max_output_tokens}, "
+                f"safety_margin={safety_margin_tokens}, effective_context={verified_context_tokens}"
+            )
+        return estimated, hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
-        Ollama's global context is configured by OLLAMA_CONTEXT_LENGTH. Sending
-        options.num_ctx here would create a differently sized runner and can
-        repeatedly unload an otherwise permanently kept-alive model.
-        """
-        if not max_tokens:
-            return
-        schema_text = json.dumps(schema, ensure_ascii=False) if schema else ""
-        estimated = cls._estimate_tokens("\n".join((system, prompt, schema_text)))
-        if estimated > int(max_tokens):
-            raise ValueError(
-                f"项目请求预计需要 {estimated} tokens，超过项目上下文上限 {int(max_tokens)}；"
-                "请减小输入或提高项目上下文上限"
+    @staticmethod
+    def _validate_response_protocol(payload: dict[str, Any], estimated: int) -> None:
+        if payload.get("done") is not True:
+            raise OllamaProtocolError("Ollama response is incomplete")
+        if str(payload.get("done_reason") or "").lower() in {"length", "max_tokens"}:
+            raise OllamaProtocolError("Ollama response was truncated by output length")
+        actual = int(payload.get("prompt_eval_count") or 0)
+        if actual <= 0:
+            raise OllamaProtocolError("Ollama response omitted prompt_eval_count")
+        allowed = max(
+            Config.ollama_token_variance_absolute,
+            math.ceil(estimated * Config.ollama_token_variance_ratio),
+        )
+        if actual > estimated + allowed:
+            raise OllamaProtocolError(
+                "Ollama prompt token estimate underestimated actual usage: "
+                f"estimated={estimated}, actual={actual}, allowed_variance={allowed}"
             )
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        """Conservative tokenizer-free estimate for mixed Chinese/ASCII text."""
-        cjk = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
-        return max(1, cjk + math.ceil(max(0, len(text) - cjk) / 4))
+        """Compatibility helper; request admission uses the replaceable estimator."""
+        return ConservativeTokenEstimator().estimate(text)
+
+    @staticmethod
+    def _same_model(requested: str, runner: str) -> bool:
+        def canonical(value: str) -> str:
+            value = value.strip()
+            return value if ":" in value else f"{value}:latest"
+
+        return canonical(requested) == canonical(runner)
 
     @staticmethod
     def _parse_json(content: str) -> dict[str, Any]:

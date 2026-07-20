@@ -53,7 +53,8 @@ def test_live_ollama_structured_output_and_embedding_contract():
         prompt="Set status to ok and copy this exact evidence: live-smoke-evidence",
         schema=schema,
         temperature=0,
-        max_tokens=2048,
+        context_budget_tokens=2048,
+        max_output_tokens=256,
     )
     assert result == {"status": "ok", "evidence": "live-smoke-evidence"}
 

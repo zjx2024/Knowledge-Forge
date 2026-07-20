@@ -1326,7 +1326,9 @@ class KnowledgeForgeService:
             result = self.relation_shadow.classify_shadow(
                 classifier=self.ollama,
                 model=project.get("llm_model") or Config.default_llm_model,
-                model_max_tokens=int(project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS),
+                context_budget_tokens=int(
+                    project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS
+                ),
                 project_scope=(
                     f"{project.get('project_key') or project['id']}:{chunk.get('revision_id') or 'legacy'}"
                 ),

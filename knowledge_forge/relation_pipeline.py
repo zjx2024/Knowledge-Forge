@@ -387,7 +387,7 @@ class VersionedRelationPipeline:
         *,
         classifier: Any,
         model: str,
-        model_max_tokens: int,
+        context_budget_tokens: int,
         project_scope: str,
         chunk_key: str,
         content: str,
@@ -426,11 +426,11 @@ class VersionedRelationPipeline:
                 plan.gleaning_passes = 1
         output_reserve = min(
             max(128, Config.relation_classifier_output_reserve),
-            max(128, int(model_max_tokens) // 3),
+            max(128, int(context_budget_tokens) // 3),
         )
         candidate_budget = max(
             0,
-            int(model_max_tokens) - output_reserve - Config.relation_classifier_safety_margin,
+            int(context_budget_tokens) - output_reserve - Config.relation_classifier_safety_margin,
         )
         batches = self.build_batches(
             plan,
@@ -496,7 +496,9 @@ class VersionedRelationPipeline:
                     prompt=batch.prompt,
                     schema=response_schema,
                     temperature=0,
-                    max_tokens=batch.output_token_reserve,
+                    context_budget_tokens=context_budget_tokens,
+                    max_output_tokens=batch.output_token_reserve,
+                    safety_margin_tokens=Config.relation_classifier_safety_margin,
                 )
                 metrics["output_tokens"] += estimate_tokens(
                     json.dumps(raw, ensure_ascii=False, separators=(",", ":"))

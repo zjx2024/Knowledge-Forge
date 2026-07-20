@@ -49,6 +49,7 @@ def test_lexical_score_and_identifier_conflicts_are_conservative():
 class FakeOllama:
     def __init__(self):
         self.chat_calls = 0
+        self.chat_kwargs = []
 
     def embed(self, values, model):
         assert model == "embed"
@@ -56,6 +57,7 @@ class FakeOllama:
 
     def json_chat(self, **kwargs):
         self.chat_calls += 1
+        self.chat_kwargs.append(kwargs)
         return {
             "decision": "merge",
             "candidate_id": 7,
@@ -198,6 +200,9 @@ def test_dense_candidate_is_sent_to_llm_and_resolution_is_audited():
     assert database.decision["decision"] == "llm_merge"
     assert database.decision["candidate_entity_ids"] == [7]
     assert vectors.ollama.chat_calls == 1
+    assert vectors.ollama.chat_kwargs[0]["context_budget_tokens"] == 32768
+    assert vectors.ollama.chat_kwargs[0]["max_output_tokens"] == Config.entity_review_max_output_tokens
+    assert "max_tokens" not in vectors.ollama.chat_kwargs[0]
     assert "国际商业机器公司" in database.entity["aliases"]
 
 

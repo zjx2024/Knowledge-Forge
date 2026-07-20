@@ -10,7 +10,7 @@ from knowledge_forge.observability import (
     metrics_scope,
     timed,
 )
-from knowledge_forge.ollama import OllamaClient
+from knowledge_forge.ollama import EffectiveModelContext, OllamaClient
 
 
 class Response:
@@ -45,15 +45,25 @@ def test_metrics_scope_is_nested_fail_open_and_contains_no_payload():
 def test_ollama_transport_counts_logical_http_inputs_and_repairs(monkeypatch):
     replies = iter([
         Response({"embeddings": [[1.0, 0.0], [0.0, 1.0]]}),
-        Response({"message": {"content": "not-json"}}),
-        Response({"message": {"content": '{"ok": true}'}}),
+        Response({"message": {"content": "not-json"}, "done": True,
+                  "done_reason": "stop", "prompt_eval_count": 10, "eval_count": 3}),
+        Response({"message": {"content": '{"ok": true}'}, "done": True,
+                  "done_reason": "stop", "prompt_eval_count": 20, "eval_count": 3}),
     ])
     monkeypatch.setattr("knowledge_forge.ollama.requests.post", lambda *args, **kwargs: next(replies))
     client = OllamaClient("http://ollama.test")
+    monkeypatch.setattr(
+        client,
+        "effective_model_context",
+        lambda model: EffectiveModelContext(model, 8192, 8192, "test", "runner"),
+    )
 
     with metrics_scope("transport") as metrics:
         assert len(client.embed(["one", "two"], "embed")) == 2
-        assert client.json_chat(model="llm", system="s", prompt="p") == {"ok": True}
+        assert client.json_chat(
+            model="llm", system="s", prompt="p",
+            context_budget_tokens=8192, max_output_tokens=256,
+        ) == {"ok": True}
 
     counters = metrics.snapshot()["counters"]
     assert counters["ollama_logical_calls"] == 2

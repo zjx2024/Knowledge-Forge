@@ -47,6 +47,26 @@ class Config:
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", f"http://{service_host}:11434")
     ollama_keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "-1m")
     ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "480"))
+    # Application request budgets. These never alter Ollama's runner num_ctx.
+    ollama_effective_context_fallback = int(
+        os.getenv("OLLAMA_EFFECTIVE_CONTEXT_FALLBACK_TOKENS", "8192")
+    )
+    ollama_default_context_budget = int(
+        os.getenv("OLLAMA_DEFAULT_CONTEXT_BUDGET_TOKENS", "8192")
+    )
+    ollama_default_max_output = int(os.getenv("OLLAMA_DEFAULT_MAX_OUTPUT_TOKENS", "2048"))
+    ollama_default_safety_margin = int(os.getenv("OLLAMA_SAFETY_MARGIN_TOKENS", "256"))
+    ollama_token_variance_absolute = int(
+        os.getenv("OLLAMA_TOKEN_VARIANCE_ABSOLUTE_TOKENS", "128")
+    )
+    ollama_token_variance_ratio = float(os.getenv("OLLAMA_TOKEN_VARIANCE_RATIO", "0.50"))
+    ollama_context_cache_seconds = int(os.getenv("OLLAMA_CONTEXT_CACHE_SECONDS", "60"))
+    ollama_image_token_estimate = int(os.getenv("OLLAMA_IMAGE_TOKEN_ESTIMATE", "1024"))
+    entity_review_max_output_tokens = int(os.getenv("ENTITY_REVIEW_MAX_OUTPUT_TOKENS", "512"))
+    relation_review_max_output_tokens = int(os.getenv("RELATION_REVIEW_MAX_OUTPUT_TOKENS", "2048"))
+    schema_review_max_output_tokens = int(os.getenv("SCHEMA_REVIEW_MAX_OUTPUT_TOKENS", "2048"))
+    extraction_max_output_tokens = int(os.getenv("EXTRACTION_MAX_OUTPUT_TOKENS", "4096"))
+    image_analysis_max_output_tokens = int(os.getenv("IMAGE_ANALYSIS_MAX_OUTPUT_TOKENS", "2048"))
     default_llm_model = os.getenv("DEFAULT_LLM_MODEL", "qwen3.6:latest")
     default_embedding_model = os.getenv("DEFAULT_EMBEDDING_MODEL", "bge-m3:latest")
 

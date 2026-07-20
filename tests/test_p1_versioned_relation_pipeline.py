@@ -228,7 +228,7 @@ def test_coverage_gleaning_expands_only_uncovered_cue_windows_once():
         },
     ]
     result = pipeline.classify_shadow(
-        classifier=_Classifier(), model="fixture", model_max_tokens=4096,
+        classifier=_Classifier(), model="fixture", context_budget_tokens=4096,
         project_scope="p", chunk_key="c", content=content,
         entities=entities, logical_schema=_schema(),
     )
@@ -299,17 +299,18 @@ def test_shadow_classifier_is_bounded_and_missing_decision_fails_closed():
     pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
     classifier = _Classifier()
     result = pipeline.classify_shadow(
-        classifier=classifier, model="fixture", model_max_tokens=4096,
+        classifier=classifier, model="fixture", context_budget_tokens=4096,
         project_scope="project-1", chunk_key="chunk-1", content="Alpha uses Beta.",
         entities=_entities(), logical_schema=_schema(),
     )
     assert result.status == "completed"
     assert result.metrics["classified"] == 1
     assert result.metrics["model_calls"] == 1
-    assert classifier.calls[0]["max_tokens"] < 4096
+    assert classifier.calls[0]["context_budget_tokens"] == 4096
+    assert classifier.calls[0]["max_output_tokens"] < 4096
 
     failed = pipeline.classify_shadow(
-        classifier=_Classifier(omit=True), model="fixture", model_max_tokens=4096,
+        classifier=_Classifier(omit=True), model="fixture", context_budget_tokens=4096,
         project_scope="project-1", chunk_key="chunk-1", content="Alpha uses Beta.",
         entities=_entities(), logical_schema=_schema(),
     )
