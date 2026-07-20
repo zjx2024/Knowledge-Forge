@@ -12,6 +12,7 @@ import uuid
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
@@ -41,9 +42,26 @@ from .relation_verification import (
 )
 from .observability import InstrumentedConnection, current_metrics, increment
 from .policy import POLICY_AXES, normalize_policy_set
+from .migrations import MigrationRunner
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ContentRevisionError(RuntimeError):
+    """Base error for immutable document content revisions."""
+
+
+class RevisionManifestMismatch(ContentRevisionError):
+    """The same ingestion run was retried with different immutable inputs."""
+
+
+class StaleContentRevision(ContentRevisionError):
+    """A late worker attempted to mutate or activate an obsolete revision."""
+
+
+class RevisionLeaseLost(StaleContentRevision):
+    """The worker no longer owns the revision lease."""
 
 
 SCHEMA_SQL = r"""
@@ -646,6 +664,9 @@ class Database:
     _hnsw_cache: OrderedDict[tuple[str, str, str, int], None] = OrderedDict()
     _hnsw_cache_lock = threading.RLock()
     _hnsw_cache_limit = 256
+    _revision_context: ContextVar[dict[str, str] | None] = ContextVar(
+        "knowledge_forge_revision_context", default=None,
+    )
 
     def __init__(self, config: type[Config] = Config):
         self.config = config
@@ -660,11 +681,18 @@ class Database:
             pass
         with self.connection() as conn:
             self._enable_vector_extensions(conn)
+            migrations = MigrationRunner()
+            migrations.ensure_table(conn)
+            revision_schema_applied = migrations.is_applied(
+                conn, "0001_document_content_revisions",
+            )
+            if not revision_schema_applied:
+                conn.execute(SCHEMA_SQL)
+            migrations.apply(conn)
             conn.execute(
                 "ALTER TABLE IF EXISTS canonical_entities "
                 "ADD COLUMN IF NOT EXISTS normalized_aliases TEXT[] NOT NULL DEFAULT '{}'"
             )
-            conn.execute(SCHEMA_SQL)
             self._migrate_relation_verification_policy(conn)
             self._migrate_graph_policy(conn)
             self._migrate_vector_storage(conn)
@@ -782,10 +810,37 @@ class Database:
     def connection(self) -> Iterator[psycopg.Connection]:
         increment("db_connection_count")
         with psycopg.connect(**self.config.postgres, row_factory=dict_row) as conn:
+            revision = self._revision_context.get()
+            if revision:
+                conn.execute(
+                    "SELECT set_config('knowledge_forge.revision_id',%s,TRUE),"
+                    "set_config('knowledge_forge.ingestion_run_id',%s,TRUE),"
+                    "set_config('knowledge_forge.revision_lease_token',%s,TRUE)",
+                    (
+                        revision["revision_id"], revision["ingestion_run_id"],
+                        revision["lease_token"],
+                    ),
+                )
             if current_metrics() is None:
                 yield conn
             else:
                 yield InstrumentedConnection(conn)
+
+    @contextmanager
+    def content_revision_context(
+        self, revision_id: str, ingestion_run_id: str, lease_token: str,
+    ) -> Iterator[None]:
+        """Attach a revision lease to every short transaction in this worker."""
+
+        token = self._revision_context.set({
+            "revision_id": revision_id,
+            "ingestion_run_id": ingestion_run_id,
+            "lease_token": lease_token,
+        })
+        try:
+            yield
+        finally:
+            self._revision_context.reset(token)
 
     def record_operation_metrics(
         self,
@@ -1151,14 +1206,241 @@ class Database:
             if not row: raise LookupError("文档不存在")
             return row
 
+    @staticmethod
+    def _revision_manifest_hash(manifest: dict[str, Any]) -> str:
+        payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def begin_document_revision(
+        self,
+        document_id: int,
+        ingestion_run_id: str,
+        manifest: dict[str, Any],
+        *,
+        lease_seconds: int = 86400,
+    ) -> dict[str, Any]:
+        """Create or resume one immutable building revision in a short transaction."""
+
+        if not ingestion_run_id:
+            raise ValueError("ingestion_run_id 不能为空")
+        manifest = dict(manifest or {})
+        manifest_hash = self._revision_manifest_hash(manifest)
+        lease_token = uuid.uuid4().hex
+        lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, lease_seconds))
+        with self.connection() as conn:
+            document = conn.execute(
+                "SELECT * FROM documents WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (document_id,),
+            ).fetchone()
+            if not document:
+                raise LookupError("文档不存在或已删除")
+            existing = conn.execute(
+                """SELECT * FROM document_content_revisions
+                   WHERE document_id=%s AND ingestion_run_id=%s FOR UPDATE""",
+                (document_id, ingestion_run_id),
+            ).fetchone()
+            if existing:
+                if existing["manifest_hash"] != manifest_hash:
+                    raise RevisionManifestMismatch(
+                        "同一 ingestion_run_id 的 manifest 已改变，拒绝非幂等重试"
+                    )
+                if existing["status"] == "active":
+                    return {**existing, "idempotent": True, "already_active": True}
+                if existing["status"] in {"retired", "legacy_orphan"}:
+                    raise StaleContentRevision("历史修订不能重新进入构建状态")
+                row = conn.execute(
+                    """UPDATE document_content_revisions
+                       SET status='building',lease_token=%s,lease_expires_at=%s,
+                           failure='',failed_at=NULL,updated_at=NOW()
+                       WHERE revision_id=%s RETURNING *""",
+                    (lease_token, lease_expires_at, existing["revision_id"]),
+                ).fetchone()
+                return {**row, "idempotent": True, "already_active": False}
+
+            next_version = int(conn.execute(
+                """SELECT COALESCE(MAX(content_version),0)+1 AS version
+                   FROM document_content_revisions WHERE document_id=%s""",
+                (document_id,),
+            ).fetchone()["version"])
+            revision_material = f"{document['project_id']}|{document_id}|{ingestion_run_id}"
+            revision_id = "revision_" + hashlib.sha256(revision_material.encode("utf-8")).hexdigest()
+            row = conn.execute(
+                """INSERT INTO document_content_revisions(
+                       revision_id,project_id,document_id,ingestion_run_id,content_version,
+                       content_hash,source_hash,config_hash,policy_hash,manifest_hash,manifest,
+                       status,lease_token,lease_expires_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,'building',%s,%s)
+                   RETURNING *""",
+                (
+                    revision_id, document["project_id"], document_id, ingestion_run_id,
+                    next_version, str(manifest.get("content_hash") or document["doc_hash"]),
+                    str(manifest.get("source_hash") or document["doc_hash"]),
+                    str(manifest.get("config_hash") or ""),
+                    str(manifest.get("policy_hash") or ""), manifest_hash,
+                    self._json(manifest), lease_token, lease_expires_at,
+                ),
+            ).fetchone()
+            return {**row, "idempotent": False, "already_active": False}
+
+    def get_document_revision(self, revision_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM document_content_revisions WHERE revision_id=%s",
+                (revision_id,),
+            ).fetchone()
+
+    def list_document_revisions(self, document_id: int) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM document_content_revisions WHERE document_id=%s
+                   ORDER BY content_version DESC""",
+                (document_id,),
+            ).fetchall()
+
+    def renew_document_revision_lease(
+        self, revision_id: str, ingestion_run_id: str, lease_token: str, *, lease_seconds: int = 86400,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE document_content_revisions SET lease_expires_at=%s,updated_at=NOW()
+                   WHERE revision_id=%s AND ingestion_run_id=%s AND lease_token=%s
+                     AND status='building' RETURNING *""",
+                (
+                    datetime.now(timezone.utc) + timedelta(seconds=max(60, lease_seconds)),
+                    revision_id, ingestion_run_id, lease_token,
+                ),
+            ).fetchone()
+            if not row:
+                raise RevisionLeaseLost("修订 lease 已失效或不再属于当前 worker")
+            return row
+
+    def fail_document_revision(
+        self, revision_id: str, ingestion_run_id: str, lease_token: str, failure: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE document_content_revisions
+                   SET status='failed',failure=%s,failed_at=NOW(),lease_token=NULL,
+                       lease_expires_at=NULL,updated_at=NOW()
+                   WHERE revision_id=%s AND ingestion_run_id=%s AND lease_token=%s
+                     AND status='building' RETURNING *""",
+                (failure, revision_id, ingestion_run_id, lease_token),
+            ).fetchone()
+
+    def activate_document_revision(
+        self,
+        document_id: int,
+        revision_id: str,
+        ingestion_run_id: str,
+        lease_token: str,
+        *,
+        reason: str,
+        document_values: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically publish a complete revision and advance the graph generation."""
+
+        document_values = dict(document_values or {})
+        json_fields = {"metadata", "chunk_config", "parse_quality"}
+        with self.connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (document_id,))
+            document = conn.execute(
+                "SELECT * FROM documents WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (document_id,),
+            ).fetchone()
+            if not document:
+                raise LookupError("文档不存在或已删除")
+            revision = conn.execute(
+                """SELECT * FROM document_content_revisions
+                   WHERE revision_id=%s AND document_id=%s FOR UPDATE""",
+                (revision_id, document_id),
+            ).fetchone()
+            if not revision:
+                raise LookupError("内容修订不存在")
+            if revision["status"] == "active" and document["active_revision_id"] == revision_id:
+                project = conn.execute(
+                    "SELECT * FROM projects WHERE id=%s", (document["project_id"],)
+                ).fetchone()
+                return document, project
+            if revision["status"] != "building":
+                raise StaleContentRevision(f"修订状态不允许激活: {revision['status']}")
+            if revision["ingestion_run_id"] != ingestion_run_id:
+                raise StaleContentRevision("ingestion_run_id 与修订不匹配")
+            if revision["lease_token"] != lease_token:
+                raise RevisionLeaseLost("激活前 revision lease 已丢失")
+            if not revision["lease_expires_at"] or revision["lease_expires_at"] <= datetime.now(timezone.utc):
+                raise RevisionLeaseLost("激活前 revision lease 已过期")
+            newer = conn.execute(
+                """SELECT revision_id,status FROM document_content_revisions
+                   WHERE document_id=%s AND content_version>%s
+                     AND status IN ('building','active') ORDER BY content_version DESC LIMIT 1""",
+                (document_id, revision["content_version"]),
+            ).fetchone()
+            if newer:
+                raise StaleContentRevision(
+                    f"存在更新的修订 {newer['revision_id']}，旧 worker 不得覆盖"
+                )
+            conn.execute(
+                """UPDATE document_content_revisions
+                   SET status='retired',retired_at=NOW(),lease_token=NULL,
+                       lease_expires_at=NULL,updated_at=NOW()
+                   WHERE document_id=%s AND status='active' AND revision_id<>%s""",
+                (document_id, revision_id),
+            )
+            conn.execute(
+                """UPDATE document_content_revisions
+                   SET status='active',activated_at=NOW(),lease_token=NULL,
+                       lease_expires_at=NULL,updated_at=NOW()
+                   WHERE revision_id=%s""",
+                (revision_id,),
+            )
+            fields = list(document_values)
+            assignments = ["active_revision_id=%s", "content_version=%s"]
+            params: list[Any] = [revision_id, revision["content_version"]]
+            for key in fields:
+                assignments.append(f"{key}={'%s::jsonb' if key in json_fields else '%s'}")
+                value = document_values[key]
+                params.append(
+                    self._json(value) if key in json_fields and not isinstance(value, str) else value
+                )
+            document = conn.execute(
+                f"""UPDATE documents SET {','.join(assignments)},updated_at=NOW()
+                    WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                [*params, document_id],
+            ).fetchone()
+            self._retire_orphan_entities(conn, int(document["project_id"]))
+            project = conn.execute(
+                """UPDATE projects SET graph_generation=graph_generation+1,graph_status=%s,
+                       graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
+                   WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                (GRAPH_STALE, reason, document["project_id"]),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            return document, project
+
     def finalize_document_graph_facts(
         self,
         document_id: int,
         *,
         reason: str,
+        revision_id: str | None = None,
+        ingestion_run_id: str | None = None,
+        lease_token: str | None = None,
         **values: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Commit the indexed document projection and generation advance together."""
+
+        if revision_id:
+            if not ingestion_run_id or not lease_token:
+                raise ValueError("激活修订必须提供 ingestion_run_id 和 lease_token")
+            return self.activate_document_revision(
+                document_id,
+                revision_id,
+                ingestion_run_id,
+                lease_token,
+                reason=reason,
+                document_values=values,
+            )
 
         fields = list(values)
         json_fields = {"metadata", "chunk_config", "parse_quality"}
@@ -1193,34 +1475,24 @@ class Database:
     def soft_delete_document(self, document_id: int) -> dict[str, Any] | None:
         with self.connection() as conn:
             scope = conn.execute(
-                "SELECT project_id FROM documents WHERE id=%s", (document_id,)
+                "SELECT project_id,active_revision_id FROM documents WHERE id=%s", (document_id,)
             ).fetchone()
+            if not scope:
+                return None
             affected_rows = conn.execute(
                 "SELECT DISTINCT canonical_entity_id AS id FROM entity_mentions "
-                "WHERE document_id=%s AND is_deleted=FALSE",
-                (document_id,),
+                "WHERE document_id=%s AND revision_id=%s AND is_deleted=FALSE",
+                (document_id, scope.get("active_revision_id")),
             ).fetchall()
             affected_ids = [int(item["id"]) for item in affected_rows]
             row = conn.execute(
                 """UPDATE documents SET is_deleted=TRUE,status='deleted',deleted_at=NOW(),updated_at=NOW()
                 WHERE id=%s AND is_deleted=FALSE RETURNING *""", (document_id,)
             ).fetchone()
-            conn.execute("UPDATE sections SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute("UPDATE chunks SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute("UPDATE vector_embeddings SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute("UPDATE entity_mentions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute(
-                "UPDATE canonical_entity_documents SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s",
-                (document_id,),
-            )
-            conn.execute("UPDATE entity_resolution_decisions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute("UPDATE relation_assertions SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute("UPDATE relation_candidates SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            if scope:
+            if row:
                 self._retire_orphan_entities(
                     conn, project_id=int(scope["project_id"]), entity_ids=affected_ids,
                 )
-            if row:
                 conn.execute(
                     """UPDATE projects
                        SET graph_generation=graph_generation+1,graph_status=%s,
@@ -1230,52 +1502,100 @@ class Database:
                 )
             return row
 
-    def replace_document_content(self, document_id: int, sections: list[dict[str, Any]], chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        with self.connection() as conn:
-            document = conn.execute(
-                "SELECT project_id FROM documents WHERE id=%s AND is_deleted=FALSE",
-                (document_id,),
-            ).fetchone()
-            if not document: raise LookupError("文档不存在或已删除")
-            affected_rows = conn.execute(
-                "SELECT DISTINCT canonical_entity_id AS id FROM entity_mentions "
-                "WHERE document_id=%s AND is_deleted=FALSE",
-                (document_id,),
-            ).fetchall()
-            affected_ids = [int(item["id"]) for item in affected_rows]
-            conn.execute("UPDATE relation_candidates SET is_deleted=TRUE,updated_at=NOW() WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM indexing_failures WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM vector_embeddings WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM relation_assertions WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM entity_resolution_decisions WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM entity_mentions WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM canonical_entity_documents WHERE document_id=%s", (document_id,))
-            self._retire_orphan_entities(
-                conn, project_id=int(document["project_id"]), entity_ids=affected_ids,
+    def replace_document_content(
+        self,
+        document_id: int,
+        sections: list[dict[str, Any]],
+        chunks: list[dict[str, Any]],
+        *,
+        revision_id: str | None = None,
+        ingestion_run_id: str | None = None,
+        lease_token: str | None = None,
+        manifest: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Write one immutable content revision without deleting prior audit history."""
+
+        implicit_revision = revision_id is None
+        if implicit_revision:
+            ingestion_run_id = ingestion_run_id or f"compat:{uuid.uuid4().hex}"
+            manifest = manifest or {
+                "content_hash": hashlib.sha256(
+                    self._json({"sections": sections, "chunks": chunks}).encode("utf-8")
+                ).hexdigest(),
+                "source_hash": "compatibility-api",
+                "config_hash": "compatibility-api",
+                "policy_hash": "compatibility-api",
+            }
+            revision = self.begin_document_revision(document_id, ingestion_run_id, manifest)
+            revision_id = str(revision["revision_id"])
+            lease_token = str(revision["lease_token"])
+        if not revision_id or not ingestion_run_id or not lease_token:
+            raise ValueError("写入内容必须绑定 revision_id、ingestion_run_id 和 lease_token")
+
+        with self.content_revision_context(revision_id, ingestion_run_id, lease_token):
+            with self.connection() as conn:
+                document = conn.execute(
+                    "SELECT project_id FROM documents WHERE id=%s AND is_deleted=FALSE",
+                    (document_id,),
+                ).fetchone()
+                if not document:
+                    raise LookupError("文档不存在或已删除")
+                section_ids: dict[str, int] = {}
+                for section in sections:
+                    row = conn.execute(
+                        """INSERT INTO sections(
+                               project_id,document_id,revision_id,section_key,title,level,
+                               content,content_hash,metadata)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                           ON CONFLICT(revision_id,section_key) DO UPDATE SET
+                               title=EXCLUDED.title,level=EXCLUDED.level,content=EXCLUDED.content,
+                               content_hash=EXCLUDED.content_hash,metadata=EXCLUDED.metadata,
+                               is_deleted=FALSE,updated_at=NOW() RETURNING id""",
+                        (
+                            document["project_id"], document_id, revision_id, section["key"],
+                            section["title"], section["level"], section["content"],
+                            section["content_hash"], self._json(section.get("metadata")),
+                        ),
+                    ).fetchone()
+                    section_ids[section["key"]] = int(row["id"])
+                inserted = []
+                for chunk in chunks:
+                    row = conn.execute(
+                        """INSERT INTO chunks(
+                               project_id,document_id,revision_id,section_id,chunk_key,content,
+                               content_hash,chunk_index,metadata)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                           ON CONFLICT(revision_id,chunk_key) DO UPDATE SET
+                               section_id=EXCLUDED.section_id,content=EXCLUDED.content,
+                               content_hash=EXCLUDED.content_hash,chunk_index=EXCLUDED.chunk_index,
+                               metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW()
+                           RETURNING *""",
+                        (
+                            document["project_id"], document_id, revision_id,
+                            section_ids.get(chunk["section_key"]), chunk["key"], chunk["content"],
+                            chunk["content_hash"], chunk["part_index"],
+                            self._json(chunk.get("metadata")),
+                        ),
+                    ).fetchone()
+                    inserted.append(row)
+        if implicit_revision:
+            self.activate_document_revision(
+                document_id,
+                revision_id,
+                ingestion_run_id,
+                lease_token,
+                reason="兼容写入接口激活内容修订",
+                document_values={},
             )
-            conn.execute("DELETE FROM chunks WHERE document_id=%s", (document_id,))
-            conn.execute("DELETE FROM sections WHERE document_id=%s", (document_id,))
-            section_ids: dict[str, int] = {}
-            for section in sections:
-                row = conn.execute(
-                    """INSERT INTO sections(project_id,document_id,section_key,title,level,content,content_hash,metadata)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING id""",
-                    (document["project_id"],document_id,section["key"],section["title"],section["level"],section["content"],section["content_hash"],self._json(section.get("metadata"))),
-                ).fetchone(); section_ids[section["key"]] = int(row["id"])
-            inserted = []
-            for chunk in chunks:
-                row = conn.execute(
-                    """INSERT INTO chunks(project_id,document_id,section_id,chunk_key,content,content_hash,chunk_index,metadata)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
-                    (document["project_id"],document_id,section_ids.get(chunk["section_key"]),chunk["key"],chunk["content"],chunk["content_hash"],chunk["part_index"],self._json(chunk.get("metadata"))),
-                ).fetchone(); inserted.append(row)
-            return inserted
+        return inserted
 
     def list_document_chunks(self, document_id: int) -> list[dict[str, Any]]:
         with self.connection() as conn:
             return conn.execute(
                 """SELECT c.*,s.title AS section_title FROM chunks c LEFT JOIN sections s ON s.id=c.section_id
-                WHERE c.document_id=%s AND c.is_deleted=FALSE ORDER BY c.chunk_index,c.id""", (document_id,)
+                JOIN documents d ON d.id=c.document_id AND d.active_revision_id=c.revision_id
+                WHERE c.document_id=%s AND c.is_deleted=FALSE AND d.is_deleted=FALSE
+                ORDER BY c.chunk_index,c.id""", (document_id,)
             ).fetchall()
 
     def replace_document_embeddings(self, document_id: int, records: list[dict[str, Any]]) -> None:
@@ -1286,7 +1606,6 @@ class Database:
             ).fetchone()
             if not active:
                 raise LookupError("文档不存在或已删除")
-            conn.execute("DELETE FROM vector_embeddings WHERE document_id=%s AND object_type='chunk'", (document_id,))
             for record in records: self._upsert_embedding(conn, record)
 
     def upsert_embedding(self, record: dict[str, Any]) -> None:
@@ -1296,15 +1615,29 @@ class Database:
         vector = list(record["embedding"])
         vector_literal = self._vector_literal(vector)
         self._ensure_hnsw_index(conn, record["model_name"], len(vector))
+        revision = self._revision_context.get()
+        revision_id = (
+            revision["revision_id"] if record.get("document_id") is not None and revision
+            else record.get("revision_id")
+        )
+        if record.get("document_id") is not None and not revision_id:
+            raise ValueError("文档向量写入必须绑定内容修订")
+        conflict = (
+            "ON CONFLICT(revision_id,object_type,object_key,model_name) "
+            "WHERE revision_id IS NOT NULL"
+            if record.get("document_id") is not None
+            else "ON CONFLICT(project_id,object_type,object_key,model_name) "
+                 "WHERE revision_id IS NULL"
+        )
         conn.execute(
-            """INSERT INTO vector_embeddings(project_id,document_id,chunk_id,object_type,object_key,content,content_hash,
+            f"""INSERT INTO vector_embeddings(project_id,document_id,revision_id,chunk_id,object_type,object_key,content,content_hash,
             model_name,embedding,embedding_vector,dimension,metadata)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,%s::jsonb)
-            ON CONFLICT(project_id,object_type,object_key,model_name) DO UPDATE SET document_id=EXCLUDED.document_id,
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,%s::jsonb)
+            {conflict} DO UPDATE SET document_id=EXCLUDED.document_id,
             chunk_id=EXCLUDED.chunk_id,content=EXCLUDED.content,content_hash=EXCLUDED.content_hash,embedding=EXCLUDED.embedding,
             embedding_vector=EXCLUDED.embedding_vector,dimension=EXCLUDED.dimension,metadata=EXCLUDED.metadata,
             is_deleted=FALSE,updated_at=NOW()""",
-            (record["project_id"],record.get("document_id"),record.get("chunk_id"),record["object_type"],
+            (record["project_id"],record.get("document_id"),revision_id,record.get("chunk_id"),record["object_type"],
              record["object_key"],record["content"],record["content_hash"],record["model_name"],vector,
              vector_literal,len(vector),self._json(record.get("metadata"))),
         )
@@ -1330,17 +1663,23 @@ class Database:
             relation_filter = (
                 " AND EXISTS (SELECT 1 FROM relation_assertions r "
                 "WHERE r.project_id=v0.project_id AND r.id::text=v0.object_key "
+                "AND r.revision_id IS NOT DISTINCT FROM v0.revision_id "
                 "AND r.is_deleted=FALSE AND " + relation_clause + ")"
             )
+        active_filter = (
+            " AND (v0.document_id IS NULL OR EXISTS (SELECT 1 FROM documents active_document "
+            "WHERE active_document.id=v0.document_id AND active_document.is_deleted=FALSE "
+            "AND active_document.active_revision_id=v0.revision_id))"
+        )
         statement = sql.SQL(
             """WITH vector_hits AS (
                 SELECT id FROM vector_embeddings v0
-                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {}
+                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {} {}
                 ORDER BY embedding_vector::{} <=> %s::{}
                 LIMIT %s
             ), lexical_hits AS (
                 SELECT id FROM vector_embeddings v0
-                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {}
+                WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s AND is_deleted=FALSE {} {}
                   AND content ILIKE %s
                 ORDER BY length(content),id LIMIT %s
             ), candidates AS (
@@ -1353,12 +1692,13 @@ class Database:
             FROM candidates hit JOIN vector_embeddings v ON v.id=hit.id
             LEFT JOIN documents d ON d.id=v.document_id
             LEFT JOIN chunks c ON c.id=v.chunk_id LEFT JOIN sections s ON s.id=c.section_id
-            WHERE (d.id IS NULL OR d.is_deleted=FALSE)
+            WHERE (d.id IS NULL OR (d.is_deleted=FALSE AND d.active_revision_id=v.revision_id))
             ORDER BY v.embedding_vector::{} <=> %s::{}
             LIMIT %s"""
         ).format(
-            sql.SQL(relation_filter), vector_type, vector_type,
-            sql.SQL(relation_filter), vector_type, vector_type, vector_type, vector_type,
+            sql.SQL(relation_filter), sql.SQL(active_filter), vector_type, vector_type,
+            sql.SQL(relation_filter), sql.SQL(active_filter), vector_type, vector_type,
+            vector_type, vector_type,
         )
         params = (
             project_id,object_type,model_name,dimension,*relation_policy_params,
@@ -1374,13 +1714,21 @@ class Database:
     def record_indexing_failure(self, values: dict[str, Any]) -> dict[str, Any]:
         """Persist a retryable derived-index failure without changing source truth."""
 
+        revision = self._revision_context.get()
+        revision_id = (
+            revision["revision_id"] if values.get("document_id") is not None and revision
+            else values.get("revision_id")
+        )
+        if values.get("document_id") is not None and not revision_id:
+            raise ValueError("文档索引失败记录必须绑定内容修订")
         with self.connection() as conn:
             existing = conn.execute(
                 """SELECT attempts,max_attempts FROM indexing_failures
-                   WHERE project_id=%s AND object_type=%s AND object_key=%s AND model_name=%s
+                   WHERE project_id=%s AND revision_id IS NOT DISTINCT FROM %s
+                     AND object_type=%s AND object_key=%s AND model_name=%s
                    FOR UPDATE""",
                 (
-                    values["project_id"], values["object_type"], str(values["object_key"]),
+                    values["project_id"], revision_id, values["object_type"], str(values["object_key"]),
                     values["model_name"],
                 ),
             ).fetchone()
@@ -1396,17 +1744,24 @@ class Database:
                 Config.indexing_retry_base_seconds * (2 ** max(0, attempts - 1)),
             )
             next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+            conflict = (
+                "ON CONFLICT(revision_id,object_type,object_key,model_name) "
+                "WHERE revision_id IS NOT NULL"
+                if values.get("document_id") is not None
+                else "ON CONFLICT(project_id,object_type,object_key,model_name) "
+                     "WHERE revision_id IS NULL"
+            )
             return conn.execute(
-                """INSERT INTO indexing_failures(project_id,document_id,chunk_id,object_type,
+                f"""INSERT INTO indexing_failures(project_id,document_id,revision_id,chunk_id,object_type,
                    object_key,model_name,status,attempts,max_attempts,next_attempt_at,last_error,payload)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                   ON CONFLICT(project_id,object_type,object_key,model_name) DO UPDATE SET
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   {conflict} DO UPDATE SET
                    document_id=EXCLUDED.document_id,chunk_id=EXCLUDED.chunk_id,status=EXCLUDED.status,
                    attempts=EXCLUDED.attempts,max_attempts=EXCLUDED.max_attempts,
                    next_attempt_at=EXCLUDED.next_attempt_at,last_error=EXCLUDED.last_error,
                    payload=EXCLUDED.payload,completed_at=NULL,updated_at=NOW() RETURNING *""",
                 (
-                    values["project_id"], values.get("document_id"), values.get("chunk_id"),
+                    values["project_id"], values.get("document_id"), revision_id, values.get("chunk_id"),
                     values["object_type"], str(values["object_key"]), values["model_name"],
                     status, attempts, max_attempts, next_attempt_at,
                     values.get("last_error") or "", self._json(values.get("payload")),
@@ -1416,13 +1771,31 @@ class Database:
     def complete_indexing_failure(
         self, project_id: int, object_type: str, object_key: str, model_name: str,
     ) -> None:
+        revision = self._revision_context.get()
+        revision_id = revision["revision_id"] if revision else None
         with self.connection() as conn:
-            conn.execute(
-                """UPDATE indexing_failures SET status='completed',last_error='',
-                   completed_at=NOW(),updated_at=NOW()
-                   WHERE project_id=%s AND object_type=%s AND object_key=%s AND model_name=%s""",
-                (project_id, object_type, str(object_key), model_name),
-            )
+            if revision_id:
+                conn.execute(
+                    """UPDATE indexing_failures SET status='completed',last_error='',
+                       completed_at=NOW(),updated_at=NOW()
+                       WHERE project_id=%s AND revision_id=%s
+                         AND object_type=%s AND object_key=%s AND model_name=%s""",
+                    (project_id, revision_id, object_type, str(object_key), model_name),
+                )
+            else:
+                conn.execute(
+                    """UPDATE indexing_failures failure
+                       SET status='completed',last_error='',completed_at=NOW(),updated_at=NOW()
+                       WHERE failure.project_id=%s AND failure.object_type=%s
+                         AND failure.object_key=%s AND failure.model_name=%s
+                         AND (failure.revision_id IS NULL OR EXISTS(
+                             SELECT 1 FROM documents document
+                             WHERE document.id=failure.document_id
+                               AND document.is_deleted=FALSE
+                               AND document.active_revision_id=failure.revision_id
+                         ))""",
+                    (project_id, object_type, str(object_key), model_name),
+                )
 
     def list_pending_indexing_failures(
         self,
@@ -1434,9 +1807,15 @@ class Database:
         page_size = max(1, min(limit or Config.indexing_retry_batch_size, 1000))
         with self.connection() as conn:
             return conn.execute(
-                """SELECT * FROM indexing_failures WHERE project_id=%s AND object_type=%s
+                """SELECT failure.* FROM indexing_failures failure
+                   LEFT JOIN documents document ON document.id=failure.document_id
+                   WHERE failure.project_id=%s AND failure.object_type=%s
+                   AND (failure.document_id IS NULL OR (
+                       document.is_deleted=FALSE
+                       AND document.active_revision_id=failure.revision_id
+                   ))
                    AND status='pending' AND next_attempt_at<=NOW()
-                   ORDER BY next_attempt_at,id LIMIT %s""",
+                   ORDER BY failure.next_attempt_at,failure.id LIMIT %s""",
                 (project_id, object_type, page_size),
             ).fetchall()
 
@@ -1458,6 +1837,8 @@ class Database:
     def cleanup_indexing_failures(self) -> int:
         """Bound completed/permanent outbox history by the configured retention."""
 
+        if not Config.indexing_failure_cleanup_enabled:
+            return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=Config.indexing_failure_retention_days)
         with self.connection() as conn:
             result = conn.execute(
@@ -1474,7 +1855,8 @@ class Database:
                 FROM vector_embeddings v LEFT JOIN documents d ON d.id=v.document_id
                 LEFT JOIN chunks c ON c.id=v.chunk_id LEFT JOIN sections s ON s.id=c.section_id
                 WHERE v.project_id=%s AND v.object_type=%s AND v.model_name=%s AND v.is_deleted=FALSE
-                AND (d.id IS NULL OR d.is_deleted=FALSE)""", (project_id,object_type,model_name)
+                AND (d.id IS NULL OR (d.is_deleted=FALSE AND d.active_revision_id=v.revision_id))""",
+                (project_id,object_type,model_name)
             ).fetchall()
 
     def list_document_embeddings(
@@ -1484,8 +1866,10 @@ class Database:
             return conn.execute(
                 """SELECT id,project_id,document_id,chunk_id,object_type,object_key,content,
                           model_name,embedding,dimension,metadata
-                   FROM vector_embeddings
-                   WHERE document_id=%s AND object_type=%s AND model_name=%s AND is_deleted=FALSE
+                   FROM vector_embeddings v JOIN documents d
+                     ON d.id=v.document_id AND d.active_revision_id=v.revision_id
+                   WHERE v.document_id=%s AND v.object_type=%s AND v.model_name=%s
+                     AND v.is_deleted=FALSE AND d.is_deleted=FALSE
                    ORDER BY chunk_id,id""",
                 (document_id, object_type, model_name),
             ).fetchall()
@@ -1513,10 +1897,12 @@ class Database:
         vector_type = sql.SQL("vector({})").format(sql.Literal(dimension))
         statement = sql.SQL(
             """SELECT GREATEST(0.0,1.0-(embedding_vector::{} <=> %s::{})) AS score
-               FROM vector_embeddings
-               WHERE project_id=%s AND object_type=%s AND model_name=%s AND dimension=%s
-                 AND is_deleted=FALSE AND (%s IS NULL OR document_id<>%s)
-               ORDER BY embedding_vector::{} <=> %s::{}
+               FROM vector_embeddings v LEFT JOIN documents d ON d.id=v.document_id
+               WHERE v.project_id=%s AND v.object_type=%s AND v.model_name=%s AND v.dimension=%s
+                 AND v.is_deleted=FALSE
+                 AND (d.id IS NULL OR (d.is_deleted=FALSE AND d.active_revision_id=v.revision_id))
+                 AND (%s IS NULL OR v.document_id<>%s)
+               ORDER BY v.embedding_vector::{} <=> %s::{}
                LIMIT 1"""
         ).format(vector_type, vector_type, vector_type, vector_type)
         with self.connection() as conn:
@@ -1986,7 +2372,7 @@ class Database:
             row = conn.execute(
                 """INSERT INTO entity_mentions(project_id,document_id,chunk_id,canonical_entity_id,mention_text,normalized_name,entity_type,description,confidence,extraction_version,evidence_text,evidence_start,evidence_end,metadata)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                ON CONFLICT(document_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET description=EXCLUDED.description,
+                ON CONFLICT(revision_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET description=EXCLUDED.description,
                 confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                 evidence_end=EXCLUDED.evidence_end,metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                 (values["project_id"],values["document_id"],values["chunk_id"],values["canonical_entity_id"],values["mention_text"],values["normalized_name"],values["entity_type"],values.get("description") or "",0.5 if values.get("confidence") is None else values.get("confidence"),values.get("extraction_version") or "v2",values.get("evidence_text") or "",values.get("evidence_start"),values.get("evidence_end"),self._json(values.get("metadata"))),
@@ -1994,7 +2380,7 @@ class Database:
             conn.execute(
                 """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
                    VALUES(%s,%s,%s)
-                   ON CONFLICT(canonical_entity_id,document_id) DO UPDATE
+                   ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE
                    SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
                 (values["project_id"], values["canonical_entity_id"], values["document_id"]),
             )
@@ -2009,7 +2395,7 @@ class Database:
                 """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,canonical_entity_id,
                 mention_text,normalized_name,entity_type,decision,candidate_entity_ids,scores,reason,model_name,metadata)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
-                ON CONFLICT(document_id,chunk_id,mention_text,entity_type) DO UPDATE SET
+                ON CONFLICT(revision_id,chunk_id,mention_text,entity_type) DO UPDATE SET
                 canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
                 candidate_entity_ids=EXCLUDED.candidate_entity_ids,scores=EXCLUDED.scores,
                 reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
@@ -2082,7 +2468,7 @@ class Database:
                     mention_text,normalized_name,entity_type,description,confidence,extraction_version,
                     evidence_text,evidence_start,evidence_end,mention_key,extraction_policy_version,metadata)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                    ON CONFLICT(document_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET
+                    ON CONFLICT(revision_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET
                     description=EXCLUDED.description,confidence=EXCLUDED.confidence,
                     evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                     evidence_end=EXCLUDED.evidence_end,
@@ -2120,7 +2506,7 @@ class Database:
                        project_id,document_id,chunk_id,mention_id,mention_key,entity_type,
                        confidence,evidence_text,evidence_start,evidence_end,policy_version,source,metadata)
                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'model',%s::jsonb)
-                       ON CONFLICT(project_id,mention_key,entity_type,policy_version,source)
+                       ON CONFLICT(revision_id,mention_key,entity_type,policy_version,source)
                        DO UPDATE SET confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,
                        evidence_start=EXCLUDED.evidence_start,evidence_end=EXCLUDED.evidence_end,
                        metadata=EXCLUDED.metadata""",
@@ -2161,7 +2547,7 @@ class Database:
                     canonical_entity_id,mention_text,normalized_name,entity_type,decision,
                     candidate_entity_ids,scores,reason,model_name,metadata)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
-                    ON CONFLICT(document_id,chunk_id,mention_text,entity_type) DO UPDATE SET
+                    ON CONFLICT(revision_id,chunk_id,mention_text,entity_type) DO UPDATE SET
                     canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
                     candidate_entity_ids=EXCLUDED.candidate_entity_ids,scores=EXCLUDED.scores,
                     reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
@@ -2178,7 +2564,7 @@ class Database:
             conn.execute(
                 """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
                    SELECT %s,entity_id,%s FROM unnest(%s::bigint[]) AS entity_id
-                   ON CONFLICT(canonical_entity_id,document_id) DO UPDATE
+                   ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE
                    SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
                 (project_id, document_id, affected_ids),
             )
@@ -2293,7 +2679,7 @@ class Database:
         row = conn.execute(
                 """INSERT INTO relation_assertions(project_id,document_id,chunk_id,source_entity_id,target_entity_id,relation_key,relation_type,description,confidence,extraction_version,ingestion_run_id,evidence_text,evidence_start,evidence_end,verification_status,metadata)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                ON CONFLICT(project_id,relation_key) DO UPDATE SET document_id=EXCLUDED.document_id,
+                ON CONFLICT(revision_id,relation_key) DO UPDATE SET document_id=EXCLUDED.document_id,
                 chunk_id=EXCLUDED.chunk_id,source_entity_id=EXCLUDED.source_entity_id,
                 target_entity_id=EXCLUDED.target_entity_id,relation_type=EXCLUDED.relation_type,description=EXCLUDED.description,
                 confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
@@ -2467,8 +2853,9 @@ class Database:
                 schema_version=int(project.get("active_schema_version") or 1),
             )
             documents = conn.execute(
-                """SELECT id FROM documents
-                   WHERE project_id=%s AND status='indexed' AND is_deleted=FALSE ORDER BY id""",
+                """SELECT id,active_revision_id FROM documents
+                   WHERE project_id=%s AND status='indexed' AND is_deleted=FALSE
+                     AND active_revision_id IS NOT NULL ORDER BY id""",
                 (project_id,),
             ).fetchall()
             actual_documents = len(documents)
@@ -2490,9 +2877,9 @@ class Database:
             ).fetchone()
             for document in documents:
                 conn.execute(
-                    """INSERT INTO policy_snapshot_documents(snapshot_id,document_id)
-                       VALUES(%s,%s) ON CONFLICT(snapshot_id,document_id) DO NOTHING""",
-                    (snapshot_id, document["id"]),
+                    """INSERT INTO policy_snapshot_documents(snapshot_id,document_id,revision_id)
+                       VALUES(%s,%s,%s) ON CONFLICT(snapshot_id,document_id) DO NOTHING""",
+                    (snapshot_id, document["id"], document["active_revision_id"]),
                 )
             return row
 
@@ -2830,23 +3217,30 @@ class Database:
                                                target_redirect.target_entity_id,r.target_entity_id)
                            THEN 'self relation after entity assignment change' ELSE '' END
                FROM relation_assertions r
+               JOIN documents active_document
+                 ON active_document.id=r.document_id
+                AND active_document.active_revision_id=r.revision_id
+                AND active_document.is_deleted=FALSE
                LEFT JOIN LATERAL (
                    SELECT fact.source_mention_key,fact.target_mention_key
                    FROM mention_relation_assertions fact
                    WHERE fact.project_id=r.project_id AND fact.canonical_assertion_id=r.id
+                     AND fact.revision_id=r.revision_id
                    ORDER BY fact.created_at DESC,fact.id DESC LIMIT 1
                ) mention_fact ON TRUE
                LEFT JOIN entity_mentions source_mention
-                 ON source_mention.project_id=r.project_id
+                ON source_mention.project_id=r.project_id
                 AND source_mention.mention_key=mention_fact.source_mention_key
+                AND source_mention.revision_id=r.revision_id
                 AND source_mention.is_deleted=FALSE
                LEFT JOIN entity_assignments source_assignment
                  ON source_assignment.project_id=r.project_id
                 AND source_assignment.mention_id=source_mention.id
                 AND source_assignment.active=TRUE
                LEFT JOIN entity_mentions target_mention
-                 ON target_mention.project_id=r.project_id
+                ON target_mention.project_id=r.project_id
                 AND target_mention.mention_key=mention_fact.target_mention_key
+                AND target_mention.revision_id=r.revision_id
                 AND target_mention.is_deleted=FALSE
                LEFT JOIN entity_assignments target_assignment
                  ON target_assignment.project_id=r.project_id
@@ -2885,6 +3279,10 @@ class Database:
                       source.entity_type AS source_type,target.entity_type AS target_type
                FROM canonical_relation_projections projection
                JOIN relation_assertions r ON r.id=projection.assertion_id
+               JOIN documents active_document
+                 ON active_document.id=r.document_id
+                AND active_document.active_revision_id=r.revision_id
+                AND active_document.is_deleted=FALSE
                JOIN canonical_entities source ON source.id=projection.source_entity_id
                JOIN canonical_entities target ON target.id=projection.target_entity_id
                WHERE projection.project_id=%s AND projection.publishable=TRUE""",
@@ -2924,8 +3322,13 @@ class Database:
         if not ids:
             return
         conn.execute(
-            """UPDATE canonical_entity_documents SET is_deleted=TRUE,updated_at=NOW()
-               WHERE project_id=%s AND canonical_entity_id=ANY(%s)""",
+            """UPDATE canonical_entity_documents source
+               SET is_deleted=TRUE,updated_at=NOW()
+               FROM documents document
+               WHERE source.project_id=%s AND source.canonical_entity_id=ANY(%s)
+                 AND document.id=source.document_id
+                 AND document.active_revision_id=source.revision_id
+                 AND document.is_deleted=FALSE""",
             (project_id, ids),
         )
         conn.execute(
@@ -2935,11 +3338,12 @@ class Database:
                FROM entity_assignments assignment
                JOIN entity_mentions mention ON mention.id=assignment.mention_id
                JOIN documents document ON document.id=mention.document_id
+                 AND document.active_revision_id=mention.revision_id
                WHERE assignment.project_id=%s AND assignment.active=TRUE
                  AND assignment.canonical_entity_id=ANY(%s)
                  AND mention.is_deleted=FALSE AND document.is_deleted=FALSE
                GROUP BY assignment.project_id,assignment.canonical_entity_id,mention.document_id
-               ON CONFLICT(canonical_entity_id,document_id) DO UPDATE SET
+               ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE SET
                project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
             (project_id, ids),
         )
@@ -2972,6 +3376,9 @@ class Database:
                    jsonb_build_object('mention_key',mention.mention_key),%s
                FROM entity_assignments assignment
                JOIN entity_mentions mention ON mention.id=assignment.mention_id
+               JOIN documents document ON document.id=mention.document_id
+                 AND document.active_revision_id=mention.revision_id
+                 AND document.is_deleted=FALSE
                JOIN canonical_entities entity ON entity.id=assignment.canonical_entity_id
                WHERE assignment.project_id=%s AND assignment.active=TRUE
                  AND assignment.canonical_entity_id=ANY(%s)
@@ -3056,20 +3463,31 @@ class Database:
                    policy_version,reason,active)
                    SELECT m.project_id,m.id,m.canonical_entity_id,1,%s,'legacy assignment',TRUE
                    FROM entity_mentions m
+                   JOIN documents d ON d.id=m.document_id
+                     AND d.active_revision_id=m.revision_id AND d.is_deleted=FALSE
                    WHERE m.project_id=%s AND m.is_deleted=FALSE
                    ON CONFLICT(project_id,mention_id) WHERE active=TRUE DO NOTHING""",
                 (policy_version, project_id),
             )
             assignments = conn.execute(
-                """SELECT id,mention_id,canonical_entity_id,assignment_generation
-                   FROM entity_assignments WHERE project_id=%s AND canonical_entity_id=%s
-                   AND active=TRUE ORDER BY mention_id FOR UPDATE""",
+                """SELECT assignment.id,assignment.mention_id,assignment.canonical_entity_id,
+                          assignment.assignment_generation
+                   FROM entity_assignments assignment
+                   JOIN entity_mentions mention ON mention.id=assignment.mention_id
+                   JOIN documents document ON document.id=mention.document_id
+                     AND document.active_revision_id=mention.revision_id
+                     AND document.is_deleted=FALSE
+                   WHERE assignment.project_id=%s AND assignment.canonical_entity_id=%s
+                     AND assignment.active=TRUE ORDER BY assignment.mention_id FOR UPDATE""",
                 (project_id, source_entity_id),
             ).fetchall()
             source_documents = conn.execute(
-                """SELECT document_id FROM canonical_entity_documents
-                   WHERE project_id=%s AND canonical_entity_id=%s AND is_deleted=FALSE
-                   ORDER BY document_id""",
+                """SELECT source.document_id FROM canonical_entity_documents source
+                   JOIN documents document ON document.id=source.document_id
+                     AND document.active_revision_id=source.revision_id
+                     AND document.is_deleted=FALSE
+                   WHERE source.project_id=%s AND source.canonical_entity_id=%s
+                     AND source.is_deleted=FALSE ORDER BY source.document_id""",
                 (project_id, source_entity_id),
             ).fetchall()
             before_state = {
@@ -3114,13 +3532,24 @@ class Database:
                 """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
                    SELECT project_id,%s,document_id FROM canonical_entity_documents
                    WHERE project_id=%s AND canonical_entity_id=%s AND is_deleted=FALSE
-                   ON CONFLICT(canonical_entity_id,document_id) DO UPDATE
+                     AND EXISTS(
+                         SELECT 1 FROM documents document
+                         WHERE document.id=canonical_entity_documents.document_id
+                           AND document.active_revision_id=canonical_entity_documents.revision_id
+                           AND document.is_deleted=FALSE
+                     )
+                   ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE
                    SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
                 (target_entity_id, project_id, source_entity_id),
             )
             conn.execute(
-                """UPDATE canonical_entity_documents SET is_deleted=TRUE,updated_at=NOW()
-                   WHERE project_id=%s AND canonical_entity_id=%s""",
+                """UPDATE canonical_entity_documents source
+                   SET is_deleted=TRUE,updated_at=NOW()
+                   FROM documents document
+                   WHERE source.project_id=%s AND source.canonical_entity_id=%s
+                     AND document.id=source.document_id
+                     AND document.active_revision_id=source.revision_id
+                     AND document.is_deleted=FALSE""",
                 (project_id, source_entity_id),
             )
             conn.execute(
@@ -3189,6 +3618,18 @@ class Database:
                 raise ValueError("当前只支持回滚 merge 事件")
             source_id = int(event["source_entity_id"])
             assignment_ids = [int(item["id"]) for item in (event.get("before_state") or {}).get("assignments", [])]
+            if assignment_ids:
+                current_count = int(conn.execute(
+                    """SELECT COUNT(*) AS count FROM entity_assignments assignment
+                       JOIN entity_mentions mention ON mention.id=assignment.mention_id
+                       JOIN documents document ON document.id=mention.document_id
+                         AND document.active_revision_id=mention.revision_id
+                         AND document.is_deleted=FALSE
+                       WHERE assignment.id=ANY(%s)""",
+                    (assignment_ids,),
+                ).fetchone()["count"])
+                if current_count != len(assignment_ids):
+                    raise ValueError("该 merge 事件属于历史内容修订，不能改写退休事实")
             conn.execute(
                 "UPDATE entity_assignments SET active=FALSE WHERE event_id=%s AND active=TRUE",
                 (event_id,),
@@ -3212,8 +3653,14 @@ class Database:
             ]
             if document_ids:
                 conn.execute(
-                    """UPDATE canonical_entity_documents SET is_deleted=FALSE,updated_at=NOW()
-                       WHERE project_id=%s AND canonical_entity_id=%s AND document_id=ANY(%s)""",
+                    """UPDATE canonical_entity_documents source
+                       SET is_deleted=FALSE,updated_at=NOW()
+                       FROM documents document
+                       WHERE source.project_id=%s AND source.canonical_entity_id=%s
+                         AND source.document_id=ANY(%s)
+                         AND document.id=source.document_id
+                         AND document.active_revision_id=source.revision_id
+                         AND document.is_deleted=FALSE""",
                     (project_id, source_id, document_ids),
                 )
             conn.execute(
@@ -3279,6 +3726,10 @@ class Database:
                           a.assignment_generation,a.policy_version,a.event_id,a.reason,
                           a.active,a.metadata
                    FROM entity_assignments a
+                   JOIN entity_mentions mention ON mention.id=a.mention_id
+                   JOIN documents document ON document.id=mention.document_id
+                     AND document.active_revision_id=mention.revision_id
+                     AND document.is_deleted=FALSE
                    WHERE a.project_id=%s AND a.mention_id=ANY(%s)
                      AND a.canonical_entity_id=%s AND a.active=TRUE
                    ORDER BY a.mention_id FOR UPDATE""",
@@ -3443,7 +3894,8 @@ class Database:
                   ON projection.project_id=r.project_id AND projection.assertion_id=r.id
                 JOIN canonical_entities s ON s.id=COALESCE(projection.source_entity_id,r.source_entity_id)
                 JOIN canonical_entities t ON t.id=COALESCE(projection.target_entity_id,r.target_entity_id)
-                JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
+                JOIN documents d ON d.id=r.document_id AND d.active_revision_id=r.revision_id
+                JOIN chunks c ON c.id=r.chunk_id
                 WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
                 AND COALESCE(projection.publishable,TRUE)=TRUE
                 AND """ + clause + " ORDER BY r.id", (project_id, *policy_params)
@@ -3461,7 +3913,7 @@ class Database:
         with self.connection() as conn:
             row = conn.execute(
                 """SELECT COUNT(*) AS count FROM relation_assertions r
-                   JOIN documents d ON d.id=r.document_id
+                   JOIN documents d ON d.id=r.document_id AND d.active_revision_id=r.revision_id
                    LEFT JOIN canonical_relation_projections projection
                      ON projection.project_id=r.project_id AND projection.assertion_id=r.id
                    WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
@@ -3482,7 +3934,7 @@ class Database:
                 JOIN canonical_entities s ON s.id=r.source_entity_id
                 JOIN canonical_entities t ON t.id=r.target_entity_id
                 JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
-                WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                WHERE r.project_id=%s AND r.is_deleted=FALSE
                 ORDER BY r.id""",
                 (project_id,),
             ).fetchall()
@@ -3491,7 +3943,9 @@ class Database:
         with self.connection() as conn:
             return conn.execute(
                 """SELECT m.*,e.name,e.entity_type,e.graph_vertex_id FROM entity_mentions m
-                JOIN canonical_entities e ON e.id=m.canonical_entity_id WHERE m.document_id=%s AND m.is_deleted=FALSE""", (document_id,)
+                JOIN canonical_entities e ON e.id=m.canonical_entity_id
+                JOIN documents d ON d.id=m.document_id AND d.active_revision_id=m.revision_id
+                WHERE m.document_id=%s AND m.is_deleted=FALSE AND d.is_deleted=FALSE""", (document_id,)
             ).fetchall()
 
     def list_document_relations(self, document_id: int) -> list[dict[str, Any]]:
@@ -3507,7 +3961,8 @@ class Database:
                   ON projection.project_id=r.project_id AND projection.assertion_id=r.id
                 JOIN canonical_entities s ON s.id=COALESCE(projection.source_entity_id,r.source_entity_id)
                 JOIN canonical_entities t ON t.id=COALESCE(projection.target_entity_id,r.target_entity_id)
-                WHERE r.document_id=%s AND r.is_deleted=FALSE
+                JOIN documents d ON d.id=r.document_id AND d.active_revision_id=r.revision_id
+                WHERE r.document_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
                 AND COALESCE(projection.publishable,TRUE)=TRUE AND """ + clause,
                 (document_id, *policy_params),
             ).fetchall()
@@ -3564,12 +4019,16 @@ class Database:
             """UPDATE canonical_entities e
                SET source_count=(
                        SELECT COUNT(*) FROM canonical_entity_documents source
-                       WHERE source.project_id=e.project_id
+                       JOIN documents document ON document.id=source.document_id
+                         AND document.active_revision_id=source.revision_id
+                       WHERE source.project_id=e.project_id AND document.is_deleted=FALSE
                          AND source.canonical_entity_id=e.id AND source.is_deleted=FALSE
                    ),
                    is_deleted=NOT EXISTS(
                        SELECT 1 FROM canonical_entity_documents source
-                       WHERE source.project_id=e.project_id
+                       JOIN documents document ON document.id=source.document_id
+                         AND document.active_revision_id=source.revision_id
+                       WHERE source.project_id=e.project_id AND document.is_deleted=FALSE
                          AND source.canonical_entity_id=e.id AND source.is_deleted=FALSE
                    ),
                    updated_at=NOW()
@@ -3609,12 +4068,17 @@ class Database:
         clause, policy_params = self._publishable_relation_clause("r")
         statement = f"""SELECT
             (SELECT COUNT(*) FROM documents WHERE project_id=%s AND is_deleted=FALSE) documents,
-            (SELECT COUNT(*) FROM chunks WHERE project_id=%s AND is_deleted=FALSE) chunks,
+            (SELECT COUNT(*) FROM chunks c JOIN documents d
+                ON d.id=c.document_id AND d.active_revision_id=c.revision_id
+                WHERE c.project_id=%s AND c.is_deleted=FALSE AND d.is_deleted=FALSE) chunks,
             (SELECT COUNT(*) FROM canonical_entities WHERE project_id=%s AND is_deleted=FALSE) entities,
-            (SELECT COUNT(*) FROM relation_assertions r WHERE r.project_id=%s
-                AND r.is_deleted=FALSE AND {clause}) relations,
-            (SELECT COUNT(*) FROM relation_candidates rc WHERE rc.project_id=%s
-                AND rc.is_deleted=FALSE) relation_candidates"""
+            (SELECT COUNT(*) FROM relation_assertions r JOIN documents d
+                ON d.id=r.document_id AND d.active_revision_id=r.revision_id
+                WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                AND {clause}) relations,
+            (SELECT COUNT(*) FROM relation_candidates rc JOIN documents d
+                ON d.id=rc.document_id AND d.active_revision_id=rc.revision_id
+                WHERE rc.project_id=%s AND rc.is_deleted=FALSE AND d.is_deleted=FALSE) relation_candidates"""
         with self.connection() as conn:
             row = conn.execute(
                 statement,
@@ -3637,7 +4101,8 @@ class Database:
                   ON projection.project_id=r.project_id AND projection.assertion_id=r.id
                 JOIN canonical_entities s ON s.id=COALESCE(projection.source_entity_id,r.source_entity_id)
                 JOIN canonical_entities t ON t.id=COALESCE(projection.target_entity_id,r.target_entity_id)
-                JOIN documents d ON d.id=r.document_id JOIN chunks c ON c.id=r.chunk_id
+                JOIN documents d ON d.id=r.document_id AND d.active_revision_id=r.revision_id
+                JOIN chunks c ON c.id=r.chunk_id
                 WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
                 AND COALESCE(projection.publishable,TRUE)=TRUE
                 AND """ + clause + """
@@ -3678,6 +4143,7 @@ class Database:
                    JOIN canonical_entities target
                      ON target.id=COALESCE(projection.target_entity_id,r.target_entity_id)
                    JOIN documents document ON document.id=r.document_id
+                     AND document.active_revision_id=r.revision_id
                    WHERE r.project_id=%s AND r.is_deleted=FALSE AND document.is_deleted=FALSE
                      AND COALESCE(projection.publishable,TRUE)=TRUE
                      AND (COALESCE(projection.source_entity_id,r.source_entity_id)=ANY(%s)

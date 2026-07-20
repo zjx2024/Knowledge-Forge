@@ -114,6 +114,7 @@ class VectorStore:
         content = f"{source_name} {relation['relation_type']} {target_name}\n{relation.get('description') or ''}".strip()
         vector = self.ollama.embed([content], model)[0]
         self.db.upsert_embedding({"project_id": project_id, "document_id": document_id, "chunk_id": chunk_id,
+            "revision_id": relation.get("revision_id"),
             "object_type": "relation", "object_key": str(relation["id"]), "content": content,
             "content_hash": relation["relation_key"], "model_name": model, "embedding": vector,
             "metadata": {"relation_type": relation["relation_type"]}})

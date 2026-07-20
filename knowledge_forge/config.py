@@ -72,6 +72,9 @@ class Config:
     indexing_retry_batch_size = max(1, int(os.getenv("INDEXING_RETRY_BATCH_SIZE", "100")))
     indexing_retry_max_attempts = max(1, int(os.getenv("INDEXING_RETRY_MAX_ATTEMPTS", "8")))
     indexing_retry_base_seconds = max(1, int(os.getenv("INDEXING_RETRY_BASE_SECONDS", "30")))
+    indexing_failure_cleanup_enabled = os.getenv(
+        "INDEXING_FAILURE_CLEANUP_ENABLED", "false",
+    ).lower() == "true"
     indexing_failure_retention_days = max(1, int(os.getenv("INDEXING_FAILURE_RETENTION_DAYS", "30")))
     entity_merge_threshold = float(os.getenv("ENTITY_MERGE_THRESHOLD", "0.90"))
     entity_lexical_top_k = int(os.getenv("ENTITY_LEXICAL_TOP_K", "10"))

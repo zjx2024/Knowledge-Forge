@@ -40,7 +40,7 @@ from .hugegraph_store import HugeGraphStore
 from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
-from .policy import P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW_POLICY_SET
+from .policy import POLICY_AXES, P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW_POLICY_SET
 from .quality import evaluate_release_gate, validate_gold_manifest
 from .relation_pipeline import VersionedRelationPipeline
 from .schema_evolution import SchemaEvolutionService
@@ -315,6 +315,7 @@ class KnowledgeForgeService:
             if existing and existing.get("is_deleted"):
                 return self.db.update_document(int(existing["id"]), **{**values, "status": "uploaded", "error_message": None,
                     "is_deleted": False, "deleted_at": None, "indexed_at": None,
+                    "active_revision_id": None,
                     "effective_parser": None, "effective_chunk_strategy": None, "parse_quality": {},
                     "routing_reason": None, "processing_stage": "uploaded", "structure_ready_at": None,
                     "chunks_ready_at": None, "graph_ready_at": None})
@@ -464,6 +465,7 @@ class KnowledgeForgeService:
                 self.db.record_indexing_failure({
                     "project_id": project_id,
                     "document_id": relation.get("document_id"),
+                    "revision_id": relation.get("revision_id"),
                     "chunk_id": relation.get("chunk_id"),
                     "object_type": "relation",
                     "object_key": object_key,
@@ -849,6 +851,8 @@ class KnowledgeForgeService:
 
     @recorded_job("ingestion")
     def _ingest_document(self, job_id: str, document_id: int) -> None:
+        revision: dict[str, Any] | None = None
+        revision_scope: Any = None
         try:
             with self._document_lock(document_id):
                 self._assert_ingestion_active(job_id, document_id)
@@ -860,6 +864,31 @@ class KnowledgeForgeService:
             if not document: raise LookupError("文档不存在")
             project = self.db.get_project(int(document["project_id"]))
             if not project: raise LookupError("项目不存在")
+            revision_manifest = {
+                "content_hash": document["doc_hash"],
+                "source_hash": document["doc_hash"],
+                "config_hash": hashlib.sha256(json.dumps({
+                    "requested_parser": document.get("requested_parser") or "auto",
+                    "requested_chunk_strategy": document.get("requested_chunk_strategy") or "auto",
+                    "chunk_max_tokens": int(project.get("chunk_max_tokens") or self.DEFAULT_CHUNK_MAX_TOKENS),
+                    "llm_model": project.get("llm_model") or Config.default_llm_model,
+                    "embedding_model": project.get("embedding_model") or Config.default_embedding_model,
+                }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+                "policy_hash": graph_policy_hash(
+                    {axis: str(project.get(axis) or "") for axis in POLICY_AXES},
+                    schema_version=int(project.get("active_schema_version") or 1),
+                ),
+                "document_id": document_id,
+                "project_id": int(project["id"]),
+            }
+            revision = self.db.begin_document_revision(document_id, job_id, revision_manifest)
+            if revision.get("already_active"):
+                self._job(job_id, "completed", 100, "相同入库 run 已完成，无需重复发布", stage="completed")
+                return
+            revision_scope = self.db.content_revision_context(
+                str(revision["revision_id"]), job_id, str(revision["lease_token"]),
+            )
+            revision_scope.__enter__()
             source_path = Path(document["local_path"])
             plan, parsed = parse_document_structure(
                 source_path,
@@ -959,7 +988,15 @@ class KnowledgeForgeService:
             with self._document_lock(document_id):
                 self._assert_ingestion_active(job_id, document_id)
                 self._write_process_payload(payload_path, document["original_filename"], result)
-                stored_chunks = self.db.replace_document_content(document_id, section_values, chunk_values)
+                stored_chunks = self.db.replace_document_content(
+                    document_id,
+                    section_values,
+                    chunk_values,
+                    revision_id=str(revision["revision_id"]),
+                    ingestion_run_id=job_id,
+                    lease_token=str(revision["lease_token"]),
+                    manifest=revision_manifest,
+                )
                 self.db.update_document(document_id, processing_stage="chunk_ready",
                                         chunks_ready_at=datetime.now(timezone.utc),
                                         metadata={**process_metadata, "section_count": len(sections),
@@ -1120,6 +1157,9 @@ class KnowledgeForgeService:
                 _, graph_project = self.db.finalize_document_graph_facts(
                     document_id,
                     reason="文档事实已更新，等待当前代次图谱重建",
+                    revision_id=str(revision["revision_id"]),
+                    ingestion_run_id=job_id,
+                    lease_token=str(revision["lease_token"]),
                     **document_values,
                 )
             else:
@@ -1194,6 +1234,10 @@ class KnowledgeForgeService:
                       published_to_hugegraph=graph_report["relations"])
         except IngestionCancelled as exc:
             LOGGER.info("Document ingestion cancelled: %s: %s", document_id, exc)
+            if revision:
+                self.db.fail_document_revision(
+                    str(revision["revision_id"]), job_id, str(revision["lease_token"]), str(exc),
+                )
             job = self.db.get_job(job_id)
             if job and job.get("project_id"):
                 self.db.set_graph_state(
@@ -1205,6 +1249,10 @@ class KnowledgeForgeService:
                 self.db.update_job(job_id, status="cancelled", log=str(exc), metadata={"stage": "cancelled"})
         except Exception as exc:
             job = self.db.get_job(job_id)
+            if revision:
+                self.db.fail_document_revision(
+                    str(revision["revision_id"]), job_id, str(revision["lease_token"]), str(exc),
+                )
             if (job and job.get("status") == "cancelled") or not self.db.get_document(document_id):
                 LOGGER.info("Document ingestion stopped after deletion/cancellation: %s: %s", document_id, exc)
                 if job and job.get("project_id"):
@@ -1222,14 +1270,21 @@ class KnowledgeForgeService:
                     )
                 return
             LOGGER.exception("Document ingestion failed: %s", document_id)
-            if job and job.get("project_id"):
-                self.db.set_graph_state(
-                    int(job["project_id"]), GRAPH_FAILED, error=str(exc),
-                )
+            current_document = self.db.get_document(document_id)
+            if job and job.get("project_id") and not (current_document or {}).get("active_revision_id"):
+                self.db.set_graph_state(int(job["project_id"]), GRAPH_FAILED, error=str(exc))
             self._fail_active_ingestion_subtask(job_id, str(exc))
-            self.db.update_document(document_id, status="failed", processing_stage="failed", error_message=str(exc))
+            self.db.update_document(
+                document_id,
+                status="indexed" if (current_document or {}).get("active_revision_id") else "failed",
+                processing_stage="failed",
+                error_message=str(exc),
+            )
             self.db.update_job(job_id, status="failed", progress=100, log=f"处理失败：{exc}", error=str(exc),
                                metadata={"stage": "failed"})
+        finally:
+            if revision_scope is not None:
+                revision_scope.__exit__(None, None, None)
 
     def _run_relation_shadow(
         self,
@@ -1272,7 +1327,9 @@ class KnowledgeForgeService:
                 classifier=self.ollama,
                 model=project.get("llm_model") or Config.default_llm_model,
                 model_max_tokens=int(project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS),
-                project_scope=str(project.get("project_key") or project["id"]),
+                project_scope=(
+                    f"{project.get('project_key') or project['id']}:{chunk.get('revision_id') or 'legacy'}"
+                ),
                 chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
                 content=str(chunk.get("content") or ""),
                 entities=list(extraction.get("entities") or []),
@@ -1504,6 +1561,7 @@ class KnowledgeForgeService:
                 self.db.record_indexing_failure({
                     "project_id": project_id,
                     "document_id": failure.get("document_id"),
+                    "revision_id": failure.get("revision_id"),
                     "chunk_id": failure.get("chunk_id"),
                     "object_type": "relation",
                     "object_key": object_key,
