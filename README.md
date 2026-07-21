@@ -428,6 +428,9 @@ fake HugeGraph 测试覆盖进程状态恢复、代次变化、数量不一致�
 
 ## 验证
 
+上线前 revision、shadow snapshot、Gold/release gate、HugeGraph sentinel、迁移恢复和隔离
+E2E 的完整操作见 [`docs/pre-live-readiness.md`](docs/pre-live-readiness.md)。
+
 ```bash
 .venv/bin/python -m py_compile knowledge_forge/*.py server.py
 .venv/bin/python -m pytest -q
