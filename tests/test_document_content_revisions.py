@@ -263,6 +263,7 @@ def test_bootstrap_is_restart_safe_after_revision_migration():
             {"version": "0006_graph_namespace_manifest", "count": 1},
             {"version": "0007_indexing_failure_status", "count": 1},
             {"version": "0008_mention_occurrence_identity", "count": 1},
+            {"version": "0009_policy_snapshot_coverage", "count": 1},
         ]
         assert conn.execute(
             "SELECT to_regclass('uq_chunks_revision_key') AS index_name"

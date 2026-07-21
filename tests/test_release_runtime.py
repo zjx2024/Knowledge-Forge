@@ -131,6 +131,58 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
     assert "--upgrade pip" not in workflow
 
 
+def test_python312_local_entrypoint_matches_ci_and_docker_dependencies():
+    assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.12"
+
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    for required in (
+        ".venv/",
+        ".venv-*-backup-*/",
+        ".venv-*-failed-*/",
+        ".graphrag-smoke/",
+    ):
+        assert required in gitignore
+
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    assert ".venv-*" in dockerignore
+
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    full_install = (
+        "python -m pip install -c constraints.txt -r requirements.txt "
+        "-r requirements-docling.txt -r requirements-entity-resolution.txt"
+    )
+    assert workflow.count(full_install) == 2
+
+    for path in (
+        ROOT / "README.md",
+        ROOT / "docs/pre-live-readiness.md",
+        ROOT / "docs/migrations-and-release-safety.md",
+    ):
+        content = path.read_text(encoding="utf-8")
+        assert "conda run -n knowledge-forge-py312" not in content, path
+        assert ".venv/bin/python" in content, path
+
+    generator = (ROOT / "scripts/generate_python312_constraints.py").read_text(
+        encoding="utf-8"
+    )
+    assert "conda run -n" not in generator
+    assert ".venv/" not in generator
+    assert "python3.12" in generator
+
+    for path in (ROOT / "constraints.txt", ROOT / "constraints-gpu.txt"):
+        content = path.read_text(encoding="utf-8")
+        assert "conda run -n" not in content, path
+        assert ".venv/" not in content, path
+        assert "/home/" not in content, path
+        assert "python3.12" in content, path
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "python3.12 -m venv .venv" in readme
+    assert ".venv/bin/python -m pip install pip==25.3" in readme
+    assert ".venv/bin/python" in readme
+    assert "VS Code" in readme
+
+
 def test_backup_restore_and_migration_runbook_are_executable_not_just_documented():
     verifier = (ROOT / "scripts/verify_postgres_backup_restore.py").read_text(encoding="utf-8")
     for required in (

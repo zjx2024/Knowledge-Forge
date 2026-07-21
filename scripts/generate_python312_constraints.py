@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-HEADER = """# Fully resolved for Python 3.12 on Linux x86_64.\n# Regenerate from one resolver run after changing any requirements file:\n#   conda run -n knowledge-forge-py312 python -m pip install --dry-run -c constraints.txt --report /tmp/knowledge-forge-py312-resolver-report.json -r requirements.txt -r requirements-docling.txt -r requirements-entity-resolution.txt\n#   conda run -n knowledge-forge-py312 python scripts/generate_python312_constraints.py --report /tmp/knowledge-forge-py312-resolver-report.json\n# Then run pip check plus the unit, PostgreSQL, and Docker verification suites.\n\n"""
+HEADER = """# Fully resolved for Python 3.12 on Linux x86_64.\n# Regenerate from one resolver run after changing any requirements file:\n#   python3.12 -m pip install --dry-run -c constraints.txt --report /tmp/knowledge-forge-py312-resolver-report.json -r requirements.txt -r requirements-docling.txt -r requirements-entity-resolution.txt\n#   python3.12 scripts/generate_python312_constraints.py --report /tmp/knowledge-forge-py312-resolver-report.json\n# Then run pip check plus the unit, PostgreSQL, and Docker verification suites.\n\n"""
 
 
 def _locked_lines(report: Path, *, torch_variant: str) -> list[str]:

@@ -5,14 +5,14 @@
 以下只读命令不会创建迁移表或修改业务数据：
 
 ```bash
-conda run -n knowledge-forge-py312 python scripts/manage_migrations.py plan
-conda run -n knowledge-forge-py312 python scripts/manage_migrations.py status
+.venv/bin/python scripts/manage_migrations.py plan
+.venv/bin/python scripts/manage_migrations.py status
 ```
 
 显式执行全部版本化迁移：
 
 ```bash
-conda run -n knowledge-forge-py312 python scripts/manage_migrations.py apply
+.venv/bin/python scripts/manage_migrations.py apply
 ```
 
 服务启动仅执行标记为快速且安全的迁移。回填、并发索引等重操作必须由运维人员显式执行。迁移受 PostgreSQL advisory lock 保护，每一步独立记录 checksum、状态、耗时、执行模式和进度；失败后再次执行会从持久化状态继续。已应用迁移的 checksum 改变时必须停止并使用新的 forward-fix 迁移，禁止改写历史脚本。
@@ -22,13 +22,13 @@ conda run -n knowledge-forge-py312 python scripts/manage_migrations.py apply
 正式迁移前先对合成临时库验证本机 `pg_dump` 和 `pg_restore` 链路：
 
 ```bash
-conda run -n knowledge-forge-py312 python scripts/verify_postgres_backup_restore.py
+.venv/bin/python scripts/verify_postgres_backup_restore.py
 ```
 
 若 PostgreSQL 客户端仅存在于容器中：
 
 ```bash
-conda run -n knowledge-forge-py312 python scripts/verify_postgres_backup_restore.py \
+.venv/bin/python scripts/verify_postgres_backup_restore.py \
   --docker-container knowledge-forge-postgres
 ```
 
@@ -41,7 +41,7 @@ conda run -n knowledge-forge-py312 python scripts/verify_postgres_backup_restore
 默认命令只展示计划：
 
 ```bash
-conda run -n knowledge-forge-py312 python scripts/manage_migrations.py cleanup-legacy-columns
+.venv/bin/python scripts/manage_migrations.py cleanup-legacy-columns
 ```
 
 只有确认无数据库对象引用并持有可追溯备份后，才可同时提供备份标识与两个显式开关执行。服务启动永远不会执行该清理。

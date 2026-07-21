@@ -1,5 +1,8 @@
 .git
 .venv
+.venv-*
+.graphrag-smoke
+graphrag-output
 **/__pycache__
 __pycache__
 .pytest_cache

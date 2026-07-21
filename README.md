@@ -59,7 +59,7 @@ knowledge-forge/
 Docling 用于处理扫描 PDF 或复杂论文版面，默认随项目依赖安装：
 
 ```bash
-conda run -n knowledge-forge-py312 python -m pip install -c constraints.txt -r requirements-docling.txt
+.venv/bin/python -m pip install -c constraints.txt -r requirements-docling.txt
 ```
 
 Docling 首次处理复杂文档时会下载版面分析和 OCR 模型。Docker Compose 将
@@ -158,11 +158,20 @@ HugeGraph 官方 `init-store.sh`，然后重新启动容器。不会清空其他
 ```bash
 cd /home/kdfy/zjx-projects/knowledge-forge
 cp -n .env.example .env
-conda create -n knowledge-forge-py312 python=3.12 pip setuptools wheel
-conda run -n knowledge-forge-py312 python -m pip install -c constraints.txt \
+python3.12 -m venv .venv
+.venv/bin/python -m pip install pip==25.3
+.venv/bin/python -m pip install -c constraints.txt \
   -r requirements.txt -r requirements-docling.txt -r requirements-entity-resolution.txt
-conda run -n knowledge-forge-py312 python server.py
+.venv/bin/python server.py
 ```
+
+`python3.12` 必须是独立 CPython 3.12，不能指向 Conda 环境。项目的正式本地开发
+入口始终是根目录 `.venv`；已有 Conda 环境只可作为迁移回退或依赖对照，不参与日常启动。
+VS Code 中使用“Python: Select Interpreter”并选择
+`<仓库根目录>/.venv/bin/python`。
+
+依赖中固定包含 `graphrag==3.1.1`，用于 Python 3.12 运行兼容和后续评估；当前业务管线
+尚未接入 GraphRAG BYOG，Knowledge Forge 仍使用自身的实体、关系和 HugeGraph 写入流程。
 
 ### 依赖锁更新
 
@@ -171,10 +180,10 @@ conda run -n knowledge-forge-py312 python server.py
 `requirements*.txt` 后，在同一个新环境中重新解析并生成锁：
 
 ```bash
-conda run -n knowledge-forge-py312 python -m pip install --dry-run \
+.venv/bin/python -m pip install --dry-run \
   -c constraints.txt --report /tmp/knowledge-forge-py312-resolver-report.json \
   -r requirements.txt -r requirements-docling.txt -r requirements-entity-resolution.txt
-conda run -n knowledge-forge-py312 python scripts/generate_python312_constraints.py \
+.venv/bin/python scripts/generate_python312_constraints.py \
   --report /tmp/knowledge-forge-py312-resolver-report.json
 ```
 
@@ -402,7 +411,7 @@ pgvector 会按 Embedding 模型和维度创建 partial HNSW 索引。维度不�
 trigram、来源映射和 HNSW 查询计划可用以下命令验证：
 
 ```bash
-conda run -n knowledge-forge-py312 python scripts/run_disposable_postgres_tests.py tests/test_p1_postgres_plans.py
+.venv/bin/python scripts/run_disposable_postgres_tests.py tests/test_p1_postgres_plans.py
 ```
 
 脚本只在临时数据库生成 10k/100k 验证数据，测试结束无论成功或失败都会终止连接并删除该
@@ -422,9 +431,9 @@ conda run -n knowledge-forge-py312 python scripts/run_disposable_postgres_tests.
 工程 fixture、操作数基准和人工标注包命令：
 
 ```bash
-conda run -n knowledge-forge-py312 python benchmarks/benchmark_kg_construction.py
-conda run -n knowledge-forge-py312 python benchmarks/build_annotation_bundle.py --help
-conda run -n knowledge-forge-py312 python benchmarks/evaluate_kg_gold.py --help
+.venv/bin/python benchmarks/benchmark_kg_construction.py
+.venv/bin/python benchmarks/build_annotation_bundle.py --help
+.venv/bin/python benchmarks/evaluate_kg_gold.py --help
 ```
 
 质量报告覆盖实体 exact/overlap span、类型 macro-F1、候选召回、pairwise/B3 聚类、严格关系
@@ -434,8 +443,8 @@ conda run -n knowledge-forge-py312 python benchmarks/evaluate_kg_gold.py --help
 默认 pytest 不访问外部服务。环境具备时显式运行：
 
 ```bash
-RUN_LIVE_MODEL_TESTS=1 conda run -n knowledge-forge-py312 python -m pytest -q -m live_model
-RUN_HUGEGRAPH_INTEGRATION=1 conda run -n knowledge-forge-py312 python -m pytest -q -m hugegraph_integration
+RUN_LIVE_MODEL_TESTS=1 .venv/bin/python -m pytest -q -m live_model
+RUN_HUGEGRAPH_INTEGRATION=1 .venv/bin/python -m pytest -q -m hugegraph_integration
 ```
 
 模型 smoke 验证 Ollama 模型 digest/context、严格 JSON、Embedding 数量/顺序/维度/finite 和
@@ -449,9 +458,9 @@ fake HugeGraph 测试覆盖进程状态恢复、代次变化、数量不一致�
 E2E 的完整操作见 [`docs/pre-live-readiness.md`](docs/pre-live-readiness.md)。
 
 ```bash
-conda run -n knowledge-forge-py312 python -m py_compile knowledge_forge/*.py server.py
-conda run -n knowledge-forge-py312 python -m pytest -q
-conda run -n knowledge-forge-py312 python scripts/run_disposable_postgres_tests.py
+.venv/bin/python -m py_compile knowledge_forge/*.py server.py
+.venv/bin/python -m pytest -q
+.venv/bin/python scripts/run_disposable_postgres_tests.py
 curl http://127.0.0.1:8011/health
 curl http://127.0.0.1:8080/graphs
 ```

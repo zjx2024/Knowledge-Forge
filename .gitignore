@@ -1,6 +1,10 @@
 .env
 .env.docker
 .venv/
+.venv-*-backup-*/
+.venv-*-failed-*/
+.graphrag-smoke/
+graphrag-output/
 __pycache__/
 *.py[cod]
 .pytest_cache/

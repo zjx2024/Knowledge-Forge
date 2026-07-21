@@ -24,7 +24,7 @@ jobs:
           python-version: '3.12.13'
           cache: pip
       - run: python -m pip install pip==25.3
-      - run: python -m pip install -c constraints.txt -r requirements.txt
+      - run: python -m pip install -c constraints.txt -r requirements.txt -r requirements-docling.txt -r requirements-entity-resolution.txt
       - run: python -m pip check
       - run: python -c "from importlib.metadata import version; assert version('graphrag') == '3.1.1'"
       - run: python -m pytest --strict-markers -q -m "not integration and not live_model and not hugegraph_integration"
@@ -62,7 +62,7 @@ jobs:
           python-version: '3.12.13'
           cache: pip
       - run: python -m pip install pip==25.3
-      - run: python -m pip install -c constraints.txt -r requirements.txt
+      - run: python -m pip install -c constraints.txt -r requirements.txt -r requirements-docling.txt -r requirements-entity-resolution.txt
       - run: python -m pip check
       - run: python -c "from importlib.metadata import version; assert version('graphrag') == '3.1.1'"
       - name: Collect integration tests
