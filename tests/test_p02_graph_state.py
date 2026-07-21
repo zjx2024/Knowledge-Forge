@@ -421,19 +421,22 @@ def test_relation_indexing_outbox_is_retried_without_changing_assertion_state():
 
 
 @pytest.mark.integration
-def test_p02_real_postgres_policy_migration_and_audit_transactions():
+def test_p02_real_postgres_policy_migration_and_audit_transactions(active_document_revision):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
-    schema_name = f"kf_p02_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_p02_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as admin:
-        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             admin.execute(
                 sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name))
             )
-            admin.execute(SCHEMA_SQL)
-            admin.execute(SCHEMA_SQL)
+            if not managed_schema:
+                admin.execute(SCHEMA_SQL)
+                admin.execute(SCHEMA_SQL)
             project_id = admin.execute(
                 "INSERT INTO projects(project_key,name) VALUES('p02','P02') RETURNING id"
             ).fetchone()["id"]
@@ -443,6 +446,8 @@ def test_p02_real_postgres_policy_migration_and_audit_transactions():
                    VALUES(%s,'hash','a.txt','a.txt','/a','/a',1) RETURNING id""",
                 (project_id,),
             ).fetchone()["id"]
+            if managed_schema:
+                active_document_revision(admin, project_id, document_id)
             chunk_id = admin.execute(
                 """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
                    VALUES(%s,%s,'chunk','Alpha uses Beta','chunk-hash') RETURNING id""",
@@ -625,4 +630,5 @@ def test_p02_real_postgres_policy_migration_and_audit_transactions():
             }
             assert recorded_runs == {success_run}
         finally:
-            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))

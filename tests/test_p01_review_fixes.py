@@ -381,17 +381,20 @@ def test_explicit_project_graph_rebuild_purges_stale_edges_before_sync():
 
 
 @pytest.mark.integration
-def test_disposable_postgres_schema_and_policy_migration():
+def test_disposable_postgres_schema_and_policy_migration(active_document_revision):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
-    schema_name = f"kf_p01_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_p01_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True) as conn:
-        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             conn.execute(sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name)))
-            conn.execute(SCHEMA_SQL)
-            conn.execute(SCHEMA_SQL)
+            if not managed_schema:
+                conn.execute(SCHEMA_SQL)
+                conn.execute(SCHEMA_SQL)
             project_id = conn.execute(
                 "INSERT INTO projects(project_key,name) VALUES('p','P') RETURNING id"
             ).fetchone()[0]
@@ -401,6 +404,9 @@ def test_disposable_postgres_schema_and_policy_migration():
                 RETURNING id""",
                 (project_id,),
             ).fetchone()[0]
+            revision_id = None
+            if managed_schema:
+                revision_id = active_document_revision(conn, project_id, document_id)
             chunk_id = conn.execute(
                 """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
                 VALUES(%s,%s,'c','Alpha uses Beta','ch') RETURNING id""",
@@ -452,10 +458,19 @@ def test_disposable_postgres_schema_and_policy_migration():
                 "SELECT is_deleted FROM vector_embeddings WHERE object_key=%s", (str(assertion_id),)
             ).fetchone()[0] is True
             with pytest.raises(psycopg.errors.ForeignKeyViolation):
-                conn.execute(
-                    """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
-                    VALUES(%s,999999,'bad','bad','bad')""",
-                    (project_id,),
-                )
+                if managed_schema:
+                    conn.execute(
+                        """INSERT INTO chunks(
+                           project_id,document_id,revision_id,chunk_key,content,content_hash)
+                           VALUES(%s,999999,%s,'bad','bad','bad')""",
+                        (project_id, revision_id),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
+                        VALUES(%s,999999,'bad','bad','bad')""",
+                        (project_id,),
+                    )
         finally:
-            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))

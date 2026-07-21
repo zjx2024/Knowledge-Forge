@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import os
 import uuid
 
@@ -26,13 +27,53 @@ def _connect(dsn: str, schema: str):
     return conn
 
 
+def _clean_owned_schema(dsn: str, schema: str) -> None:
+    probe_tables = {
+        "migration_probe", "migration_resume_probe", "concurrent_probe",
+        "heavy_probe", "safe_probe", "backfill_probe",
+    }
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        rows = connection.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname=%s AND tablename=ANY(%s)",
+            (schema, sorted(probe_tables)),
+        ).fetchall()
+        for row in rows:
+            connection.execute(
+                sql.SQL("DROP TABLE {}.{} CASCADE").format(
+                    sql.Identifier(schema), sql.Identifier(row[0]),
+                )
+            )
+        if connection.execute(
+            "SELECT to_regclass('schema_migrations')"
+        ).fetchone()[0]:
+            connection.execute("DELETE FROM schema_migrations WHERE version LIKE '9%'")
+
+
+@contextmanager
+def _migration_schema(dsn: str, prefix: str):
+    owned_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "")
+    if owned_schema:
+        schema = owned_schema
+        _clean_owned_schema(dsn, schema)
+        try:
+            yield schema
+        finally:
+            _clean_owned_schema(dsn, schema)
+        return
+    schema = prefix + uuid.uuid4().hex[:12]
+    with psycopg.connect(dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        yield schema
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
 @pytest.mark.integration
 def test_migration_plan_apply_idempotency_failure_resume_and_tamper():
     dsn = _dsn()
-    schema = "migration_" + uuid.uuid4().hex[:12]
-    with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-    try:
+    with _migration_schema(dsn, "migration_") as schema:
         first = Migration(
             "9001_probe", "create probe",
             "CREATE TABLE migration_probe(id INTEGER PRIMARY KEY);"
@@ -41,15 +82,20 @@ def test_migration_plan_apply_idempotency_failure_resume_and_tamper():
         runner = MigrationRunner((first,))
         with _connect(dsn, schema) as conn:
             before = conn.execute(
-                "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema=%s",
+                "SELECT COUNT(*) AS count FROM information_schema.tables "
+                "WHERE table_schema=%s AND table_name<>'kf_e2e_sentinel'",
                 (schema,),
             ).fetchone()["count"]
             assert runner.plan(conn)[0]["status"] == "pending"
             after = conn.execute(
-                "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema=%s",
+                "SELECT COUNT(*) AS count FROM information_schema.tables "
+                "WHERE table_schema=%s AND table_name<>'kf_e2e_sentinel'",
                 (schema,),
             ).fetchone()["count"]
-            assert before == after == 0
+            assert before == after
+            assert conn.execute(
+                "SELECT to_regclass('migration_probe') AS name"
+            ).fetchone()["name"] is None
             assert runner.apply(conn) == ["9001_probe"]
             assert runner.apply(conn) == []
             assert conn.execute("SELECT COUNT(*) AS count FROM migration_probe").fetchone()["count"] == 1
@@ -77,29 +123,23 @@ def test_migration_plan_apply_idempotency_failure_resume_and_tamper():
             tampered = MigrationRunner((Migration("9001_probe", "changed", "SELECT 2"),))
             with pytest.raises(RuntimeError, match="checksum mismatch"):
                 tampered.plan(conn)
-    finally:
-        with psycopg.connect(dsn, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 @pytest.mark.integration
 def test_two_migration_processes_are_serialized_and_apply_exactly_once():
     dsn = _dsn()
-    schema = "migration_concurrent_" + uuid.uuid4().hex[:10]
-    with psycopg.connect(dsn, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-    migration = Migration(
-        "9100_concurrent", "concurrent probe",
-        "CREATE TABLE concurrent_probe(id INTEGER PRIMARY KEY);"
-        "INSERT INTO concurrent_probe VALUES(1);"
-        "SELECT pg_sleep(0.15);",
-    )
+    with _migration_schema(dsn, "migration_concurrent_") as schema:
+        migration = Migration(
+            "9100_concurrent", "concurrent probe",
+            "CREATE TABLE concurrent_probe(id INTEGER PRIMARY KEY);"
+            "INSERT INTO concurrent_probe VALUES(1);"
+            "SELECT pg_sleep(0.15);",
+        )
 
-    def apply_once():
-        with _connect(dsn, schema) as conn:
-            return MigrationRunner((migration,)).apply(conn)
+        def apply_once():
+            with _connect(dsn, schema) as conn:
+                return MigrationRunner((migration,)).apply(conn)
 
-    try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = [future.result(timeout=10) for future in (pool.submit(apply_once), pool.submit(apply_once))]
         assert sorted(len(result) for result in results) == [0, 1]
@@ -108,18 +148,12 @@ def test_two_migration_processes_are_serialized_and_apply_exactly_once():
             assert conn.execute(
                 "SELECT COUNT(*) AS count FROM schema_migrations WHERE version='9100_concurrent' AND status='applied'"
             ).fetchone()["count"] == 1
-    finally:
-        with psycopg.connect(dsn, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 @pytest.mark.integration
 def test_startup_safe_filter_nontransactional_mode_and_resumable_backfill():
     dsn = _dsn()
-    schema = "migration_modes_" + uuid.uuid4().hex[:10]
-    with psycopg.connect(dsn, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-    try:
+    with _migration_schema(dsn, "migration_modes_") as schema:
         heavy = Migration(
             "9200_heavy", "operator-only migration",
             "CREATE TABLE heavy_probe(id INTEGER PRIMARY KEY);",
@@ -206,6 +240,3 @@ def test_startup_safe_filter_nontransactional_mode_and_resumable_backfill():
             assert conn.execute(
                 "SELECT progress FROM schema_migrations WHERE version='9203_backfill'"
             ).fetchone()["progress"] == {"processed": 4, "complete": True}
-    finally:
-        with psycopg.connect(dsn, autocommit=True) as admin:
-            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))

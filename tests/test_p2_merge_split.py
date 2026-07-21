@@ -214,20 +214,25 @@ def test_graph_generation_cannot_become_ready_with_blocking_derived_index_outbox
 
 
 @pytest.mark.integration
-def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints():
+def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints(
+    active_document_revision,
+):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
     from knowledge_forge.database import Database
 
-    schema_name = f"kf_merge_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_merge_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             conn.execute(sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name)))
-            conn.execute(SCHEMA_SQL)
+            if not managed_schema:
+                conn.execute(SCHEMA_SQL)
             project_id = int(conn.execute(
                 """INSERT INTO projects(project_key,name,active_policy_hash)
                    VALUES('p-merge','P merge','policy-v1') RETURNING id"""
@@ -238,6 +243,8 @@ def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints():
                    VALUES(%s,'doc-hash','doc.txt','doc.txt','/doc','/doc',10,'indexed') RETURNING id""",
                 (project_id,),
             ).fetchone()["id"])
+            if managed_schema:
+                active_document_revision(conn, project_id, document_id)
             chunk_id = int(conn.execute(
                 """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
                    VALUES(%s,%s,'chunk-1','Alpha uses Beta','chunk-hash') RETURNING id""",
@@ -373,4 +380,5 @@ def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints():
             )
             assert projection["quarantine_reason"] == "self relation after entity assignment change"
         finally:
-            conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema_name)))

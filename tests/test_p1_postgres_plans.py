@@ -36,18 +36,21 @@ def _assert_selective_index_plan(plan, *, expected_fragment: str = ""):
 
 
 @pytest.mark.integration
-def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes():
+def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_document_revision):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
-    schema_name = f"kf_plans_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_plans_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             conn.execute(sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name)))
-            conn.execute(SCHEMA_SQL)
+            if not managed_schema:
+                conn.execute(SCHEMA_SQL)
             project_id = conn.execute(
                 "INSERT INTO projects(project_key,name) VALUES('plans','Plans') RETURNING id"
             ).fetchone()["id"]
@@ -57,6 +60,8 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes():
                    VALUES(%s,'plans-doc','plans.txt','plans.txt','/plans','/plans',1) RETURNING id""",
                 (project_id,),
             ).fetchone()["id"]
+            if managed_schema:
+                active_document_revision(conn, project_id, document_id)
             for target in (10_000, 100_000):
                 existing = conn.execute(
                     "SELECT COUNT(*) AS count FROM canonical_entities WHERE project_id=%s",
@@ -82,7 +87,7 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes():
                 conn.execute(
                     """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
                        SELECT project_id,id,%s FROM canonical_entities WHERE project_id=%s
-                       ON CONFLICT(canonical_entity_id,document_id) DO NOTHING""",
+                       ON CONFLICT DO NOTHING""",
                     (document_id, project_id),
                 )
                 rare_alias = f"rarealiastarget{target}"
@@ -138,8 +143,9 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes():
                     assert int(fuzzy_alias.get("Actual Rows") or 0) <= 10
                 assert not any(node.get("Node Type") == "Seq Scan" for node in _nodes(sources))
         finally:
-            conn.execute("SET search_path TO public")
-            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                conn.execute("SET search_path TO public")
+                conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
 
 
 @pytest.mark.integration
@@ -147,14 +153,17 @@ def test_postgres_hnsw_entity_and_relation_top_k_plan():
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
-    schema_name = f"kf_hnsw_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_hnsw_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             conn.execute(sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name)))
-            conn.execute(SCHEMA_SQL)
+            if not managed_schema:
+                conn.execute(SCHEMA_SQL)
             project_id = conn.execute(
                 "INSERT INTO projects(project_key,name) VALUES('vectors','Vectors') RETURNING id"
             ).fetchone()["id"]
@@ -188,5 +197,6 @@ def test_postgres_hnsw_entity_and_relation_top_k_plan():
                            for node in _nodes(plan))
                 assert int(plan.get("Actual Rows") or 0) <= 10
         finally:
-            conn.execute("SET search_path TO public")
-            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                conn.execute("SET search_path TO public")
+                conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
