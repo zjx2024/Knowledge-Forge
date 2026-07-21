@@ -29,13 +29,13 @@ Chunk、实体提及、关系、审计和 snapshot 输入均绑定 `revision_id`
 写入后不可变。
 
 ```bash
-.venv/bin/python -m knowledge_forge.policy_snapshot build \
+conda run -n knowledge-forge-py312 python -m knowledge_forge.policy_snapshot build \
   --project-id <PROJECT_ID> --mode relation_only
-.venv/bin/python -m knowledge_forge.policy_snapshot build \
+conda run -n knowledge-forge-py312 python -m knowledge_forge.policy_snapshot build \
   --project-id <PROJECT_ID> --mode end_to_end
-.venv/bin/python -m knowledge_forge.policy_snapshot status --snapshot-id <SNAPSHOT_ID>
-.venv/bin/python -m knowledge_forge.policy_snapshot resume --snapshot-id <SNAPSHOT_ID>
-.venv/bin/python -m knowledge_forge.policy_snapshot cancel --snapshot-id <SNAPSHOT_ID>
+conda run -n knowledge-forge-py312 python -m knowledge_forge.policy_snapshot status --snapshot-id <SNAPSHOT_ID>
+conda run -n knowledge-forge-py312 python -m knowledge_forge.policy_snapshot resume --snapshot-id <SNAPSHOT_ID>
+conda run -n knowledge-forge-py312 python -m knowledge_forge.policy_snapshot cancel --snapshot-id <SNAPSHOT_ID>
 ```
 
 队列状态为 `pending/leased/retryable_failed/completed/terminal_failed/cancelled`。重试受最大
@@ -70,11 +70,11 @@ spurious prediction、未完成 work item 均进入指标分母；pairwise/B3、
 成本和 control/treatment 差异不能只在交集上计算。
 
 ```bash
-.venv/bin/python benchmarks/evaluate_kg_gold.py \
+conda run -n knowledge-forge-py312 python benchmarks/evaluate_kg_gold.py \
   --snapshot-id <SNAPSHOT_ID> \
   --gold-manifest <HUMAN_GOLD_MANIFEST.json> \
   --output artifacts/evaluation.json
-.venv/bin/python -m knowledge_forge.release_gate \
+conda run -n knowledge-forge-py312 python -m knowledge_forge.release_gate \
   --evaluation-run-id <EVALUATION_RUN_ID>
 ```
 
@@ -93,7 +93,7 @@ actual 三份内容 manifest 在同一 generation/lease 下完全一致，且无
 永远只读：
 
 ```bash
-.venv/bin/python scripts/hugegraph_test_guard.py preflight \
+conda run -n knowledge-forge-py312 python scripts/hugegraph_test_guard.py preflight \
   --host <TEST_HOST> --port 8080 --graph <NON_DEFAULT_EMPTY_GRAPH> \
   --namespace <UUID>
 ```
@@ -102,7 +102,7 @@ actual 三份内容 manifest 在同一 generation/lease 下完全一致，且无
 
 ```bash
 RUN_HUGEGRAPH_INTEGRATION=1 \
-.venv/bin/python -m pytest -q -ra --strict-markers \
+conda run -n knowledge-forge-py312 python -m pytest -q -ra --strict-markers \
   -m "hugegraph_integration and not destructive"
 ```
 
@@ -111,18 +111,18 @@ RUN_HUGEGRAPH_INTEGRATION=1 \
 
 ```bash
 RUN_HUGEGRAPH_INTEGRATION=1 RUN_HUGEGRAPH_DESTRUCTIVE_TESTS=1 \
-.venv/bin/python scripts/hugegraph_test_guard.py arm \
+conda run -n knowledge-forge-py312 python scripts/hugegraph_test_guard.py arm \
   --host <TEST_HOST> --port 8080 --graph <NON_DEFAULT_EMPTY_GRAPH> \
   --namespace <UUID> --run-id <RANDOM_RUN_ID>
 
 RUN_HUGEGRAPH_INTEGRATION=1 RUN_HUGEGRAPH_DESTRUCTIVE_TESTS=1 \
 HUGEGRAPH_TEST_GRAPH=<NON_DEFAULT_EMPTY_GRAPH> GRAPH_NAMESPACE_ID=<UUID> \
 HUGEGRAPH_TEST_SENTINEL=<ONE_TIME_SENTINEL> \
-.venv/bin/python -m pytest -q -ra --strict-markers \
+conda run -n knowledge-forge-py312 python -m pytest -q -ra --strict-markers \
   -m "hugegraph_integration and destructive"
 
 RUN_HUGEGRAPH_INTEGRATION=1 RUN_HUGEGRAPH_DESTRUCTIVE_TESTS=1 \
-.venv/bin/python scripts/hugegraph_test_guard.py cleanup \
+conda run -n knowledge-forge-py312 python scripts/hugegraph_test_guard.py cleanup \
   --host <TEST_HOST> --port 8080 --graph <NON_DEFAULT_EMPTY_GRAPH> \
   --namespace <UUID> --run-id <RANDOM_RUN_ID> \
   --sentinel <ONE_TIME_SENTINEL>
@@ -135,10 +135,10 @@ injection。
 ## 7. 迁移、备份与显式清理
 
 ```bash
-.venv/bin/python scripts/manage_migrations.py plan
-.venv/bin/python scripts/manage_migrations.py status
-.venv/bin/python scripts/manage_migrations.py apply
-.venv/bin/python scripts/verify_postgres_backup_restore.py \
+conda run -n knowledge-forge-py312 python scripts/manage_migrations.py plan
+conda run -n knowledge-forge-py312 python scripts/manage_migrations.py status
+conda run -n knowledge-forge-py312 python scripts/manage_migrations.py apply
+conda run -n knowledge-forge-py312 python scripts/verify_postgres_backup_restore.py \
   --docker-container knowledge-forge-postgres
 ```
 
@@ -154,14 +154,14 @@ forward-fix。服务启动只应用快速安全 migration；重 backfill/HNSW �
 资源：
 
 ```bash
-.venv/bin/python scripts/run_disposable_postgres_tests.py \
+conda run -n knowledge-forge-py312 python scripts/run_disposable_postgres_tests.py \
   -m integration -q -ra --strict-markers
 ```
 
 统一 E2E 第一步始终是零写预检：
 
 ```bash
-.venv/bin/python scripts/run_isolated_e2e.py --preflight-only
+conda run -n knowledge-forge-py312 python scripts/run_isolated_e2e.py --preflight-only
 ```
 
 只有清单证明 PostgreSQL、Ollama/Embedding/reranker、HugeGraph、API、namespace、sentinel、

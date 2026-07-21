@@ -1,4 +1,4 @@
-FROM python:3.10.16-slim-bookworm@sha256:f9fd9a142c9e3bc54d906053b756eb7e7e386ee1cf784d82c251cf640c502512
+FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 ARG CONSTRAINTS_FILE=constraints.txt
 ARG DOCLING_REQUIREMENTS=requirements-docling.txt

@@ -95,8 +95,8 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
 
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert (
-        "FROM python:3.10.16-slim-bookworm@sha256:"
-        "f9fd9a142c9e3bc54d906053b756eb7e7e386ee1cf784d82c251cf640c502512"
+        "FROM python:3.12.13-slim-bookworm@sha256:"
+        "d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
     ) in dockerfile
     assert "ARG CONSTRAINTS_FILE=constraints.txt" in dockerfile
     assert "ARG DOCLING_REQUIREMENTS=requirements-docling.txt" in dockerfile
@@ -105,7 +105,7 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
 
     cpu_requirements = (ROOT / "requirements-docling.txt").read_text(encoding="utf-8")
     gpu_requirements = (ROOT / "requirements-docling-gpu.txt").read_text(encoding="utf-8")
-    assert "torch==2.7.1+cpu" in cpu_requirements
+    assert "torch-2.7.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl" in cpu_requirements
     assert "torch==2.7.1+cu128" in gpu_requirements
 
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

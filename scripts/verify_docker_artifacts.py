@@ -32,7 +32,7 @@ def _output(*command: str) -> str:
     ).stdout.strip()
 
 
-def _verify_health() -> None:
+def _verify_health(application_image: str) -> None:
     suffix = uuid.uuid4().hex[:10]
     network = f"kf-ci-{suffix}"
     postgres = f"kf-ci-postgres-{suffix}"
@@ -63,7 +63,7 @@ def _verify_health() -> None:
             "-e", "POSTGRES_USER=postgres", "-e", "POSTGRES_PASSWORD=ci-postgres-secret",
             "-e", "POSTGRES_DB=knowledge_forge", "-e", "POSTGRES_MAINTENANCE_DB=postgres",
             "-e", "HUGEGRAPH_HOST=127.0.0.1", "-e", "OLLAMA_BASE_URL=http://127.0.0.1:9",
-            "knowledge-forge:ci",
+            application_image,
         )
         mapping = _output("docker", "port", application, "8011/tcp")
         port = int(mapping.rsplit(":", 1)[1])
@@ -101,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--health requires --build")
     created: list[Path] = []
     marker = "KF_CANARY_" + uuid.uuid4().hex
+    application_image = f"knowledge-forge:ci-{uuid.uuid4().hex[:10]}"
     context_dockerfile: Path | None = None
     try:
         for relative in CANARIES:
@@ -114,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             "w", prefix=".docker-context-check-", suffix=".Dockerfile",
             dir=ROOT, delete=False,
         ) as handle:
-            handle.write("FROM python:3.10.16-slim-bookworm\nCOPY . /context\n")
+            handle.write("FROM python:3.12.13-slim-bookworm\nCOPY . /context\n")
             context_dockerfile = Path(handle.name)
         _run(
             "docker", "build", "--network=host", "-f", str(context_dockerfile),
@@ -124,12 +125,18 @@ def main(argv: list[str] | None = None) -> int:
              f"! grep -R -F {marker} /context")
         if args.build:
             _run(
-                "docker", "build", "--network=host", "-t", "knowledge-forge:ci", ".",
+                "docker", "build", "--network=host", "-t", application_image, ".",
             )
-            _run("docker", "run", "--rm", "knowledge-forge:ci", "sh", "-c",
+            _run(
+                "docker", "run", "--rm", application_image, "python", "-c",
+                "import sys; from importlib.metadata import version; "
+                "assert sys.version_info[:2] == (3, 12); "
+                "assert version('graphrag') == '3.1.1'",
+            )
+            _run("docker", "run", "--rm", application_image, "sh", "-c",
                  f"! grep -R -F {marker} /app /home/knowledgeforge 2>/dev/null")
         if args.health:
-            _verify_health()
+            _verify_health(application_image)
     finally:
         for path in reversed(created):
             path.unlink(missing_ok=True)
@@ -145,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
         if shutil.which("docker"):
             subprocess.run(
                 ["docker", "image", "rm", "knowledge-forge-context-check"],
+                cwd=ROOT, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["docker", "image", "rm", application_image],
                 cwd=ROOT, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
     return 0
