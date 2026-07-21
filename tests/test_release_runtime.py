@@ -115,10 +115,14 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
         "docker-build:", "pytest", "py_compile", "pip check",
     ):
         assert required in workflow
-    assert "KNOWLEDGE_FORGE_TEST_POSTGRES_DSN" in workflow
+    assert "KNOWLEDGE_FORGE_TEST_POSTGRES_DSN" not in workflow
+    assert "POSTGRES_MAINTENANCE_DB: postgres" in workflow
     assert "--strict-markers" in workflow
     assert "--health" in workflow
     assert "Require at least one passed integration test" in workflow
+    assert "scripts/run_disposable_postgres_tests.py" in workflow
+    assert "cp .env.docker.example .env.docker" in workflow
+    assert "python -m pytest --strict-markers -q -m integration" not in workflow
     assert "actions/checkout@v4" not in workflow
     assert "actions/setup-python@v5" not in workflow
     assert "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5" in workflow
