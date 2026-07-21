@@ -12,6 +12,26 @@ from knowledge_forge.chunking import (
 )
 
 
+def test_general_sentence_segmentation_uses_shared_exact_spans():
+    from knowledge_forge.chunking import _segment_spans
+
+    content = (
+        "Version v1.2.3 costs 3.14 USD. Visit https://example.com/a.b and a.b@example.com. "
+        "Dr. Smith said ready... 然后继续……完成！分块: 正文。"
+    )
+    spans = _segment_spans(content)
+    assert "".join(content[start:end] for start, end, _ in spans) == content
+    assert all(content[start:end] == value for start, end, value in spans)
+    assert [value for _, _, value in spans] == [
+        "Version v1.2.3 costs 3.14 USD. ",
+        "Visit https://example.com/a.b and a.b@example.com. ",
+        "Dr. Smith said ready... ",
+        "然后继续……",
+        "完成！",
+        "分块: 正文。",
+    ]
+
+
 def test_structure_parsing_can_be_inspected_before_chunking(tmp_path):
     source = tmp_path / "staged.md"
     source.write_text("# 第一章\n\n正文内容。", encoding="utf-8")

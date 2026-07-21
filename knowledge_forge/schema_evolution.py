@@ -86,10 +86,22 @@ EXTRACTION_FORMAT = {
     "required": ["entities", "relations"],
 }
 
+_ENTITY_ONLY_ITEM_FORMAT = copy.deepcopy(EXTRACTION_FORMAT["properties"]["entities"]["items"])
+_ENTITY_ONLY_ITEM_FORMAT["properties"]["mention_start"] = {"type": "integer"}
+_ENTITY_ONLY_ITEM_FORMAT["properties"]["mention_end"] = {"type": "integer"}
+_ENTITY_ONLY_ITEM_FORMAT["required"] = [
+    *_ENTITY_ONLY_ITEM_FORMAT["required"], "mention_start", "mention_end",
+]
+
 ENTITY_ONLY_EXTRACTION_FORMAT = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {"entities": EXTRACTION_FORMAT["properties"]["entities"]},
+    "properties": {
+        "entities": {
+            **EXTRACTION_FORMAT["properties"]["entities"],
+            "items": _ENTITY_ONLY_ITEM_FORMAT,
+        },
+    },
     "required": ["entities"],
 }
 

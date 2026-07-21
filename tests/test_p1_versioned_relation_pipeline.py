@@ -18,12 +18,16 @@ from knowledge_forge.relation_pipeline import (
 def _entities():
     return [
         {
-            "id": "m1", "name": "Alpha", "type": "Organization",
-            "evidence_text": "Alpha", "evidence_start": 0, "evidence_end": 5,
+            "mention_id": "m1", "mention_key": "mention-key-1",
+            "surface": "Alpha", "name": "Alpha", "type": "Organization",
+            "mention_start": 0, "mention_end": 5, "confidence": 0.95,
+            "canonical_id": "canonical-1", "evidence": "Alpha uses Beta.",
         },
         {
-            "id": "m2", "name": "Beta", "type": "Product",
-            "evidence_text": "Beta", "evidence_start": 11, "evidence_end": 15,
+            "mention_id": "m2", "mention_key": "mention-key-2",
+            "surface": "Beta", "name": "Beta", "type": "Product",
+            "mention_start": 11, "mention_end": 15, "confidence": 0.94,
+            "canonical_id": "canonical-2", "evidence": "Alpha uses Beta.",
         },
     ]
 
@@ -63,14 +67,16 @@ def test_stage_one_mentions_produce_stable_blocked_candidates_and_counts():
     assert first.blocked_pairs == 1
     assert first.admitted_count == 1
     assert first.candidates[0].candidate_id == second.candidates[0].candidate_id
-    assert first.candidates[0].source_mention_id.startswith("p1mention_")
-    assert first.candidates[0].target_mention_id.startswith("p1mention_")
+    assert first.candidates[0].source_mention_id == "m1"
+    assert first.candidates[0].target_mention_id == "m2"
     renamed_ids = pipeline.plan(
         project_scope="project-1", chunk_key="chunk-1", content="Alpha uses Beta.",
-        entities=[{**item, "id": f"other-{index}"} for index, item in enumerate(_entities())],
+        entities=[{
+            **item, "mention_id": f"other-{index}",
+        } for index, item in enumerate(_entities())],
         logical_schema=_schema(),
     )
-    assert renamed_ids.candidates[0].candidate_id == first.candidates[0].candidate_id
+    assert renamed_ids.candidates[0].candidate_id != first.candidates[0].candidate_id
 
 
 def test_relation_planner_checks_only_sentence_local_pairs_without_changing_denominator(
@@ -88,9 +94,11 @@ def test_relation_planner_checks_only_sentence_local_pairs_without_changing_deno
         start = content.index(name, cursor)
         cursor = start + len(sentence)
         entities.append({
-            "id": f"m{index}", "name": name, "type": "GenericEntity",
-            "evidence_text": name, "evidence_start": start,
-            "evidence_end": start + len(name),
+            "mention_id": f"m{index}", "mention_key": f"key-{index}",
+            "surface": name, "name": name, "type": "GenericEntity",
+            "mention_start": start, "mention_end": start + len(name),
+            "confidence": 0.9, "canonical_id": f"canonical-{index}",
+            "evidence": sentence,
         })
     checks = 0
     original = relation_pipeline._type_allowed
@@ -204,8 +212,8 @@ def test_candidate_direction_constraints_cover_inverse_and_symmetric_relations()
     symmetric_entities = [
         {**_entities()[0], "type": "GenericEntity"},
         {
-            **_entities()[1], "type": "GenericEntity", "evidence_start": beta_start,
-            "evidence_end": beta_start + 4,
+            **_entities()[1], "type": "GenericEntity", "mention_start": beta_start,
+            "mention_end": beta_start + 4, "evidence": symmetric_content,
         },
     ]
     symmetric = pipeline.plan(
@@ -221,10 +229,10 @@ def test_coverage_gleaning_expands_only_uncovered_cue_windows_once():
     pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
     content = "Alpha is present. The system depends on context. Beta is present."
     entities = [
-        {**_entities()[0], "evidence_start": 0, "evidence_end": 5, "evidence_text": "Alpha"},
+        {**_entities()[0], "mention_start": 0, "mention_end": 5, "evidence": content},
         {
-            **_entities()[1], "evidence_start": content.index("Beta"),
-            "evidence_end": content.index("Beta") + 4, "evidence_text": "Beta",
+            **_entities()[1], "mention_start": content.index("Beta"),
+            "mention_end": content.index("Beta") + 4, "evidence": content,
         },
     ]
     result = pipeline.classify_shadow(

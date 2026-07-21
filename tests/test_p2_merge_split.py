@@ -289,13 +289,16 @@ def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints(
             ).fetchone()["id"])
             entity_rows = conn.execute(
                 """INSERT INTO canonical_entities(
-                       project_id,entity_key,name,normalized_name,entity_type)
+                   project_id,entity_key,name,normalized_name,entity_type)
                    VALUES(%s,'alpha','Alpha','alpha','Concept'),
-                         (%s,'beta','Beta','beta','Concept') RETURNING id,entity_key""",
-                (project_id, project_id),
+                         (%s,'beta','Beta','beta','Concept'),
+                         (%s,'gamma','Gamma','gamma','Concept') RETURNING id,entity_key""",
+                (project_id, project_id, project_id),
             ).fetchall()
             entity_ids = {str(item["entity_key"]): int(item["id"]) for item in entity_rows}
-            alpha_id, beta_id = entity_ids["alpha"], entity_ids["beta"]
+            alpha_id, beta_id, gamma_id = (
+                entity_ids["alpha"], entity_ids["beta"], entity_ids["gamma"],
+            )
             mention_rows = conn.execute(
                 """INSERT INTO entity_mentions(
                        project_id,document_id,chunk_id,canonical_entity_id,mention_text,
@@ -370,6 +373,10 @@ def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints(
                 postgres = config_values
 
             database = Database(TestConfig)
+            database.add_entity_cannot_link(
+                project_id, left_entity_id=alpha_id, right_entity_id=gamma_id,
+                reason="distinct identities", policy_version="p2",
+            )
             merged = database.manual_merge_entities(
                 project_id, alpha_id, beta_id, reason="same", policy_version="p2",
             )
@@ -385,6 +392,13 @@ def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints(
             assert projection["target_entity_id"] == beta_id
             assert projection["publishable"] is False
             assert alpha == {"source_count": 0, "is_deleted": True}
+            assert database.blocked_entity_candidate_ids(
+                project_id, "mention-alpha", [alpha_id, beta_id, gamma_id],
+            ) == [gamma_id]
+            with pytest.raises(ValueError, match="cannot-link"):
+                database.manual_merge_entities(
+                    project_id, beta_id, gamma_id, reason="unsafe", policy_version="p2",
+                )
 
             database.undo_entity_resolution_event(
                 project_id, merged["event_id"], reason="reviewed",

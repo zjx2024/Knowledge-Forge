@@ -35,6 +35,8 @@ class RelationCandidate:
     candidate_id: str
     source_mention_id: str
     target_mention_id: str
+    source_mention_key: str
+    target_mention_key: str
     source_name: str
     target_name: str
     source_type: str
@@ -50,7 +52,9 @@ class RelationCandidate:
     source_end_char: int
     target_start_char: int
     target_end_char: int
-    priority_key: tuple[int, int, int, float, str] = (0, 0, 0, 0.0, "")
+    source_canonical_id: str = ""
+    target_canonical_id: str = ""
+    priority_key: tuple[int, int, int, int, float, str] = (0, 0, 0, 0, 0.0, "")
 
 
 @dataclass(frozen=True)
@@ -178,29 +182,36 @@ class VersionedRelationPipeline:
             sentence_window = Config.relation_sentence_window
         fixed: list[dict[str, Any]] = []
         for item in entities:
-            name = str(item.get("name") or "")
-            start = item.get("evidence_start")
-            end = item.get("evidence_end")
-            if not name or start is None or end is None:
+            mention_id = str(item.get("mention_id") or "")
+            name = str(item.get("surface") or item.get("name") or "")
+            canonical_id = str(item.get("canonical_id") or "")
+            start = item.get("mention_start")
+            end = item.get("mention_end")
+            if (
+                not mention_id
+                or not name
+                or not canonical_id
+                or start is None
+                or end is None
+                or item.get("confidence") is None
+            ):
                 continue
             start, end = int(start), int(end)
-            evidence = str(item.get("evidence_text") or "")
-            if start < 0 or end <= start or end > len(content) or content[start:end] != evidence:
+            if start < 0 or end <= start or end > len(content) or content[start:end] != name:
                 continue
-            material = "\x1f".join((
-                project_scope, chunk_key, str(start), str(end), evidence,
-                str(item.get("type") or "GenericEntity"),
-                self.policy_set["entity_extraction_policy_version"],
-            ))
             fixed.append({
                 **item,
-                "original_id": str(item.get("id") or ""),
-                "id": "p1mention_" + hashlib.sha256(material.encode("utf-8")).hexdigest(),
+                "mention_id": mention_id,
+                "mention_key": str(item.get("mention_key") or mention_id),
+                "name": name,
+                "canonical_id": canonical_id,
+                "mention_start": start,
+                "mention_end": end,
             })
         raw_pairs = len(fixed) * max(0, len(fixed) - 1)
         sentences = _sentences(content)
         locations = [
-            _sentence_index(sentences, int(item.get("evidence_start") or 0))
+            _sentence_index(sentences, int(item["mention_start"]))
             for item in fixed
         ]
         sentence_buckets: dict[int, list[int]] = defaultdict(list)
@@ -226,7 +237,8 @@ class VersionedRelationPipeline:
             for target_index in target_indexes:
                 pair_checks += 1
                 target = fixed[target_index]
-                source_id, target_id = str(source["id"]), str(target["id"])
+                source_id = str(source["mention_id"])
+                target_id = str(target["mention_id"])
                 left_index, right_index = source_sentence, locations[target_index]
                 allowed_directions: dict[str, str] = {}
                 source_type = str(source.get("type") or "GenericEntity")
@@ -257,8 +269,8 @@ class VersionedRelationPipeline:
                     continue
                 sentence_distance = abs(left_index - right_index)
                 char_distance = abs(
-                    (int(source["evidence_start"]) + int(source["evidence_end"])) // 2
-                    - (int(target["evidence_start"]) + int(target["evidence_end"])) // 2
+                    (int(source["mention_start"]) + int(source["mention_end"])) // 2
+                    - (int(target["mention_start"]) + int(target["mention_end"])) // 2
                 )
                 if char_distance > Config.relation_max_char_distance:
                     continue
@@ -277,6 +289,8 @@ class VersionedRelationPipeline:
                     candidate_id=candidate_id,
                     source_mention_id=source_id,
                     target_mention_id=target_id,
+                    source_mention_key=str(source["mention_key"]),
+                    target_mention_key=str(target["mention_key"]),
                     source_name=str(source["name"]),
                     target_name=str(target["name"]),
                     source_type=str(source.get("type") or "GenericEntity"),
@@ -288,12 +302,16 @@ class VersionedRelationPipeline:
                     sentence_end=context_end,
                     context_start_char=sentences[context_start][0],
                     context_end_char=sentences[context_end][1],
-                    source_start_char=int(source["evidence_start"]),
-                    source_end_char=int(source["evidence_end"]),
-                    target_start_char=int(target["evidence_start"]),
-                    target_end_char=int(target["evidence_end"]),
+                    source_start_char=int(source["mention_start"]),
+                    source_end_char=int(source["mention_end"]),
+                    target_start_char=int(target["mention_start"]),
+                    target_end_char=int(target["mention_end"]),
+                    source_canonical_id=str(source["canonical_id"]),
+                    target_canonical_id=str(target["canonical_id"]),
                     priority_key=(
                         sentence_distance,
+                        int(source_type == "GenericEntity")
+                        + int(target_type == "GenericEntity"),
                         0 if _RELATION_CUE.search(context) else 1,
                         char_distance,
                         -float(source.get("confidence") or 0.0)
@@ -319,6 +337,10 @@ class VersionedRelationPipeline:
             "candidate_id": candidate.candidate_id,
             "source_id": candidate.source_mention_id,
             "target_id": candidate.target_mention_id,
+            "source_mention_key": candidate.source_mention_key,
+            "target_mention_key": candidate.target_mention_key,
+            "source_canonical_id": candidate.source_canonical_id,
+            "target_canonical_id": candidate.target_canonical_id,
             "allowed_predicates": list(candidate.allowed_predicates),
             "allowed_directions": list(candidate.allowed_directions),
             "context_id": candidate.context_id,
@@ -358,11 +380,13 @@ class VersionedRelationPipeline:
                     "id": item.source_mention_id,
                     "name": item.source_name,
                     "type": item.source_type,
+                    "canonical_id": item.source_canonical_id,
                 })
                 entities.setdefault(item.target_mention_id, {
                     "id": item.target_mention_id,
                     "name": item.target_name,
                     "type": item.target_type,
+                    "canonical_id": item.target_canonical_id,
                 })
                 contexts.setdefault(item.context_id, {
                     "context_id": item.context_id,

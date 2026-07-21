@@ -244,12 +244,51 @@ def test_disposable_postgres_snapshot_leases_cas_and_artifact_immutability():
             relation["id"], relation["lease_token"], artifact={"winner": "old"},
         )
     database.settle_policy_snapshot_work(
-        replacement["id"], replacement["lease_token"], artifact={"winner": "new"},
+        replacement["id"], replacement["lease_token"],
+        artifact={"winner": "new", "coverage_complete": True},
     )
     ready = database.finalize_policy_snapshot(snapshot["id"])
     assert ready["status"] == "ready"
     assert ready["completed_items"] == ready["expected_items"] == 2
     assert ready["artifact_root_hash"]
+
+    incomplete_manifest = build_snapshot_manifest(
+        project=project, documents=inputs, mode="relation_only",
+        policy_set=P2_ENTITY_SHADOW_POLICY_SET, models={},
+        config={"coverage": "overflow"}, prompts={},
+        gold_manifest={"pilot": True}, thresholds={}, metric_formulas={}, created_by="test",
+        git=GitProvenance("abc", "tree", False, "", ()),
+        created_at="2026-07-20T00:00:00.500000+00:00",
+    )
+    incomplete = orchestrator.create(
+        project["id"], incomplete_manifest, P2_ENTITY_SHADOW_POLICY_SET,
+    )
+    control = database.claim_policy_snapshot_work(incomplete["id"], "coverage-worker")
+    assert control and control["phase"] == "control"
+    database.settle_policy_snapshot_work(
+        control["id"], control["lease_token"], artifact={"stable": True},
+    )
+    relation = database.claim_policy_snapshot_work(incomplete["id"], "coverage-worker")
+    assert relation and relation["phase"] == "relation"
+    database.settle_policy_snapshot_work(
+        relation["id"], relation["lease_token"],
+        artifact={"coverage_complete": False, "coverage_failures": ["overflow"]},
+    )
+    with pytest.raises(ValueError, match="coverage incomplete"):
+        database.finalize_policy_snapshot(incomplete["id"])
+    incomplete_status = database.policy_snapshot_status(incomplete["id"])["snapshot"]
+    assert incomplete_status["status"] == "failed"
+    assert incomplete_status["coverage_complete"] is False
+    with pytest.raises(ValueError, match="coverage"):
+        database.activate_policy_snapshot(project["id"], incomplete["id"])
+
+    from knowledge_forge.service import KnowledgeForgeService
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = database
+    with pytest.raises(RuntimeError, match="coverage"):
+        service.evaluate_policy_snapshot_artifacts(
+            project["id"], incomplete["id"], gold_manifest={}, gold_items=[],
+        )
 
     cancelled_manifest = build_snapshot_manifest(
         project=project, documents=inputs, mode="relation_only",

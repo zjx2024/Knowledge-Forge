@@ -1047,6 +1047,12 @@ CREATE INDEX IF NOT EXISTS idx_entity_alias_exact
 """
 
 
+POLICY_SNAPSHOT_COVERAGE_SQL = r"""
+ALTER TABLE policy_snapshots
+    ADD COLUMN IF NOT EXISTS coverage_complete BOOLEAN NOT NULL DEFAULT TRUE;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1088,6 +1094,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0008_mention_occurrence_identity",
         description="Preserve repeated mention occurrences with stable revision-scoped identity",
         sql=MENTION_OCCURRENCE_IDENTITY_SQL,
+    ),
+    Migration(
+        version="0009_policy_snapshot_coverage",
+        description="Fail policy promotion closed on incomplete relation coverage",
+        sql=POLICY_SNAPSHOT_COVERAGE_SQL,
     ),
 )
 

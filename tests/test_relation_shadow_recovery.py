@@ -20,6 +20,7 @@ from knowledge_forge.relation_pipeline import (
     VersionedRelationPipeline,
     _sentences,
 )
+from knowledge_forge.service import KnowledgeForgeService
 
 
 def candidate() -> RelationCandidate:
@@ -27,6 +28,8 @@ def candidate() -> RelationCandidate:
         candidate_id="candidate-1",
         source_mention_id="mention-a",
         target_mention_id="mention-b",
+        source_mention_key="mention-key-a",
+        target_mention_key="mention-key-b",
         source_name="Alpha",
         target_name="Beta",
         source_type="Organization",
@@ -43,6 +46,37 @@ def candidate() -> RelationCandidate:
         target_start_char=15,
         target_end_char=19,
     )
+
+
+@pytest.mark.parametrize(
+    ("overflow", "deferred", "work", "decision_count", "expected"),
+    [
+        ([{"candidate_id": "overflow"}], [], [], 0, {"overflow"}),
+        ([], [{"candidate_id": "deferred"}], [], 0, {"deferred"}),
+        ([], [], [{"status": "terminal_failed", "error_message": "missing response"}], 1,
+         {"missing_response", "terminal_failure"}),
+        ([], [], [{"status": "terminal_failed", "error_message": "model unavailable"}], 1,
+         {"terminal_failure"}),
+        ([], [], [{"status": "quarantined", "error_message": "unsafe"}], 1,
+         {"quarantined"}),
+    ],
+)
+def test_relation_coverage_failures_propagate_all_terminal_states(
+    overflow, deferred, work, decision_count, expected,
+):
+    plan = RelationPlan(
+        policy_set=P1_RELATION_SHADOW_POLICY_SET,
+        raw_pairs=1,
+        blocked_pairs=0,
+        candidates=[candidate()],
+        deferred=list(deferred),
+        overflow=list(overflow),
+        qualified_count=1,
+    )
+    failures = KnowledgeForgeService._relation_coverage_failures(
+        plan, work, decision_count,
+    )
+    assert expected <= set(failures)
 
 
 def _database_for_dsn(dsn: str) -> Database:
@@ -159,6 +193,185 @@ def test_evidence_offsets_are_half_open_and_must_match_source_exactly():
         )
 
 
+def test_p2_control_protocol_preserves_mention_identity_and_exact_half_open_positions():
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Alpha produces Beta. Alpha is archived."
+    beta_start = content.index("Beta")
+    plan = pipeline.plan(
+        project_scope="project:revision",
+        chunk_key="protocol",
+        content=content,
+        entities=[
+            {
+                "mention_id": "mention-alpha",
+                "mention_key": "original-alpha-key",
+                "surface": "Alpha",
+                "type": "Organization",
+                "mention_start": 0,
+                "mention_end": 5,
+                "confidence": 0.91,
+                "canonical_id": "canonical-alpha",
+                "evidence": "Alpha produces Beta.",
+            },
+            {
+                "mention_id": "mention-beta",
+                "mention_key": "original-beta-key",
+                "name": "Beta",
+                "type": "Product",
+                "mention_start": beta_start,
+                "mention_end": beta_start + 4,
+                "confidence": 0.88,
+                "canonical_id": "canonical-beta",
+                "evidence": "Alpha produces Beta.",
+            },
+        ],
+        logical_schema={
+            "relation_types": [{
+                "name": "produces",
+                "source_types": ["Organization"],
+                "target_types": ["Product"],
+            }],
+        },
+    )
+
+    assert plan.admitted_count == 1
+    relation = plan.candidates[0]
+    assert relation.source_mention_id == "mention-alpha"
+    assert relation.target_mention_id == "mention-beta"
+    assert relation.source_mention_key == "original-alpha-key"
+    assert relation.target_mention_key == "original-beta-key"
+    assert relation.source_canonical_id == "canonical-alpha"
+    assert relation.target_canonical_id == "canonical-beta"
+    assert (relation.source_start_char, relation.source_end_char) == (0, 5)
+    assert (relation.target_start_char, relation.target_end_char) == (
+        beta_start,
+        beta_start + 4,
+    )
+
+    invalid = pipeline.plan(
+        project_scope="project:revision",
+        chunk_key="invalid-protocol",
+        content=content,
+        entities=[{
+            "mention_id": "mention-alpha",
+            "surface": "Alpha",
+            "type": "Organization",
+            "mention_start": content.rindex("Alpha"),
+            "mention_end": content.rindex("Alpha") + 4,
+            "confidence": 1.0,
+            "canonical_id": "canonical-alpha",
+            "evidence": "Alpha produces Beta.",
+        }],
+        logical_schema={"relation_types": []},
+    )
+    assert invalid.candidates == []
+    assert invalid.raw_pairs == 0
+
+
+def test_relation_only_snapshot_passes_strict_control_protocol_and_maps_canonical_by_key():
+    content = "Alpha produces Beta."
+
+    class SnapshotDb:
+        @staticmethod
+        def get_revision_chunk(chunk_id, revision_id):
+            assert (chunk_id, revision_id) == (7, "revision-1")
+            return {
+                "id": 7, "document_id": 5, "revision_id": "revision-1",
+                "chunk_key": "chunk-1", "content": content, "content_hash": "chunk-hash",
+            }
+
+        @staticmethod
+        def get_project(project_id):
+            assert project_id == 3
+            return {"id": 3, "project_key": "project-3", "llm_model": "llm",
+                    "model_max_tokens": 4096, "active_policy_hash": "control"}
+
+        @staticmethod
+        def get_schema_version(project_id, version):
+            assert (project_id, version) == (3, 1)
+            return {
+                "version": 1,
+                "schema_json": {"relation_types": [{
+                    "name": "produces", "source_types": ["Organization"],
+                    "target_types": ["Product"],
+                }]},
+            }
+
+        @staticmethod
+        def list_control_entities_for_chunk(chunk_id, revision_id):
+            assert (chunk_id, revision_id) == (7, "revision-1")
+            return [
+                {"id": 101, "mention_key": "key-alpha", "name": "Alpha",
+                 "entity_type": "Organization", "canonical_entity_id": 201,
+                 "document_id": 5, "revision_id": "revision-1", "chunk_id": 7,
+                 "confidence": 0.91, "evidence_text": content,
+                 "metadata": {"mention_start": 0, "mention_end": 5}},
+                {"id": 102, "mention_key": "key-beta", "name": "Beta",
+                 "entity_type": "Product", "canonical_entity_id": 202,
+                 "document_id": 5, "revision_id": "revision-1", "chunk_id": 7,
+                 "confidence": 0.88, "evidence_text": content,
+                 "metadata": {"mention_start": 15, "mention_end": 19}},
+            ]
+
+        @staticmethod
+        def list_control_relations_for_chunk(_chunk_id, _revision_id):
+            return []
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = SnapshotDb()
+    captured = {}
+
+    def relation_shadow(_run_id, _project, _document_id, _chunk, extraction, _schema, **_):
+        captured["entities"] = extraction["entities"]
+        return {
+            "coverage_complete": True,
+            "coverage_failures": [],
+            "metrics": {"input_tokens": 10, "output_tokens": 5, "model_calls": 1},
+            "candidates": [{
+                "candidate_id": "candidate-1",
+                "source_mention_id": "101", "target_mention_id": "102",
+                "source_mention_key": "key-alpha", "target_mention_key": "key-beta",
+            }],
+            "decisions": [{
+                "candidate_id": "candidate-1", "predicate": "produces",
+                "direction": "as_is", "evidence": content,
+                "evidence_start": 0, "evidence_end": len(content), "confidence": 0.99,
+            }],
+        }
+
+    service._run_relation_shadow = relation_shadow
+    manifest = {
+        "manifest_hash": "manifest-hash",
+        "project": {"schema_version": 1},
+        "documents": [{
+            "document_id": 5, "revision_id": "revision-1",
+            "chunks": [{"chunk_id": 7, "content_hash": "chunk-hash"}],
+        }],
+    }
+    result = service.process_policy_snapshot_work(
+        {"id": "snapshot-1", "project_id": 3, "mode": "relation_only",
+         "snapshot_manifest": manifest, "manifest_hash": "manifest-hash",
+         "policy_hash": "treatment"},
+        {"phase": "relation", "document_id": 5, "revision_id": "revision-1", "chunk_id": 7},
+    )
+
+    assert captured["entities"] == [
+        {"mention_id": "101", "mention_key": "key-alpha", "surface": "Alpha",
+         "name": "Alpha", "type": "Organization", "evidence": content,
+         "mention_start": 0, "mention_end": 5, "confidence": 0.91,
+         "canonical_id": "201"},
+        {"mention_id": "102", "mention_key": "key-beta", "surface": "Beta",
+         "name": "Beta", "type": "Product", "evidence": content,
+         "mention_start": 15, "mention_end": 19, "confidence": 0.88,
+         "canonical_id": "202"},
+    ]
+    treatment_relation = result["evaluation_item"]["treatment"]["relations"][0]
+    assert treatment_relation["subject_mention_id"] == "101"
+    assert treatment_relation["subject_canonical_id"] == "201"
+    assert treatment_relation["object_mention_id"] == "102"
+    assert treatment_relation["object_canonical_id"] == "202"
+
+
 def test_long_unrelated_chunk_prefix_does_not_consume_candidate_batch_budget():
     pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
     content = ("Unrelated background sentence. " * 300) + "Alpha produces Beta."
@@ -169,14 +382,18 @@ def test_long_unrelated_chunk_prefix_does_not_consume_candidate_batch_budget():
         chunk_key="long-chunk", content=content,
         entities=[
             {
-                "id": "alpha", "name": "Alpha", "type": "Organization",
-                "evidence_text": "Alpha", "evidence_start": alpha_start,
-                "evidence_end": alpha_start + 5,
+                "mention_id": "alpha", "mention_key": "alpha-key",
+                "surface": "Alpha", "name": "Alpha", "type": "Organization",
+                "mention_start": alpha_start, "mention_end": alpha_start + 5,
+                "confidence": 0.9, "canonical_id": "canonical-alpha",
+                "evidence": "Alpha produces Beta.",
             },
             {
-                "id": "beta", "name": "Beta", "type": "Product",
-                "evidence_text": "Beta", "evidence_start": beta_start,
-                "evidence_end": beta_start + 4,
+                "mention_id": "beta", "mention_key": "beta-key",
+                "surface": "Beta", "name": "Beta", "type": "Product",
+                "mention_start": beta_start, "mention_end": beta_start + 4,
+                "confidence": 0.9, "canonical_id": "canonical-beta",
+                "evidence": "Alpha produces Beta.",
             },
         ],
         logical_schema={
@@ -208,8 +425,10 @@ def test_dense_candidates_are_streamed_across_batches_without_loss():
         start = content.index(name, cursor)
         cursor = start + 1
         entities.append({
-            "id": name, "name": name, "type": "GenericEntity",
-            "evidence_text": name, "evidence_start": start, "evidence_end": start + 1,
+            "mention_id": name, "mention_key": f"key-{name}", "surface": name,
+            "name": name, "type": "GenericEntity", "mention_start": start,
+            "mention_end": start + 1, "confidence": 0.9,
+            "canonical_id": f"canonical-{name}", "evidence": content,
         })
     plan = pipeline.plan(
         project_scope="project:revision", chunk_key="dense", content=content,
@@ -240,8 +459,10 @@ def test_relation_candidate_limits_are_deterministic_and_conserve_overflow(monke
         start = content.index(name, cursor)
         cursor = start + 1
         entities.append({
-            "id": name, "name": name, "type": "GenericEntity",
-            "evidence_text": name, "evidence_start": start, "evidence_end": start + 1,
+            "mention_id": name, "mention_key": f"key-{name}", "surface": name,
+            "name": name, "type": "GenericEntity", "mention_start": start,
+            "mention_end": start + 1, "confidence": 0.9,
+            "canonical_id": f"canonical-{name}", "evidence": content,
         })
     plan = pipeline.plan(
         project_scope="project:revision", chunk_key="bounded", content=content,
@@ -261,39 +482,62 @@ def test_relation_candidate_limits_are_deterministic_and_conserve_overflow(monke
     )
 
 
-@pytest.mark.parametrize(("count", "expected_batches"), [(20, 1), (50, 2), (100, 4)])
-def test_relation_batches_conserve_20_50_100_candidates_with_hard_batch_cap(
-    count, expected_batches,
+@pytest.mark.parametrize("count", [20, 50, 100])
+def test_relation_plan_and_batches_bound_real_20_50_100_positioned_entities(
+    monkeypatch, count,
 ):
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
-    values = [
-        RelationCandidate(
-            candidate_id=f"candidate-{index}", source_mention_id=f"source-{index}",
-            target_mention_id=f"target-{index}", source_name="A", target_name="B",
-            source_type="GenericEntity", target_type="GenericEntity",
-            allowed_predicates=("related_to",), allowed_directions=("as_is",),
-            context_id="ctx-0-0", sentence_start=0, sentence_end=0,
-            context_start_char=0, context_end_char=12, source_start_char=0,
-            source_end_char=1, target_start_char=10, target_end_char=11,
-        )
-        for index in range(count)
-    ]
-    plan = RelationPlan(
-        policy_set=dict(pipeline.policy_set), raw_pairs=count,
-        blocked_pairs=0, candidates=values, qualified_count=count,
+    monkeypatch.setattr(
+        "knowledge_forge.relation_pipeline.Config.relation_max_char_distance", 4096,
     )
-
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    names = [f"Entity{index:03d}" for index in range(count)]
+    content = " relates ".join(names) + "."
+    entities = []
+    cursor = 0
+    for index, name in enumerate(names):
+        start = content.index(name, cursor)
+        cursor = start + len(name)
+        entities.append({
+            "mention_id": f"mention-{index:03d}",
+            "mention_key": f"original-{index:03d}",
+            "surface": name,
+            "type": "Organization" if index % 3 else "GenericEntity",
+            "mention_start": start,
+            "mention_end": start + len(name),
+            "confidence": 0.99 - index / 1000,
+            "canonical_id": f"canonical-{index:03d}",
+            "evidence": content,
+        })
+    plan = pipeline.plan(
+        project_scope="project:revision",
+        chunk_key=f"real-{count}",
+        content=content,
+        entities=entities,
+        logical_schema={
+            "relation_types": [{"name": "related_to", "symmetric": True}],
+        },
+    )
     batches = pipeline.build_batches(
-        plan, content="A relates B.",
+        plan, content=content,
         logical_schema={"relation_types": [{"name": "related_to"}]},
         candidate_budget_tokens=100_000, max_candidates_per_batch=100,
     )
 
-    assert len(batches) == expected_batches
+    assert plan.qualified_count == count * (count - 1) // 2
+    assert plan.admitted_count <= 256
+    assert plan.qualified_count == plan.admitted_count + len(plan.overflow)
+    per_source = {}
+    for item in plan.candidates:
+        per_source[item.source_mention_id] = per_source.get(item.source_mention_id, 0) + 1
+    assert max(per_source.values(), default=0) <= 12
     assert all(len(batch.candidate_ids) <= 32 for batch in batches)
     assert [item for batch in batches for item in batch.candidate_ids] == [
-        item.candidate_id for item in values
+        item.candidate_id for item in plan.candidates
     ]
+    assert len(batches) == (plan.admitted_count + 31) // 32
+    assert [item.priority_key for item in plan.candidates] == sorted(
+        item.priority_key for item in plan.candidates
+    )
 
 
 def test_relation_char_distance_blocks_far_pairs_before_model_calls(monkeypatch):
@@ -304,10 +548,14 @@ def test_relation_char_distance_blocks_far_pairs_before_model_calls(monkeypatch)
     plan = pipeline.plan(
         project_scope="project:revision", chunk_key="far", content=content,
         entities=[
-            {"id": "a", "name": "Alpha", "type": "GenericEntity",
-             "evidence_text": "Alpha", "evidence_start": 0, "evidence_end": 5},
-            {"id": "b", "name": "Beta", "type": "GenericEntity",
-             "evidence_text": "Beta", "evidence_start": beta, "evidence_end": beta + 4},
+            {"mention_id": "a", "mention_key": "key-a", "surface": "Alpha",
+             "name": "Alpha", "type": "GenericEntity", "mention_start": 0,
+             "mention_end": 5, "confidence": 0.9, "canonical_id": "canonical-a",
+             "evidence": content},
+            {"mention_id": "b", "mention_key": "key-b", "surface": "Beta",
+             "name": "Beta", "type": "GenericEntity", "mention_start": beta,
+             "mention_end": beta + 4, "confidence": 0.9, "canonical_id": "canonical-b",
+             "evidence": content},
         ],
         logical_schema={"relation_types": [{"name": "related_to", "symmetric": True}]},
     )
@@ -484,3 +732,86 @@ def test_relation_shadow_queue_recovers_leases_retries_and_late_workers_without_
                 )
             }
         assert product_after == product_before
+
+
+@pytest.mark.integration
+def test_postgres_same_name_retry_preserves_two_occurrence_assignments():
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
+    database = _database_for_dsn(dsn)
+    database.bootstrap()
+    suffix = uuid.uuid4().hex[:12]
+    with database.connection() as conn:
+        project_id = int(conn.execute(
+            "INSERT INTO projects(project_key,name) VALUES(%s,%s) RETURNING id",
+            (f"same-name-{suffix}", f"Same Name {suffix}"),
+        ).fetchone()["id"])
+        document_id = int(conn.execute(
+            """INSERT INTO documents(project_id,doc_hash,original_filename,stored_filename,
+               storage_path,local_path,file_size_bytes)
+               VALUES(%s,%s,'same.txt','same.txt','/same','/same',1) RETURNING id""",
+            (project_id, f"same-{suffix}"),
+        ).fetchone()["id"])
+        entities = conn.execute(
+            """INSERT INTO canonical_entities(
+               project_id,entity_key,name,normalized_name,entity_type)
+               VALUES(%s,%s,'张伟','张伟','Person'),(%s,%s,'张伟','张伟','Person')
+               RETURNING id""",
+            (project_id, f"zhang-a-{suffix}", project_id, f"zhang-b-{suffix}"),
+        ).fetchall()
+    first_entity, second_entity = sorted(int(item["id"]) for item in entities)
+    run_id = f"same-name-run-{suffix}"
+    manifest = {
+        "content_hash": f"same-content-{suffix}", "source_hash": f"same-source-{suffix}",
+        "config_hash": "config", "policy_hash": "policy",
+    }
+    revision = database.begin_document_revision(document_id, run_id, manifest)
+    chunks = database.replace_document_content(
+        document_id,
+        [{"key": "section", "title": "Section", "level": 1,
+          "content": "张伟会见张伟。", "content_hash": "section-hash"}],
+        [{"key": "chunk", "section_key": "section", "part_index": 1,
+          "content": "张伟会见张伟。", "content_hash": "chunk-hash"}],
+        revision_id=revision["revision_id"], ingestion_run_id=run_id,
+        lease_token=revision["lease_token"], manifest=manifest,
+    )
+    chunk_id = int(chunks[0]["id"])
+    base = {
+        "project_id": project_id, "document_id": document_id, "chunk_id": chunk_id,
+        "revision_id": revision["revision_id"], "mention_text": "张伟",
+        "normalized_name": "张伟", "entity_type": "Person", "confidence": 0.9,
+        "extraction_version": "v2", "evidence_text": "张伟会见张伟。",
+        "evidence_start": 0, "evidence_end": 7,
+    }
+    mentions = [
+        {**base, "canonical_entity_id": first_entity, "mention_start": 0, "mention_end": 2},
+        {**base, "canonical_entity_id": second_entity, "mention_start": 4, "mention_end": 6},
+    ]
+    for item in mentions:
+        item["mention_key"] = Database._stable_mention_key(item)
+
+    def decisions(values):
+        return [{
+            **item, "decision": "llm_merge", "candidate_entity_ids": [item["canonical_entity_id"]],
+            "scores": {"llm": 0.99}, "reason": "test", "model_name": "test-llm",
+        } for item in values]
+
+    with database.content_revision_context(
+        revision["revision_id"], run_id, revision["lease_token"],
+    ):
+        database.persist_entity_resolution_batch(mentions, decisions(mentions))
+        reversed_retry = [
+            {**mentions[0], "canonical_entity_id": second_entity},
+            {**mentions[1], "canonical_entity_id": first_entity},
+        ]
+        database.persist_entity_resolution_batch(
+            reversed_retry, decisions(reversed_retry),
+        )
+
+    assignments = database.find_active_entity_assignments_by_mention_keys(
+        project_id, [item["mention_key"] for item in mentions],
+    )
+    assert assignments[mentions[0]["mention_key"]]["id"] == first_entity
+    assert assignments[mentions[1]["mention_key"]]["id"] == second_entity
+    assert first_entity != second_entity

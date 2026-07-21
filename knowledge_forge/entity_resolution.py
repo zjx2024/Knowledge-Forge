@@ -440,6 +440,17 @@ class EntityResolver:
                     "reason": "未召回达到复核阈值的候选实体",
                 }
 
+        if entity and not self._filter_cannot_linked(
+            session, raw, chunk, [dict(entity)],
+        ):
+            entity = None
+            decision = {
+                "decision": "new_after_cannot_link",
+                "candidate_ids": list(decision.get("candidate_ids") or []),
+                "scores": dict(decision.get("scores") or {}),
+                "reason": "最终接受前 cannot-link 复核拒绝候选实体",
+            }
+
         aliases = credible_aliases(raw["name"], raw.get("aliases") or [])
         normalized_aliases = [value for value in (normalize_name(alias) for alias in aliases) if value]
         if not entity:
@@ -519,11 +530,32 @@ class EntityResolver:
         project_id = int(project["id"])
         session = session or self.start_session(project)
         raw_entities = [
-            raw for raw in (extraction.get("entities") or [])
+            {**raw, "_document_id": document_id}
+            for raw in (extraction.get("entities") or [])
             if normalize_name(raw.get("name") or "")
         ]
+        mention_keys: dict[str, str] = {}
+        for raw in raw_entities:
+            mention_values = {
+                "project_id": project_id, "document_id": document_id,
+                "revision_id": str(chunk.get("revision_id") or ""),
+                "chunk_id": int(chunk["id"]), "entity_type": raw["type"],
+                "mention_text": raw["name"], "mention_start": raw.get("mention_start"),
+                "mention_end": raw.get("mention_end"),
+                "evidence_start": raw.get("evidence_start"),
+                "evidence_end": raw.get("evidence_end"),
+            }
+            mention_keys[str(raw["id"])] = Database._stable_mention_key(mention_values)
+        active_assignments = (
+            self.db.find_active_entity_assignments_by_mention_keys(
+                project_id, list(mention_keys.values()),
+            )
+            if hasattr(self.db, "find_active_entity_assignments_by_mention_keys") else {}
+        )
         unique_raws: dict[tuple[str, str], dict[str, Any]] = {}
         for raw in raw_entities:
+            if mention_keys[str(raw["id"])] in active_assignments:
+                continue
             key = (str(raw["type"]), normalize_name(raw["name"]))
             unique_raws.setdefault(key, raw)
         exact_requests = [
@@ -569,9 +601,18 @@ class EntityResolver:
             normalized = normalize_name(raw["name"])
             if not normalized: continue
             aliases = credible_aliases(raw["name"], raw.get("aliases") or [])
-            entity, resolution = self._resolve_one(
-                session, {**raw, "_document_id": document_id}, chunk, schema_version,
-            )
+            mention_key = mention_keys[str(raw["id"])]
+            entity = active_assignments.get(mention_key)
+            if entity:
+                resolution = {
+                    "decision": "existing_assignment",
+                    "candidate_ids": [int(entity["id"])], "scores": {},
+                    "reason": "稳定 mention_key 已有活动 assignment，保持 occurrence 归属",
+                }
+            else:
+                entity, resolution = self._resolve_one(
+                    session, raw, chunk, schema_version,
+                )
             local_map[raw["id"]] = entity
             mention_values.append({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "revision_id": str(chunk.get("revision_id") or ""),
@@ -593,7 +634,7 @@ class EntityResolver:
                 "reason": resolution.get("reason") or "", "model_name": session.llm_model,
                 "metadata": {"schema_version": schema_version},
             })
-            mention_values[-1]["mention_key"] = Database._stable_mention_key(mention_values[-1])
+            mention_values[-1]["mention_key"] = mention_key
             decision_values[-1]["mention_key"] = mention_values[-1]["mention_key"]
         if hasattr(self.db, "persist_entity_resolution_batch"):
             mentions = self.db.persist_entity_resolution_batch(mention_values, decision_values)

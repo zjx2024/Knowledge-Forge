@@ -7,7 +7,6 @@ import hashlib
 import logging
 import math
 import re
-import unicodedata
 import uuid
 import threading
 from collections import OrderedDict
@@ -21,6 +20,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from .config import Config
+from .entity_identity import normalize_name
 from .graph_manifest import GRAPH_MANIFEST_PROTOCOL
 from .graph_policy import (
     GRAPH_EMPTY,
@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS policy_snapshots (
     source_generation BIGINT NOT NULL, expected_documents INTEGER NOT NULL DEFAULT 0,
     completed_documents INTEGER NOT NULL DEFAULT 0, snapshot_manifest JSONB NOT NULL DEFAULT '{}'::jsonb,
     metrics JSONB NOT NULL DEFAULT '{}'::jsonb, error_message TEXT NOT NULL DEFAULT '',
+    coverage_complete BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ, activated_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_policy_snapshots_project
@@ -737,8 +738,7 @@ class Database:
 
     @staticmethod
     def _normalize_entity_name(value: str) -> str:
-        value = unicodedata.normalize("NFKC", value or "").lower().strip()
-        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value)
+        return normalize_name(value)
 
     def _migrate_entity_aliases(self, conn: psycopg.Connection) -> None:
         rows = conn.execute(
@@ -2294,6 +2294,7 @@ class Database:
             return conn.execute(
                 """SELECT id,canonical_entity_id,document_id,revision_id,chunk_id,
                           mention_text AS name,entity_type,description AS evidence,
+                          mention_key,evidence_text,evidence_start,evidence_end,
                           metadata,confidence
                    FROM entity_mentions
                    WHERE chunk_id=%s AND revision_id=%s AND is_deleted=FALSE
@@ -2579,49 +2580,81 @@ class Database:
         result = {request: [] for request in unique_requests}
         if not unique_requests:
             return result
-        entity_types = [item[0] for item in unique_requests]
-        normalized_names = [item[1] for item in unique_requests]
+        statement, params = self.build_exact_entity_candidates_batch_query(
+            project_id, unique_requests,
+        )
         with self.connection() as conn:
-            rows = conn.execute(
-                """WITH requested AS (
-                       SELECT entity_type,normalized_name,ordinality
-                       FROM unnest(%s::text[],%s::text[]) WITH ORDINALITY
-                            AS request(entity_type,normalized_name,ordinality)
-                   )
-                   SELECT DISTINCT ON (request.ordinality,entity.id)
-                          request.entity_type AS requested_entity_type,
-                          request.normalized_name AS requested_normalized_name,
-                          entity.*,
-                          CASE WHEN entity.normalized_name=request.normalized_name
-                               THEN 1.0 ELSE 0.99 END AS lexical_score
-                   FROM requested request
-                   JOIN canonical_entity_aliases alias
-                     ON alias.project_id=%s AND alias.active=TRUE
-                    AND alias.normalized_alias=request.normalized_name
-                   JOIN canonical_entities entity
-                     ON entity.id=alias.canonical_entity_id
-                    AND entity.project_id=alias.project_id AND entity.is_deleted=FALSE
-                   LEFT JOIN canonical_entity_redirects redirect
-                     ON redirect.project_id=entity.project_id
-                    AND redirect.source_entity_id=entity.id AND redirect.active=TRUE
-                   WHERE redirect.source_entity_id IS NULL
-                    AND (request.entity_type='GenericEntity'
-                         OR alias.entity_type=request.entity_type
-                         OR alias.entity_type='GenericEntity')
-                   ORDER BY request.ordinality,entity.id,
-                            (entity.entity_type=request.entity_type) DESC,
-                            (entity.normalized_name=request.normalized_name) DESC,
-                            entity.source_count DESC,entity.id""",
-                (entity_types, normalized_names, project_id),
-            ).fetchall()
+            rows = conn.execute(statement, params).fetchall()
         for row in rows:
             key = (
                 str(row.pop("requested_entity_type")),
                 str(row.pop("requested_normalized_name")),
             )
-            if len(result[key]) < 10:
-                result[key].append(row)
+            row.pop("request_rank", None)
+            row.pop("ordinality", None)
+            row.pop("exact_type", None)
+            row.pop("canonical_alias", None)
+            result[key].append(row)
         return result
+
+    @staticmethod
+    def build_exact_entity_candidates_batch_query(
+        project_id: int,
+        requests: list[tuple[str, str]],
+        per_request_limit: int = 10,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build the production and EXPLAIN query with a hard per-request SQL cap."""
+
+        unique_requests = list(dict.fromkeys(
+            (str(entity_type), str(normalized_name))
+            for entity_type, normalized_name in requests
+            if normalized_name
+        ))
+        entity_types = [item[0] for item in unique_requests]
+        normalized_names = [item[1] for item in unique_requests]
+        bounded = max(1, min(10, int(per_request_limit)))
+        statement = """WITH requested AS (
+               SELECT entity_type,normalized_name,ordinality
+               FROM unnest(%s::text[],%s::text[]) WITH ORDINALITY
+                    AS request(entity_type,normalized_name,ordinality)
+           ), deduplicated AS (
+               SELECT DISTINCT ON (request.ordinality,entity.id)
+                      request.ordinality,request.entity_type AS requested_entity_type,
+                      request.normalized_name AS requested_normalized_name,
+                      entity.*,
+                      CASE WHEN entity.normalized_name=request.normalized_name
+                           THEN 1.0 ELSE 0.99 END AS lexical_score,
+                      (entity.entity_type=request.entity_type) AS exact_type,
+                      (alias.alias_kind='canonical_name') AS canonical_alias
+               FROM requested request
+               JOIN canonical_entity_aliases alias
+                 ON alias.project_id=%s AND alias.active=TRUE
+                AND alias.normalized_alias=request.normalized_name
+               JOIN canonical_entities entity
+                 ON entity.id=alias.canonical_entity_id
+                AND entity.project_id=alias.project_id AND entity.is_deleted=FALSE
+               LEFT JOIN canonical_entity_redirects redirect
+                 ON redirect.project_id=entity.project_id
+                AND redirect.source_entity_id=entity.id AND redirect.active=TRUE
+               WHERE redirect.source_entity_id IS NULL
+                 AND (request.entity_type='GenericEntity'
+                      OR alias.entity_type=request.entity_type
+                      OR alias.entity_type='GenericEntity')
+               ORDER BY request.ordinality,entity.id,
+                        (entity.entity_type=request.entity_type) DESC,
+                        (alias.alias_kind='canonical_name') DESC,
+                        entity.source_count DESC,entity.id
+           ), ranked AS (
+               SELECT deduplicated.*,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY ordinality
+                        ORDER BY exact_type DESC,canonical_alias DESC,source_count DESC,id
+                      ) AS request_rank
+               FROM deduplicated
+           )
+           SELECT * FROM ranked WHERE ranked.request_rank<=%s
+           ORDER BY ordinality,request_rank"""
+        return statement, (entity_types, normalized_names, int(project_id), bounded)
 
     def search_entity_name_candidates(
         self,
@@ -2722,13 +2755,19 @@ class Database:
                 if mention_row and mention_row.get("canonical_entity_id") is not None
                 else None
             )
-            relevant_roots = sorted(roots | ({mention_root} if mention_root is not None else set()))
+            relevant_roots = roots | ({mention_root} if mention_root is not None else set())
+            relevant_ids = sorted({
+                entity_id for entity_id in {
+                    *ids, *redirect_map.keys(), *redirect_map.values(), *relevant_roots,
+                }
+                if root(entity_id) in relevant_roots
+            })
             links = conn.execute(
                 """SELECT left_entity_id,right_entity_id,left_mention_key,right_mention_key
                    FROM entity_cannot_links WHERE project_id=%s AND active=TRUE
                      AND (left_entity_id=ANY(%s) OR right_entity_id=ANY(%s)
                           OR left_mention_key=%s OR right_mention_key=%s)""",
-                (project_id, relevant_roots, relevant_roots, mention_key, mention_key),
+                (project_id, relevant_ids, relevant_ids, mention_key, mention_key),
             ).fetchall()
         blocked_roots: set[int] = set()
         for link in links:
@@ -2945,7 +2984,7 @@ class Database:
                     evidence_text,evidence_start,evidence_end,mention_key,extraction_policy_version,metadata)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                     ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
-                    DO UPDATE SET canonical_entity_id=EXCLUDED.canonical_entity_id,
+                    DO UPDATE SET canonical_entity_id=entity_mentions.canonical_entity_id,
                     description=EXCLUDED.description,confidence=EXCLUDED.confidence,
                     evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                     evidence_end=EXCLUDED.evidence_end,
@@ -2962,7 +3001,11 @@ class Database:
                         values.get("extraction_version") or "v2", values.get("evidence_text") or "",
                         values.get("evidence_start"), values.get("evidence_end"),
                         mention_key, extraction_policy,
-                        self._json(values.get("metadata")),
+                        self._json({
+                            **(values.get("metadata") or {}),
+                            "mention_start": values.get("mention_start"),
+                            "mention_end": values.get("mention_end"),
+                        }),
                     ),
                 ).fetchone()
                 persisted_by_key[key] = row
@@ -3239,7 +3282,34 @@ class Database:
                         self._json({"relation_key": values["relation_key"]}),
                     ),
                 )
-            return persisted
+        return persisted
+
+    def find_active_entity_assignments_by_mention_keys(
+        self, project_id: int, mention_keys: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Return immutable occurrence assignments before any new resolution work."""
+
+        keys = sorted({str(value) for value in mention_keys if value})
+        if not keys:
+            return {}
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT ON (mention.mention_key)
+                          mention.mention_key,entity.*
+                   FROM entity_mentions mention
+                   JOIN entity_assignments assignment
+                     ON assignment.project_id=mention.project_id
+                    AND assignment.mention_id=mention.id AND assignment.active=TRUE
+                   JOIN canonical_entities entity
+                     ON entity.project_id=assignment.project_id
+                    AND entity.id=assignment.canonical_entity_id
+                   WHERE mention.project_id=%s AND mention.mention_key=ANY(%s)
+                     AND mention.is_deleted=FALSE
+                   ORDER BY mention.mention_key,assignment.assignment_generation DESC,
+                            assignment.id DESC""",
+                (project_id, keys),
+            ).fetchall()
+        return {str(row.pop("mention_key")): row for row in rows}
 
     def start_relation_shadow_run(self, values: dict[str, Any]) -> dict[str, Any]:
         """Start an isolated treatment run without mutating product projection state."""
@@ -3806,6 +3876,7 @@ class Database:
             ).fetchone()
 
     def finalize_policy_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        coverage_error = ""
         with self.connection() as conn:
             snapshot = conn.execute(
                 "SELECT * FROM policy_snapshots WHERE id=%s FOR UPDATE", (snapshot_id,),
@@ -3821,7 +3892,8 @@ class Database:
                 (snapshot_id,),
             ).fetchone()
             artifacts = conn.execute(
-                """SELECT artifact_key,content_hash FROM policy_snapshot_artifacts
+                """SELECT artifact_key,content_hash,kind,payload
+                   FROM policy_snapshot_artifacts
                    WHERE snapshot_id=%s ORDER BY artifact_key""",
                 (snapshot_id,),
             ).fetchall()
@@ -3833,17 +3905,32 @@ class Database:
                 or len(artifacts) != expected
             ):
                 raise ValueError("策略快照 item/artifact universe 尚未精确完成")
-            root_hash = hashlib.sha256(
-                self._canonical_json([
-                    [item["artifact_key"], item["content_hash"]] for item in artifacts
-                ]).encode("utf-8")
-            ).hexdigest()
-            return conn.execute(
-                """UPDATE policy_snapshots SET status='ready',completed_items=%s,
-                   failed_items=0,artifact_root_hash=%s,completed_at=NOW()
-                   WHERE id=%s AND status='building' RETURNING *""",
-                (expected, root_hash, snapshot_id),
-            ).fetchone() or snapshot
+            incomplete = [
+                item for item in artifacts
+                if item.get("kind") == "relation"
+                and not bool((item.get("payload") or {}).get("coverage_complete"))
+            ]
+            if incomplete:
+                coverage_error = "relation coverage incomplete; snapshot finalization blocked"
+                conn.execute(
+                    """UPDATE policy_snapshots SET status='failed',coverage_complete=FALSE,
+                       failed_items=GREATEST(failed_items,%s),error_message=%s,
+                       completed_at=NOW() WHERE id=%s""",
+                    (len(incomplete), coverage_error, snapshot_id),
+                )
+            else:
+                root_hash = hashlib.sha256(
+                    self._canonical_json([
+                        [item["artifact_key"], item["content_hash"]] for item in artifacts
+                    ]).encode("utf-8")
+                ).hexdigest()
+                return conn.execute(
+                    """UPDATE policy_snapshots SET status='ready',coverage_complete=TRUE,
+                       completed_items=%s,failed_items=0,artifact_root_hash=%s,completed_at=NOW()
+                       WHERE id=%s AND status='building' RETURNING *""",
+                    (expected, root_hash, snapshot_id),
+                ).fetchone() or snapshot
+        raise ValueError(coverage_error)
 
     def request_policy_snapshot_cancel(self, snapshot_id: str) -> dict[str, Any]:
         with self.connection() as conn:
@@ -3950,12 +4037,14 @@ class Database:
 
         with self.connection() as conn:
             snapshot = conn.execute(
-                """SELECT policy_set FROM policy_snapshots
+                """SELECT policy_set,coverage_complete FROM policy_snapshots
                    WHERE id=%s AND project_id=%s FOR UPDATE""",
                 (snapshot_id, project_id),
             ).fetchone()
             if not snapshot:
                 raise LookupError("策略快照不存在")
+            if not bool(snapshot.get("coverage_complete")):
+                raise ValueError("策略快照 coverage 不完整，禁止激活")
             from .policy import CONTROL_POLICY_SET
             if normalize_policy_set(snapshot["policy_set"]) != dict(CONTROL_POLICY_SET):
                 gate = conn.execute(
@@ -3980,6 +4069,8 @@ class Database:
             ).fetchone()
             if not snapshot or snapshot.get("status") not in {"ready", "rolled_back"}:
                 raise ValueError("策略快照未完整就绪，禁止激活")
+            if not bool(snapshot.get("coverage_complete")):
+                raise ValueError("策略快照 coverage 不完整，禁止激活")
             coverage = conn.execute(
                 """SELECT COUNT(*) AS total,
                           COUNT(*) FILTER (WHERE status='ready') AS ready,
@@ -4144,6 +4235,7 @@ class Database:
                           snapshot.expected_items AS snapshot_expected_items,
                           snapshot.completed_items AS snapshot_completed_items,
                           snapshot.failed_items AS snapshot_failed_items,
+                          snapshot.coverage_complete AS snapshot_coverage_complete,
                           gold.manifest_hash AS current_gold_manifest_hash,
                           gold.annotations_hash AS current_gold_items_hash,
                           gold.manifest AS current_gold_manifest,
@@ -4188,6 +4280,13 @@ class Database:
 
         gate_id = str(values.get("id") or uuid.uuid4().hex)
         with self.connection() as conn:
+            snapshot = conn.execute(
+                """SELECT coverage_complete FROM policy_snapshots
+                   WHERE id=%s AND project_id=%s""",
+                (values["snapshot_id"], values["project_id"]),
+            ).fetchone()
+            if not snapshot or not bool(snapshot.get("coverage_complete")):
+                raise ValueError("策略快照 coverage 不完整，禁止创建激活门禁")
             existing = conn.execute(
                 "SELECT * FROM policy_activation_gates WHERE evaluation_run_id=%s",
                 (values["evaluation_run_id"],),

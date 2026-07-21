@@ -85,11 +85,27 @@ def _bundle() -> tuple[dict, list[dict], dict]:
     prediction["item_hash"] = canonical_digest(prediction)
     snapshot = {
         "id": "snapshot-1", "status": "ready", "pilot": True,
+        "coverage_complete": True,
         "manifest_hash": "b" * 64,
         "artifact_root_hash": canonical_digest([["item-1", prediction["item_hash"]]]),
         "expected_items": 1, "completed_items": 1, "failed_items": 0,
     }
     return manifest, gold, {"snapshot": snapshot, "items": [prediction]}
+
+
+def test_quality_gate_fails_closed_before_approval_when_snapshot_coverage_is_incomplete():
+    class IncompleteCoverageDb:
+        @staticmethod
+        def get_quality_evaluation_run(_evaluation_run_id):
+            return {
+                "status": "completed",
+                "snapshot_coverage_complete": False,
+            }
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = IncompleteCoverageDb()
+    with pytest.raises(RuntimeError, match="coverage"):
+        service.evaluate_policy_snapshot_gate("evaluation-overflow")
 
 
 def test_gate_api_only_accepts_persisted_evaluation_run_id():

@@ -1,4 +1,8 @@
-from knowledge_forge.schema_evolution import BASE_SCHEMA, SchemaEvolutionService
+from knowledge_forge.schema_evolution import (
+    BASE_SCHEMA,
+    ENTITY_ONLY_EXTRACTION_FORMAT,
+    SchemaEvolutionService,
+)
 from knowledge_forge.config import Config
 
 
@@ -268,6 +272,57 @@ def test_extract_chunk_rejects_entity_without_source_evidence(monkeypatch):
     )
     assert result["entities"] == []
     assert result["_diagnostics"]["rejected_entities"] == 1
+
+
+def test_entity_only_schema_requires_integer_mention_offsets_and_calls_only_json_chat_once():
+    entity_schema = ENTITY_ONLY_EXTRACTION_FORMAT["properties"]["entities"]["items"]
+    assert {"mention_start", "mention_end"} <= set(entity_schema["required"])
+    assert entity_schema["properties"]["mention_start"] == {"type": "integer"}
+    assert entity_schema["properties"]["mention_end"] == {"type": "integer"}
+
+    class SpyOllama:
+        def __init__(self):
+            self.calls = []
+
+        def json_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"entities": [{
+                "id": "e1",
+                "name": "Alpha",
+                "type": "Organization",
+                "description": "",
+                "aliases": [],
+                "evidence": "Alpha",
+                "evidence_start": 0,
+                "evidence_end": 5,
+                "mention_start": 0,
+                "mention_end": 5,
+                "confidence": 0.9,
+            }]}
+
+    ollama = SpyOllama()
+    service = SchemaEvolutionService(None, ollama)
+    service.extract_chunk = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("extract_chunk must not be called")
+    )
+    service._glean_extraction = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("gleaning must not be called")
+    )
+    service._verify_relations = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("relation verifier must not be called")
+    )
+
+    result = service.extract_entities_only(
+        {"llm_model": "test"},
+        {"schema_json": BASE_SCHEMA},
+        {"content": "Alpha works."},
+    )
+
+    assert len(ollama.calls) == 1
+    assert ollama.calls[0]["schema"] is ENTITY_ONLY_EXTRACTION_FORMAT
+    assert result["relations"] == []
+    assert result["_diagnostics"]["llm_calls"] == 1
+    assert result["_diagnostics"]["verification_llm_calls"] == 0
 
 
 class SequentialExtractionOllama:

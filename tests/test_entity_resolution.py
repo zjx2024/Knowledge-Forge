@@ -17,6 +17,7 @@ from knowledge_forge.observability import metrics_scope
 def test_normalize_name_unifies_spacing_case_and_punctuation():
     assert normalize_name(" Knowledge-Forge ") == "knowledgeforge"
     assert normalize_name("上海 浦东（新区）") == "上海浦东新区"
+    assert normalize_name("Straße") == normalize_name("STRASSE") == "strasse"
 
 
 def test_name_compatibility_is_conservative():
@@ -253,6 +254,46 @@ def test_dense_candidate_is_sent_to_llm_and_resolution_is_audited():
     assert "国际商业机器公司" in database.entity["aliases"]
 
 
+def test_retry_reuses_two_same_name_occurrence_assignments_before_model_calls():
+    project = {"id": 3, "embedding_model": "embed", "llm_model": "chat"}
+    chunk = {"id": 9, "revision_id": "revision-1", "content": "张伟会见张伟。"}
+    raws = [
+        {"id": "first", "name": "张伟", "type": "Person", "mention_start": 0,
+         "mention_end": 2, "evidence_start": 0, "evidence_end": 2, "confidence": 0.9},
+        {"id": "second", "name": "张伟", "type": "Person", "mention_start": 4,
+         "mention_end": 6, "evidence_start": 4, "evidence_end": 6, "confidence": 0.9},
+    ]
+    keys = [Database._stable_mention_key({
+        "project_id": 3, "document_id": 5, "revision_id": "revision-1", "chunk_id": 9,
+        "entity_type": "Person", "mention_text": "张伟",
+        "mention_start": raw["mention_start"], "mention_end": raw["mention_end"],
+    }) for raw in raws]
+
+    class RetryDatabase(FakeResolutionDatabase):
+        def find_active_entity_assignments_by_mention_keys(self, _project_id, mention_keys):
+            assert set(mention_keys) == set(keys)
+            return {
+                keys[0]: {**self.entity, "id": 41, "entity_key": "zhang-wei-1"},
+                keys[1]: {**self.entity, "id": 42, "entity_key": "zhang-wei-2"},
+            }
+
+    database = RetryDatabase(name="张伟", entity_type="Person")
+    vectors = FakeVectors()
+    resolver = EntityResolver(database, vectors, reranker=FakeReranker())
+    first, _ = resolver.resolve_chunk(
+        project, 5, chunk, {"entities": raws, "relations": []}, 1,
+    )
+    second, _ = resolver.resolve_chunk(
+        project, 5, chunk, {"entities": raws, "relations": []}, 1,
+    )
+
+    assert [item["canonical_entity_id"] for item in first] == [41, 42]
+    assert [item["canonical_entity_id"] for item in second] == [41, 42]
+    assert first[0]["mention_key"] != first[1]["mention_key"]
+    assert vectors.ollama.chat_calls == 0
+    assert vectors.entity_updates == []
+
+
 def test_reranker_relevance_alone_does_not_trigger_automatic_merge():
     database = FakeResolutionDatabase("Microsoft Azure")
     vectors = FakeVectors()
@@ -411,6 +452,19 @@ def test_formal_exact_and_lexical_queries_are_alias_table_driven_and_bounded():
     assert "canonical_entity_aliases" in lexical_sql
     assert "unnest" not in lexical_sql
     assert lexical_params[-1] == 20
+
+
+def test_batch_exact_query_ranks_and_limits_each_request_inside_postgres():
+    statement, params = Database.build_exact_entity_candidates_batch_query(
+        3,
+        [("Organization", "zhangwei"), ("Person", "zhangwei")],
+    )
+
+    assert "ROW_NUMBER() OVER" in statement
+    assert "PARTITION BY ordinality" in statement
+    assert "alias.alias_kind='canonical_name'" in statement
+    assert "ranked.request_rank<=%s" in statement
+    assert params[-1] == 10
 
 
 def test_unique_exact_hit_skips_embedding_reranker_and_llm():

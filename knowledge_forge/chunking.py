@@ -20,6 +20,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from .config import Config
+from .sentence_spans import split_sentences
 
 
 LOGGER = logging.getLogger(__name__)
@@ -689,13 +690,14 @@ def estimate_tokens(text: str) -> int:
     return max(1, cjk + math.ceil(words * 1.3) + math.ceil(other / 4))
 
 
+def _segment_spans(text: str) -> list[tuple[int, int, str]]:
+    """Return shared sentence spans without normalizing away source coordinates."""
+
+    return split_sentences(text)
+
+
 def _segments(text: str) -> list[str]:
-    paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
-    segments: list[str] = []
-    for paragraph in paragraphs:
-        sentences = [item.strip() for item in re.split(r"(?<=[。！？；.!?;])\s*", paragraph) if item.strip()]
-        segments.extend(sentences or [paragraph])
-    return segments
+    return [value.strip() for _, _, value in _segment_spans(text) if value.strip()]
 
 
 def _token_pieces(text: str, target_tokens: int, max_tokens: int, overlap_percent: int) -> list[str]:

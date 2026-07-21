@@ -6,6 +6,7 @@ import uuid
 import psycopg
 import pytest
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 from knowledge_forge.database import Database, SCHEMA_SQL
@@ -118,6 +119,34 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_docume
                 conn.execute("ANALYZE canonical_entity_aliases")
                 conn.execute("ANALYZE canonical_entity_documents")
 
+                shared_ids = [
+                    int(row["id"]) for row in conn.execute(
+                        "SELECT id FROM canonical_entities WHERE project_id=%s ORDER BY id LIMIT 25",
+                        (project_id,),
+                    ).fetchall()
+                ]
+                conn.execute(
+                    """UPDATE canonical_entities
+                       SET entity_type=CASE WHEN id %% 2=0 THEN 'Organization'
+                                            ELSE 'GenericEntity' END,
+                           source_count=CASE WHEN id %% 2=0 THEN 3 ELSE 2 END
+                       WHERE project_id=%s AND id=ANY(%s)""",
+                    (project_id, shared_ids),
+                )
+                conn.execute(
+                    """INSERT INTO canonical_entity_aliases(
+                       project_id,canonical_entity_id,entity_type,alias,normalized_alias,
+                       alias_kind,policy_version)
+                       SELECT project_id,id,entity_type,'Shared Alias','sharedalias',
+                              'observed','batch-plan-test'
+                       FROM canonical_entities WHERE project_id=%s AND id=ANY(%s)
+                       ON CONFLICT(project_id,canonical_entity_id,normalized_alias,alias_kind)
+                       DO UPDATE SET entity_type=EXCLUDED.entity_type""",
+                    (project_id, shared_ids),
+                )
+                conn.execute("ANALYZE canonical_entities")
+                conn.execute("ANALYZE canonical_entity_aliases")
+
                 exact_sql, exact_params = Database.build_exact_entity_candidates_query(
                     project_id, "GenericEntity", f"entity{target}", 10,
                 )
@@ -126,6 +155,12 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_docume
                 )
                 exact_alias = _explain(conn, exact_sql, exact_params)
                 fuzzy_alias = _explain(conn, lexical_sql, lexical_params)
+                batch_sql, batch_params = Database.build_exact_entity_candidates_batch_query(
+                    project_id,
+                    [("Organization", "sharedalias"), ("GenericEntity", "sharedalias")],
+                    per_request_limit=99,
+                )
+                batch_exact = _explain(conn, batch_sql, batch_params)
                 sources = _explain(
                     conn,
                     """SELECT COUNT(*) FROM canonical_entity_documents
@@ -136,6 +171,9 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_docume
                     (project_id, project_id, f"entity{target}"),
                 )
                 _assert_selective_index_plan(exact_alias, expected_fragment="idx_entity_alias_exact")
+                _assert_selective_index_plan(
+                    batch_exact, expected_fragment="idx_entity_alias_exact",
+                )
                 if target >= 100_000:
                     _assert_selective_index_plan(
                         fuzzy_alias, expected_fragment="idx_entity_alias_trgm",
@@ -143,6 +181,26 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_docume
                 else:
                     assert int(fuzzy_alias.get("Actual Rows") or 0) <= 10
                 assert not any(node.get("Node Type") == "Seq Scan" for node in _nodes(sources))
+
+                config_values = conninfo_to_dict(dsn)
+                config_values["options"] = f"-c search_path={schema_name},public"
+
+                class BatchConfig:
+                    postgres = config_values
+
+                candidates = Database(BatchConfig).find_exact_entity_candidates_batch(
+                    project_id,
+                    [("Organization", "sharedalias"), ("GenericEntity", "sharedalias")],
+                )
+                assert all(len(items) == 10 for items in candidates.values())
+                assert all(
+                    item["entity_type"] == "Organization"
+                    for item in candidates[("Organization", "sharedalias")]
+                )
+                assert all(
+                    item["entity_type"] == "GenericEntity"
+                    for item in candidates[("GenericEntity", "sharedalias")]
+                )
         finally:
             if not managed_schema:
                 conn.execute("SET search_path TO public")

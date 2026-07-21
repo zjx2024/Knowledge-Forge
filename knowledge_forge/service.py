@@ -951,25 +951,41 @@ class KnowledgeForgeService:
             if not namespace or namespace.get("status") != "ready":
                 raise RuntimeError("relation treatment 缺少完整 entity shadow endpoint")
             mentions = self.db.list_entity_shadow_mentions(str(namespace["id"]), chunk_id=chunk_id)
+            shadow_state = self.db.load_entity_shadow_snapshot(str(namespace["id"]))
+            canonical_by_mention = {
+                str(item["mention_key"]): str(item["canonical_key"])
+                for item in shadow_state.get("assignments") or []
+            }
             entities = [{
-                "id": str(item["mention_key"]),
+                "mention_id": str(item["mention_key"]),
+                "mention_key": str(item["mention_key"]),
+                "surface": str(item["surface"]),
                 "name": str(item["surface"]),
                 "type": str(item.get("entity_type") or "GenericEntity"),
                 "evidence": str(item.get("evidence_text") or item["surface"]),
                 "mention_start": int(item["evidence_start"]),
                 "mention_end": int(item["evidence_end"]),
+                "confidence": float(item.get("confidence") or 0.0),
+                "canonical_id": canonical_by_mention[str(item["mention_key"])],
             } for item in mentions]
         else:
             entities = []
             for item in self.db.list_control_entities_for_chunk(chunk_id, revision_id):
-                metadata = self._metadata(item.get("metadata"))
+                metadata = item.get("metadata") or {}
+                start = metadata.get("mention_start")
+                end = metadata.get("mention_end")
+                if start is None or end is None:
+                    continue
                 entities.append({
-                    "id": str(item["id"]),
+                    "mention_id": str(item["id"]),
+                    "mention_key": str(item.get("mention_key") or item["id"]),
+                    "surface": str(item["name"]),
                     "name": str(item["name"]),
                     "type": str(item.get("entity_type") or "GenericEntity"),
-                    "evidence": str(item.get("evidence") or item["name"]),
-                    "mention_start": metadata.get("mention_start"),
-                    "mention_end": metadata.get("mention_end"),
+                    "evidence": str(item.get("evidence_text") or item["name"]),
+                    "mention_start": int(start), "mention_end": int(end),
+                    "confidence": float(item.get("confidence") or 0.0),
+                    "canonical_id": str(item.get("canonical_entity_id") or item["id"]),
                 })
         treatment_run = self._run_relation_shadow(
             str(snapshot["id"]), project, int(work["document_id"]), chunk,
@@ -978,25 +994,24 @@ class KnowledgeForgeService:
         control_rows = self.db.list_control_entities_for_chunk(chunk_id, revision_id)
 
         def control_mention(item: dict[str, Any]) -> dict[str, Any]:
-            metadata = self._metadata(item.get("metadata"))
+            metadata = item.get("metadata") or {}
             return {
-                "mention_id": str(item["id"]), "document_id": int(item["document_id"]),
+                "mention_id": str(item["id"]),
+                "mention_key": str(item.get("mention_key") or item["id"]),
+                "document_id": int(item["document_id"]),
                 "revision_id": str(item["revision_id"]), "content_hash": expected_hash,
                 "chunk_id": int(item["chunk_id"]),
-                "start": metadata.get("mention_start"), "end": metadata.get("mention_end"),
+                "start": metadata.get("mention_start"),
+                "end": metadata.get("mention_end"),
                 "type": str(item.get("entity_type") or "GenericEntity"),
                 "canonical_id": str(item.get("canonical_entity_id") or item["id"]),
             }
 
         control_mentions = [control_mention(item) for item in control_rows]
         if str(snapshot.get("mode")) == "end_to_end":
-            shadow_state = self.db.load_entity_shadow_snapshot(str(namespace["id"]))
-            canonical_by_mention = {
-                str(item["mention_key"]): str(item["canonical_key"])
-                for item in shadow_state.get("assignments") or []
-            }
             treatment_mentions = [{
-                "mention_id": str(item["mention_key"]),
+                "mention_id": str(item.get("id") or item["mention_key"]),
+                "mention_key": str(item["mention_key"]),
                 "document_id": int(item["document_id"]),
                 "revision_id": str(item["revision_id"]), "content_hash": expected_hash,
                 "chunk_id": int(item["chunk_id"]), "start": int(item["evidence_start"]),
@@ -1009,7 +1024,7 @@ class KnowledgeForgeService:
         else:
             treatment_mentions = list(control_mentions)
             canonical_by_mention = {
-                str(item["mention_id"]): str(item["canonical_id"])
+                str(item.get("mention_key") or item["mention_id"]): str(item["canonical_id"])
                 for item in treatment_mentions
             }
 
@@ -1026,18 +1041,26 @@ class KnowledgeForgeService:
                 (candidate or {}).get("target_mention_id")
                 or metadata.get("target_mention_id") or item.get("target_entity_id") or ""
             )
+            source_mention_key = str(
+                (candidate or {}).get("source_mention_key")
+                or metadata.get("source_mention_key") or source_mention
+            )
+            target_mention_key = str(
+                (candidate or {}).get("target_mention_key")
+                or metadata.get("target_mention_key") or target_mention
+            )
             return {
                 "document_id": int(work["document_id"]), "revision_id": revision_id,
                 "content_hash": expected_hash, "chunk_id": chunk_id,
                 "subject_mention_id": source_mention,
                 "subject_canonical_id": (
-                    canonical_by_mention.get(source_mention, source_mention) if treatment
+                    canonical_by_mention.get(source_mention_key, source_mention) if treatment
                     else str(item.get("source_entity_id") or source_mention)
                 ),
                 "predicate": str(item.get("predicate") or item.get("relation_type") or ""),
                 "object_mention_id": target_mention,
                 "object_canonical_id": (
-                    canonical_by_mention.get(target_mention, target_mention) if treatment
+                    canonical_by_mention.get(target_mention_key, target_mention) if treatment
                     else str(item.get("target_entity_id") or target_mention)
                 ),
                 "direction": str(item.get("direction") or metadata.get("direction") or "forward"),
@@ -1104,9 +1127,15 @@ class KnowledgeForgeService:
         snapshot = status["snapshot"]
         if int(snapshot["project_id"]) != int(project_id):
             raise ValueError("evaluation project 与 snapshot 不一致")
+        if not bool(snapshot.get("coverage_complete")):
+            raise RuntimeError("snapshot relation coverage 不完整，禁止评估")
         evaluation_items = []
         for artifact in status["artifacts"]:
             payload = self._metadata(artifact.get("payload"))
+            if artifact.get("kind") == "relation" and not bool(
+                payload.get("coverage_complete")
+            ):
+                raise RuntimeError("relation artifact coverage 不完整，禁止评估")
             item = payload.get("evaluation_item")
             if isinstance(item, dict):
                 evaluation_items.append(item)
@@ -1174,6 +1203,8 @@ class KnowledgeForgeService:
             raise LookupError("evaluation_run 不存在")
         if evaluation["status"] != "completed":
             raise RuntimeError("evaluation_run 未完成")
+        if not bool(evaluation.get("snapshot_coverage_complete")):
+            raise RuntimeError("snapshot relation coverage 不完整，门禁 fail closed")
         if evaluation["evaluator_version"] not in ALLOWED_EVALUATOR_VERSIONS:
             raise RuntimeError("evaluator version 不在允许列表")
         if evaluation["release_level"] != evaluation["current_gold_level"]:
@@ -1937,6 +1968,34 @@ class KnowledgeForgeService:
             if revision_scope is not None:
                 revision_scope.__exit__(None, None, None)
 
+    @staticmethod
+    def _relation_coverage_failures(
+        plan: Any,
+        persisted_work: list[dict[str, Any]],
+        decision_count: int,
+    ) -> list[str]:
+        failures: list[str] = []
+        terminal_failed = [
+            item for item in persisted_work if item.get("status") == "terminal_failed"
+        ]
+        if plan.overflow:
+            failures.append("overflow")
+        if plan.deferred:
+            failures.append("deferred")
+        if any(
+            token in str(item.get("error_message") or "").lower()
+            for item in terminal_failed
+            for token in ("missing", "response", "decision")
+        ):
+            failures.append("missing_response")
+        if terminal_failed:
+            failures.append("terminal_failure")
+        if any(item.get("status") == "quarantined" for item in persisted_work):
+            failures.append("quarantined")
+        if int(decision_count) != int(plan.admitted_count):
+            failures.append("unclassified_candidate")
+        return sorted(set(failures))
+
     def _run_relation_shadow(
         self,
         ingestion_run_id: str,
@@ -2134,6 +2193,22 @@ class KnowledgeForgeService:
                 item for item in persisted_work
                 if item["status"] in {"terminal_failed", "quarantined"}
             ]
+            terminal_failed = sum(
+                1 for item in persisted_work if item["status"] == "terminal_failed"
+            )
+            quarantined_count = sum(
+                1 for item in persisted_work if item["status"] == "quarantined"
+            )
+            missing_responses = sum(
+                1 for item in persisted_work
+                if item["status"] == "terminal_failed"
+                and any(token in str(item.get("error_message") or "").lower()
+                        for token in ("missing", "response", "decision"))
+            )
+            coverage_failures = self._relation_coverage_failures(
+                prepared.plan, persisted_work, len(decisions),
+            )
+            coverage_complete = not coverage_failures
             final_status = "completed"
             if any(item["status"] == "terminal_failed" for item in failed_items):
                 final_status = "terminal_failed"
@@ -2156,6 +2231,11 @@ class KnowledgeForgeService:
                     max(0, int(item.get("attempt") or 0) - 1) for item in persisted_work
                 ),
                 "failed": len(failed_items),
+                "terminal_failed": terminal_failed,
+                "quarantined": quarantined_count,
+                "missing_responses": missing_responses,
+                "coverage_complete": coverage_complete,
+                "coverage_failures": coverage_failures,
                 "published": 0,
                 "verified": sum(
                     1 for item in decisions if item.get("status") == "classified"
@@ -2179,6 +2259,8 @@ class KnowledgeForgeService:
                 "metrics": metrics,
                 "candidates": candidates,
                 "decisions": decisions,
+                "coverage_complete": coverage_complete,
+                "coverage_failures": coverage_failures,
             }
         except Exception as exc:
             LOGGER.warning("Relation shadow failed without affecting control: %s", exc)
@@ -2186,7 +2268,9 @@ class KnowledgeForgeService:
                 try:
                     self.db.finish_relation_shadow_run(
                         run_id, candidates=[], decisions=[],
-                        metrics={"shadow_exception": type(exc).__name__},
+                        metrics={"shadow_exception": type(exc).__name__,
+                                 "coverage_complete": False,
+                                 "coverage_failures": ["terminal_failure"]},
                         status="failed", error_message=str(exc)[:2000],
                     )
                 except Exception:
@@ -2197,9 +2281,13 @@ class KnowledgeForgeService:
                 "run_id": run_id,
                 "status": "failed",
                 "artifact_hash": "",
-                "metrics": {"shadow_exception": type(exc).__name__},
+                "metrics": {"shadow_exception": type(exc).__name__,
+                            "coverage_complete": False,
+                            "coverage_failures": ["terminal_failure"]},
                 "candidates": [],
                 "decisions": [],
+                "coverage_complete": False,
+                "coverage_failures": ["terminal_failure"],
             }
 
     def _rebuild_project_graph(
