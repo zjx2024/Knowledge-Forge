@@ -75,6 +75,10 @@ class _FakeSchemas:
             "relations": [],
         }
 
+    def extract_entities_only(self, project, schema, chunk):
+        result = self.extract_chunk(project, schema, chunk)
+        return {**result, "relations": []}
+
 
 def _database(dsn: str) -> Database:
     params = conninfo_to_dict(dsn)
@@ -194,10 +198,7 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
         if (item.get("metadata") or {}).get("evidence_start") in (0,)
     ]
     assert len({item["canonical_key"] for item in ibm_assignments}) == 1
-    assert len(first["relation_endpoints"]) == 1
-    endpoint = first["relation_endpoints"][0]
-    assert endpoint["source_canonical_key"] != endpoint["target_canonical_key"]
-    assert endpoint["metadata"]["same_entity_snapshot"] == first["namespace_id"]
+    assert first["relation_endpoints"] == []
 
     with database.connection() as conn:
         after = {

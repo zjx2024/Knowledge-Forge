@@ -15,14 +15,20 @@ SOURCE = "Alpha produces Beta. Beta uses Gamma."
 
 
 def extraction(relations=None):
+    alpha_start = SOURCE.index("Alpha")
+    beta_start = SOURCE.index("Beta")
+    gamma_start = SOURCE.index("Gamma")
     return {
         "entities": [
             {"id": "e1", "name": "Alpha", "type": "Organization", "description": "", "aliases": [],
-             "evidence": "Alpha", "confidence": 0.9},
+             "evidence": "Alpha", "mention_start": alpha_start,
+             "mention_end": alpha_start + len("Alpha"), "confidence": 0.9},
             {"id": "e2", "name": "Beta", "type": "Product", "description": "", "aliases": [],
-             "evidence": "Beta", "confidence": 0.9},
+             "evidence": "Beta", "mention_start": beta_start,
+             "mention_end": beta_start + len("Beta"), "confidence": 0.9},
             {"id": "e3", "name": "Gamma", "type": "Technology", "description": "", "aliases": [],
-             "evidence": "Gamma", "confidence": 0.9},
+             "evidence": "Gamma", "mention_start": gamma_start,
+             "mention_end": gamma_start + len("Gamma"), "confidence": 0.9},
         ],
         "relations": relations if relations is not None else [
             {"source": "e1", "target": "e2", "type": "produces", "description": "",

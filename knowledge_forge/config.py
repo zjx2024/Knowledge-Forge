@@ -201,6 +201,18 @@ class Config:
     relation_classifier_gleaning_window = max(
         1, min(3, int(os.getenv("RELATION_CLASSIFIER_GLEANING_WINDOW", "2"))),
     )
+    relation_sentence_window = max(
+        0, min(1, int(os.getenv("RELATION_SENTENCE_WINDOW", "1"))),
+    )
+    relation_max_char_distance = max(
+        1, min(4096, int(os.getenv("RELATION_MAX_CHAR_DISTANCE", "384"))),
+    )
+    relation_max_targets_per_source = max(
+        1, min(128, int(os.getenv("RELATION_MAX_TARGETS_PER_SOURCE", "12"))),
+    )
+    relation_max_candidates_per_chunk = max(
+        1, min(2048, int(os.getenv("RELATION_MAX_CANDIDATES_PER_CHUNK", "256"))),
+    )
     files_root = PROJECT_ROOT / "KnowledgeFiles"
     docs_root = files_root / "docs"
     chunks_root = files_root / "chunks"

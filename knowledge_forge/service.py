@@ -58,6 +58,10 @@ class IngestionCancelled(RuntimeError):
     """Raised inside a worker after its document has been deleted or cancelled."""
 
 
+class TreatmentMaterializationRequired(RuntimeError):
+    """Treatment snapshots cannot activate until formal materialization is implemented."""
+
+
 class KnowledgeForgeService:
     INGESTION_SUBTASKS = (
         "structure",
@@ -662,7 +666,7 @@ class KnowledgeForgeService:
                 )
                 continue
             try:
-                extraction = self.schemas.extract_chunk(project, active_schema, chunk)
+                extraction = self.schemas.extract_entities_only(project, active_schema, chunk)
                 normalized = extractor.normalize(
                     project_scope=str(project.get("project_key") or project_id),
                     document_key=str(chunk.get("revision_id") or chunk["document_id"]),
@@ -1237,13 +1241,9 @@ class KnowledgeForgeService:
         return {"evaluation": evaluation, "gate": gate, "report": gate_report}
 
     def activate_treatment_snapshot(self, project_id: int, snapshot_id: str) -> dict[str, Any]:
-        project = self.db.activate_policy_snapshot_with_gate(project_id, snapshot_id)
-        rollout = self.db.record_policy_rollout(
-            project_id, snapshot_id, "canary", percentage=100.0, status="active",
-            reason="生产门禁通过后按项目级 canary 激活",
+        raise TreatmentMaterializationRequired(
+            "treatment snapshot 尚未正式物化，禁止激活或触发图重建"
         )
-        self.submit_graph_build(project_id)
-        return {"project": project, "rollout": rollout}
 
     @staticmethod
     def _project_provenance_gremlin(project_id: int, namespace_id: str) -> str:
@@ -1974,10 +1974,16 @@ class KnowledgeForgeService:
             entities=list(extraction.get("entities") or []),
             logical_schema=schema_record.get("schema_json") or {},
         )
-        candidates = [
+        admitted_candidates = [
             {**asdict(item), "chunk_id": int(chunk["id"])}
             for item in prepared.plan.candidates
         ]
+        overflow_candidates = [
+            {**dict(item.get("candidate") or {}), "chunk_id": int(chunk["id"])}
+            for item in prepared.plan.overflow
+            if item.get("candidate")
+        ]
+        candidates = [*admitted_candidates, *overflow_candidates]
         candidate_map = {item["candidate_id"]: item for item in candidates}
         input_payload = {
             "revision_id": revision_id,
@@ -2034,7 +2040,7 @@ class KnowledgeForgeService:
                     "max_attempts": Config.relation_shadow_max_attempts,
                 })
             quarantined = []
-            for item in prepared.plan.deferred:
+            for item in [*prepared.plan.deferred, *prepared.plan.overflow]:
                 candidate_id = str(item["candidate_id"])
                 fingerprint = hashlib.sha256(
                     f"{input_fingerprint}|quarantined|{candidate_id}".encode("utf-8")
@@ -2673,4 +2679,5 @@ class KnowledgeForgeService:
         graphs = self.graph.available_graphs()
         return {"status": "ok", "postgres": "reachable", "ollama_models": ollama_models,
                 "hugegraph": Config.hugegraph_graph, "hugegraph_ready": Config.hugegraph_graph in graphs,
-                "vector_backend": "pgvector-hnsw"}
+                "vector_backend": "pgvector-hnsw",
+                "entity_reranker": self.resolver.reranker.diagnostics()}

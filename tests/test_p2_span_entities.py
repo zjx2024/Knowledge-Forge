@@ -3,7 +3,7 @@ from __future__ import annotations
 from knowledge_forge.span_entities import SpanFirstEntityExtractor
 
 
-def test_span_first_mentions_are_exact_stable_and_type_independent():
+def test_span_first_mentions_are_exact_stable_and_type_sensitive():
     content = "Acme Corp released Model-X."
     extractor = SpanFirstEntityExtractor("entity-extraction-p2-shadow-v1")
     raw = [{
@@ -18,7 +18,7 @@ def test_span_first_mentions_are_exact_stable_and_type_independent():
         project_scope="p", document_key="d", chunk_key="c", content=content,
         raw_entities=[{**raw[0], "type": "Product"}], chunk_metadata={},
     )
-    assert first.mentions[0].mention_id == changed_type.mentions[0].mention_id
+    assert first.mentions[0].mention_id != changed_type.mentions[0].mention_id
     assert first.mentions[0].surface == "Acme Corp"
     assert first.type_assertions[0].entity_type == "Organization"
 
@@ -67,3 +67,32 @@ def test_mention_span_is_independent_from_sentence_evidence_span():
     assert result.mentions[0].surface == "IBM"
     assert (result.mentions[0].start, result.mentions[0].end) == (0, 3)
     assert result.mentions[0].evidence == content
+
+
+def test_three_repeated_ascii_multiword_mentions_keep_distinct_occurrence_ids():
+    content = "New York links New York; New York remains distinct by source position."
+    surface = "New York"
+    starts = []
+    cursor = 0
+    while True:
+        start = content.find(surface, cursor)
+        if start < 0:
+            break
+        starts.append(start)
+        cursor = start + len(surface)
+    extractor = SpanFirstEntityExtractor("entity-extraction-p2-shadow-v1")
+    result = extractor.normalize(
+        project_scope="p", document_key="d", chunk_key="c", content=content,
+        raw_entities=[{
+            "name": surface, "type": "Location", "mention_start": start,
+            "mention_end": start + len(surface), "evidence_text": surface,
+            "evidence_start": start, "evidence_end": start + len(surface),
+        } for start in starts],
+        chunk_metadata={},
+    )
+
+    assert len(result.mentions) == 3
+    assert len({item.mention_id for item in result.mentions}) == 3
+    assert [(item.start, item.end) for item in result.mentions] == [
+        (start, start + len(surface)) for start in starts
+    ]

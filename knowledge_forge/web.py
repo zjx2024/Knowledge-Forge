@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from .config import Config
 from .chunking import CHUNK_STRATEGY_OPTIONS, PARSER_OPTIONS, docling_available, validate_processing_request
 from .graph_policy import GraphNotReadyError, is_current_graph
-from .service import KnowledgeForgeService
+from .service import KnowledgeForgeService, TreatmentMaterializationRequired
 from .runtime_safety import validate_runtime_config
 
 
@@ -330,7 +330,16 @@ class AppHandler(BaseHTTPRequestHandler):
             if match: self._json(202, {"ok": True, "job_id": SERVICE.submit_graph_build(int(match.group(1)))}); return
             match = re.fullmatch(r"/api/projects/(\d+)/schema/reassess", parsed.path)
             if match: self._json(202, {"ok": True, "job_id": SERVICE.submit_schema_reassessment(int(match.group(1)))}); return
+            match = re.fullmatch(r"/api/projects/(\d+)/treatment/([^/]+)/activate", parsed.path)
+            if match:
+                result = SERVICE.activate_treatment_snapshot(
+                    int(match.group(1)), unquote(match.group(2)),
+                )
+                self._json(200, {"ok": True, "result": result})
+                return
             self._json(404, {"error": "接口不存在"})
+        except TreatmentMaterializationRequired as exc:
+            self._json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
         except Exception as exc:
             LOGGER.exception("Request failed: %s", self.path)
             if self.path.startswith("/api/"): self._json(400, {"ok": False, "error": str(exc)})

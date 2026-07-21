@@ -264,7 +264,8 @@ CREATE TABLE IF NOT EXISTS canonical_entity_aliases (
     UNIQUE(project_id,canonical_entity_id,normalized_alias,alias_kind)
 );
 CREATE INDEX IF NOT EXISTS idx_entity_alias_exact
-    ON canonical_entity_aliases(project_id,entity_type,normalized_alias,active);
+    ON canonical_entity_aliases(project_id,normalized_alias,entity_type,canonical_entity_id)
+    WHERE active=TRUE;
 CREATE INDEX IF NOT EXISTS idx_entity_alias_trgm ON canonical_entity_aliases
     USING gin(normalized_alias gin_trgm_ops) WHERE active=TRUE;
 
@@ -2484,24 +2485,86 @@ class Database:
         with self.connection() as conn:
             return int(conn.execute(query, params).fetchone()["count"])
 
+    @staticmethod
+    def build_exact_entity_candidates_query(
+        project_id: int,
+        entity_type: str,
+        normalized_name: str,
+        limit: int = 10,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build the production exact-alias query used by runtime and EXPLAIN tests."""
+
+        bounded = max(1, min(50, int(limit)))
+        statement = """WITH matched AS (
+               SELECT entity.*,
+                      MAX(CASE WHEN alias.alias_kind='canonical_name' THEN 1.0 ELSE 0.99 END)
+                          AS lexical_score,
+                      BOOL_OR(alias.alias_kind='canonical_name') AS canonical_alias_match
+               FROM canonical_entity_aliases alias
+               JOIN canonical_entities entity
+                 ON entity.id=alias.canonical_entity_id
+                AND entity.project_id=alias.project_id
+               LEFT JOIN canonical_entity_redirects redirect
+                 ON redirect.project_id=entity.project_id
+                AND redirect.source_entity_id=entity.id AND redirect.active=TRUE
+               WHERE alias.project_id=%s AND alias.active=TRUE
+                 AND alias.normalized_alias=%s
+                 AND entity.is_deleted=FALSE AND redirect.source_entity_id IS NULL
+                 AND (%s='GenericEntity' OR alias.entity_type=%s
+                      OR alias.entity_type='GenericEntity')
+               GROUP BY entity.id
+           )
+           SELECT * FROM matched
+           ORDER BY (entity_type=%s) DESC,canonical_alias_match DESC,source_count DESC,id
+           LIMIT %s"""
+        return statement, (
+            int(project_id), str(normalized_name), str(entity_type), str(entity_type),
+            str(entity_type), bounded,
+        )
+
+    @staticmethod
+    def build_lexical_entity_candidates_query(
+        project_id: int,
+        entity_type: str,
+        normalized_name: str,
+        limit: int,
+        threshold: float,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build a bounded trigram query over the normalized alias source of truth."""
+
+        bounded = max(1, min(100, int(limit)))
+        score_floor = max(0.0, min(1.0, float(threshold)))
+        statement = """WITH matched AS (
+               SELECT entity.*,MAX(similarity(alias.normalized_alias,%s)) AS lexical_score
+               FROM canonical_entity_aliases alias
+               JOIN canonical_entities entity
+                 ON entity.id=alias.canonical_entity_id
+                AND entity.project_id=alias.project_id
+               LEFT JOIN canonical_entity_redirects redirect
+                 ON redirect.project_id=entity.project_id
+                AND redirect.source_entity_id=entity.id AND redirect.active=TRUE
+               WHERE alias.project_id=%s AND alias.active=TRUE
+                 AND entity.is_deleted=FALSE AND redirect.source_entity_id IS NULL
+                 AND (%s='GenericEntity' OR alias.entity_type=%s
+                      OR alias.entity_type='GenericEntity')
+                 AND alias.normalized_alias %% %s
+                 AND similarity(alias.normalized_alias,%s)>=%s
+               GROUP BY entity.id
+           )
+           SELECT * FROM matched ORDER BY lexical_score DESC,source_count DESC,id LIMIT %s"""
+        return statement, (
+            str(normalized_name), int(project_id), str(entity_type), str(entity_type),
+            str(normalized_name), str(normalized_name), score_floor, bounded,
+        )
+
     def find_exact_entity_candidates(
         self, project_id: int, entity_type: str, normalized_name: str
     ) -> list[dict[str, Any]]:
+        statement, params = self.build_exact_entity_candidates_query(
+            project_id, entity_type, normalized_name, 10,
+        )
         with self.connection() as conn:
-            return conn.execute(
-                """SELECT *,
-                          CASE WHEN normalized_name=%s THEN 1.0 ELSE 0.99 END AS lexical_score
-                   FROM canonical_entities
-                   WHERE project_id=%s AND is_deleted=FALSE
-                     AND (%s='GenericEntity' OR entity_type=%s OR entity_type='GenericEntity')
-                     AND (normalized_name=%s OR %s=ANY(normalized_aliases))
-                   ORDER BY (entity_type=%s) DESC,(normalized_name=%s) DESC,source_count DESC,id
-                   LIMIT 10""",
-                (
-                    normalized_name, project_id, entity_type, entity_type,
-                    normalized_name, normalized_name, entity_type, normalized_name,
-                ),
-            ).fetchall()
+            return conn.execute(statement, params).fetchall()
 
     def find_exact_entity_candidates_batch(
         self,
@@ -2525,20 +2588,27 @@ class Database:
                        FROM unnest(%s::text[],%s::text[]) WITH ORDINALITY
                             AS request(entity_type,normalized_name,ordinality)
                    )
-                   SELECT request.entity_type AS requested_entity_type,
+                   SELECT DISTINCT ON (request.ordinality,entity.id)
+                          request.entity_type AS requested_entity_type,
                           request.normalized_name AS requested_normalized_name,
                           entity.*,
                           CASE WHEN entity.normalized_name=request.normalized_name
                                THEN 1.0 ELSE 0.99 END AS lexical_score
                    FROM requested request
+                   JOIN canonical_entity_aliases alias
+                     ON alias.project_id=%s AND alias.active=TRUE
+                    AND alias.normalized_alias=request.normalized_name
                    JOIN canonical_entities entity
-                     ON entity.project_id=%s AND entity.is_deleted=FALSE
+                     ON entity.id=alias.canonical_entity_id
+                    AND entity.project_id=alias.project_id AND entity.is_deleted=FALSE
+                   LEFT JOIN canonical_entity_redirects redirect
+                     ON redirect.project_id=entity.project_id
+                    AND redirect.source_entity_id=entity.id AND redirect.active=TRUE
+                   WHERE redirect.source_entity_id IS NULL
                     AND (request.entity_type='GenericEntity'
-                         OR entity.entity_type=request.entity_type
-                         OR entity.entity_type='GenericEntity')
-                    AND (entity.normalized_name=request.normalized_name
-                         OR request.normalized_name=ANY(entity.normalized_aliases))
-                   ORDER BY request.ordinality,
+                         OR alias.entity_type=request.entity_type
+                         OR alias.entity_type='GenericEntity')
+                   ORDER BY request.ordinality,entity.id,
                             (entity.entity_type=request.entity_type) DESC,
                             (entity.normalized_name=request.normalized_name) DESC,
                             entity.source_count DESC,entity.id""",
@@ -2561,33 +2631,15 @@ class Database:
         limit: int,
         threshold: float,
     ) -> list[dict[str, Any]]:
+        statement, params = self.build_lexical_entity_candidates_query(
+            project_id, entity_type, normalized_name, limit, threshold,
+        )
         with self.connection() as conn:
             conn.execute(
                 "SELECT set_config('pg_trgm.similarity_threshold',%s,TRUE)",
                 (str(max(0.0, min(1.0, threshold))),),
             )
-            return conn.execute(
-                """SELECT c.*,
-                          GREATEST(
-                            similarity(c.normalized_name,%s),
-                            COALESCE((SELECT MAX(similarity(alias,%s))
-                                      FROM unnest(c.normalized_aliases) AS alias),0.0)
-                          ) AS lexical_score
-                   FROM canonical_entities c
-                   WHERE project_id=%s AND is_deleted=FALSE
-                     AND (%s='GenericEntity' OR entity_type=%s OR entity_type='GenericEntity')
-                     AND (
-                       normalized_name %% %s
-                       OR EXISTS (SELECT 1 FROM unnest(c.normalized_aliases) AS alias
-                                  WHERE similarity(alias,%s)>=%s)
-                     )
-                   ORDER BY lexical_score DESC,source_count DESC,id
-                   LIMIT %s""",
-                (
-                    normalized_name, normalized_name, project_id, entity_type, entity_type,
-                    normalized_name, normalized_name, threshold, limit,
-                ),
-            ).fetchall()
+            return conn.execute(statement, params).fetchall()
 
     def search_entity_vector_candidates(
         self,
@@ -2623,9 +2675,78 @@ class Database:
                 ),
             ).fetchall()
 
+    def blocked_entity_candidate_ids(
+        self,
+        project_id: int,
+        mention_key: str,
+        candidate_ids: list[int],
+    ) -> list[int]:
+        """Return cannot-linked current roots in one bounded candidate query."""
+
+        ids = sorted({int(value) for value in candidate_ids})
+        if not ids:
+            return []
+        with self.connection() as conn:
+            redirects = conn.execute(
+                """SELECT source_entity_id,target_entity_id FROM canonical_entity_redirects
+                   WHERE project_id=%s AND active=TRUE""",
+                (project_id,),
+            ).fetchall()
+            redirect_map = {
+                int(item["source_entity_id"]): int(item["target_entity_id"])
+                for item in redirects
+            }
+
+            def root(entity_id: int) -> int:
+                seen: set[int] = set()
+                while entity_id in redirect_map and entity_id not in seen:
+                    seen.add(entity_id)
+                    entity_id = redirect_map[entity_id]
+                return entity_id
+
+            roots = {root(value) for value in ids}
+            mention_row = conn.execute(
+                """SELECT COALESCE(assignment.canonical_entity_id,
+                                   mention.canonical_entity_id) AS canonical_entity_id
+                   FROM entity_mentions mention
+                   LEFT JOIN entity_assignments assignment
+                     ON assignment.project_id=mention.project_id
+                    AND assignment.mention_id=mention.id AND assignment.active=TRUE
+                   WHERE mention.project_id=%s AND mention.mention_key=%s
+                     AND mention.is_deleted=FALSE
+                   ORDER BY mention.id DESC LIMIT 1""",
+                (project_id, mention_key),
+            ).fetchone()
+            mention_root = (
+                root(int(mention_row["canonical_entity_id"]))
+                if mention_row and mention_row.get("canonical_entity_id") is not None
+                else None
+            )
+            relevant_roots = sorted(roots | ({mention_root} if mention_root is not None else set()))
+            links = conn.execute(
+                """SELECT left_entity_id,right_entity_id,left_mention_key,right_mention_key
+                   FROM entity_cannot_links WHERE project_id=%s AND active=TRUE
+                     AND (left_entity_id=ANY(%s) OR right_entity_id=ANY(%s)
+                          OR left_mention_key=%s OR right_mention_key=%s)""",
+                (project_id, relevant_roots, relevant_roots, mention_key, mention_key),
+            ).fetchall()
+        blocked_roots: set[int] = set()
+        for link in links:
+            left_id = root(int(link["left_entity_id"])) if link.get("left_entity_id") else None
+            right_id = root(int(link["right_entity_id"])) if link.get("right_entity_id") else None
+            if link.get("left_mention_key") == mention_key and right_id is not None:
+                blocked_roots.add(right_id)
+            if link.get("right_mention_key") == mention_key and left_id is not None:
+                blocked_roots.add(left_id)
+            if mention_root is not None and left_id == mention_root and right_id is not None:
+                blocked_roots.add(right_id)
+            if mention_root is not None and right_id == mention_root and left_id is not None:
+                blocked_roots.add(left_id)
+        return [value for value in ids if root(value) in blocked_roots]
+
     def upsert_canonical_entity(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as conn:
-            return conn.execute(
+            row = conn.execute(
                 """INSERT INTO canonical_entities(project_id,entity_key,name,normalized_name,entity_type,aliases,
                 normalized_aliases,description,schema_version,metadata)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
@@ -2639,6 +2760,42 @@ class Database:
                  values.get("aliases") or [],values.get("normalized_aliases") or [],values.get("description") or "",
                  values.get("schema_version") or 1,self._json(values.get("metadata"))),
             ).fetchone()
+            self._sync_entity_alias_rows(
+                conn, row,
+                [row["name"], *(row.get("aliases") or [])],
+                policy_version=str((values.get("metadata") or {}).get("policy_version")
+                                   or "entity-resolution-p0-v1"),
+            )
+            return row
+
+    @classmethod
+    def _sync_entity_alias_rows(
+        cls,
+        conn: psycopg.Connection,
+        entity: dict[str, Any],
+        aliases: list[str],
+        *,
+        policy_version: str,
+    ) -> None:
+        canonical = cls._normalize_entity_name(str(entity.get("name") or ""))
+        for alias in dict.fromkeys(str(item).strip() for item in aliases if str(item).strip()):
+            normalized = cls._normalize_entity_name(alias)
+            if not normalized:
+                continue
+            alias_kind = "canonical_name" if normalized == canonical else "observed"
+            conn.execute(
+                """INSERT INTO canonical_entity_aliases(
+                   project_id,canonical_entity_id,entity_type,alias,normalized_alias,
+                   alias_kind,policy_version)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(project_id,canonical_entity_id,normalized_alias,alias_kind)
+                   DO UPDATE SET alias=EXCLUDED.alias,entity_type=EXCLUDED.entity_type,
+                       active=TRUE,policy_version=EXCLUDED.policy_version,updated_at=NOW()""",
+                (
+                    entity["project_id"], entity["id"], entity["entity_type"], alias,
+                    normalized, alias_kind, policy_version,
+                ),
+            )
 
     def merge_canonical_entity_evidence(
         self,
@@ -2648,7 +2805,7 @@ class Database:
         description: str,
     ) -> dict[str, Any]:
         with self.connection() as conn:
-            return conn.execute(
+            row = conn.execute(
                 """UPDATE canonical_entities SET
                    aliases=(SELECT ARRAY(SELECT DISTINCT unnest(aliases || %s::text[]))),
                    normalized_aliases=(SELECT ARRAY(SELECT DISTINCT unnest(normalized_aliases || %s::text[]))),
@@ -2657,6 +2814,11 @@ class Database:
                    WHERE id=%s RETURNING *""",
                 (aliases, normalized_aliases, description, description, entity_id),
             ).fetchone()
+            self._sync_entity_alias_rows(
+                conn, row, [row["name"], *aliases],
+                policy_version="entity-resolution-p0-v1",
+            )
+            return row
 
     def update_canonical_entity_type(self, entity_id: int, entity_type: str) -> dict[str, Any]:
         with self.connection() as conn:
@@ -2666,14 +2828,25 @@ class Database:
             ).fetchone()
 
     def add_entity_mention(self, values: dict[str, Any]) -> dict[str, Any]:
+        mention_key = self._mention_conflict_key(values)
         with self.connection() as conn:
             row = conn.execute(
-                """INSERT INTO entity_mentions(project_id,document_id,chunk_id,canonical_entity_id,mention_text,normalized_name,entity_type,description,confidence,extraction_version,evidence_text,evidence_start,evidence_end,metadata)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                ON CONFLICT(revision_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET description=EXCLUDED.description,
+                """INSERT INTO entity_mentions(project_id,document_id,chunk_id,
+                canonical_entity_id,mention_key,mention_text,normalized_name,entity_type,
+                description,confidence,extraction_version,evidence_text,evidence_start,evidence_end,metadata)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
+                DO UPDATE SET canonical_entity_id=EXCLUDED.canonical_entity_id,
+                description=EXCLUDED.description,
                 confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                 evidence_end=EXCLUDED.evidence_end,metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW() RETURNING *""",
-                (values["project_id"],values["document_id"],values["chunk_id"],values["canonical_entity_id"],values["mention_text"],values["normalized_name"],values["entity_type"],values.get("description") or "",0.5 if values.get("confidence") is None else values.get("confidence"),values.get("extraction_version") or "v2",values.get("evidence_text") or "",values.get("evidence_start"),values.get("evidence_end"),self._json(values.get("metadata"))),
+                (values["project_id"],values["document_id"],values["chunk_id"],
+                 values["canonical_entity_id"],mention_key,
+                 values["mention_text"],values["normalized_name"],values["entity_type"],
+                 values.get("description") or "",0.5 if values.get("confidence") is None
+                 else values.get("confidence"),values.get("extraction_version") or "v2",
+                 values.get("evidence_text") or "",values.get("evidence_start"),
+                 values.get("evidence_end"),self._json(values.get("metadata"))),
             ).fetchone()
             conn.execute(
                 """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
@@ -2688,46 +2861,51 @@ class Database:
             return row
 
     def add_entity_resolution_decision(self, values: dict[str, Any]) -> dict[str, Any]:
+        mention_key = self._mention_conflict_key(values)
         with self.connection() as conn:
             return conn.execute(
-                """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,canonical_entity_id,
-                mention_text,normalized_name,entity_type,decision,candidate_entity_ids,scores,reason,model_name,metadata)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
-                ON CONFLICT(revision_id,chunk_id,mention_text,entity_type) DO UPDATE SET
+                """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,
+                canonical_entity_id,mention_key,mention_text,normalized_name,entity_type,
+                decision,candidate_entity_ids,scores,reason,model_name,metadata)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
+                DO UPDATE SET
                 canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
                 candidate_entity_ids=EXCLUDED.candidate_entity_ids,scores=EXCLUDED.scores,
                 reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
                 is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                 (
                     values["project_id"], values["document_id"], values["chunk_id"],
-                    values["canonical_entity_id"], values["mention_text"], values["normalized_name"],
-                    values["entity_type"], values["decision"], values.get("candidate_entity_ids") or [],
+                    values["canonical_entity_id"], mention_key,
+                    values["mention_text"], values["normalized_name"], values["entity_type"],
+                    values["decision"], values.get("candidate_entity_ids") or [],
                     self._json(values.get("scores")), values.get("reason") or "", values.get("model_name"),
                     self._json(values.get("metadata")),
                 ),
             ).fetchone()
 
     @staticmethod
-    def _mention_conflict_key(values: dict[str, Any]) -> tuple[int, int, int, str]:
-        return (
-            int(values["document_id"]), int(values["chunk_id"]),
-            int(values["canonical_entity_id"]), str(values["mention_text"]),
-        )
+    def _mention_conflict_key(values: dict[str, Any]) -> str:
+        return str(values.get("mention_key") or Database._stable_mention_key(values))
 
     @staticmethod
-    def _decision_conflict_key(values: dict[str, Any]) -> tuple[int, int, str, str]:
-        return (
-            int(values["document_id"]), int(values["chunk_id"]),
-            str(values["mention_text"]), str(values["entity_type"]),
-        )
+    def _decision_conflict_key(values: dict[str, Any]) -> str:
+        return str(values.get("mention_key") or Database._stable_mention_key(values))
 
     @staticmethod
     def _stable_mention_key(values: dict[str, Any]) -> str:
+        mention_start = values.get("mention_start")
+        mention_end = values.get("mention_end")
+        if mention_start is None:
+            mention_start = values.get("evidence_start")
+        if mention_end is None:
+            mention_end = values.get("evidence_end")
         material = "\x1f".join((
-            str(values["project_id"]), str(values["document_id"]), str(values["chunk_id"]),
-            str(values.get("evidence_start") if values.get("evidence_start") is not None else ""),
-            str(values.get("evidence_end") if values.get("evidence_end") is not None else ""),
-            str(values.get("evidence_text") or values.get("mention_text") or ""),
+            str(values["project_id"]), str(values["document_id"]),
+            str(values.get("revision_id") or ""), str(values["chunk_id"]),
+            str(mention_start if mention_start is not None else ""),
+            str(mention_end if mention_end is not None else ""),
+            str(values.get("entity_type") or ""), str(values.get("mention_text") or ""),
         ))
         return "mention_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -2747,15 +2925,15 @@ class Database:
             for item in [*mentions, *decisions]
         ):
             raise ValueError("实体批次必须属于同一项目和文档")
-        unique_mentions: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+        unique_mentions: dict[str, dict[str, Any]] = {}
         for item in mentions:
             unique_mentions[self._mention_conflict_key(item)] = item
-        unique_decisions: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+        unique_decisions: dict[str, dict[str, Any]] = {}
         for item in decisions:
             unique_decisions[self._decision_conflict_key(item)] = item
 
         with self.connection() as conn:
-            persisted_by_key: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+            persisted_by_key: dict[str, dict[str, Any]] = {}
             for key, values in unique_mentions.items():
                 mention_key = str(values.get("mention_key") or self._stable_mention_key(values))
                 extraction_policy = str(
@@ -2766,7 +2944,8 @@ class Database:
                     mention_text,normalized_name,entity_type,description,confidence,extraction_version,
                     evidence_text,evidence_start,evidence_end,mention_key,extraction_policy_version,metadata)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                    ON CONFLICT(revision_id,chunk_id,canonical_entity_id,mention_text) DO UPDATE SET
+                    ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
+                    DO UPDATE SET canonical_entity_id=EXCLUDED.canonical_entity_id,
                     description=EXCLUDED.description,confidence=EXCLUDED.confidence,
                     evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                     evidence_end=EXCLUDED.evidence_end,
@@ -2834,7 +3013,7 @@ class Database:
                         (
                             project_id, values["canonical_entity_id"], values["entity_type"], alias,
                             normalized_alias,
-                            "canonical_name" if alias == values.get("mention_text") else "observed",
+                            "observed",
                             self._json({"mention_key": mention_key}),
                             str(values.get("resolution_policy_version") or "entity-resolution-p0-v1"),
                         ),
@@ -2842,10 +3021,11 @@ class Database:
             for values in unique_decisions.values():
                 conn.execute(
                     """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,
-                    canonical_entity_id,mention_text,normalized_name,entity_type,decision,
+                    canonical_entity_id,mention_text,normalized_name,entity_type,mention_key,decision,
                     candidate_entity_ids,scores,reason,model_name,metadata)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
-                    ON CONFLICT(revision_id,chunk_id,mention_text,entity_type) DO UPDATE SET
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                    ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
+                    DO UPDATE SET
                     canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
                     candidate_entity_ids=EXCLUDED.candidate_entity_ids,scores=EXCLUDED.scores,
                     reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
@@ -2853,7 +3033,8 @@ class Database:
                     (
                         values["project_id"], values["document_id"], values["chunk_id"],
                         values["canonical_entity_id"], values["mention_text"], values["normalized_name"],
-                        values["entity_type"], values["decision"], values.get("candidate_entity_ids") or [],
+                        values["entity_type"], values.get("mention_key") or self._stable_mention_key(values),
+                        values["decision"], values.get("candidate_entity_ids") or [],
                         self._json(values.get("scores")), values.get("reason") or "",
                         values.get("model_name"), self._json(values.get("metadata")),
                     ),
@@ -4441,10 +4622,32 @@ class Database:
             raise ValueError("不能合并同一实体")
         if not reason.strip():
             raise ValueError("人工合并必须说明原因")
-        event_id = self._resolution_event_id(
-            project_id, "merge", f"{source_entity_id}:{target_entity_id}",
-        )
         with self.connection() as conn:
+            redirect_rows = conn.execute(
+                """SELECT source_entity_id,target_entity_id
+                   FROM canonical_entity_redirects
+                   WHERE project_id=%s AND active=TRUE FOR SHARE""",
+                (project_id,),
+            ).fetchall()
+            redirect_map = {
+                int(item["source_entity_id"]): int(item["target_entity_id"])
+                for item in redirect_rows
+            }
+
+            def root(entity_id: int) -> int:
+                seen: set[int] = set()
+                while entity_id in redirect_map and entity_id not in seen:
+                    seen.add(entity_id)
+                    entity_id = redirect_map[entity_id]
+                return entity_id
+
+            source_entity_id = root(int(source_entity_id))
+            target_entity_id = root(int(target_entity_id))
+            if source_entity_id == target_entity_id:
+                raise ValueError("两个实体已经指向同一当前根实体")
+            event_id = self._resolution_event_id(
+                project_id, "merge", f"{source_entity_id}:{target_entity_id}",
+            )
             revisioned = all((
                 self._column_exists(conn, "documents", "active_revision_id"),
                 self._column_exists(conn, "entity_mentions", "revision_id"),
@@ -4470,12 +4673,42 @@ class Database:
             ).fetchall()
             if {int(item["id"]) for item in entities} != {source_entity_id, target_entity_id}:
                 raise LookupError("待合并实体不存在或不属于该项目")
-            blocked = conn.execute(
-                """SELECT id FROM entity_cannot_links WHERE project_id=%s AND active=TRUE
-                   AND ((left_entity_id=%s AND right_entity_id=%s)
-                     OR (left_entity_id=%s AND right_entity_id=%s)) LIMIT 1""",
-                (project_id, source_entity_id, target_entity_id, target_entity_id, source_entity_id),
-            ).fetchone()
+            mention_roots = {
+                str(item["mention_key"]): root(int(item["canonical_entity_id"]))
+                for item in conn.execute(
+                    """SELECT mention.mention_key,
+                              COALESCE(assignment.canonical_entity_id,
+                                       mention.canonical_entity_id) AS canonical_entity_id
+                       FROM entity_mentions mention
+                       LEFT JOIN entity_assignments assignment
+                         ON assignment.project_id=mention.project_id
+                        AND assignment.mention_id=mention.id AND assignment.active=TRUE
+                       WHERE mention.project_id=%s AND mention.is_deleted=FALSE
+                         AND COALESCE(assignment.canonical_entity_id,
+                                      mention.canonical_entity_id)=ANY(%s)""",
+                    (project_id, [source_entity_id, target_entity_id]),
+                ).fetchall()
+            }
+            cannot_links = conn.execute(
+                """SELECT left_entity_id,right_entity_id,left_mention_key,right_mention_key
+                   FROM entity_cannot_links WHERE project_id=%s AND active=TRUE""",
+                (project_id,),
+            ).fetchall()
+            blocked = False
+            for link in cannot_links:
+                left_root = (
+                    root(int(link["left_entity_id"]))
+                    if link.get("left_entity_id") is not None
+                    else mention_roots.get(str(link.get("left_mention_key") or ""))
+                )
+                right_root = (
+                    root(int(link["right_entity_id"]))
+                    if link.get("right_entity_id") is not None
+                    else mention_roots.get(str(link.get("right_mention_key") or ""))
+                )
+                if {left_root, right_root} == {source_entity_id, target_entity_id}:
+                    blocked = True
+                    break
             if blocked:
                 raise ValueError("实体存在有效 cannot-link，禁止合并")
             conn.execute(

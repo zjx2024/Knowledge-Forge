@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from knowledge_forge.database import SCHEMA_SQL
-from knowledge_forge.migrations import Migration, MigrationRunner
+from knowledge_forge.migrations import MIGRATIONS, Migration, MigrationRunner
 
 
 def test_startup_bootstrap_is_additive_and_has_no_legacy_column_drop():
@@ -69,3 +69,19 @@ def test_migration_cli_exposes_plan_status_apply_and_explicit_cleanup():
     assert all(command in source for command in ("plan", "status", "apply", "cleanup-legacy-columns"))
     assert "--backup-confirmation" in source
     assert "--startup-safe-only" in source
+
+
+def test_mention_occurrence_migration_replaces_payload_uniqueness_idempotently():
+    migration = next(
+        item for item in MIGRATIONS if item.version == "0008_mention_occurrence_identity"
+    )
+
+    assert "ADD COLUMN IF NOT EXISTS mention_key" in migration.sql
+    assert "DROP INDEX IF EXISTS uq_entity_mentions_revision_payload" in migration.sql
+    assert "DROP INDEX IF EXISTS uq_resolution_revision_key" in migration.sql
+    assert "DROP INDEX IF EXISTS idx_entity_alias_exact" in migration.sql
+    assert "uq_resolution_revision_mention" in migration.sql
+    assert "canonical_entity_aliases(project_id,normalized_alias,entity_type" in migration.sql
+    assert "WHERE mention_key<>'' AND is_deleted=FALSE" in migration.sql
+    assert "md5(" in migration.sql
+    assert "digest(" not in migration.sql

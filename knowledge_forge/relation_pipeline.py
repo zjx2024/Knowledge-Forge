@@ -13,6 +13,8 @@ from .chunking import estimate_tokens
 from .config import Config
 from .observability import increment
 from .policy import normalize_policy_set
+from .sentence_spans import sentence_index as _sentence_index
+from .sentence_spans import split_sentences as _sentences
 
 
 NO_RELATION = "NO_RELATION"
@@ -48,6 +50,7 @@ class RelationCandidate:
     source_end_char: int
     target_start_char: int
     target_end_char: int
+    priority_key: tuple[int, int, int, float, str] = (0, 0, 0, 0.0, "")
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,8 @@ class RelationPlan:
     raw_pairs: int
     blocked_pairs: int
     candidates: list[RelationCandidate]
+    overflow: list[dict[str, Any]] = field(default_factory=list)
+    qualified_count: int = 0
     deferred: list[dict[str, Any]] = field(default_factory=list)
     classified_count: int = 0
     gleaning_passes: int = 0
@@ -101,72 +106,6 @@ class PreparedRelationShadow:
     plan: RelationPlan
     batches: list[RelationBatch]
     metrics: dict[str, int]
-
-
-_CLOSING_PUNCTUATION = frozenset('"\'”’）)]】》')
-_ABBREVIATION_RE = re.compile(
-    r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e|[A-Z])\.$",
-    re.IGNORECASE,
-)
-_INITIALISM_RE = re.compile(r"(?:[A-Za-z]\.){2,}$")
-
-
-def _period_is_boundary(content: str, index: int) -> bool:
-    previous = content[index - 1] if index else ""
-    following = content[index + 1] if index + 1 < len(content) else ""
-    if following == ".":
-        return False
-    if previous == ".":
-        return following != "."
-    if previous.isdigit() and following.isdigit():
-        return False
-    if previous.isalnum() and following.isalnum():
-        return False
-    token_start = index
-    while token_start and not content[token_start - 1].isspace():
-        token_start -= 1
-    prefix = content[token_start:index + 1]
-    if _ABBREVIATION_RE.fullmatch(prefix) or _INITIALISM_RE.fullmatch(prefix):
-        return False
-    return True
-
-
-def _sentences(content: str) -> list[tuple[int, int, str]]:
-    """Split sentences while preserving exact half-open source offsets."""
-
-    result: list[tuple[int, int, str]] = []
-    start = 0
-    index = 0
-    length = len(content)
-    while index < length:
-        value = content[index]
-        boundary = value in "。！？!?\n"
-        if value == ".":
-            boundary = _period_is_boundary(content, index)
-        elif value == "…":
-            boundary = index + 1 >= length or content[index + 1] != "…"
-        if not boundary:
-            index += 1
-            continue
-        end = index + 1
-        while end < length and content[end] in _CLOSING_PUNCTUATION:
-            end += 1
-        while end < length and content[end].isspace() and content[end] != "\n":
-            end += 1
-        if end > start:
-            result.append((start, end, content[start:end]))
-        start = end
-        index = end
-    if start < length:
-        result.append((start, length, content[start:]))
-    return result
-
-
-def _sentence_index(sentences: list[tuple[int, int, str]], offset: int) -> int | None:
-    for index, (start, end, _) in enumerate(sentences):
-        if start <= offset < end:
-            return index
-    return None
 
 
 def _relation_types(logical_schema: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -196,6 +135,35 @@ class VersionedRelationPipeline:
     def __init__(self, policy_set: Mapping[str, object]):
         self.policy_set = normalize_policy_set(policy_set)
 
+    @staticmethod
+    def _apply_candidate_limits(
+        candidates: list[RelationCandidate],
+    ) -> tuple[list[RelationCandidate], list[dict[str, Any]]]:
+        ordered = sorted(candidates, key=lambda item: item.priority_key)
+        admitted: list[RelationCandidate] = []
+        overflow: list[dict[str, Any]] = []
+        per_source: dict[str, int] = defaultdict(int)
+        for candidate in ordered:
+            if per_source[candidate.source_mention_id] >= Config.relation_max_targets_per_source:
+                overflow.append({
+                    "candidate_id": candidate.candidate_id,
+                    "source_mention_id": candidate.source_mention_id,
+                    "reason": "per_source_limit",
+                    "candidate": asdict(candidate),
+                })
+                continue
+            if len(admitted) >= Config.relation_max_candidates_per_chunk:
+                overflow.append({
+                    "candidate_id": candidate.candidate_id,
+                    "source_mention_id": candidate.source_mention_id,
+                    "reason": "chunk_limit",
+                    "candidate": asdict(candidate),
+                })
+                continue
+            admitted.append(candidate)
+            per_source[candidate.source_mention_id] += 1
+        return admitted, overflow
+
     def plan(
         self,
         *,
@@ -204,8 +172,10 @@ class VersionedRelationPipeline:
         content: str,
         entities: list[dict[str, Any]],
         logical_schema: Mapping[str, Any],
-        sentence_window: int = 1,
+        sentence_window: int | None = None,
     ) -> RelationPlan:
+        if sentence_window is None:
+            sentence_window = Config.relation_sentence_window
         fixed: list[dict[str, Any]] = []
         for item in entities:
             name = str(item.get("name") or "")
@@ -286,6 +256,12 @@ class VersionedRelationPipeline:
                 if right_index is None or not allowed:
                     continue
                 sentence_distance = abs(left_index - right_index)
+                char_distance = abs(
+                    (int(source["evidence_start"]) + int(source["evidence_end"])) // 2
+                    - (int(target["evidence_start"]) + int(target["evidence_end"])) // 2
+                )
+                if char_distance > Config.relation_max_char_distance:
+                    continue
                 context_start, context_end = sorted((left_index, right_index))
                 context = " ".join(item[2] for item in sentences[context_start:context_end + 1])
                 if sentence_distance > sentence_window or (
@@ -316,13 +292,25 @@ class VersionedRelationPipeline:
                     source_end_char=int(source["evidence_end"]),
                     target_start_char=int(target["evidence_start"]),
                     target_end_char=int(target["evidence_end"]),
+                    priority_key=(
+                        sentence_distance,
+                        0 if _RELATION_CUE.search(context) else 1,
+                        char_distance,
+                        -float(source.get("confidence") or 0.0)
+                        - float(target.get("confidence") or 0.0),
+                        candidate_id,
+                    ),
                 ))
+        qualified_count = len(candidates)
+        candidates, overflow = self._apply_candidate_limits(candidates)
         increment("relation_raw_pairs", raw_pairs)
         increment("relation_pair_checks", pair_checks)
         increment("relation_candidates", len(candidates))
+        increment("relation_candidate_overflow", len(overflow))
         return RelationPlan(
             policy_set=dict(self.policy_set), raw_pairs=raw_pairs,
-            blocked_pairs=raw_pairs - len(candidates), candidates=candidates,
+            blocked_pairs=raw_pairs - qualified_count, candidates=candidates,
+            overflow=overflow, qualified_count=qualified_count,
         )
 
     @staticmethod
@@ -349,6 +337,7 @@ class VersionedRelationPipeline:
         output_token_reserve: int = 256,
         max_candidates_per_batch: int = 32,
     ) -> list[RelationBatch]:
+        max_candidates_per_batch = max(1, min(32, int(max_candidates_per_batch)))
         if candidate_budget_tokens <= 0:
             plan.deferred.extend({"candidate_id": item.candidate_id, "reason": "no_candidate_budget"}
                                  for item in plan.candidates)
@@ -541,9 +530,15 @@ class VersionedRelationPipeline:
                 )
             ]
             if additions:
-                plan.candidates.extend(additions)
-                plan.blocked_pairs = max(0, plan.raw_pairs - len(plan.candidates))
+                combined, gleaning_overflow = self._apply_candidate_limits([
+                    *plan.candidates, *additions,
+                ])
+                plan.candidates = combined
+                plan.overflow.extend(gleaning_overflow)
+                plan.qualified_count += len(additions)
+                plan.blocked_pairs = max(0, plan.raw_pairs - plan.qualified_count)
                 plan.gleaning_passes = 1
+                increment("relation_gleaning_calls")
         output_reserve = min(
             max(128, Config.relation_classifier_output_reserve),
             max(128, int(context_budget_tokens) // 3),
@@ -564,6 +559,8 @@ class VersionedRelationPipeline:
             "raw_pairs": plan.raw_pairs,
             "blocked_pairs": plan.blocked_pairs,
             "admitted_candidates": plan.admitted_count,
+            "qualified_candidates": plan.qualified_count,
+            "overflow_candidates": len(plan.overflow),
             "classified": 0,
             "deferred": len(plan.deferred),
             "model_calls": 0,
@@ -606,6 +603,7 @@ class VersionedRelationPipeline:
         }
         for batch in batches:
             metrics["model_calls"] += 1
+            increment("relation_classifier_batches")
             metrics["input_tokens"] += batch.estimated_input_tokens
             try:
                 raw = classifier.json_chat(
@@ -633,6 +631,7 @@ class VersionedRelationPipeline:
                     logical_schema=logical_schema,
                 )
             except Exception as exc:
+                increment("relation_classifier_failures")
                 return ShadowClassificationResult(
                     status="failed", plan=plan, decisions=[], batches=batch_audit,
                     metrics={**metrics, "classified": 0}, error=str(exc),
@@ -648,11 +647,21 @@ class VersionedRelationPipeline:
                 "status": "negative" if item.predicate == NO_RELATION else "classified",
                 "request_batch_id": batch.batch_id,
             } for item in validated)
+            increment("relation_verified_positive", sum(
+                1 for item in validated if item.predicate != NO_RELATION
+            ))
+            increment("relation_verified_negative", sum(
+                1 for item in validated if item.predicate == NO_RELATION
+            ))
         plan.classified_count = len(decisions)
         metrics["classified"] = len(decisions)
         return ShadowClassificationResult(
-            status="completed", plan=plan, decisions=decisions,
-            batches=batch_audit, metrics=metrics,
+            status="incomplete" if plan.overflow else "completed",
+            plan=plan, decisions=decisions, batches=batch_audit, metrics=metrics,
+            error=(
+                "bounded candidate limits deferred one or more qualified candidates"
+                if plan.overflow else ""
+            ),
         )
 
     def prepare_shadow(
@@ -688,9 +697,15 @@ class VersionedRelationPipeline:
                 ))
             ]
             if additions:
-                plan.candidates.extend(additions)
-                plan.blocked_pairs = max(0, plan.raw_pairs - len(plan.candidates))
+                combined, gleaning_overflow = self._apply_candidate_limits([
+                    *plan.candidates, *additions,
+                ])
+                plan.candidates = combined
+                plan.overflow.extend(gleaning_overflow)
+                plan.qualified_count += len(additions)
+                plan.blocked_pairs = max(0, plan.raw_pairs - plan.qualified_count)
                 plan.gleaning_passes = 1
+                increment("relation_gleaning_calls")
         output_reserve = min(
             max(128, Config.relation_classifier_output_reserve),
             max(128, int(context_budget_tokens) // 3),
@@ -714,6 +729,8 @@ class VersionedRelationPipeline:
                 "raw_pairs": plan.raw_pairs,
                 "blocked_pairs": plan.blocked_pairs,
                 "admitted_candidates": plan.admitted_count,
+                "qualified_candidates": plan.qualified_count,
+                "overflow_candidates": len(plan.overflow),
                 "classified": 0,
                 "deferred": len(plan.deferred),
                 "model_calls": 0,
@@ -765,27 +782,38 @@ class VersionedRelationPipeline:
             "required": ["decisions"],
             "additionalProperties": False,
         }
-        raw = classifier.json_chat(
-            model=model,
-            system=(
-                "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
-                "Return exactly one decision per candidate_id. Use an allowed predicate only when "
-                "an exact quote proves endpoints, meaning and direction; otherwise return NO_RELATION. "
-                "When evidence text occurs more than once, return its exact half-open character offsets."
-            ),
-            prompt=batch.prompt,
-            schema=response_schema,
-            temperature=0,
-            context_budget_tokens=context_budget_tokens,
-            max_output_tokens=batch.output_token_reserve,
-            safety_margin_tokens=Config.relation_classifier_safety_margin,
-        )
-        validated = self.validate_decisions(
-            candidates,
-            raw.get("decisions") if isinstance(raw, dict) else None,
-            content=content,
-            logical_schema=logical_schema,
-        )
+        increment("relation_classifier_batches")
+        try:
+            raw = classifier.json_chat(
+                model=model,
+                system=(
+                    "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
+                    "Return exactly one decision per candidate_id. Use an allowed predicate only when "
+                    "an exact quote proves endpoints, meaning and direction; otherwise return NO_RELATION. "
+                    "When evidence text occurs more than once, return its exact half-open character offsets."
+                ),
+                prompt=batch.prompt,
+                schema=response_schema,
+                temperature=0,
+                context_budget_tokens=context_budget_tokens,
+                max_output_tokens=batch.output_token_reserve,
+                safety_margin_tokens=Config.relation_classifier_safety_margin,
+            )
+            validated = self.validate_decisions(
+                candidates,
+                raw.get("decisions") if isinstance(raw, dict) else None,
+                content=content,
+                logical_schema=logical_schema,
+            )
+        except Exception:
+            increment("relation_classifier_failures")
+            raise
+        increment("relation_verified_positive", sum(
+            1 for item in validated if item.predicate != NO_RELATION
+        ))
+        increment("relation_verified_negative", sum(
+            1 for item in validated if item.predicate == NO_RELATION
+        ))
         return [
             {
                 **asdict(item),

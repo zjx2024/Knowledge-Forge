@@ -16,6 +16,7 @@ from knowledge_forge.policy import P1_RELATION_SHADOW_POLICY_SET
 from knowledge_forge.relation_pipeline import (
     RelationBatchValidationError,
     RelationCandidate,
+    RelationPlan,
     VersionedRelationPipeline,
     _sentences,
 )
@@ -225,6 +226,93 @@ def test_dense_candidates_are_streamed_across_batches_without_loss():
     assert len(planned) == 15
     assert batched == planned
     assert plan.deferred == []
+
+
+def test_relation_candidate_limits_are_deterministic_and_conserve_overflow(monkeypatch):
+    monkeypatch.setattr("knowledge_forge.relation_pipeline.Config.relation_max_targets_per_source", 2)
+    monkeypatch.setattr("knowledge_forge.relation_pipeline.Config.relation_max_candidates_per_chunk", 5)
+    monkeypatch.setattr("knowledge_forge.relation_pipeline.Config.relation_max_char_distance", 384)
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "A links B links C links D links E links F."
+    entities = []
+    cursor = 0
+    for name in "ABCDEF":
+        start = content.index(name, cursor)
+        cursor = start + 1
+        entities.append({
+            "id": name, "name": name, "type": "GenericEntity",
+            "evidence_text": name, "evidence_start": start, "evidence_end": start + 1,
+        })
+    plan = pipeline.plan(
+        project_scope="project:revision", chunk_key="bounded", content=content,
+        entities=entities,
+        logical_schema={"relation_types": [{"name": "related_to", "symmetric": True}]},
+    )
+
+    assert len(plan.candidates) == 5
+    assert plan.qualified_count == len(plan.candidates) + len(plan.overflow)
+    assert all(item["reason"] in {"per_source_limit", "chunk_limit"} for item in plan.overflow)
+    assert [item.candidate_id for item in plan.candidates] == sorted(
+        (item.candidate_id for item in plan.candidates),
+        key=lambda candidate_id: next(
+            candidate.priority_key for candidate in plan.candidates
+            if candidate.candidate_id == candidate_id
+        ),
+    )
+
+
+@pytest.mark.parametrize(("count", "expected_batches"), [(20, 1), (50, 2), (100, 4)])
+def test_relation_batches_conserve_20_50_100_candidates_with_hard_batch_cap(
+    count, expected_batches,
+):
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    values = [
+        RelationCandidate(
+            candidate_id=f"candidate-{index}", source_mention_id=f"source-{index}",
+            target_mention_id=f"target-{index}", source_name="A", target_name="B",
+            source_type="GenericEntity", target_type="GenericEntity",
+            allowed_predicates=("related_to",), allowed_directions=("as_is",),
+            context_id="ctx-0-0", sentence_start=0, sentence_end=0,
+            context_start_char=0, context_end_char=12, source_start_char=0,
+            source_end_char=1, target_start_char=10, target_end_char=11,
+        )
+        for index in range(count)
+    ]
+    plan = RelationPlan(
+        policy_set=dict(pipeline.policy_set), raw_pairs=count,
+        blocked_pairs=0, candidates=values, qualified_count=count,
+    )
+
+    batches = pipeline.build_batches(
+        plan, content="A relates B.",
+        logical_schema={"relation_types": [{"name": "related_to"}]},
+        candidate_budget_tokens=100_000, max_candidates_per_batch=100,
+    )
+
+    assert len(batches) == expected_batches
+    assert all(len(batch.candidate_ids) <= 32 for batch in batches)
+    assert [item for batch in batches for item in batch.candidate_ids] == [
+        item.candidate_id for item in values
+    ]
+
+
+def test_relation_char_distance_blocks_far_pairs_before_model_calls(monkeypatch):
+    monkeypatch.setattr("knowledge_forge.relation_pipeline.Config.relation_max_char_distance", 32)
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Alpha " + ("x" * 100) + " Beta."
+    beta = content.index("Beta")
+    plan = pipeline.plan(
+        project_scope="project:revision", chunk_key="far", content=content,
+        entities=[
+            {"id": "a", "name": "Alpha", "type": "GenericEntity",
+             "evidence_text": "Alpha", "evidence_start": 0, "evidence_end": 5},
+            {"id": "b", "name": "Beta", "type": "GenericEntity",
+             "evidence_text": "Beta", "evidence_start": beta, "evidence_end": beta + 4},
+        ],
+        logical_schema={"relation_types": [{"name": "related_to", "symmetric": True}]},
+    )
+    assert plan.candidates == []
+    assert plan.qualified_count == 0
 
 
 @pytest.mark.integration

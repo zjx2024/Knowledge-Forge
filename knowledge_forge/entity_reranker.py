@@ -25,10 +25,33 @@ class EntityReranker:
         self._torch: Any = None
         self._device = "cpu"
         self._disabled_reason = ""
+        self._last_fallback_reason = ""
+        self._last_score_used_model = False
 
     @property
     def available(self) -> bool:
         return Config.entity_reranker_enabled and self.model_path.exists() and not self._disabled_reason
+
+    @property
+    def last_score_used_model(self) -> bool:
+        return self._last_score_used_model
+
+    def diagnostics(self) -> dict[str, Any]:
+        enabled = bool(Config.entity_reranker_enabled)
+        exists = self.model_path.exists()
+        return {
+            "reranker_enabled": enabled,
+            "reranker_loaded": self._model is not None,
+            "last_score_used_model": self._last_score_used_model,
+            "reranker_model": str(self.model_path),
+            "reranker_device": self._device,
+            "fallback_reason": (
+                self._disabled_reason
+                or self._last_fallback_reason
+                or ("model path does not exist" if enabled and not exists else "")
+                or ("disabled by configuration" if not enabled else "")
+            ),
+        }
 
     def _load(self) -> bool:
         if self._model is not None:
@@ -57,6 +80,7 @@ class EntityReranker:
                 )
                 model.eval().to(device)
                 self._torch, self._tokenizer, self._model, self._device = torch, tokenizer, model, device
+                self._last_fallback_reason = ""
                 LOGGER.info("实体重排器已加载: %s (%s)", self.model_path, device)
                 return True
             except Exception as exc:
@@ -76,6 +100,7 @@ class EntityReranker:
         return [mention, canonical]
 
     def score(self, raw: dict[str, Any], candidates: list[dict[str, Any]]) -> list[float]:
+        self._last_score_used_model = False
         if not candidates or not self._load():
             return [0.0] * len(candidates)
         with self._lock:
@@ -92,11 +117,14 @@ class EntityReranker:
                     with self._torch.inference_mode():
                         logits = self._model(**inputs, return_dict=True).logits.view(-1).float()
                         scores.extend(float(value) for value in self._torch.sigmoid(logits).cpu().tolist())
+                self._last_score_used_model = True
                 return scores
             except self._torch.cuda.OutOfMemoryError as exc:
                 self._torch.cuda.empty_cache()
+                self._last_fallback_reason = f"CUDA OOM: {exc}"
                 LOGGER.warning("实体重排器 GPU OOM，本批次跳过重排: %s", exc)
                 return [0.0] * len(candidates)
             except Exception as exc:
+                self._last_fallback_reason = str(exc)
                 LOGGER.warning("实体重排失败，本批次使用规则与 LLM 回退: %s", exc)
                 return [0.0] * len(candidates)

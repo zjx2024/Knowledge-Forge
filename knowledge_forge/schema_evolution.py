@@ -29,6 +29,7 @@ from .relation_verification import (
     is_publishable_relation,
     relation_candidate_id,
 )
+from .sentence_spans import split_sentences
 from .value_parsing import coerce_confidence
 
 
@@ -67,15 +68,29 @@ EXTRACTION_FORMAT = {
         "entities": {"type": "array", "items": {"type": "object", "properties": {
             "id": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"},
             "description": {"type": "string"}, "aliases": {"type": "array", "items": {"type": "string"}},
-            "evidence": {"type": "string"}, "confidence": {"type": "number"}},
+            "evidence": {"type": "string"},
+            "evidence_start": {"type": ["integer", "null"]},
+            "evidence_end": {"type": ["integer", "null"]},
+            "mention_start": {"type": ["integer", "null"]},
+            "mention_end": {"type": ["integer", "null"]},
+            "confidence": {"type": "number"}},
             "required": ["id", "name", "type", "description", "aliases", "evidence", "confidence"]}},
         "relations": {"type": "array", "items": {"type": "object", "properties": {
             "source": {"type": "string"}, "target": {"type": "string"}, "type": {"type": "string"},
             "description": {"type": "string"}, "evidence": {"type": "string"},
+            "evidence_start": {"type": ["integer", "null"]},
+            "evidence_end": {"type": ["integer", "null"]},
             "confidence": {"type": "number"}},
             "required": ["source", "target", "type", "description", "evidence", "confidence"]}},
     },
     "required": ["entities", "relations"],
+}
+
+ENTITY_ONLY_EXTRACTION_FORMAT = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"entities": EXTRACTION_FORMAT["properties"]["entities"]},
+    "required": ["entities"],
 }
 
 
@@ -786,14 +801,53 @@ class SchemaEvolutionService:
 
     @staticmethod
     def _sentence_evidence(content: str, source_names: list[str], target_names: list[str]) -> tuple[str, int | None, int | None]:
-        for match in re.finditer(r"[^\n。！？.!?]+(?:[。！？.!?]+|$)", content):
-            sentence = match.group(0).strip()
+        for start, end, sentence in split_sentences(content):
             folded = sentence.casefold()
             if any(name.casefold() in folded for name in source_names if name) and any(
                 name.casefold() in folded for name in target_names if name
             ):
-                start = match.start() + len(match.group(0)) - len(match.group(0).lstrip())
-                return sentence, start, start + len(sentence)
+                return sentence, start, end
+        return "", None, None
+
+    @staticmethod
+    def _exact_source_span(
+        content: str,
+        start: Any,
+        end: Any,
+        surfaces: list[str],
+    ) -> tuple[int, int] | None:
+        try:
+            left, right = int(start), int(end)
+        except (TypeError, ValueError):
+            return None
+        if left < 0 or right <= left or right > len(content):
+            return None
+        actual = re.sub(r"\s+", " ", content[left:right]).strip().casefold()
+        expected = {
+            re.sub(r"\s+", " ", value).strip().casefold()
+            for value in surfaces if str(value).strip()
+        }
+        return (left, right) if actual in expected else None
+
+    @staticmethod
+    def _sentence_for_span(content: str, start: int, end: int) -> tuple[str, int, int]:
+        for sentence_start, sentence_end, sentence in split_sentences(content):
+            if sentence_start <= start and end <= sentence_end:
+                return sentence, sentence_start, sentence_end
+        return content[start:end], start, end
+
+    @staticmethod
+    def _sentence_for_two_spans(
+        content: str,
+        first: tuple[int, int],
+        second: tuple[int, int],
+    ) -> tuple[str, int | None, int | None]:
+        for sentence_start, sentence_end, sentence in split_sentences(content):
+            if (
+                sentence_start <= first[0] < first[1] <= sentence_end
+                and sentence_start <= second[0] < second[1] <= sentence_end
+            ):
+                return sentence, sentence_start, sentence_end
         return "", None, None
 
     @staticmethod
@@ -836,13 +890,40 @@ class SchemaEvolutionService:
                 continue
             aliases = [alias for alias in raw_aliases if _surface_spans(content, alias)]
             verified_surface_forms = list(dict.fromkeys([name, *aliases]))
-            evidence, start, end = self._locate_evidence(
-                content, str(raw.get("evidence") or ""), verified_surface_forms,
-                near=name_spans[0][0],
+            mention_span = self._exact_source_span(
+                content, raw.get("mention_start"), raw.get("mention_end"),
+                verified_surface_forms,
             )
-            if not evidence or not any(_contains_surface(evidence, form) for form in verified_surface_forms):
-                start, end = name_spans[0]
+            if mention_span is None:
+                if len(name_spans) != 1:
+                    rejected_entities += 1
+                    continue
+                mention_span = name_spans[0]
+            mention_start, mention_end = mention_span
+            raw_evidence = str(raw.get("evidence") or "")
+            evidence_span = self._exact_source_span(
+                content, raw.get("evidence_start"), raw.get("evidence_end"),
+                [raw_evidence],
+            )
+            if evidence_span is not None and (
+                evidence_span[0] <= mention_start < mention_end <= evidence_span[1]
+            ):
+                start, end = evidence_span
                 evidence = content[start:end]
+            else:
+                inferred_evidence, inferred_start, inferred_end = self._locate_evidence(
+                    content, raw_evidence, near=mention_start,
+                )
+                if (
+                    inferred_start is not None
+                    and inferred_end is not None
+                    and inferred_start <= mention_start < mention_end <= inferred_end
+                ):
+                    evidence, start, end = inferred_evidence, inferred_start, inferred_end
+                else:
+                    evidence, start, end = self._sentence_for_span(
+                        content, mention_start, mention_end,
+                    )
             entity = {
                 "id": local_id,
                 "name": name,
@@ -855,8 +936,8 @@ class SchemaEvolutionService:
                 "evidence_text": evidence,
                 "evidence_start": start,
                 "evidence_end": end,
-                "mention_start": name_spans[0][0],
-                "mention_end": name_spans[0][1],
+                "mention_start": mention_start,
+                "mention_end": mention_end,
                 "alias_spans": [
                     {
                         "surface": alias,
@@ -889,7 +970,22 @@ class SchemaEvolutionService:
             )
             source_names = source.get("verified_surface_forms") or [source["name"]]
             target_names = target.get("verified_surface_forms") or [target["name"]]
-            evidence, start, end = self._locate_evidence(content, str(raw.get("evidence") or ""))
+            raw_evidence = str(raw.get("evidence") or "")
+            evidence_span = self._exact_source_span(
+                content, raw.get("evidence_start"), raw.get("evidence_end"),
+                [raw_evidence],
+            )
+            if evidence_span is not None:
+                start, end = evidence_span
+                evidence = content[start:end]
+            elif raw_evidence:
+                evidence, start, end = self._sentence_for_two_spans(
+                    content,
+                    (int(source["mention_start"]), int(source["mention_end"])),
+                    (int(target["mention_start"]), int(target["mention_end"])),
+                )
+            else:
+                evidence, start, end = "", None, None
             confidence = coerce_confidence(raw.get("confidence"), 0.5)
             explicit_endpoints = bool(
                 evidence
@@ -1434,6 +1530,8 @@ class SchemaEvolutionService:
             system=(
                 "Extract a concise knowledge graph using only facts explicitly stated in the source text. "
                 "Every entity and relation must include an exact evidence quote copied from the source. "
+                "Every entity must include exact half-open mention_start/mention_end offsets; every relation "
+                "must include exact half-open evidence_start/evidence_end offsets. "
                 "Entity ids are local unique ids and every relation endpoint must reference one of them. "
                 "Do not create entities absent from the text, and do not infer relations from co-occurrence. "
                 "Prefer specific allowed types; use GenericEntity or related_to only when the text supports the fact but not a specific type."
@@ -1522,4 +1620,52 @@ class SchemaEvolutionService:
                 for key in ("evidence_start", "evidence_end"):
                     if record.get(key) is not None:
                         record[key] = int(record[key]) + body_start
+        return extraction
+
+    def extract_entities_only(
+        self,
+        project: dict[str, Any],
+        schema_record: dict[str, Any],
+        chunk: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run the isolated P2 entity treatment without relation work or gleaning."""
+
+        logical = schema_record["schema_json"]
+        content, body_start = _chunk_body_with_offset(chunk)
+        model = project.get("llm_model") or Config.default_llm_model
+        raw = self.ollama.json_chat(
+            model=model,
+            system=(
+                "Extract only source-backed entity mentions. Preserve every distinct occurrence, "
+                "including repeated surface forms. Return exact half-open mention/evidence offsets "
+                "for every entity. Do not extract or infer relations."
+            ),
+            prompt=(
+                f"Entity schema:\n{json.dumps(logical.get('entity_types') or [], ensure_ascii=False)}"
+                f"\n\nSource text:\n{content}"
+            ),
+            schema=ENTITY_ONLY_EXTRACTION_FORMAT,
+            context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+            max_output_tokens=Config.extraction_max_output_tokens,
+        )
+        extraction = self._sanitize_extraction(
+            {"entities": raw.get("entities") or [], "relations": []}, content, logical,
+        )
+        extraction["relations"] = []
+        extraction["_verification_events"] = []
+        extraction["_diagnostics"] = {
+            **extraction.get("_diagnostics", {}),
+            "llm_calls": 1,
+            "entity_only": True,
+            "gleaning_used": False,
+            "verification_llm_calls": 0,
+        }
+        for entity in extraction.get("entities") or []:
+            for key in ("evidence_start", "evidence_end", "mention_start", "mention_end"):
+                if entity.get(key) is not None:
+                    entity[key] = int(entity[key]) + body_start
+            for alias in entity.get("alias_spans") or []:
+                for key in ("start", "end"):
+                    if alias.get(key) is not None:
+                        alias[key] = int(alias[key]) + body_start
         return extraction

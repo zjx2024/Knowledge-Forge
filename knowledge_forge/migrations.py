@@ -1022,6 +1022,31 @@ $$;
 """
 
 
+MENTION_OCCURRENCE_IDENTITY_SQL = r"""
+ALTER TABLE entity_resolution_decisions
+    ADD COLUMN IF NOT EXISTS mention_key TEXT NOT NULL DEFAULT '';
+
+UPDATE entity_resolution_decisions decision
+SET mention_key='mention_' || md5(
+    concat_ws(E'\x1f',decision.project_id::text,decision.document_id::text,
+              decision.revision_id,decision.chunk_id::text,decision.entity_type,
+              decision.mention_text))
+WHERE mention_key='';
+
+DROP INDEX IF EXISTS uq_entity_mentions_revision_payload;
+DROP INDEX IF EXISTS uq_resolution_revision_key;
+DROP INDEX IF EXISTS idx_entity_alias_exact;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_resolution_revision_mention
+    ON entity_resolution_decisions(revision_id,mention_key)
+    WHERE mention_key<>'' AND is_deleted=FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_entity_alias_exact
+    ON canonical_entity_aliases(project_id,normalized_alias,entity_type,canonical_entity_id)
+    WHERE active=TRUE;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1058,6 +1083,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Safely extend the indexing failure terminal-state constraint",
         sql=INDEXING_FAILURE_STATUS_SQL,
         startup_safe=True,
+    ),
+    Migration(
+        version="0008_mention_occurrence_identity",
+        description="Preserve repeated mention occurrences with stable revision-scoped identity",
+        sql=MENTION_OCCURRENCE_IDENTITY_SQL,
     ),
 )
 

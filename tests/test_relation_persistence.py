@@ -64,7 +64,7 @@ def test_confidence_zero_is_preserved_for_mentions_candidates_and_relations():
         "confidence": 0,
     })
     mention_insert = connection.calls[0]
-    assert mention_insert[1][8] == 0
+    assert mention_insert[1][9] == 0
 
     connection.calls.clear()
     database.upsert_relation_candidate({

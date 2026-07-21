@@ -106,7 +106,11 @@ class SpanFirstEntityExtractor:
                 result.rejected.append({"raw": dict(raw), "reason": "structural_node"})
                 continue
             left, right = span
-            material = "\x1f".join((project_scope, document_key, chunk_key, str(left), str(right), surface))
+            entity_type = str(raw.get("type") or "GenericEntity")
+            material = "\x1f".join((
+                project_scope, document_key, chunk_key, str(left), str(right),
+                entity_type, surface,
+            ))
             mention_id = "mention_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
             if mention_id in seen:
                 continue
@@ -125,7 +129,7 @@ class SpanFirstEntityExtractor:
             result.mentions.append(mention)
             result.type_assertions.append(TypeAssertion(
                 mention_id=mention_id,
-                entity_type=str(raw.get("type") or "GenericEntity"),
+                entity_type=entity_type,
                 confidence=confidence,
                 evidence=surface,
                 policy_version=self.policy_version,

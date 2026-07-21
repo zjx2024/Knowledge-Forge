@@ -69,7 +69,8 @@ def test_entity_shadow_pipeline_reads_active_chunks_not_formal_mentions():
     source = inspect.getsource(KnowledgeForgeService.build_entity_shadow_namespace)
     assert "list_document_chunks" in source
     assert "SpanFirstEntityExtractor" in source
-    assert "schemas.extract_chunk" in source
+    assert "schemas.extract_entities_only" in source
+    assert "schemas.extract_chunk" not in source
     assert "list_document_mentions" not in source
 
 

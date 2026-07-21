@@ -213,6 +213,43 @@ def test_graph_generation_cannot_become_ready_with_blocking_derived_index_outbox
         service._rebuild_project_graph_locked(9, target_generation=4)
 
 
+def test_treatment_activation_fails_closed_without_formal_materialization():
+    from knowledge_forge.service import KnowledgeForgeService, TreatmentMaterializationRequired
+
+    class NoSideEffectDb:
+        def __getattr__(self, name):
+            raise AssertionError(f"activation side effect attempted: {name}")
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = NoSideEffectDb()
+    with pytest.raises(TreatmentMaterializationRequired):
+        service.activate_treatment_snapshot(9, "snapshot-1")
+
+
+def test_treatment_activation_http_endpoint_returns_409_without_side_effects(monkeypatch):
+    from knowledge_forge import web
+    from knowledge_forge.service import TreatmentMaterializationRequired
+
+    class FailClosedService:
+        @staticmethod
+        def activate_treatment_snapshot(project_id: int, snapshot_id: str):
+            assert project_id == 9
+            assert snapshot_id == "snapshot-1"
+            raise TreatmentMaterializationRequired("treatment 尚未正式物化")
+
+    monkeypatch.setattr(web, "SERVICE", FailClosedService())
+    handler = object.__new__(web.AppHandler)
+    handler.path = "/api/projects/9/treatment/snapshot-1/activate"
+    response = {}
+    handler._json = lambda status, data: response.update(status=status, data=data)
+
+    handler.do_POST()
+
+    assert response["status"] == 409
+    assert response["data"]["ok"] is False
+    assert "尚未正式物化" in response["data"]["error"]
+
+
 @pytest.mark.integration
 def test_postgres_merge_undo_split_rebuilds_provenance_and_relation_endpoints(
     active_document_revision,

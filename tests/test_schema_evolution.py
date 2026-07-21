@@ -283,17 +283,24 @@ class SequentialExtractionOllama:
 def test_informative_empty_first_pass_gets_one_targeted_second_pass(monkeypatch):
     monkeypatch.setattr(Config, "extraction_gleaning_enabled", True)
     monkeypatch.setattr(Config, "extraction_verification_enabled", False)
+    core_start = RICH_INDUSTRY.index("核心企业")
+    servo_start = RICH_INDUSTRY.index("伺服系统")
+    relation_start = RICH_INDUSTRY.index("核心企业使用伺服系统")
+    relation_text = "核心企业使用伺服系统"
     ollama = SequentialExtractionOllama([
         {"entities": [], "relations": []},
         {
             "entities": [
                 {"id": "e1", "name": "核心企业", "type": "Organization", "description": "", "aliases": [],
-                 "evidence": "核心企业", "confidence": 0.9},
+                 "evidence": "核心企业", "mention_start": core_start,
+                 "mention_end": core_start + len("核心企业"), "confidence": 0.9},
                 {"id": "e2", "name": "伺服系统", "type": "Product", "description": "", "aliases": [],
-                 "evidence": "伺服系统", "confidence": 0.9},
+                 "evidence": "伺服系统", "mention_start": servo_start,
+                 "mention_end": servo_start + len("伺服系统"), "confidence": 0.9},
             ],
             "relations": [{"source": "e1", "target": "e2", "type": "uses", "description": "",
-                           "evidence": "核心企业使用伺服系统", "confidence": 0.9}],
+                           "evidence": relation_text, "evidence_start": relation_start,
+                           "evidence_end": relation_start + len(relation_text), "confidence": 0.9}],
         },
     ])
     result = SchemaEvolutionService(None, ollama).extract_chunk(

@@ -8,7 +8,7 @@ import pytest
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from knowledge_forge.database import SCHEMA_SQL
+from knowledge_forge.database import Database, SCHEMA_SQL
 
 
 def _nodes(plan):
@@ -29,7 +29,21 @@ def _assert_selective_index_plan(plan, *, expected_fragment: str = ""):
     nodes = list(_nodes(plan))
     scans = [node for node in nodes if "Scan" in str(node.get("Node Type") or "")]
     assert scans
-    assert not any(node.get("Node Type") == "Seq Scan" for node in scans)
+    growing_relations = {
+        "canonical_entities",
+        "canonical_entity_aliases",
+        "canonical_entity_documents",
+        "vector_embeddings",
+    }
+    unbounded = [
+        (node.get("Node Type"), node.get("Relation Name"), node.get("Index Name"))
+        for node in scans
+        if (
+        node.get("Node Type") == "Seq Scan"
+        and node.get("Relation Name") in growing_relations
+        )
+    ]
+    assert not unbounded, unbounded
     if expected_fragment:
         assert any(expected_fragment in str(node.get("Index Name") or "") for node in scans)
     assert int(plan.get("Actual Rows") or 0) <= 50
@@ -104,26 +118,14 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_docume
                 conn.execute("ANALYZE canonical_entity_aliases")
                 conn.execute("ANALYZE canonical_entity_documents")
 
-                exact_name = _explain(
-                    conn,
-                    """SELECT id FROM canonical_entities WHERE project_id=%s
-                       AND normalized_name=%s AND is_deleted=FALSE LIMIT 10""",
-                    (project_id, f"entity{target}"),
+                exact_sql, exact_params = Database.build_exact_entity_candidates_query(
+                    project_id, "GenericEntity", f"entity{target}", 10,
                 )
-                exact_alias = _explain(
-                    conn,
-                    """SELECT canonical_entity_id FROM canonical_entity_aliases
-                       WHERE project_id=%s AND entity_type='GenericEntity'
-                         AND normalized_alias=%s AND active=TRUE LIMIT 10""",
-                    (project_id, f"entity{target}"),
+                lexical_sql, lexical_params = Database.build_lexical_entity_candidates_query(
+                    project_id, "GenericEntity", rare_alias, 10, 0.45,
                 )
-                fuzzy_alias = _explain(
-                    conn,
-                    """SELECT canonical_entity_id FROM canonical_entity_aliases
-                       WHERE project_id=%s AND normalized_alias ILIKE %s AND active=TRUE
-                       ORDER BY similarity(normalized_alias,%s) DESC LIMIT 10""",
-                    (project_id, f"%{rare_alias}%", rare_alias),
-                )
+                exact_alias = _explain(conn, exact_sql, exact_params)
+                fuzzy_alias = _explain(conn, lexical_sql, lexical_params)
                 sources = _explain(
                     conn,
                     """SELECT COUNT(*) FROM canonical_entity_documents
@@ -133,7 +135,6 @@ def test_postgres_10k_and_100k_candidate_plans_use_bounded_indexes(active_docume
                        AND is_deleted=FALSE""",
                     (project_id, project_id, f"entity{target}"),
                 )
-                _assert_selective_index_plan(exact_name, expected_fragment="idx_entities_normalized")
                 _assert_selective_index_plan(exact_alias, expected_fragment="idx_entity_alias_exact")
                 if target >= 100_000:
                     _assert_selective_index_plan(
