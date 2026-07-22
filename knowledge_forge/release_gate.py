@@ -11,13 +11,15 @@ from .database import Database
 from .quality import (
     b3_metrics,
     calibration_metrics,
-    candidate_recall,
     canonical_digest,
+    entity_candidate_recall_at_k,
+    evaluate_entity_pair_constraints,
     evaluate_entity_mentions,
     evaluate_relations,
     evaluate_release_gate,
     paired_discordance,
     pairwise_clustering_metrics,
+    relation_pair_candidate_recall_at_budget,
     validate_gold_annotations,
     validate_gold_manifest,
 )
@@ -37,6 +39,31 @@ def _mention_identity(item: dict[str, Any]) -> str:
     ))
 
 
+def _pair(value: Any, *, relation: bool = False) -> tuple[str, str] | None:
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return str(value[0]), str(value[1])
+    if not isinstance(value, dict):
+        return None
+    if relation:
+        left_keys = ("subject_mention_id", "source_mention_id", "source", "left")
+        right_keys = ("object_mention_id", "target_mention_id", "target", "right")
+    else:
+        left_keys = ("left_mention_id", "left", "source_mention_id", "source")
+        right_keys = ("right_mention_id", "right", "target_mention_id", "target")
+    left = next((value.get(key) for key in left_keys if value.get(key) is not None), None)
+    right = next((value.get(key) for key in right_keys if value.get(key) is not None), None)
+    if left is None or right is None:
+        return None
+    return str(left), str(right)
+
+
+def _scoped_pair(item_id: str, value: Any, *, relation: bool = False) -> tuple[str, str] | None:
+    pair = _pair(value, relation=relation)
+    if pair is None:
+        return None
+    return f"{item_id}:{pair[0]}", f"{item_id}:{pair[1]}"
+
+
 def _policy_metrics(gold_items: list[dict[str, Any]], predictions: list[dict[str, Any]], policy: str) -> dict[str, Any]:
     gold_mentions: list[dict[str, Any]] = []
     predicted_mentions: list[dict[str, Any]] = []
@@ -44,8 +71,16 @@ def _policy_metrics(gold_items: list[dict[str, Any]], predictions: list[dict[str
     predicted_relations: list[dict[str, Any]] = []
     gold_clusters: dict[str, str] = {}
     predicted_clusters: dict[str, str] = {}
-    gold_candidate_links: list[tuple[str, str]] = []
-    predicted_candidate_links: list[tuple[str, str]] = []
+    assignment_by_mention: dict[str, str] = {}
+    must_links: list[tuple[str, str]] = []
+    cannot_links: list[tuple[str, str]] = []
+    hard_negatives: list[tuple[str, str]] = []
+    gold_entity_candidate_links: list[tuple[str, str]] = []
+    predicted_entity_candidate_links: list[tuple[str, str]] = []
+    gold_relation_candidate_links: list[tuple[str, str]] = []
+    predicted_relation_candidate_links: list[tuple[str, str]] = []
+    entity_candidate_limits: list[int] = []
+    relation_candidate_budgets: list[int] = []
     calibration_labels: list[int] = []
     calibration_probabilities: list[float] = []
     item_correct: list[bool] = []
@@ -67,20 +102,51 @@ def _policy_metrics(gold_items: list[dict[str, Any]], predictions: list[dict[str
             predicted_clusters[_mention_identity(mention)] = str(
                 mention.get("canonical_id") or mention.get("mention_id") or _mention_identity(mention)
             )
+            mention_id = str(mention.get("mention_id") or _mention_identity(mention))
+            assignment_by_mention[f"{item_id}:{mention_id}"] = str(
+                mention.get("canonical_id") or mention_id
+            )
+        for field, target in (
+            ("must_links", must_links),
+            ("cannot_links", cannot_links),
+            ("entity_hard_negatives", hard_negatives),
+        ):
+            values = gold_item.get(field)
+            if values is None and field == "entity_hard_negatives":
+                values = gold_item.get("hard_negatives")
+            for value in values or []:
+                pair = _scoped_pair(item_id, value)
+                if pair is not None:
+                    target.append(pair)
+        gold_entity_candidate_links.extend(
+            pair for value in gold_item.get("must_links") or []
+            if (pair := _scoped_pair(item_id, value)) is not None
+        )
+        predicted_entity_candidate_links.extend(
+            pair for value in prediction.get("entity_candidates") or []
+            if (pair := _scoped_pair(item_id, value)) is not None
+        )
+        if prediction.get("entity_candidate_k") is not None:
+            entity_candidate_limits.append(int(prediction["entity_candidate_k"]))
         current_gold_relations = list(gold_item.get("relations") or [])
         current_predicted_relations = list(prediction.get("relations") or [])
         gold_relations.extend(current_gold_relations)
         predicted_relations.extend(current_predicted_relations)
         for relation in current_gold_relations:
-            gold_candidate_links.append((
-                str(relation.get("subject_mention_id") or relation.get("source")),
-                str(relation.get("object_mention_id") or relation.get("target")),
-            ))
-        for candidate in prediction.get("candidates") or current_predicted_relations:
-            predicted_candidate_links.append((
-                str(candidate.get("subject_mention_id") or candidate.get("source_mention_id") or candidate.get("source")),
-                str(candidate.get("object_mention_id") or candidate.get("target_mention_id") or candidate.get("target")),
-            ))
+            pair = _scoped_pair(item_id, relation, relation=True)
+            if pair is not None:
+                gold_relation_candidate_links.append(pair)
+        relation_candidates = (
+            prediction.get("relation_candidates")
+            or prediction.get("candidates")
+            or current_predicted_relations
+        )
+        for candidate in relation_candidates:
+            pair = _scoped_pair(item_id, candidate, relation=True)
+            if pair is not None:
+                predicted_relation_candidate_links.append(pair)
+        if prediction.get("relation_candidate_budget") is not None:
+            relation_candidate_budgets.append(int(prediction["relation_candidate_budget"]))
         probabilities = {
             str(item["key"]): float(item.get("probability") or 0.0)
             for item in prediction.get("calibration") or []
@@ -100,7 +166,22 @@ def _policy_metrics(gold_items: list[dict[str, Any]], predictions: list[dict[str
     pairwise = pairwise_clustering_metrics(gold_clusters, predicted_clusters)
     b3 = b3_metrics(gold_clusters, predicted_clusters)
     relation_report = evaluate_relations(gold_relations, predicted_relations)
-    candidates = candidate_recall(gold_candidate_links, predicted_candidate_links)
+    entity_candidates = entity_candidate_recall_at_k(
+        gold_entity_candidate_links,
+        predicted_entity_candidate_links,
+        k=max(entity_candidate_limits) if entity_candidate_limits else None,
+    )
+    relation_candidates = relation_pair_candidate_recall_at_budget(
+        gold_relation_candidate_links,
+        predicted_relation_candidate_links,
+        budget=max(relation_candidate_budgets) if relation_candidate_budgets else None,
+    )
+    entity_constraints = evaluate_entity_pair_constraints(
+        must_links=must_links,
+        cannot_links=cannot_links,
+        hard_negatives=hard_negatives,
+        assignments=assignment_by_mention,
+    )
     invalid_evidence = sum(
         relation.get("evidence_start") is None or relation.get("evidence_end") is None
         or not (relation.get("evidence_text") or relation.get("evidence"))
@@ -111,17 +192,28 @@ def _policy_metrics(gold_items: list[dict[str, Any]], predictions: list[dict[str
         "pairwise": pairwise,
         "b3": b3,
         "relations": relation_report,
-        "candidate_recall": candidates,
+        "entity_candidate_recall_at_k": entity_candidates,
+        "relation_pair_candidate_recall_at_budget": relation_candidates,
+        "entity_constraints": entity_constraints,
         "calibration": calibration_metrics(calibration_labels, calibration_probabilities),
         "cost": {"tokens": total_tokens, "model_calls": total_calls},
         "safety": {
             "invalid_evidence_publication": invalid_evidence,
-            "critical_errors": invalid_evidence,
+            "incomplete_entity_constraint_coverage": int(
+                not entity_constraints["coverage_complete"]
+            ),
+            "critical_errors": invalid_evidence + int(
+                not entity_constraints["coverage_complete"]
+            ),
         },
         "item_correct": item_correct,
         "denominators": {
             "gold_mentions": len(gold_mentions), "predicted_mentions": len(predicted_mentions),
             "gold_relations": len(gold_relations), "predicted_relations": len(predicted_relations),
+            "must_links": len(must_links), "cannot_links": len(cannot_links),
+            "hard_negatives": len(hard_negatives),
+            "entity_candidate_pairs": len(predicted_entity_candidate_links),
+            "relation_candidate_pairs": len(predicted_relation_candidate_links),
             "calibration_items": len(calibration_labels), "items": len(gold_items),
         },
     }
@@ -172,7 +264,12 @@ def evaluate_frozen_bundle(
             "entity_f1": float(control["entity_mentions"]["exact_span"]["f1"]),
             "b3_f1": float(control["b3"]["f1"]),
             "relation_f1": float(control["relations"]["strict"]["f1"]),
-            "candidate_recall": float(control["candidate_recall"]["recall"]),
+            "entity_candidate_recall_at_k": float(
+                control["entity_candidate_recall_at_k"]["recall"]
+            ),
+            "relation_pair_candidate_recall_at_budget": float(
+                control["relation_pair_candidate_recall_at_budget"]["recall"]
+            ),
             "critical_errors": int(control["safety"]["critical_errors"]),
             "cost": float(control["cost"]["tokens"]),
         },
@@ -180,7 +277,12 @@ def evaluate_frozen_bundle(
             "entity_f1": float(treatment["entity_mentions"]["exact_span"]["f1"]),
             "b3_f1": float(treatment["b3"]["f1"]),
             "relation_f1": float(treatment["relations"]["strict"]["f1"]),
-            "candidate_recall": float(treatment["candidate_recall"]["recall"]),
+            "entity_candidate_recall_at_k": float(
+                treatment["entity_candidate_recall_at_k"]["recall"]
+            ),
+            "relation_pair_candidate_recall_at_budget": float(
+                treatment["relation_pair_candidate_recall_at_budget"]["recall"]
+            ),
             "critical_errors": int(treatment["safety"]["critical_errors"]),
             "cost": float(treatment["cost"]["tokens"]),
         },

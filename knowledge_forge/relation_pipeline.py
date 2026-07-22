@@ -130,7 +130,13 @@ def _types(definition: Mapping[str, Any], side: str) -> set[str]:
 
 
 def _type_allowed(actual: str, expected: set[str]) -> bool:
-    return not expected or "GenericEntity" in expected or actual in expected or actual == "GenericEntity"
+    return (
+        not expected
+        or "*" in expected
+        or "GenericEntity" in expected
+        or actual in expected
+        or actual == "GenericEntity"
+    )
 
 
 class VersionedRelationPipeline:

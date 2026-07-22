@@ -332,10 +332,170 @@ def b3_metrics(gold: dict[str, str], predicted: dict[str, str]) -> dict[str, Any
 
 
 def candidate_recall(gold_links: Iterable[tuple[str, str]], candidates: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Compatibility wrapper for legacy callers; new reports use domain-specific names."""
+
     gold = {tuple(sorted(pair)) for pair in gold_links}
     recalled = {tuple(sorted(pair)) for pair in candidates}
     return {"gold": len(gold), "candidates": len(recalled),
             "recall": len(gold & recalled) / len(gold) if gold else 1.0}
+
+
+def _candidate_recall_details(
+    gold_links: Iterable[tuple[str, str]],
+    candidates: Iterable[tuple[str, str]],
+    *,
+    directed: bool,
+    metric: str,
+    limit_name: str,
+    limit: int | None,
+) -> dict[str, Any]:
+    def normalize(pair: tuple[str, str]) -> tuple[str, str]:
+        left, right = str(pair[0]), str(pair[1])
+        return (left, right) if directed else tuple(sorted((left, right)))
+
+    gold = {normalize(pair) for pair in gold_links}
+    recalled = {normalize(pair) for pair in candidates}
+    matched = gold & recalled
+    missing = gold - recalled
+    separator = "->" if directed else "|"
+    lower, upper = wilson_interval(len(matched), len(gold))
+    return {
+        "metric": metric,
+        limit_name: int(limit) if limit is not None else None,
+        "gold": len(gold),
+        "candidates": len(recalled),
+        "true_positive": len(matched),
+        "false_negative": len(missing),
+        "recall": len(matched) / len(gold) if gold else 1.0,
+        "recall_wilson_95": [lower, upper],
+        "true_positive_ids": [separator.join(pair) for pair in sorted(matched)],
+        "false_negative_ids": [separator.join(pair) for pair in sorted(missing)],
+    }
+
+
+def entity_candidate_recall_at_k(
+    gold_links: Iterable[tuple[str, str]],
+    candidates: Iterable[tuple[str, str]],
+    *,
+    k: int | None = None,
+) -> dict[str, Any]:
+    """Recall of must-link entity pairs inside the bounded normalization candidates."""
+
+    return _candidate_recall_details(
+        gold_links,
+        candidates,
+        directed=False,
+        metric="entity_candidate_recall_at_k",
+        limit_name="k",
+        limit=k,
+    )
+
+
+def relation_pair_candidate_recall_at_budget(
+    gold_links: Iterable[tuple[str, str]],
+    candidates: Iterable[tuple[str, str]],
+    *,
+    budget: int | None = None,
+) -> dict[str, Any]:
+    """Recall of directed Gold relation endpoints inside the bounded pair plan."""
+
+    return _candidate_recall_details(
+        gold_links,
+        candidates,
+        directed=True,
+        metric="relation_pair_candidate_recall_at_budget",
+        limit_name="budget",
+        limit=budget,
+    )
+
+
+def evaluate_entity_pair_constraints(
+    *,
+    must_links: Iterable[tuple[str, str]],
+    cannot_links: Iterable[tuple[str, str]],
+    hard_negatives: Iterable[tuple[str, str]],
+    assignments: dict[str, str],
+) -> dict[str, Any]:
+    """Evaluate positive and negative pair labels against canonical assignments."""
+
+    must = {tuple(sorted((str(left), str(right)))) for left, right in must_links}
+    cannot = {tuple(sorted((str(left), str(right)))) for left, right in cannot_links}
+    hard = {tuple(sorted((str(left), str(right)))) for left, right in hard_negatives}
+    negatives = cannot | hard
+    overlap = must & negatives
+    if overlap:
+        raise GoldManifestError(f"pair appears in positive and negative Gold: {sorted(overlap)}")
+
+    tp_ids: list[str] = []
+    fn_ids: list[str] = []
+    tn_ids: list[str] = []
+    fp_ids: list[str] = []
+    unresolved_ids: list[str] = []
+
+    def same_cluster(pair: tuple[str, str]) -> bool | None:
+        left, right = pair
+        if left not in assignments or right not in assignments:
+            return None
+        return str(assignments[left]) == str(assignments[right])
+
+    for pair in sorted(must):
+        verdict = same_cluster(pair)
+        pair_id = "|".join(pair)
+        if verdict is None:
+            unresolved_ids.append(pair_id)
+        elif verdict:
+            tp_ids.append(pair_id)
+        else:
+            fn_ids.append(pair_id)
+    for pair in sorted(negatives):
+        verdict = same_cluster(pair)
+        pair_id = "|".join(pair)
+        if verdict is None:
+            unresolved_ids.append(pair_id)
+        elif verdict:
+            fp_ids.append(pair_id)
+        else:
+            tn_ids.append(pair_id)
+
+    precision_total = len(tp_ids) + len(fp_ids)
+    recall_total = len(tp_ids) + len(fn_ids)
+    precision_lower, precision_upper = wilson_interval(len(tp_ids), precision_total)
+    recall_lower, recall_upper = wilson_interval(len(tp_ids), recall_total)
+    review_queue = [
+        {"pair_id": pair_id, "reason": reason}
+        for reason, values in (
+            ("must_link_not_merged", fn_ids),
+            ("negative_pair_merged", fp_ids),
+            ("missing_assignment", unresolved_ids),
+        )
+        for pair_id in values
+    ]
+    return {
+        "confusion_matrix": {
+            "true_positive": len(tp_ids),
+            "true_negative": len(tn_ids),
+            "false_positive": len(fp_ids),
+            "false_negative": len(fn_ids),
+        },
+        "denominators": {
+            "must_links": len(must),
+            "cannot_links": len(cannot),
+            "hard_negatives": len(hard),
+        },
+        "sample_ids": {
+            "true_positive": tp_ids,
+            "true_negative": tn_ids,
+            "false_positive": fp_ids,
+            "false_negative": fn_ids,
+            "unresolved": sorted(unresolved_ids),
+        },
+        "precision": len(tp_ids) / precision_total if precision_total else 1.0,
+        "recall": len(tp_ids) / recall_total if recall_total else float(not must),
+        "precision_wilson_95": [precision_lower, precision_upper],
+        "recall_wilson_95": [recall_lower, recall_upper],
+        "coverage_complete": not unresolved_ids,
+        "review_queue": review_queue,
+    }
 
 
 def _relation_key(item: dict[str, Any]) -> tuple[Any, ...]:
@@ -423,8 +583,18 @@ def evaluate_release_gate(
         failed.append("human_gold")
     if treatment.get("critical_errors", 0) > 0:
         failed.append("critical_errors")
-    if treatment.get("candidate_recall", 0) < 0.99:
-        failed.append("candidate_recall")
+    legacy_recall = treatment.get("candidate_recall")
+    entity_candidate_recall = treatment.get(
+        "entity_candidate_recall_at_k", legacy_recall if legacy_recall is not None else 0,
+    )
+    relation_candidate_recall = treatment.get(
+        "relation_pair_candidate_recall_at_budget",
+        legacy_recall if legacy_recall is not None else 0,
+    )
+    if entity_candidate_recall < 0.99:
+        failed.append("entity_candidate_recall_at_k")
+    if relation_candidate_recall < 0.99:
+        failed.append("relation_pair_candidate_recall_at_budget")
     for metric, tolerance in (("entity_f1", 0.005), ("b3_f1", 0.005), ("relation_f1", 0.01)):
         if treatment.get(metric, 0) + tolerance < control.get(metric, 0):
             failed.append(f"{metric}_non_inferiority")

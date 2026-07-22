@@ -13,6 +13,7 @@ from knowledge_forge.relation_pipeline import (
     RelationBatchValidationError,
     VersionedRelationPipeline,
 )
+from knowledge_forge.schema_evolution import BASE_SCHEMA
 
 
 def _entities():
@@ -77,6 +78,23 @@ def test_stage_one_mentions_produce_stable_blocked_candidates_and_counts():
         logical_schema=_schema(),
     )
     assert renamed_ids.candidates[0].candidate_id != first.candidates[0].candidate_id
+
+
+def test_base_schema_wildcard_matches_multiple_concrete_entity_types() -> None:
+    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+        project_scope="project-1",
+        chunk_key="wildcard",
+        content="Alpha uses Beta.",
+        entities=_entities(),
+        logical_schema=BASE_SCHEMA,
+    )
+
+    uses = [item for item in plan.candidates if "uses" in item.allowed_predicates]
+    assert uses
+    assert {(item.source_type, item.target_type) for item in uses} == {
+        ("Organization", "Product"),
+        ("Product", "Organization"),
+    }
 
 
 def test_relation_planner_checks_only_sentence_local_pairs_without_changing_denominator(
