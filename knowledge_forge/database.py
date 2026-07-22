@@ -6150,6 +6150,376 @@ class Database:
             "edges": edges,
         }
 
+    def start_community_report_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        with self.connection() as conn:
+            detection = conn.execute(
+                "SELECT * FROM graphrag_community_runs WHERE run_id=%s FOR SHARE",
+                (values["detection_run_id"],),
+            ).fetchone()
+            if not detection or int(detection["project_id"]) != int(values["project_id"]):
+                raise LookupError("community detection run 不存在或跨项目")
+            if detection["status"] not in {"completed", "completed_empty"}:
+                raise RuntimeError("community detection run 尚未完整完成")
+            row = conn.execute(
+                """INSERT INTO graphrag_community_report_runs(
+                   run_id,project_id,graph_generation,detection_run_id,
+                   community_input_hash,input_hash,prompt_hash,model_config_hash,model_id,
+                   graphrag_version,status,expected,config)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'running',%s,%s::jsonb)
+                   ON CONFLICT(run_id) DO NOTHING RETURNING *""",
+                (
+                    values["run_id"], values["project_id"], values["graph_generation"],
+                    values["detection_run_id"], values["community_input_hash"],
+                    values["input_hash"], values["prompt_hash"],
+                    values["model_config_hash"], values["model_id"],
+                    values["graphrag_version"],
+                    values["expected"], self._json(values.get("config") or {}),
+                ),
+            ).fetchone()
+            if row:
+                return row
+            existing = conn.execute(
+                "SELECT * FROM graphrag_community_report_runs WHERE run_id=%s",
+                (values["run_id"],),
+            ).fetchone()
+            immutable = (
+                "project_id", "graph_generation", "detection_run_id", "input_hash",
+                "prompt_hash", "model_config_hash", "model_id", "graphrag_version",
+            )
+            if not existing or any(str(existing[key]) != str(values[key]) for key in immutable):
+                raise RuntimeError("community report run 幂等键与不可变输入不一致")
+            return existing
+
+    def list_community_report_items(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM graphrag_community_reports
+                   WHERE run_id=%s ORDER BY level,community_id""",
+                (run_id,),
+            ).fetchall()
+
+    def upsert_community_report_item(
+        self, run_id: str, item: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_community_report_runs WHERE run_id=%s FOR SHARE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("community report run 不存在")
+            community = conn.execute(
+                """SELECT * FROM graphrag_communities
+                   WHERE run_id=%s AND project_id=%s AND stable_community_id=%s""",
+                (run["detection_run_id"], run["project_id"], item["community_id"]),
+            ).fetchone()
+            if not community:
+                raise ValueError("community report 引用了跨项目或不存在的 community")
+            entity_ids = sorted({int(value) for value in item.get("entity_ids") or []})
+            if entity_ids:
+                matched = conn.execute(
+                    """SELECT COUNT(*) AS count FROM graphrag_community_members
+                       WHERE run_id=%s AND project_id=%s AND stable_community_id=%s
+                         AND canonical_entity_id=ANY(%s)""",
+                    (
+                        run["detection_run_id"], run["project_id"],
+                        item["community_id"], entity_ids,
+                    ),
+                ).fetchone()
+                if int(matched["count"]) != len(entity_ids):
+                    raise ValueError("community report 引用了跨社区或不存在的 entity")
+            relation_ids = sorted({str(value) for value in item.get("relation_ids") or []})
+            if relation_ids:
+                matched = conn.execute(
+                    """SELECT COUNT(*) AS count FROM graphrag_community_edges edge
+                       WHERE edge.run_id=%s AND edge.project_id=%s
+                         AND edge.stable_edge_id=ANY(%s)
+                         AND EXISTS(
+                           SELECT 1 FROM graphrag_community_members source_member
+                           WHERE source_member.run_id=edge.run_id
+                             AND source_member.stable_community_id=%s
+                             AND source_member.canonical_entity_id=edge.source_entity_id)
+                         AND EXISTS(
+                           SELECT 1 FROM graphrag_community_members target_member
+                           WHERE target_member.run_id=edge.run_id
+                             AND target_member.stable_community_id=%s
+                             AND target_member.canonical_entity_id=edge.target_entity_id)""",
+                    (
+                        run["detection_run_id"], run["project_id"], relation_ids,
+                        item["community_id"], item["community_id"],
+                    ),
+                ).fetchone()
+                if int(matched["count"]) != len(relation_ids):
+                    raise ValueError("community report 引用了跨社区或不存在的 relation")
+            return conn.execute(
+                """INSERT INTO graphrag_community_reports(
+                   report_id,run_id,project_id,detection_run_id,community_id,level,status,
+                   attempt,title,summary,findings,entity_ids,relation_ids,input_hash,
+                   output_hash,usage,latency_ms,error_category,error_message)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
+                   ON CONFLICT(run_id,community_id) DO UPDATE SET
+                     status=EXCLUDED.status,attempt=EXCLUDED.attempt,
+                     title=EXCLUDED.title,summary=EXCLUDED.summary,findings=EXCLUDED.findings,
+                     entity_ids=EXCLUDED.entity_ids,relation_ids=EXCLUDED.relation_ids,
+                     input_hash=EXCLUDED.input_hash,output_hash=EXCLUDED.output_hash,
+                     usage=EXCLUDED.usage,latency_ms=EXCLUDED.latency_ms,
+                     error_category=EXCLUDED.error_category,
+                     error_message=EXCLUDED.error_message,
+                     updated_at=NOW()
+                   WHERE graphrag_community_reports.status<>'succeeded'
+                   RETURNING *""",
+                (
+                    item["report_id"], run_id, run["project_id"], run["detection_run_id"],
+                    item["community_id"], item.get("level", 0), item["status"],
+                    item.get("attempt", 1), item.get("title", ""), item.get("summary", ""),
+                    self._json(item.get("findings") or []), entity_ids,
+                    relation_ids, item["input_hash"],
+                    item.get("output_hash", ""), self._json(item.get("usage") or {}),
+                    item.get("latency_ms", 0), item.get("error_category", ""),
+                    item.get("error", ""),
+                ),
+            ).fetchone() or conn.execute(
+                "SELECT * FROM graphrag_community_reports WHERE run_id=%s AND community_id=%s",
+                (run_id, item["community_id"]),
+            ).fetchone()
+
+    def finalize_community_report_run(
+        self, run_id: str, *, status: str, metrics: dict[str, Any], error: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"succeeded", "retryable_failed", "terminal_failed", "superseded"}:
+            raise ValueError("非法 community report run 状态")
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_community_report_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("community report run 不存在")
+            counts = conn.execute(
+                """SELECT COUNT(*) FILTER(WHERE status='succeeded') AS completed,
+                   COUNT(*) FILTER(WHERE status<>'succeeded') AS failed
+                   FROM graphrag_community_reports WHERE run_id=%s""",
+                (run_id,),
+            ).fetchone()
+            completed = int(counts["completed"])
+            failed = int(counts["failed"])
+            if status == "succeeded":
+                if completed != int(run["expected"]) or failed:
+                    raise RuntimeError("community reports 不完整，禁止 active")
+                detection = conn.execute(
+                    """SELECT detection.*,project.graph_status,
+                       project.graph_generation AS current_graph_generation,
+                       project.graph_ready_generation,project.graph_policy_version,
+                       project.graph_policy_hash AS current_graph_policy_hash,
+                       project.active_policy_hash AS current_active_policy_hash,
+                       project.active_schema_version,
+                       project.entity_extraction_policy_version,
+                       project.entity_resolution_policy_version,
+                       project.relation_candidate_policy_version,
+                       project.relation_classifier_policy_version,
+                       project.verification_policy_version,
+                       project.schema_policy_version,
+                       project.is_deleted AS project_is_deleted
+                       FROM graphrag_community_runs detection
+                       JOIN projects project ON project.id=detection.project_id
+                       WHERE detection.run_id=%s FOR SHARE OF detection,project""",
+                    (run["detection_run_id"],),
+                ).fetchone()
+                project_view = dict(detection or {})
+                if detection:
+                    project_view["graph_generation"] = detection["current_graph_generation"]
+                    project_view["graph_policy_hash"] = detection["current_graph_policy_hash"]
+                    project_view["active_policy_hash"] = detection["current_active_policy_hash"]
+                detection_current = bool(
+                    detection
+                    and not detection["project_is_deleted"]
+                    and detection["status"] in {"completed", "completed_empty"}
+                    and is_current_graph(project_view)
+                    and int(detection["graph_generation"])
+                    == int(detection["current_graph_generation"])
+                    and detection["graph_policy_hash"]
+                    == detection["current_graph_policy_hash"]
+                    and detection["active_policy_hash"]
+                    == detection["current_active_policy_hash"]
+                )
+                if not detection_current:
+                    raise RuntimeError("community detection 已 stale，禁止 active reports")
+                conn.execute(
+                    """UPDATE graphrag_community_report_runs SET active=FALSE,status='superseded'
+                       WHERE project_id=%s AND active=TRUE AND run_id<>%s""",
+                    (run["project_id"], run_id),
+                )
+            row = conn.execute(
+                """UPDATE graphrag_community_report_runs SET status=%s,active=%s,
+                   completed=%s,failed=%s,metrics=%s::jsonb,error_message=%s,
+                   completed_at=NOW() WHERE run_id=%s RETURNING *""",
+                (
+                    status, status == "succeeded", completed,
+                    failed, self._json({**metrics, "completed": completed, "failed": failed}),
+                    error, run_id,
+                ),
+            ).fetchone()
+            return row
+
+    def show_community_report_run(self, run_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_community_report_runs WHERE run_id=%s",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("community report run 不存在")
+            reports = conn.execute(
+                """SELECT * FROM graphrag_community_reports
+                   WHERE run_id=%s ORDER BY level,community_id""",
+                (run_id,),
+            ).fetchall()
+        detection = self.get_graphrag_community_run(run["detection_run_id"])
+        current = bool(
+            run["status"] == "succeeded" and run["active"] and detection.get("current")
+        )
+        return {"run": {**run, "current": current}, "reports": reports, "current": current}
+
+    def get_active_community_report_run(self, project_id: int) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM graphrag_community_report_runs
+                   WHERE project_id=%s AND active=TRUE AND status='succeeded'
+                   ORDER BY completed_at DESC LIMIT 1""",
+                (project_id,),
+            ).fetchone()
+
+    def _require_current_community_report_run(
+        self, conn, report_run_id: str, project_id: int,
+    ) -> dict[str, Any]:
+        report = conn.execute(
+            "SELECT * FROM graphrag_community_report_runs WHERE run_id=%s FOR SHARE",
+            (report_run_id,),
+        ).fetchone()
+        if not report:
+            raise LookupError("community report run 不存在")
+        if int(report["project_id"]) != int(project_id):
+            raise RuntimeError("community report run 跨项目")
+        detection = conn.execute(
+            "SELECT * FROM graphrag_community_runs WHERE run_id=%s FOR SHARE",
+            (report["detection_run_id"],),
+        ).fetchone()
+        project = conn.execute(
+            "SELECT * FROM projects WHERE id=%s FOR SHARE",
+            (project_id,),
+        ).fetchone()
+        current = bool(
+            report["active"]
+            and report["status"] == "succeeded"
+            and detection
+            and detection["status"] in {"completed", "completed_empty"}
+            and project
+            and not project["is_deleted"]
+            and is_current_graph(project)
+            and int(report["graph_generation"]) == int(detection["graph_generation"])
+            and int(detection["graph_generation"]) == int(project["graph_generation"])
+            and report["community_input_hash"] == detection["input_hash"]
+            and detection["graph_policy_hash"] == project["graph_policy_hash"]
+            and detection["active_policy_hash"] == project["active_policy_hash"]
+        )
+        if not current:
+            raise RuntimeError("community report snapshot stale or incomplete")
+        return report
+
+    def start_global_search_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        with self.connection() as conn:
+            self._require_current_community_report_run(
+                conn, values["report_run_id"], int(values["project_id"]),
+            )
+            inserted = conn.execute(
+                """INSERT INTO graphrag_global_search_runs(
+                   run_id,project_id,report_run_id,query_hash,report_input_hash,
+                   prompt_hash,model_config_hash,model_id,graphrag_version,status,config)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'running',%s::jsonb)
+                   ON CONFLICT(run_id) DO NOTHING
+                   RETURNING *""",
+                (
+                    values["run_id"], values["project_id"], values["report_run_id"],
+                    values["query_hash"], values["report_input_hash"],
+                    values["prompt_hash"], values["model_config_hash"],
+                    values["model_id"], values["graphrag_version"],
+                    self._json(values.get("config") or {}),
+                ),
+            ).fetchone()
+            if inserted:
+                return inserted
+            existing = conn.execute(
+                "SELECT * FROM graphrag_global_search_runs WHERE run_id=%s",
+                (values["run_id"],),
+            ).fetchone()
+            immutable = (
+                "project_id", "report_run_id", "query_hash", "report_input_hash",
+                "prompt_hash", "model_config_hash", "model_id", "graphrag_version",
+            )
+            if not existing or any(
+                str(existing[key]) != str(values[key]) for key in immutable
+            ):
+                raise RuntimeError("global search run 幂等键与不可变输入不一致")
+            if existing["status"] in {"succeeded", "terminal_failed"}:
+                return existing
+            return conn.execute(
+                """UPDATE graphrag_global_search_runs
+                   SET status='running',error_category='',error_message='',completed_at=NULL
+                   WHERE run_id=%s RETURNING *""",
+                (values["run_id"],),
+            ).fetchone()
+
+    def finalize_global_search_run(
+        self, run_id: str, *, status: str, result: dict[str, Any], error: str = "",
+        error_category: str = "", latency_ms: int = 0,
+    ) -> dict[str, Any]:
+        if status not in {"succeeded", "retryable_failed", "terminal_failed", "superseded"}:
+            raise ValueError("非法 global search 状态")
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_global_search_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("global search run 不存在")
+            if status == "succeeded":
+                self._require_current_community_report_run(
+                    conn, run["report_run_id"], int(run["project_id"]),
+                )
+                report_ids = sorted({
+                    str(value) for value in result.get("report_ids") or []
+                })
+                if not report_ids:
+                    raise RuntimeError("global search 缺少 report 引用")
+                matched = conn.execute(
+                    """SELECT COUNT(*) AS count FROM graphrag_community_reports
+                       WHERE run_id=%s AND status='succeeded' AND report_id=ANY(%s)""",
+                    (run["report_run_id"], report_ids),
+                ).fetchone()
+                if int(matched["count"]) != len(report_ids):
+                    raise RuntimeError("global search 引用了跨快照或不存在的 report")
+            return conn.execute(
+                """UPDATE graphrag_global_search_runs SET status=%s,result=%s::jsonb,
+                   selected_report_ids=%s,usage=%s::jsonb,latency_ms=%s,
+                   error_category=%s,error_message=%s,completed_at=NOW()
+                   WHERE run_id=%s RETURNING *""",
+                (
+                    status, self._json(result), result.get("report_ids") or [],
+                    self._json(result.get("usage") or {}), latency_ms,
+                    error_category, error, run_id,
+                ),
+            ).fetchone()
+
+    def show_global_search_run(self, run_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM graphrag_global_search_runs WHERE run_id=%s",
+                (run_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError("global search run 不存在")
+            return row
+
     def count_publishable_relations(
         self, project_id: int, document_ids: list[int] | None = None,
     ) -> int:

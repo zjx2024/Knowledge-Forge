@@ -1167,6 +1167,95 @@ CREATE INDEX idx_graphrag_community_edges_project
 """
 
 
+GRAPHRAG_REPORTS_SEARCH_SQL = r"""
+CREATE TABLE graphrag_community_report_runs (
+    run_id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    graph_generation BIGINT NOT NULL,
+    detection_run_id TEXT NOT NULL REFERENCES graphrag_community_runs(run_id),
+    community_input_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    model_config_hash TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    graphrag_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending','running','succeeded','retryable_failed','terminal_failed','superseded'
+    )),
+    active BOOLEAN NOT NULL DEFAULT FALSE,
+    expected INTEGER NOT NULL DEFAULT 0 CHECK(expected>=0),
+    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed>=0),
+    failed INTEGER NOT NULL DEFAULT 0 CHECK(failed>=0),
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(project_id,graph_generation,detection_run_id,input_hash,prompt_hash,model_config_hash)
+);
+CREATE UNIQUE INDEX uq_graphrag_report_run_active
+    ON graphrag_community_report_runs(project_id) WHERE active=TRUE;
+CREATE INDEX idx_graphrag_report_runs_project
+    ON graphrag_community_report_runs(project_id,status,created_at DESC);
+
+CREATE TABLE graphrag_community_reports (
+    report_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES graphrag_community_report_runs(run_id) ON DELETE CASCADE,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    detection_run_id TEXT NOT NULL,
+    community_id TEXT NOT NULL,
+    level INTEGER NOT NULL CHECK(level>=0),
+    status TEXT NOT NULL CHECK(status IN (
+        'pending','running','succeeded','retryable_failed','terminal_failed','superseded'
+    )),
+    attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt>0),
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    findings JSONB NOT NULL DEFAULT '[]'::jsonb,
+    entity_ids BIGINT[] NOT NULL DEFAULT '{}',
+    relation_ids TEXT[] NOT NULL DEFAULT '{}',
+    input_hash TEXT NOT NULL,
+    output_hash TEXT NOT NULL DEFAULT '',
+    usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    latency_ms BIGINT NOT NULL DEFAULT 0 CHECK(latency_ms>=0),
+    error_category TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,community_id),
+    FOREIGN KEY(detection_run_id,community_id)
+        REFERENCES graphrag_communities(run_id,stable_community_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE graphrag_global_search_runs (
+    run_id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    report_run_id TEXT NOT NULL REFERENCES graphrag_community_report_runs(run_id),
+    query_hash TEXT NOT NULL,
+    report_input_hash TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    model_config_hash TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    graphrag_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'pending','running','succeeded','retryable_failed','terminal_failed','superseded'
+    )),
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result JSONB NOT NULL DEFAULT '{}'::jsonb,
+    selected_report_ids TEXT[] NOT NULL DEFAULT '{}',
+    usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    latency_ms BIGINT NOT NULL DEFAULT 0 CHECK(latency_ms>=0),
+    error_category TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_graphrag_global_search_project
+    ON graphrag_global_search_runs(project_id,created_at DESC);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1218,6 +1307,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0010_graphrag_communities",
         description="Persist shadow GraphRAG BYOG community detection results",
         sql=GRAPHRAG_COMMUNITIES_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0011_graphrag_reports_global_search",
+        description="Persist snapshot-bound community reports and opt-in global search shadow",
+        sql=GRAPHRAG_REPORTS_SEARCH_SQL,
         startup_safe=True,
     ),
 )
