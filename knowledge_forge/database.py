@@ -5900,12 +5900,36 @@ class Database:
                      AND """ + clause + " ORDER BY r.id",
                 (project_id, *policy_params),
             ).fetchall()
+            entities = conn.execute(
+                """SELECT entity.id,entity.entity_key,entity.name,entity.entity_type,
+                   entity.description,
+                   ARRAY_AGG(DISTINCT 'chunk:' || mention.revision_id || ':' || chunk.chunk_key)
+                       AS text_unit_ids
+                   FROM canonical_entities entity
+                   JOIN entity_mentions mention
+                     ON mention.canonical_entity_id=entity.id
+                    AND mention.project_id=entity.project_id AND mention.is_deleted=FALSE
+                   JOIN documents document
+                     ON document.id=mention.document_id
+                    AND document.project_id=entity.project_id
+                    AND document.active_revision_id=mention.revision_id
+                    AND document.is_deleted=FALSE
+                   JOIN chunks chunk
+                     ON chunk.id=mention.chunk_id AND chunk.revision_id=mention.revision_id
+                    AND chunk.is_deleted=FALSE
+                   WHERE entity.project_id=%s AND entity.is_deleted=FALSE
+                   GROUP BY entity.id,entity.entity_key,entity.name,entity.entity_type,
+                            entity.description
+                   ORDER BY entity.id""",
+                (project_id,),
+            ).fetchall()
             return ControlGraphSnapshot(
                 project_id=int(project["id"]),
                 graph_generation=int(project["graph_generation"]),
                 graph_policy_hash=str(project.get("graph_policy_hash") or ""),
                 active_policy_hash=str(project.get("active_policy_hash") or ""),
                 relations=tuple(dict(item) for item in relations),
+                entities=tuple(dict(item) for item in entities),
             )
 
     def create_graphrag_community_run(

@@ -63,6 +63,7 @@ class ControlGraphSnapshot:
     graph_policy_hash: str
     active_policy_hash: str
     relations: tuple[dict[str, Any], ...]
+    entities: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,16 @@ def build_byog_snapshot(
     edge_groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
     excluded_self_loops = 0
 
+    for row in sorted(snapshot.entities, key=lambda item: int(item["id"])):
+        entity_map[int(row["id"])] = {
+            "id": int(row["id"]),
+            "entity_key": str(row["entity_key"]),
+            "name": str(row["name"]),
+            "entity_type": str(row["entity_type"]),
+            "description": str(row.get("description") or ""),
+            "text_unit_ids": sorted(map(str, row.get("text_unit_ids") or [])),
+        }
+
     for row in sorted(snapshot.relations, key=lambda item: int(item["assertion_id"])):
         source_id = int(row["source_entity_id"])
         target_id = int(row["target_entity_id"])
@@ -146,9 +157,13 @@ def build_byog_snapshot(
                 "description": str(row.get(f"{prefix}_description") or ""),
             }
             existing = entity_map.get(entity_id)
-            if existing is not None and existing != candidate:
+            if existing is not None and any(
+                existing.get(key) != candidate.get(key)
+                for key in ("id", "entity_key", "name", "entity_type", "description")
+            ):
                 raise ValueError(f"实体 {entity_id} 在同一快照中信息不一致")
-            entity_map[entity_id] = candidate
+            if existing is None:
+                entity_map[entity_id] = candidate
         if source_id == target_id:
             excluded_self_loops += 1
             continue
@@ -156,8 +171,7 @@ def build_byog_snapshot(
         edge_groups.setdefault(endpoint, []).append(row)
 
     referenced_ids = {entity_id for endpoint in edge_groups for entity_id in endpoint}
-    excluded_isolated_entities = len(set(entity_map).difference(referenced_ids))
-    entity_map = {key: value for key, value in entity_map.items() if key in referenced_ids}
+    isolated_entity_ids = set(entity_map).difference(referenced_ids)
     title_values = [item["entity_key"] for item in entity_map.values()]
     if len(title_values) != len(set(title_values)):
         raise ValueError("entity_key 在项目内不唯一，不能作为 GraphRAG title")
@@ -170,7 +184,10 @@ def build_byog_snapshot(
         assertion_frequency[source_id] += len(rows)
         assertion_frequency[target_id] += len(rows)
 
-    incident_text_units: dict[int, set[str]] = {entity_id: set() for entity_id in entity_map}
+    incident_text_units: dict[int, set[str]] = {
+        entity_id: set(map(str, entity.get("text_unit_ids") or []))
+        for entity_id, entity in entity_map.items()
+    }
     edges: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
     for human_id, ((source_id, target_id), rows) in enumerate(sorted(edge_groups.items())):
@@ -233,7 +250,8 @@ def build_byog_snapshot(
         "node_count": len(entities),
         "aggregated_edge_count": len(relationships),
         "excluded_self_loops": excluded_self_loops,
-        "excluded_isolated_entities": excluded_isolated_entities,
+        "excluded_isolated_entities": 0,
+        "isolated_entity_count": len(isolated_entity_ids),
     }
     hash_payload = {
         "project_id": snapshot.project_id,
@@ -320,7 +338,10 @@ class GraphRAGCommunityRunner:
         config.validate()
         validate_byog_snapshot(snapshot)
         if not snapshot.relationships:
-            return GraphRAGResult(communities=[], log="empty graph")
+            return GraphRAGResult(
+                communities=self._append_singletons(snapshot, []),
+                log="empty edge set; deterministic singleton communities",
+            )
         if self.workspace_root:
             self.workspace_root.mkdir(parents=True, exist_ok=True)
         workspace = Path(tempfile.mkdtemp(
@@ -358,10 +379,59 @@ class GraphRAGCommunityRunner:
             missing = REQUIRED_COMMUNITY_COLUMNS.difference(frame.columns)
             if missing:
                 raise RuntimeError(f"GraphRAG communities schema 缺少字段: {sorted(missing)}")
-            communities = self._normalize_communities(snapshot, frame.to_dict("records"))
+            communities = self._append_singletons(
+                snapshot,
+                self._normalize_communities(snapshot, frame.to_dict("records")),
+            )
             return GraphRAGResult(communities=communities, log=combined_log)
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
+
+    @staticmethod
+    def _append_singletons(
+        snapshot: BYOGSnapshot,
+        communities: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        covered = {
+            int(entity_id)
+            for community in communities
+            for entity_id in community["canonical_entity_ids"]
+        }
+        all_entity_ids = {
+            int(str(entity["id"]).split(":", 1)[1]) for entity in snapshot.entities
+        }
+        next_community = max(
+            (int(item["graphrag_community"]) for item in communities), default=-1,
+        ) + 1
+        by_id = {
+            int(str(entity["id"]).split(":", 1)[1]): entity
+            for entity in snapshot.entities
+        }
+        additions: list[dict[str, Any]] = []
+        for offset, entity_id in enumerate(sorted(all_entity_ids - covered)):
+            entity = by_id[entity_id]
+            additions.append({
+                "stable_community_id": stable_community_id(
+                    snapshot.project_id, snapshot.input_hash, 0, [entity_id],
+                ),
+                "graphrag_output_id": f"singleton:{entity_id}",
+                "graphrag_community": next_community + offset,
+                "level": 0,
+                "parent_stable_community_id": None,
+                "title": str(entity["title"]),
+                "size": 1,
+                "period": "",
+                "canonical_entity_ids": [entity_id],
+                "relationship_ids": [],
+                "text_unit_ids": sorted(map(str, entity.get("text_unit_ids") or [])),
+                "children": [],
+            })
+        return sorted(
+            [*communities, *additions],
+            key=lambda item: (
+                item["level"], item["graphrag_community"], item["stable_community_id"],
+            ),
+        )
 
     @staticmethod
     def _normalize_communities(

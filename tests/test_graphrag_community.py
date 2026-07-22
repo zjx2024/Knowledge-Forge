@@ -59,6 +59,35 @@ def snapshot(*relations: dict) -> ControlGraphSnapshot:
     )
 
 
+def test_byog_preserves_active_isolated_entities_as_singleton_communities(tmp_path):
+    graph = ControlGraphSnapshot(
+        project_id=7,
+        graph_generation=3,
+        graph_policy_hash="graph-policy",
+        active_policy_hash="active-policy",
+        relations=(relation(1, 1, "entity-a", 2, "entity-b"),),
+        entities=({
+            "id": 3,
+            "entity_key": "entity-isolated",
+            "name": "isolated",
+            "entity_type": "Concept",
+            "description": "active mention with no publishable edge",
+        },),
+    )
+
+    byog = build_byog_snapshot(graph, CommunityConfig(seed=42))
+    result = GraphRAGCommunityRunner(workspace_root=tmp_path).run(
+        byog, CommunityConfig(seed=42)
+    )
+
+    assert {item["title"] for item in byog.entities} == {
+        "entity-a", "entity-b", "entity-isolated",
+    }
+    assert byog.metrics["isolated_entity_count"] == 1
+    assert any(item["canonical_entity_ids"] == [3] for item in result.communities)
+    assert not list(tmp_path.iterdir())
+
+
 def test_byog_contract_is_stable_and_aggregates_reverse_duplicate_edges():
     graph = snapshot(
         relation(3, 2, "entity-b", 1, "entity-a", relation_type="uses"),
@@ -130,22 +159,24 @@ def test_empty_graph_is_a_completed_empty_candidate_without_graphrag_input():
         "aggregated_edge_count": 0,
         "excluded_self_loops": 0,
         "excluded_isolated_entities": 0,
+        "isolated_entity_count": 0,
     }
     validate_byog_snapshot(byog)
 
 
-def test_self_loop_only_graph_counts_the_excluded_isolated_entity():
+def test_self_loop_only_graph_preserves_the_entity_as_isolated():
     byog = build_byog_snapshot(
         snapshot(relation(1, 1, "entity-a", 1, "entity-a")), CommunityConfig()
     )
 
-    assert byog.entities == []
+    assert [item["id"] for item in byog.entities] == ["kf_entity:1"]
     assert byog.relationships == []
     assert byog.metrics == {
-        "node_count": 0,
+        "node_count": 1,
         "aggregated_edge_count": 0,
         "excluded_self_loops": 1,
-        "excluded_isolated_entities": 1,
+        "excluded_isolated_entities": 0,
+        "isolated_entity_count": 1,
     }
 
 

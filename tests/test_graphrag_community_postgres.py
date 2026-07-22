@@ -86,7 +86,10 @@ def test_control_snapshot_query_reuses_fail_closed_active_revision_semantics(mon
     snapshot = database.export_graphrag_control_snapshot(7)
 
     assert snapshot.project_id == 7
-    relation_query, params = connection.calls[-1]
+    relation_query, params = next(
+        (statement, params) for statement, params in connection.calls
+        if "FROM relation_assertions r" in statement
+    )
     normalized_query = " ".join(relation_query.split())
     assert "documents d ON d.id=r.document_id AND d.active_revision_id=r.revision_id" in normalized_query
     assert "canonical_relation_projections" in relation_query
@@ -100,6 +103,12 @@ def test_control_snapshot_query_reuses_fail_closed_active_revision_semantics(mon
         ["llm_verified", "rules_verified"],
         RELATION_VERIFICATION_POLICY_VERSION,
     )
+    entity_query, entity_params = next(
+        (statement, params) for statement, params in connection.calls
+        if "FROM canonical_entities entity" in statement
+    )
+    assert "document.active_revision_id=mention.revision_id" in "".join(entity_query.split())
+    assert entity_params == (7,)
 
 
 @pytest.mark.integration
