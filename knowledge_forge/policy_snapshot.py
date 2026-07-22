@@ -154,8 +154,11 @@ def build_snapshot_manifest(
             "schema_version": int(project.get("active_schema_version") or 1),
         },
         "documents": normalized_documents,
+        "corpus_hash": _digest(normalized_documents),
         "policy_set": normalized_policy,
+        "policy_hash": _digest(normalized_policy),
         "models": dict(models),
+        "model_config_hash": _digest(dict(models)),
         "config": dict(config),
         "config_hash": _digest(dict(config)),
         "prompts": dict(prompts),
@@ -164,6 +167,10 @@ def build_snapshot_manifest(
         "gold_manifest_hash": _digest(dict(gold_manifest)),
         "gate_thresholds": dict(thresholds),
         "metric_formulas": dict(metric_formulas),
+        "evaluator_hash": _digest({
+            "metric_formulas": dict(metric_formulas),
+            "thresholds": dict(thresholds),
+        }),
         "calibration_universe_version": str(
             gold_manifest.get("calibration_universe_version") or "unspecified"
         ),

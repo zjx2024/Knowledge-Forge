@@ -23,6 +23,7 @@ from .config import Config
 from .database import Database
 from .entity_resolution import EntityResolver
 from .entity_shadow import DatabaseShadowStore, ShadowEntityResolver, ShadowModelGateway
+from .extraction_funnel import relation_shadow_funnel
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
@@ -2208,6 +2209,17 @@ class KnowledgeForgeService:
             coverage_failures = self._relation_coverage_failures(
                 prepared.plan, persisted_work, len(decisions),
             )
+            funnel_report = relation_shadow_funnel(
+                run_id=run_id,
+                plan=prepared.plan,
+                persisted_work=persisted_work,
+                decisions=decisions,
+            )
+            if not funnel_report["coverage_complete"]:
+                coverage_failures = sorted({
+                    *coverage_failures,
+                    *(f"funnel:{failure}" for failure in funnel_report["failures"]),
+                })
             coverage_complete = not coverage_failures
             final_status = "completed"
             if any(item["status"] == "terminal_failed" for item in failed_items):
@@ -2236,6 +2248,7 @@ class KnowledgeForgeService:
                 "missing_responses": missing_responses,
                 "coverage_complete": coverage_complete,
                 "coverage_failures": coverage_failures,
+                "funnel": funnel_report,
                 "published": 0,
                 "verified": sum(
                     1 for item in decisions if item.get("status") == "classified"

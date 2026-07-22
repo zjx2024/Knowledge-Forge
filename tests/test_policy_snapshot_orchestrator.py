@@ -60,6 +60,12 @@ def test_manifest_is_canonical_immutable_and_dirty_release_is_rejected():
     assert [item["document_id"] for item in first["documents"]] == [1, 2]
     assert first["pilot"] is True
     assert first["git"]["untracked_code"] == ["scratch.py"]
+    assert len(first["corpus_hash"]) == 64
+    assert len(first["policy_hash"]) == 64
+    assert len(first["model_config_hash"]) == 64
+    assert len(first["evaluator_hash"]) == 64
+    assert first["corpus_hash"] == second["corpus_hash"]
+    assert first["evaluator_hash"] == second["evaluator_hash"]
 
     with pytest.raises(SnapshotManifestError, match="clean"):
         build_snapshot_manifest(
