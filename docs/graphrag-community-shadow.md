@@ -16,9 +16,11 @@ HugeGraph。
 - 不读取 `entity_shadow_*` 或 `relation_shadow_*` treatment 数据；
 - 运行开始和提交前分别校验 graph generation、policy 和完整输入指纹。
 
-只有正式关系实际引用的规范实体会进入 BYOG 节点。实体 `title` 使用项目内唯一的
-`entity_key`，显示名称、类型和描述放入 `description`。Chunk 来源使用稳定的
-`chunk:<revision_id>:<chunk_key>` 标识。
+当前 active revision 中仍有有效 mention 支撑的规范实体都会进入 BYOG 节点，
+不要求该实体已经出现在可发布关系中。实体 `title` 使用项目内唯一的 `entity_key`，
+显示名称、类型和描述放入 `description`。Chunk 来源使用稳定的
+`chunk:<revision_id>:<chunk_key>` 标识。没有任何边的实体会形成稳定的单点社区，
+不会因为关系召回不足而从社区快照中消失。
 
 ## 边和权重
 
@@ -64,5 +66,57 @@ HugeGraph。
 随机 UUID 或 Leiden 整数。检测期间正式图发生变化时，运行进入 `superseded`；失败
 不会产生伪 `completed`。
 
-当前未接入 `create_community_reports`、报告 embedding、Global Search、Local Search、
-DRIFT Search 或 Basic Search，也未改变 P1/P2 shadow 状态。
+## Community Reports shadow
+
+报告阶段显式调用 GraphRAG 3.1.1 的 `create_community_reports` 工作流。报告运行绑定：
+
+- project、graph generation 和 community detection run；
+- community input、prompt 和模型配置 hash；
+- GraphRAG 与模型版本、attempt、时延、usage 和错误类别；
+- 同一快照下的 community、entity 和 relation citation。
+
+报告按 community 幂等执行。输入未变化且已有成功报告时不会重复调用模型；超时和
+连接错误进入 `retryable_failed`，可继续相同运行；格式、引用等不可恢复错误进入
+`terminal_failed`。只有全部 eligible community 成功时，整个报告运行才原子切换为
+active。失败或部分完成的运行不会替换上一个 active 运行。空图产生 0-report 的成功
+运行，且模型调用数为 0。
+
+GraphRAG 原生报告不携带 Knowledge Forge 的规范实体和关系 ID。适配器会把本次
+community 的精确成员和聚合边 ID 附加到 finding，数据库再次校验这些 ID 属于同一
+project、detection snapshot 和 community。关系可通过聚合边 provenance 追溯到
+active revision 的 assertion 和 Chunk；实体可通过规范实体对应的 active mention
+追溯。这里提供的是可解析的快照级溯源，尚不能替代人工 Gold 对每个自然语言 claim
+做事实支持判定。
+
+显式执行和查看：
+
+```bash
+.venv/bin/python -m knowledge_forge.community_reports run <DETECTION_RUN_ID> \
+  --graphrag-root <GRAPHRAG_PROJECT_DIR>
+.venv/bin/python -m knowledge_forge.community_reports show <REPORT_RUN_ID>
+```
+
+## Global Search opt-in shadow
+
+Global Search 使用 GraphRAG 3.1.1 的 `graphrag.api.query.global_search`，只读取当前
+project 下 active、完整且仍对应当前 graph generation 的报告快照。调用必须显式
+opt-in；默认产品检索、问答和 HugeGraph 路径没有改变。缺少 active 报告、报告为空、
+快照 stale、跨项目引用或 map/reduce 失败时均 fail closed，不会把部分结果标为成功。
+
+每次查询保存 query/report/prompt/model config hash、GraphRAG 版本、被选报告、引用、
+map/reduce 输出、usage、时延和错误类别。默认 `allow_general_knowledge=false`。
+
+显式执行和查看：
+
+```bash
+.venv/bin/python -m knowledge_forge.global_search search <PROJECT_ID> "<QUERY>" \
+  --graphrag-root <GRAPHRAG_PROJECT_DIR>
+.venv/bin/python -m knowledge_forge.global_search show <GLOBAL_SEARCH_RUN_ID>
+```
+
+新增表为 `graphrag_community_report_runs`、`graphrag_community_reports` 和
+`graphrag_global_search_runs`，由迁移 `0011_graphrag_reports_global_search` 创建。
+社区报告和 Global Search 仍是 shadow：未接入默认生产查询，也未改变 P1/P2 shadow
+状态。报告和查询只完成 fake-model 与 disposable PostgreSQL 工程验证；真实模型语义
+质量、独立人工报告 Gold、query Gold、Local/DRIFT/Basic Search 和报告 embedding 尚未
+完成，因此不能标记为生产可用。

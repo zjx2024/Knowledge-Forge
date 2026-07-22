@@ -74,17 +74,23 @@ data stays isolated and shadow by default.
 
 - Re-run deterministic GraphRAG BYOG detection against current publishable
   control only, including real disposable PostgreSQL persistence.
+- Preserve active-revision canonical entities without publishable edges as
+  deterministic singleton communities.
 
 ### P6 - Community reports shadow
 
 - Add snapshot-bound, resumable, atomically activated report runs using the
   verified GraphRAG 3.1.1 public workflow boundary.
 - Validate citations back to active revision evidence.
+- Keep incomplete runs non-active; support retryable resume and zero-call empty
+  graph completion.
 
 ### P7 - Global Search opt-in shadow
 
 - Add an explicit non-default map/reduce query path over current complete report
   runs with fail-closed generation and citation checks.
+- Persist query/report/model hashes and map/reduce provenance without changing
+  the product's default search path.
 
 ### P8 - Release evidence
 
