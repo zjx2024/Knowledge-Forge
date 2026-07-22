@@ -23,6 +23,7 @@ PostgreSQL、HugeGraph 和 Ollama，不依赖 RAGFlow 运行时。
 - 任务状态持久化到 PostgreSQL，页面切换或服务重启不会丢失任务记录。
 - 任务面板分别展示结构解析、分块及向量索引、Schema 和基础图数据、逐块抽取实体与关系、HugeGraph 同步五个子任务的独立进度。
 - 文档删除会先立即软删除并取消关联任务，使其马上从项目列表和检索结果中移除；HugeGraph、源文件和过程文件由持久化后台清理任务处理，服务重启后可继续恢复。清理完成后会再次停用该文档的知识块、向量、实体提及和关系贡献，不影响其他文档仍支持的实体。
+- 提供显式 GraphRAG 3.1.1 BYOG 社区检测 CLI；它从当前正式 control 图生成 Leiden 社区并 shadow 持久化，不会自动运行，也不参与现有检索、问答或 HugeGraph。
 
 ## 架构与目录
 
@@ -170,8 +171,10 @@ python3.12 -m venv .venv
 VS Code 中使用“Python: Select Interpreter”并选择
 `<仓库根目录>/.venv/bin/python`。
 
-依赖中固定包含 `graphrag==3.1.1`，用于 Python 3.12 运行兼容和后续评估；当前业务管线
-尚未接入 GraphRAG BYOG，Knowledge Forge 仍使用自身的实体、关系和 HugeGraph 写入流程。
+依赖中固定包含 `graphrag==3.1.1`。当前仅接入手动触发的 BYOG 社区检测 shadow，
+Knowledge Forge 仍使用自身的实体、关系和 HugeGraph 写入流程；社区报告和 Global
+Search 尚未接入。使用方式和数据边界见
+[GraphRAG 社区检测 Shadow](docs/graphrag-community-shadow.md)。
 
 ### 依赖锁更新
 

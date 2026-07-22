@@ -1053,6 +1053,120 @@ ALTER TABLE policy_snapshots
 """
 
 
+GRAPHRAG_COMMUNITIES_SQL = r"""
+CREATE UNIQUE INDEX uq_canonical_entities_id_project
+    ON canonical_entities(id,project_id);
+
+CREATE TABLE graphrag_community_runs (
+    run_id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    graph_generation BIGINT NOT NULL,
+    graph_policy_hash TEXT NOT NULL,
+    active_policy_hash TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    graphrag_version TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    weighting_strategy TEXT NOT NULL,
+    seed INTEGER NOT NULL,
+    max_cluster_size INTEGER NOT NULL CHECK(max_cluster_size>0),
+    use_lcc BOOLEAN NOT NULL DEFAULT FALSE,
+    status TEXT NOT NULL CHECK(
+        status IN ('running','completed','completed_empty','failed','superseded')
+    ),
+    node_count INTEGER NOT NULL DEFAULT 0 CHECK(node_count>=0),
+    aggregated_edge_count INTEGER NOT NULL DEFAULT 0 CHECK(aggregated_edge_count>=0),
+    excluded_self_loops INTEGER NOT NULL DEFAULT 0 CHECK(excluded_self_loops>=0),
+    excluded_isolated_entities INTEGER NOT NULL DEFAULT 0
+        CHECK(excluded_isolated_entities>=0),
+    community_count INTEGER NOT NULL DEFAULT 0 CHECK(community_count>=0),
+    hierarchy_levels INTEGER NOT NULL DEFAULT 0 CHECK(hierarchy_levels>=0),
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(run_id,project_id)
+);
+CREATE INDEX idx_graphrag_community_runs_project
+    ON graphrag_community_runs(project_id,status,created_at DESC);
+CREATE INDEX idx_graphrag_community_runs_current
+    ON graphrag_community_runs(project_id,input_hash,created_at DESC)
+    WHERE status IN ('completed','completed_empty');
+
+CREATE TABLE graphrag_communities (
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    stable_community_id TEXT NOT NULL,
+    graphrag_output_id TEXT NOT NULL,
+    graphrag_community INTEGER NOT NULL,
+    level INTEGER NOT NULL CHECK(level>=0),
+    parent_stable_community_id TEXT,
+    title TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK(size>=0),
+    period TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(run_id,stable_community_id),
+    UNIQUE(run_id,project_id,stable_community_id),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES graphrag_community_runs(run_id,project_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id,parent_stable_community_id)
+        REFERENCES graphrag_communities(run_id,stable_community_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE INDEX idx_graphrag_communities_project
+    ON graphrag_communities(project_id,run_id,level,graphrag_community);
+
+CREATE TABLE graphrag_community_members (
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    stable_community_id TEXT NOT NULL,
+    canonical_entity_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(run_id,stable_community_id,canonical_entity_id),
+    FOREIGN KEY(run_id,project_id,stable_community_id)
+        REFERENCES graphrag_communities(run_id,project_id,stable_community_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY(canonical_entity_id,project_id)
+        REFERENCES canonical_entities(id,project_id)
+);
+CREATE INDEX idx_graphrag_community_members_entity
+    ON graphrag_community_members(project_id,canonical_entity_id,run_id);
+
+CREATE TABLE graphrag_community_edges (
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    stable_edge_id TEXT NOT NULL,
+    source_entity_id BIGINT NOT NULL,
+    target_entity_id BIGINT NOT NULL,
+    weight DOUBLE PRECISION NOT NULL CHECK(
+        weight>0 AND weight NOT IN (
+            'NaN'::DOUBLE PRECISION,
+            'Infinity'::DOUBLE PRECISION,
+            '-Infinity'::DOUBLE PRECISION
+        )
+    ),
+    assertion_ids BIGINT[] NOT NULL DEFAULT '{}',
+    chunk_ids BIGINT[] NOT NULL DEFAULT '{}',
+    relation_types TEXT[] NOT NULL DEFAULT '{}',
+    text_unit_ids TEXT[] NOT NULL DEFAULT '{}',
+    provenance_hash TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(run_id,stable_edge_id),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES graphrag_community_runs(run_id,project_id) ON DELETE CASCADE,
+    FOREIGN KEY(source_entity_id,project_id)
+        REFERENCES canonical_entities(id,project_id),
+    FOREIGN KEY(target_entity_id,project_id)
+        REFERENCES canonical_entities(id,project_id),
+    CHECK(source_entity_id<>target_entity_id)
+);
+CREATE INDEX idx_graphrag_community_edges_project
+    ON graphrag_community_edges(project_id,run_id,source_entity_id,target_entity_id);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1099,6 +1213,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0009_policy_snapshot_coverage",
         description="Fail policy promotion closed on incomplete relation coverage",
         sql=POLICY_SNAPSHOT_COVERAGE_SQL,
+    ),
+    Migration(
+        version="0010_graphrag_communities",
+        description="Persist shadow GraphRAG BYOG community detection results",
+        sql=GRAPHRAG_COMMUNITIES_SQL,
+        startup_safe=True,
     ),
 )
 

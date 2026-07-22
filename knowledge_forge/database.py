@@ -31,6 +31,7 @@ from .graph_policy import (
     GRAPH_REBUILDING,
     GRAPH_STALE,
     graph_policy_hash,
+    is_current_graph,
 )
 from .relation_verification import (
     LEGACY_UNVERIFIED,
@@ -5847,6 +5848,283 @@ class Database:
                 AND COALESCE(projection.publishable,TRUE)=TRUE
                 AND """ + clause + " ORDER BY r.id", (project_id, *policy_params)
             ).fetchall()
+
+    def export_graphrag_control_snapshot(self, project_id: int):
+        """Export one consistent fail-closed snapshot of the formal control graph."""
+
+        from .graphrag_community import ControlGraphSnapshot
+
+        clause, policy_params = self._publishable_relation_clause("r")
+        with self.connection() as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE id=%s AND is_deleted=FALSE",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            if not is_current_graph(project):
+                raise RuntimeError("项目正式图不是 current/ready 状态")
+            relations = conn.execute(
+                """SELECT
+                   r.id AS assertion_id,r.document_id,r.chunk_id,r.revision_id,
+                   r.relation_type,r.description AS relation_description,
+                   COALESCE(projection.source_entity_id,r.source_entity_id)
+                       AS source_entity_id,
+                   COALESCE(projection.target_entity_id,r.target_entity_id)
+                       AS target_entity_id,
+                   source.entity_key AS source_entity_key,
+                   source.name AS source_name,source.entity_type AS source_type,
+                   source.description AS source_description,
+                   target.entity_key AS target_entity_key,
+                   target.name AS target_name,target.entity_type AS target_type,
+                   target.description AS target_description,
+                   c.chunk_key
+                   FROM relation_assertions r
+                   LEFT JOIN canonical_relation_projections projection
+                     ON projection.project_id=r.project_id
+                    AND projection.assertion_id=r.id
+                   JOIN canonical_entities source
+                     ON source.id=COALESCE(projection.source_entity_id,r.source_entity_id)
+                    AND source.project_id=r.project_id AND source.is_deleted=FALSE
+                   JOIN canonical_entities target
+                     ON target.id=COALESCE(projection.target_entity_id,r.target_entity_id)
+                    AND target.project_id=r.project_id AND target.is_deleted=FALSE
+                   JOIN documents d
+                     ON d.id=r.document_id AND d.active_revision_id=r.revision_id
+                   JOIN chunks c
+                     ON c.id=r.chunk_id AND c.revision_id=r.revision_id
+                    AND c.is_deleted=FALSE
+                   WHERE r.project_id=%s AND r.is_deleted=FALSE AND d.is_deleted=FALSE
+                     AND COALESCE(projection.publishable,TRUE)=TRUE
+                     AND """ + clause + " ORDER BY r.id",
+                (project_id, *policy_params),
+            ).fetchall()
+            return ControlGraphSnapshot(
+                project_id=int(project["id"]),
+                graph_generation=int(project["graph_generation"]),
+                graph_policy_hash=str(project.get("graph_policy_hash") or ""),
+                active_policy_hash=str(project.get("active_policy_hash") or ""),
+                relations=tuple(dict(item) for item in relations),
+            )
+
+    def create_graphrag_community_run(
+        self,
+        *,
+        run_id: str,
+        snapshot,
+        input_hash: str,
+        config: dict[str, Any],
+        metrics: dict[str, int],
+        graphrag_version: str,
+        adapter_version: str,
+        weighting_strategy: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO graphrag_community_runs(
+                   run_id,project_id,graph_generation,graph_policy_hash,
+                   active_policy_hash,input_hash,graphrag_version,adapter_version,
+                   weighting_strategy,seed,max_cluster_size,use_lcc,status,
+                   node_count,aggregated_edge_count,excluded_self_loops,
+                   excluded_isolated_entities,config)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'running',
+                          %s,%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    run_id, snapshot.project_id, snapshot.graph_generation,
+                    snapshot.graph_policy_hash, snapshot.active_policy_hash,
+                    input_hash, graphrag_version, adapter_version, weighting_strategy,
+                    config["seed"], config["max_cluster_size"], config["use_lcc"],
+                    metrics["node_count"], metrics["aggregated_edge_count"],
+                    metrics["excluded_self_loops"],
+                    metrics["excluded_isolated_entities"], self._json(config),
+                ),
+            ).fetchone()
+
+    def supersede_graphrag_community_run(
+        self, run_id: str, reason: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_community_runs
+                   SET status='superseded',error_message=%s,completed_at=NOW()
+                   WHERE run_id=%s AND status='running' RETURNING *""",
+                (reason[-4000:], run_id),
+            ).fetchone()
+            if not row:
+                raise LookupError("GraphRAG community run 不存在或已终止")
+            return row
+
+    def fail_graphrag_community_run(self, run_id: str, error: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_community_runs
+                   SET status='failed',error_message=%s,completed_at=NOW()
+                   WHERE run_id=%s AND status='running' RETURNING *""",
+                (error[-4000:], run_id),
+            ).fetchone()
+            return row or {}
+
+    def finalize_graphrag_community_run(
+        self,
+        *,
+        run_id: str,
+        snapshot,
+        input_hash: str,
+        status: str,
+        communities: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        if status not in {"completed", "completed_empty"}:
+            raise ValueError("非法 GraphRAG community 完成状态")
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_community_runs WHERE run_id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise RuntimeError("GraphRAG community run 不存在")
+            if run["status"] in {"completed", "completed_empty"}:
+                same_completion = bool(
+                    run["status"] == status
+                    and run["input_hash"] == input_hash
+                    and int(run["graph_generation"]) == int(snapshot.graph_generation)
+                    and run["graph_policy_hash"] == snapshot.graph_policy_hash
+                    and run["active_policy_hash"] == snapshot.active_policy_hash
+                )
+                if same_completion:
+                    return run
+                raise RuntimeError("GraphRAG community run 已完成且重试参数不一致")
+            if run["status"] != "running":
+                raise RuntimeError("GraphRAG community run 不是 running")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE id=%s AND is_deleted=FALSE FOR SHARE",
+                (run["project_id"],),
+            ).fetchone()
+            unchanged = bool(
+                project
+                and is_current_graph(project)
+                and int(project["graph_generation"]) == int(snapshot.graph_generation)
+                and str(project.get("graph_policy_hash") or "") == snapshot.graph_policy_hash
+                and str(project.get("active_policy_hash") or "") == snapshot.active_policy_hash
+                and run["input_hash"] == input_hash
+            )
+            if not unchanged:
+                return conn.execute(
+                    """UPDATE graphrag_community_runs
+                       SET status='superseded',error_message=%s,completed_at=NOW()
+                       WHERE run_id=%s RETURNING *""",
+                    ("正式图 generation/policy/input_hash 已变化", run_id),
+                ).fetchone()
+
+            for community in communities:
+                community_metadata = {
+                    "relationship_ids": community["relationship_ids"],
+                    "text_unit_ids": community["text_unit_ids"],
+                    "children": community["children"],
+                }
+                conn.execute(
+                    """INSERT INTO graphrag_communities(
+                       run_id,project_id,stable_community_id,graphrag_output_id,
+                       graphrag_community,level,parent_stable_community_id,title,size,
+                       period,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(run_id,stable_community_id) DO NOTHING""",
+                    (
+                        run_id, run["project_id"], community["stable_community_id"],
+                        community["graphrag_output_id"],
+                        community["graphrag_community"], community["level"],
+                        community["parent_stable_community_id"], community["title"],
+                        community["size"], community["period"],
+                        self._json(community_metadata),
+                    ),
+                )
+                for entity_id in community["canonical_entity_ids"]:
+                    conn.execute(
+                        """INSERT INTO graphrag_community_members(
+                           run_id,project_id,stable_community_id,canonical_entity_id)
+                           VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                        (
+                            run_id, run["project_id"],
+                            community["stable_community_id"], entity_id,
+                        ),
+                    )
+            for edge in edges:
+                conn.execute(
+                    """INSERT INTO graphrag_community_edges(
+                       run_id,project_id,stable_edge_id,source_entity_id,target_entity_id,
+                       weight,assertion_ids,chunk_ids,relation_types,text_unit_ids,
+                       provenance_hash,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(run_id,stable_edge_id) DO NOTHING""",
+                    (
+                        run_id, run["project_id"], edge["stable_edge_id"],
+                        edge["source_entity_id"], edge["target_entity_id"],
+                        edge["weight"], edge["assertion_ids"], edge["chunk_ids"],
+                        edge["relation_types"], edge["text_unit_ids"],
+                        edge["provenance_hash"], self._json({}),
+                    ),
+                )
+            hierarchy_levels = len({int(item["level"]) for item in communities})
+            return conn.execute(
+                """UPDATE graphrag_community_runs SET status=%s,
+                   community_count=%s,hierarchy_levels=%s,metadata=%s::jsonb,
+                   error_message='',completed_at=NOW()
+                   WHERE run_id=%s RETURNING *""",
+                (status, len(communities), hierarchy_levels, self._json(metadata), run_id),
+            ).fetchone()
+
+    def get_graphrag_community_run(self, run_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_community_runs WHERE run_id=%s", (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("GraphRAG community run 不存在")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE id=%s AND is_deleted=FALSE",
+                (run["project_id"],),
+            ).fetchone()
+            result = dict(run)
+            result["current"] = bool(
+                run["status"] in {"completed", "completed_empty"}
+                and project
+                and is_current_graph(project)
+                and int(project["graph_generation"]) == int(run["graph_generation"])
+                and str(project.get("graph_policy_hash") or "") == run["graph_policy_hash"]
+                and str(project.get("active_policy_hash") or "") == run["active_policy_hash"]
+            )
+            return result
+
+    def show_graphrag_community_run(self, run_id: str) -> dict[str, Any]:
+        run = self.get_graphrag_community_run(run_id)
+        with self.connection() as conn:
+            communities = conn.execute(
+                """SELECT * FROM graphrag_communities
+                   WHERE run_id=%s ORDER BY level,graphrag_community,stable_community_id""",
+                (run_id,),
+            ).fetchall()
+            members = conn.execute(
+                """SELECT member.*,entity.entity_key,entity.name,entity.entity_type
+                   FROM graphrag_community_members member
+                   JOIN canonical_entities entity ON entity.id=member.canonical_entity_id
+                   WHERE member.run_id=%s
+                   ORDER BY member.stable_community_id,member.canonical_entity_id""",
+                (run_id,),
+            ).fetchall()
+            edges = conn.execute(
+                """SELECT * FROM graphrag_community_edges
+                   WHERE run_id=%s ORDER BY stable_edge_id""",
+                (run_id,),
+            ).fetchall()
+        return {
+            "run": run,
+            "current": run["current"],
+            "communities": communities,
+            "members": members,
+            "edges": edges,
+        }
 
     def count_publishable_relations(
         self, project_id: int, document_ids: list[int] | None = None,
