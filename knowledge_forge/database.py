@@ -4064,6 +4064,831 @@ class Database:
                 raise LookupError("shadow run 不存在")
             return row
 
+    @staticmethod
+    def _shadow_relation_v2_db_id(prefix: str, *parts: object) -> str:
+        material = "\x1f".join(str(part) for part in parts)
+        return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _set_shadow_relation_v2_session(
+        conn: psycopg.Connection,
+        run_id: str,
+    ) -> None:
+        # The database triggers use this transaction-local marker to turn an
+        # accidental product-table write into a hard error.
+        conn.execute(
+            "SELECT set_config('knowledge_forge.shadow_relation_v2_run_id',%s,TRUE)",
+            (run_id,),
+        )
+
+    def start_shadow_relation_v2_run(
+        self,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create one isolated v2 run without changing any active product state."""
+
+        run_id = str(values.get("id") or "")
+        fingerprint = str(values.get("input_fingerprint") or "")
+        components = dict(values.get("fingerprint_components") or {})
+        if not run_id or not fingerprint or not components:
+            raise ValueError("Shadow relation v2 run requires id and complete fingerprint")
+        project_id = int(values["project_id"])
+        source_generation = int(values.get("source_generation") or 0)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            conn.execute(
+                """INSERT INTO shadow_relation_v2_runs(
+                   id,project_id,snapshot_id,input_fingerprint,fingerprint_components,
+                   source_generation,status)
+                   VALUES(%s,%s,%s,%s,%s::jsonb,%s,'planning')
+                   ON CONFLICT(id) DO NOTHING""",
+                (
+                    run_id,
+                    project_id,
+                    values.get("snapshot_id"),
+                    fingerprint,
+                    self._canonical_json(components),
+                    source_generation,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM shadow_relation_v2_runs WHERE id=%s",
+                (run_id,),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("Shadow relation v2 run could not be created")
+            if (
+                int(row["project_id"]) != project_id
+                or str(row["input_fingerprint"]) != fingerprint
+                or int(row["source_generation"]) != source_generation
+                or dict(row.get("fingerprint_components") or {}) != components
+            ):
+                raise ValueError("Shadow relation v2 run immutable input mismatch")
+            return row
+
+    def persist_shadow_relation_v2_opportunities(
+        self,
+        run_id: str,
+        opportunities: Any,
+    ) -> list[dict[str, Any]]:
+        """Persist the complete unordered opportunity ledger before model I/O."""
+
+        values = list(opportunities)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            run = conn.execute(
+                "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("Shadow relation v2 run does not exist")
+            for item in values:
+                if str(item.run_id) != run_id:
+                    raise ValueError("pair opportunity belongs to another run")
+                if int(item.project_id) != int(run["project_id"]):
+                    raise ValueError("pair opportunity belongs to another project")
+                conn.execute(
+                    """INSERT INTO shadow_relation_pair_opportunities(
+                       id,run_id,project_id,document_revision_id,document_id,chunk_id,
+                       chunk_key,pair_identity,candidate_policy_version,
+                       left_occurrence_key,right_occurrence_key,left_mention_id,right_mention_id,
+                       left_start,left_end,right_start,right_end,left_canonical_id,
+                       right_canonical_id,left_assignment_version,right_assignment_version,
+                       context_identity,context_start,context_end,allowed_predicate_metadata,
+                       planning_reason,cue,type_status,status,provenance)
+                       VALUES(
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        item.opportunity_identity,
+                        run_id,
+                        int(item.project_id),
+                        item.document_revision_id,
+                        item.provenance.get("document_id"),
+                        item.provenance.get("chunk_id"),
+                        item.chunk_key,
+                        item.pair_identity,
+                        item.candidate_policy_version,
+                        item.left_occurrence_key,
+                        item.right_occurrence_key,
+                        item.left_mention_id,
+                        item.right_mention_id,
+                        int(item.left_span[0]),
+                        int(item.left_span[1]),
+                        int(item.right_span[0]),
+                        int(item.right_span[1]),
+                        item.left_canonical_id,
+                        item.right_canonical_id,
+                        item.left_assignment_version,
+                        item.right_assignment_version,
+                        item.context_identity,
+                        int(item.context_span[0]),
+                        int(item.context_span[1]),
+                        self._canonical_json(list(item.allowed_predicate_metadata)),
+                        item.planning_reason,
+                        item.cue,
+                        item.type_status,
+                        item.status,
+                        self._canonical_json(item.provenance),
+                    ),
+                )
+                persisted = conn.execute(
+                    """SELECT * FROM shadow_relation_pair_opportunities
+                       WHERE id=%s AND run_id=%s""",
+                    (item.opportunity_identity, run_id),
+                ).fetchone()
+                expected = (
+                    str(item.pair_identity),
+                    str(item.candidate_policy_version),
+                    str(item.left_occurrence_key),
+                    str(item.right_occurrence_key),
+                    int(item.left_span[0]),
+                    int(item.left_span[1]),
+                    int(item.right_span[0]),
+                    int(item.right_span[1]),
+                    str(item.context_identity),
+                    int(item.context_span[0]),
+                    int(item.context_span[1]),
+                )
+                actual = (
+                    str(persisted["pair_identity"]),
+                    str(persisted["candidate_policy_version"]),
+                    str(persisted["left_occurrence_key"]),
+                    str(persisted["right_occurrence_key"]),
+                    int(persisted["left_start"]),
+                    int(persisted["left_end"]),
+                    int(persisted["right_start"]),
+                    int(persisted["right_end"]),
+                    str(persisted["context_identity"]),
+                    int(persisted["context_start"]),
+                    int(persisted["context_end"]),
+                )
+                if actual != expected:
+                    raise ValueError("pair opportunity immutable input mismatch")
+            if run["status"] == "planning":
+                conn.execute(
+                    """UPDATE shadow_relation_v2_runs SET status='classifying'
+                       WHERE id=%s AND status='planning'""",
+                    (run_id,),
+                )
+            return conn.execute(
+                """SELECT * FROM shadow_relation_pair_opportunities
+                   WHERE run_id=%s ORDER BY pair_identity""",
+                (run_id,),
+            ).fetchall()
+
+    def record_shadow_relation_v2_classification_attempt(
+        self,
+        run_id: str,
+        pair_identity: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one classifier attempt without overwriting an earlier attempt."""
+
+        attempt_no = int(values.get("attempt_no") or 0)
+        status = str(values.get("status") or "")
+        if attempt_no <= 0:
+            raise ValueError("classification attempt number must be positive")
+        if status not in {
+            "accepted", "retryable_failed", "permanent_failed", "superseded",
+        }:
+            raise ValueError("invalid classification attempt status")
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            pair = conn.execute(
+                """SELECT * FROM shadow_relation_pair_opportunities
+                   WHERE run_id=%s AND pair_identity=%s""",
+                (run_id, pair_identity),
+            ).fetchone()
+            if not pair:
+                raise LookupError("classification attempt pair does not exist")
+            attempt_id = self._shadow_relation_v2_db_id(
+                "relclassdb_", pair["id"], attempt_no,
+            )
+            conn.execute(
+                """INSERT INTO shadow_relation_classification_attempts(
+                   id,pair_opportunity_id,attempt_no,status,request_hash,response_hash,
+                   classifier_prompt_version,classifier_schema_version,
+                   classifier_parser_version,classifier_model_revision,error_message,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(id) DO NOTHING""",
+                (
+                    attempt_id,
+                    pair["id"],
+                    attempt_no,
+                    status,
+                    str(values.get("request_hash") or ""),
+                    str(values.get("response_hash") or ""),
+                    str(values.get("classifier_prompt_version") or ""),
+                    str(values.get("classifier_schema_version") or ""),
+                    str(values.get("classifier_parser_version") or ""),
+                    str(values.get("classifier_model_revision") or ""),
+                    str(values.get("error_message") or ""),
+                    self._canonical_json(values.get("metadata") or {}),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM shadow_relation_classification_attempts WHERE id=%s",
+                (attempt_id,),
+            ).fetchone()
+            immutable = (
+                int(row["attempt_no"]),
+                str(row["status"]),
+                str(row["request_hash"]),
+                str(row["response_hash"]),
+                str(row["classifier_prompt_version"]),
+                str(row["classifier_schema_version"]),
+                str(row["classifier_parser_version"]),
+                str(row["classifier_model_revision"]),
+            )
+            expected = (
+                attempt_no,
+                status,
+                str(values.get("request_hash") or ""),
+                str(values.get("response_hash") or ""),
+                str(values.get("classifier_prompt_version") or ""),
+                str(values.get("classifier_schema_version") or ""),
+                str(values.get("classifier_parser_version") or ""),
+                str(values.get("classifier_model_revision") or ""),
+            )
+            if immutable != expected:
+                raise ValueError("classification attempt immutable payload mismatch")
+            return row
+
+    def persist_shadow_relation_v2_classifications(
+        self,
+        run_id: str,
+        decisions: Any,
+    ) -> list[dict[str, Any]]:
+        """Persist pair decisions and zero-to-many positive hypotheses."""
+
+        values = list(decisions)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            for decision in values:
+                pair = conn.execute(
+                    """SELECT * FROM shadow_relation_pair_opportunities
+                       WHERE run_id=%s AND pair_identity=%s FOR UPDATE""",
+                    (run_id, decision.pair_identity),
+                ).fetchone()
+                if not pair:
+                    raise LookupError("classification decision pair does not exist")
+                accepted_attempt = conn.execute(
+                    """SELECT 1 FROM shadow_relation_classification_attempts
+                       WHERE pair_opportunity_id=%s AND status='accepted' LIMIT 1""",
+                    (pair["id"],),
+                ).fetchone()
+                if not accepted_attempt:
+                    raise ValueError("classification decision has no accepted attempt")
+                current_status = str(pair["status"])
+                if current_status not in {
+                    "PENDING_CLASSIFICATION",
+                    str(decision.decision),
+                }:
+                    raise ValueError("pair already has a different terminal decision")
+                provenance = dict(pair.get("provenance") or {})
+                provenance["classification"] = {
+                    "decision": decision.decision,
+                    "reason_code": decision.reason_code,
+                    "evidence_spans": [
+                        [span.start, span.end] for span in decision.evidence_spans
+                    ],
+                }
+                conn.execute(
+                    """UPDATE shadow_relation_pair_opportunities
+                       SET status=%s,provenance=%s::jsonb,updated_at=NOW()
+                       WHERE id=%s""",
+                    (
+                        decision.decision,
+                        self._canonical_json(provenance),
+                        pair["id"],
+                    ),
+                )
+                for hypothesis in decision.hypotheses:
+                    if hypothesis.pair_identity != decision.pair_identity:
+                        raise ValueError("hypothesis belongs to another pair")
+                    database_id = self._shadow_relation_v2_db_id(
+                        "relhypdb_", run_id, hypothesis.hypothesis_id,
+                    )
+                    spans = [
+                        [span.start, span.end] for span in hypothesis.evidence_spans
+                    ]
+                    metadata = {
+                        "stable_hypothesis_id": hypothesis.hypothesis_id,
+                        "evidence_spans": spans,
+                        "classifier_confidence": hypothesis.classifier_confidence,
+                        "classifier_prompt_version": hypothesis.classifier_prompt_version,
+                        "classifier_schema_version": hypothesis.classifier_schema_version,
+                        "classifier_parser_version": hypothesis.classifier_parser_version,
+                        "predicate_metadata": hypothesis.predicate_metadata,
+                    }
+                    conn.execute(
+                        """INSERT INTO shadow_relation_hypotheses(
+                           id,pair_opportunity_id,hypothesis_key,predicate,
+                           subject_occurrence_key,object_occurrence_key,evidence_start,
+                           evidence_end,classifier_policy_version,
+                           classifier_model_revision,status,metadata)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLASSIFIED_POSITIVE',
+                                  %s::jsonb)
+                           ON CONFLICT(id) DO NOTHING""",
+                        (
+                            database_id,
+                            pair["id"],
+                            hypothesis.hypothesis_id,
+                            hypothesis.predicate,
+                            hypothesis.subject_occurrence_key,
+                            hypothesis.object_occurrence_key,
+                            min(span.start for span in hypothesis.evidence_spans),
+                            max(span.end for span in hypothesis.evidence_spans),
+                            hypothesis.classifier_policy_version,
+                            hypothesis.classifier_model_revision,
+                            self._canonical_json(metadata),
+                        ),
+                    )
+                    persisted = conn.execute(
+                        "SELECT * FROM shadow_relation_hypotheses WHERE id=%s",
+                        (database_id,),
+                    ).fetchone()
+                    immutable = (
+                        str(persisted["hypothesis_key"]),
+                        str(persisted["predicate"]),
+                        str(persisted["subject_occurrence_key"]),
+                        str(persisted["object_occurrence_key"]),
+                        dict(persisted.get("metadata") or {}).get("evidence_spans"),
+                    )
+                    expected = (
+                        hypothesis.hypothesis_id,
+                        hypothesis.predicate,
+                        hypothesis.subject_occurrence_key,
+                        hypothesis.object_occurrence_key,
+                        spans,
+                    )
+                    if immutable != expected:
+                        raise ValueError("hypothesis immutable payload mismatch")
+            conn.execute(
+                """UPDATE shadow_relation_v2_runs SET status='verifying'
+                   WHERE id=%s AND status IN ('planning','classifying')""",
+                (run_id,),
+            )
+            return conn.execute(
+                """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
+                   JOIN shadow_relation_pair_opportunities pair
+                     ON pair.id=hypothesis.pair_opportunity_id
+                   WHERE pair.run_id=%s ORDER BY hypothesis.id""",
+                (run_id,),
+            ).fetchall()
+
+    def persist_shadow_relation_v2_validations(
+        self,
+        run_id: str,
+        validations: Any,
+    ) -> list[dict[str, Any]]:
+        """Persist deterministic hard-rule outcomes before independent verification."""
+
+        values = list(validations)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            for validation in values:
+                hypothesis = conn.execute(
+                    """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
+                       JOIN shadow_relation_pair_opportunities pair
+                         ON pair.id=hypothesis.pair_opportunity_id
+                       WHERE pair.run_id=%s AND hypothesis.hypothesis_key=%s""",
+                    (run_id, validation.hypothesis_id),
+                ).fetchone()
+                if not hypothesis:
+                    raise LookupError("validation hypothesis does not exist")
+                conn.execute(
+                    """INSERT INTO shadow_relation_hypothesis_validations(
+                       hypothesis_id,status,reason_code,predicate_metadata)
+                       VALUES(%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(hypothesis_id) DO NOTHING""",
+                    (
+                        hypothesis["id"],
+                        validation.status,
+                        validation.reason_code,
+                        self._canonical_json(validation.predicate_metadata),
+                    ),
+                )
+                row = conn.execute(
+                    """SELECT * FROM shadow_relation_hypothesis_validations
+                       WHERE hypothesis_id=%s""",
+                    (hypothesis["id"],),
+                ).fetchone()
+                if (
+                    str(row["status"]) != str(validation.status)
+                    or str(row["reason_code"]) != str(validation.reason_code)
+                    or self._canonical_json(row.get("predicate_metadata") or {})
+                    != self._canonical_json(validation.predicate_metadata)
+                ):
+                    raise ValueError("hypothesis validation immutable payload mismatch")
+                persisted_status = {
+                    "PASS": "RULE_VALID",
+                    "REVIEW_ONLY": "RULE_REVIEW_ONLY",
+                    "REJECTED": "RULE_REJECTED",
+                }[validation.status]
+                conn.execute(
+                    "UPDATE shadow_relation_hypotheses SET status=%s WHERE id=%s",
+                    (persisted_status, hypothesis["id"]),
+                )
+            return conn.execute(
+                """SELECT validation.* FROM shadow_relation_hypothesis_validations validation
+                   JOIN shadow_relation_hypotheses hypothesis
+                     ON hypothesis.id=validation.hypothesis_id
+                   JOIN shadow_relation_pair_opportunities pair
+                     ON pair.id=hypothesis.pair_opportunity_id
+                   WHERE pair.run_id=%s ORDER BY validation.hypothesis_id""",
+                (run_id,),
+            ).fetchall()
+
+    def persist_shadow_relation_v2_verification_attempts(
+        self,
+        run_id: str,
+        attempts: Any,
+    ) -> list[dict[str, Any]]:
+        """Append verifier attempts; retries never overwrite earlier verdicts."""
+
+        values = list(attempts)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            for attempt in values:
+                hypothesis = conn.execute(
+                    """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
+                       JOIN shadow_relation_pair_opportunities pair
+                         ON pair.id=hypothesis.pair_opportunity_id
+                       WHERE pair.run_id=%s AND hypothesis.hypothesis_key=%s""",
+                    (run_id, attempt.hypothesis_id),
+                ).fetchone()
+                if not hypothesis:
+                    raise LookupError("verification hypothesis does not exist")
+                validation = conn.execute(
+                    """SELECT * FROM shadow_relation_hypothesis_validations
+                       WHERE hypothesis_id=%s""",
+                    (hypothesis["id"],),
+                ).fetchone()
+                if not validation:
+                    raise ValueError("verification requires deterministic validation")
+                if attempt.independent_call and validation["status"] != "PASS":
+                    raise ValueError("independent verifier cannot bypass failed rules")
+                database_id = self._shadow_relation_v2_db_id(
+                    "relverifydb_", run_id, attempt.attempt_id,
+                )
+                canonical_attempt = {
+                    "stable_attempt_id": attempt.attempt_id,
+                    "hypothesis_id": attempt.hypothesis_id,
+                    "attempt_no": int(attempt.attempt_no),
+                    "verdict": attempt.verdict,
+                    "reason_code": attempt.reason_code,
+                    "supported_evidence_spans": [
+                        [span.start, span.end]
+                        for span in attempt.supported_evidence_spans
+                    ],
+                    "independent_call": bool(attempt.independent_call),
+                    "verifier_prompt_version": attempt.verifier_prompt_version,
+                    "verifier_schema_version": attempt.verifier_schema_version,
+                    "verifier_parser_version": attempt.verifier_parser_version,
+                    "verifier_model_revision": attempt.verifier_model_revision,
+                    "error_message": attempt.error_message,
+                }
+                payload_hash = hashlib.sha256(
+                    self._canonical_json(canonical_attempt).encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    """INSERT INTO shadow_relation_verification_attempts(
+                       id,hypothesis_id,attempt_no,verdict,reason_code,
+                       supported_evidence_spans,independent_call,
+                       verifier_prompt_version,verifier_schema_version,
+                       verifier_parser_version,verifier_model_revision,
+                       request_hash,response_hash,error_message)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        database_id,
+                        hypothesis["id"],
+                        int(attempt.attempt_no),
+                        attempt.verdict,
+                        attempt.reason_code,
+                        self._canonical_json(
+                            canonical_attempt["supported_evidence_spans"]
+                        ),
+                        bool(attempt.independent_call),
+                        attempt.verifier_prompt_version,
+                        attempt.verifier_schema_version,
+                        attempt.verifier_parser_version,
+                        attempt.verifier_model_revision,
+                        payload_hash,
+                        payload_hash,
+                        attempt.error_message,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM shadow_relation_verification_attempts WHERE id=%s",
+                    (database_id,),
+                ).fetchone()
+                if (
+                    int(row["attempt_no"]) != int(attempt.attempt_no)
+                    or str(row["verdict"]) != str(attempt.verdict)
+                    or str(row["request_hash"]) != payload_hash
+                ):
+                    raise ValueError("verification attempt immutable payload mismatch")
+                conn.execute(
+                    "UPDATE shadow_relation_hypotheses SET status=%s WHERE id=%s",
+                    (f"VERIFIER_{attempt.verdict}", hypothesis["id"]),
+                )
+            return conn.execute(
+                """SELECT attempt.* FROM shadow_relation_verification_attempts attempt
+                   JOIN shadow_relation_hypotheses hypothesis
+                     ON hypothesis.id=attempt.hypothesis_id
+                   JOIN shadow_relation_pair_opportunities pair
+                     ON pair.id=hypothesis.pair_opportunity_id
+                   WHERE pair.run_id=%s
+                   ORDER BY hypothesis.hypothesis_key,attempt.attempt_no""",
+                (run_id,),
+            ).fetchall()
+
+    def persist_shadow_relation_v2_normalization(
+        self,
+        run_id: str,
+        result: Any,
+        *,
+        input_fingerprint: str,
+        materialization_decisions: Any = (),
+    ) -> dict[str, int]:
+        """Persist normalized Shadow facts and provenance, never product assertions."""
+
+        decisions = {
+            str(item.fact_id): item for item in materialization_decisions
+        }
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            run = conn.execute(
+                "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("Shadow relation v2 run does not exist")
+            if str(run["input_fingerprint"]) != str(input_fingerprint):
+                raise ValueError("normalization fingerprint does not match run")
+            for fact in result.facts:
+                if int(fact.project_id) != int(run["project_id"]):
+                    raise ValueError("normalized fact belongs to another project")
+                conn.execute(
+                    """INSERT INTO shadow_relation_normalized_facts(
+                       id,project_id,semantic_fact_key,subject_canonical_id,predicate,
+                       object_canonical_id,is_symmetric,is_reflexive,is_review_only)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        fact.fact_id,
+                        int(fact.project_id),
+                        fact.semantic_fact_key,
+                        fact.subject_canonical_id,
+                        fact.predicate,
+                        fact.object_canonical_id,
+                        bool(fact.symmetric),
+                        bool(fact.reflexive),
+                        bool(fact.review_only),
+                    ),
+                )
+                persisted = conn.execute(
+                    "SELECT * FROM shadow_relation_normalized_facts WHERE id=%s",
+                    (fact.fact_id,),
+                ).fetchone()
+                immutable = (
+                    int(persisted["project_id"]),
+                    str(persisted["semantic_fact_key"]),
+                    str(persisted["subject_canonical_id"]),
+                    str(persisted["predicate"]),
+                    str(persisted["object_canonical_id"]),
+                    bool(persisted["is_symmetric"]),
+                    bool(persisted["is_reflexive"]),
+                    bool(persisted["is_review_only"]),
+                )
+                expected = (
+                    int(fact.project_id),
+                    fact.semantic_fact_key,
+                    fact.subject_canonical_id,
+                    fact.predicate,
+                    fact.object_canonical_id,
+                    bool(fact.symmetric),
+                    bool(fact.reflexive),
+                    bool(fact.review_only),
+                )
+                if immutable != expected:
+                    raise ValueError("normalized fact immutable payload mismatch")
+                decision = decisions.get(fact.fact_id)
+                if decision and decision.eligible:
+                    membership_status = "ELIGIBLE"
+                elif fact.review_only:
+                    membership_status = "REVIEW_ONLY"
+                else:
+                    membership_status = "NORMALIZED"
+                conn.execute(
+                    """INSERT INTO shadow_relation_fact_memberships(
+                       run_id,fact_id,input_fingerprint,status)
+                       VALUES(%s,%s,%s,%s)
+                       ON CONFLICT(run_id,fact_id) DO UPDATE SET
+                           status=EXCLUDED.status
+                       WHERE shadow_relation_fact_memberships.input_fingerprint
+                             =EXCLUDED.input_fingerprint""",
+                    (
+                        run_id,
+                        fact.fact_id,
+                        input_fingerprint,
+                        membership_status,
+                    ),
+                )
+            for evidence in result.evidence:
+                hypothesis = conn.execute(
+                    """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
+                       JOIN shadow_relation_pair_opportunities pair
+                         ON pair.id=hypothesis.pair_opportunity_id
+                       WHERE pair.run_id=%s AND hypothesis.hypothesis_key=%s""",
+                    (run_id, evidence.hypothesis_id),
+                ).fetchone()
+                if not hypothesis:
+                    raise LookupError("fact evidence hypothesis does not exist")
+                verification_id = self._shadow_relation_v2_db_id(
+                    "relverifydb_", run_id, evidence.verification_attempt_id,
+                )
+                verification = conn.execute(
+                    """SELECT * FROM shadow_relation_verification_attempts
+                       WHERE id=%s AND hypothesis_id=%s""",
+                    (verification_id, hypothesis["id"]),
+                ).fetchone()
+                if (
+                    not verification
+                    or verification["verdict"] != "SUPPORTED"
+                    or not verification["independent_call"]
+                ):
+                    raise ValueError("fact evidence lacks independent verifier support")
+                evidence_id = self._shadow_relation_v2_db_id(
+                    "relevidencedb_", run_id, evidence.evidence_id,
+                )
+                conn.execute(
+                    """INSERT INTO shadow_relation_fact_evidence(
+                       id,fact_id,run_id,evidence_key,document_revision_id,
+                       subject_occurrence_key,object_occurrence_key,evidence_spans,
+                       hypothesis_id,verification_attempt_id,provenance)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        evidence_id,
+                        evidence.fact_id,
+                        run_id,
+                        evidence.evidence_key,
+                        evidence.document_revision_id,
+                        evidence.subject_occurrence_key,
+                        evidence.object_occurrence_key,
+                        self._canonical_json([
+                            [span.start, span.end] for span in evidence.evidence_spans
+                        ]),
+                        hypothesis["id"],
+                        verification_id,
+                        self._canonical_json(evidence.provenance),
+                    ),
+                )
+            for collapse in result.collapse_audit:
+                hypothesis = conn.execute(
+                    """SELECT hypothesis.id FROM shadow_relation_hypotheses hypothesis
+                       JOIN shadow_relation_pair_opportunities pair
+                         ON pair.id=hypothesis.pair_opportunity_id
+                       WHERE pair.run_id=%s AND hypothesis.hypothesis_key=%s""",
+                    (run_id, collapse["hypothesis_id"]),
+                ).fetchone()
+                if not hypothesis:
+                    raise LookupError("collapse audit hypothesis does not exist")
+                audit_id = self._shadow_relation_v2_db_id(
+                    "relcollapsedb_",
+                    run_id,
+                    collapse["fact_id"],
+                    collapse["hypothesis_id"],
+                    collapse["reason_code"],
+                )
+                conn.execute(
+                    """INSERT INTO shadow_relation_fact_collapse_audit(
+                       id,run_id,fact_id,hypothesis_id,reason_code,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        audit_id,
+                        run_id,
+                        collapse["fact_id"],
+                        hypothesis["id"],
+                        collapse["reason_code"],
+                        self._canonical_json(collapse),
+                    ),
+                )
+            for conflict in result.conflicts:
+                conn.execute(
+                    """INSERT INTO shadow_relation_fact_conflicts(
+                       id,run_id,pair_identity,hypothesis_id,reason_code,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        self._shadow_relation_v2_db_id(
+                            "relconflictdb_", run_id, conflict.conflict_id,
+                        ),
+                        run_id,
+                        conflict.pair_identity,
+                        conflict.hypothesis_id,
+                        conflict.reason_code,
+                        self._canonical_json(conflict.metadata),
+                    ),
+                )
+            conn.execute(
+                """UPDATE shadow_relation_v2_runs
+                   SET status='normalizing',metrics=%s::jsonb
+                   WHERE id=%s AND status IN ('classifying','verifying','normalizing')""",
+                (self._canonical_json(result.metrics), run_id),
+            )
+            return {
+                "facts": len(result.facts),
+                "evidence": len(result.evidence),
+                "conflicts": len(result.conflicts),
+                "collapsed": len(result.collapse_audit),
+            }
+
+    def finish_shadow_relation_v2_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        metrics: dict[str, Any],
+        input_fingerprint: str,
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        """Close the isolated run only after its pair and verifier ledgers settle."""
+
+        if status not in {"ready", "stale", "failed", "cancelled"}:
+            raise ValueError("invalid Shadow relation v2 terminal status")
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            run = conn.execute(
+                "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("Shadow relation v2 run does not exist")
+            if str(run["input_fingerprint"]) != str(input_fingerprint):
+                raise ValueError("completion fingerprint does not match run")
+            if status == "ready":
+                pending_pairs = int(conn.execute(
+                    """SELECT COUNT(*) AS count
+                       FROM shadow_relation_pair_opportunities
+                       WHERE run_id=%s AND status='PENDING_CLASSIFICATION'""",
+                    (run_id,),
+                ).fetchone()["count"])
+                incomplete_hypotheses = int(conn.execute(
+                    """SELECT COUNT(*) AS count
+                       FROM shadow_relation_hypotheses hypothesis
+                       JOIN shadow_relation_pair_opportunities pair
+                         ON pair.id=hypothesis.pair_opportunity_id
+                       LEFT JOIN shadow_relation_hypothesis_validations validation
+                         ON validation.hypothesis_id=hypothesis.id
+                       LEFT JOIN shadow_relation_verification_attempts attempt
+                         ON attempt.hypothesis_id=hypothesis.id
+                       WHERE pair.run_id=%s
+                         AND (validation.hypothesis_id IS NULL OR attempt.id IS NULL)""",
+                    (run_id,),
+                ).fetchone()["count"])
+                unsupported_eligible = int(conn.execute(
+                    """SELECT COUNT(*) AS count
+                       FROM shadow_relation_fact_memberships membership
+                       WHERE membership.run_id=%s AND membership.status='ELIGIBLE'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM shadow_relation_fact_evidence evidence
+                             JOIN shadow_relation_verification_attempts attempt
+                               ON attempt.id=evidence.verification_attempt_id
+                             WHERE evidence.run_id=membership.run_id
+                               AND evidence.fact_id=membership.fact_id
+                               AND attempt.verdict='SUPPORTED'
+                               AND attempt.independent_call=TRUE
+                         )""",
+                    (run_id,),
+                ).fetchone()["count"])
+                if pending_pairs or incomplete_hypotheses or unsupported_eligible:
+                    raise ValueError(
+                        "Shadow relation v2 run is incomplete and cannot become ready"
+                    )
+            merged_metrics = {
+                **dict(run.get("metrics") or {}),
+                **dict(metrics),
+            }
+            row = conn.execute(
+                """UPDATE shadow_relation_v2_runs
+                   SET status=%s,metrics=%s::jsonb,error_message=%s,completed_at=NOW()
+                   WHERE id=%s RETURNING *""",
+                (
+                    status,
+                    self._canonical_json(merged_metrics),
+                    error_message or "",
+                    run_id,
+                ),
+            ).fetchone()
+            return row
+
     def create_policy_snapshot(
         self,
         project_id: int,
@@ -4512,6 +5337,29 @@ class Database:
                 raise ValueError("策略快照未完整就绪，禁止激活")
             if not bool(snapshot.get("coverage_complete")):
                 raise ValueError("策略快照 coverage 不完整，禁止激活")
+            policy_set = normalize_policy_set(snapshot["policy_set"])
+            from .policy import CONTROL_POLICY_SET
+            if policy_set != dict(CONTROL_POLICY_SET):
+                materialization_fingerprint = str(
+                    snapshot.get("materialization_fingerprint") or ""
+                )
+                current = conn.execute(
+                    """SELECT current_fingerprint
+                       FROM shadow_relation_current_fingerprints
+                       WHERE project_id=%s FOR UPDATE""",
+                    (project_id,),
+                ).fetchone()
+                current_fingerprint = str(
+                    (current or {}).get("current_fingerprint") or ""
+                )
+                if (
+                    not materialization_fingerprint
+                    or not current_fingerprint
+                    or materialization_fingerprint != current_fingerprint
+                ):
+                    raise ValueError(
+                        "treatment materialization_fingerprint 已过期，禁止激活"
+                    )
             coverage = conn.execute(
                 """SELECT COUNT(*) AS total,
                           COUNT(*) FILTER (WHERE status='ready') AS ready,
@@ -4525,7 +5373,6 @@ class Database:
                 or int((coverage or {}).get("failed") or 0)
             ):
                 raise ValueError("策略快照文档覆盖不完整，禁止激活")
-            policy_set = normalize_policy_set(snapshot["policy_set"])
             conn.execute(
                 """UPDATE policy_snapshots SET status='rolled_back'
                    WHERE project_id=%s AND status='active'""",

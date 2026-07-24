@@ -137,7 +137,6 @@ def test_detection_aware_clustering_penalizes_missing_and_spurious_mentions():
     {"revision_id": "rev-2"},
     {"chunk_id": "chunk-2"},
     {"subject_canonical_id": "wrong"},
-    {"snapshot_id": "snapshot-2"},
 ])
 def test_strict_relation_requires_exact_lineage_direction_endpoints_and_evidence(change):
     report = evaluate_relations([_lineage_relation()], [_lineage_relation(**change)])

@@ -1622,26 +1622,23 @@ class KnowledgeForgeService:
         )
 
     @staticmethod
-    def _project_provenance_gremlin(project_id: int, namespace_id: str) -> str:
-        """Show the project graph plus document paths through shared entities."""
+    def _project_entity_relations_gremlin(project_id: int, namespace_id: str) -> str:
+        """Show every entity plus entity-to-entity edges, without provenance nodes."""
         project_id = int(project_id)
         namespace = json.dumps(str(uuid.UUID(str(namespace_id))))
         scoped = f'.has("kf_namespace_id",{namespace}).has("kf_project_id",{project_id})'
         return (
-            f'g.V(){scoped}.union('
-            f'__.bothE(){scoped}.dedup().otherV().limit(300),'
-            '__.hasLabel("KFEntity")'
-            f'.where(__.inE("kf_mentions"){scoped}'
-            '.values("kf_doc_id").dedup().count().is(gte(2)))'
-            f'.inE("kf_mentions"){scoped}.outV()'
-            f'.inE("kf_contains"){scoped}.outV().limit(200)'
-            ').path().limit(500)'
+            f'g.V(){scoped}.hasLabel("KFEntity")'
+            '.union('
+            '__.identity(),'
+            f'__.bothE("kf_related"){scoped}.dedup().otherV()'
+            ').path().limit(1000)'
         )
 
     def hubble_project_url(
         self, project_id: int, strategy_key: str = STABLE_STRATEGY,
     ) -> str:
-        """Resolve Hubble and prefill a cross-document provenance query."""
+        """Resolve Hubble and prefill a connected entity-relationship query."""
         strategy_key = normalize_strategy(strategy_key)
         project = self.db.get_project(project_id)
         if not project:
@@ -1707,7 +1704,7 @@ class KnowledgeForgeService:
         if not connection:
             raise RuntimeError(f"Hubble 中没有可用的 {Config.hugegraph_graph} 图连接")
 
-        gremlin = self._project_provenance_gremlin(
+        gremlin = self._project_entity_relations_gremlin(
             project_id, str(strategy_graph["namespace_id"]),
         )
         return (

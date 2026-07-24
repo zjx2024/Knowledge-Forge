@@ -1376,6 +1376,404 @@ ALTER TABLE graph_leases
 """
 
 
+SHADOW_RELATION_V2_LEDGER_SQL = r"""
+CREATE TABLE IF NOT EXISTS shadow_relation_v2_runs (
+    id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    snapshot_id TEXT,
+    input_fingerprint TEXT NOT NULL,
+    source_generation BIGINT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK(status IN (
+        'planning','classifying','verifying','normalizing','ready','stale','failed','cancelled'
+    )),
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_v2_runs_project
+    ON shadow_relation_v2_runs(project_id,status,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_pair_opportunities (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id),
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_revision_id TEXT NOT NULL,
+    document_id BIGINT,
+    chunk_id BIGINT,
+    chunk_key TEXT NOT NULL,
+    pair_identity TEXT NOT NULL,
+    candidate_policy_version TEXT NOT NULL,
+    left_occurrence_key TEXT NOT NULL,
+    right_occurrence_key TEXT NOT NULL,
+    left_mention_id TEXT NOT NULL,
+    right_mention_id TEXT NOT NULL,
+    left_start INTEGER NOT NULL,
+    left_end INTEGER NOT NULL,
+    right_start INTEGER NOT NULL,
+    right_end INTEGER NOT NULL,
+    left_canonical_id TEXT NOT NULL DEFAULT '',
+    right_canonical_id TEXT NOT NULL DEFAULT '',
+    left_assignment_version TEXT NOT NULL DEFAULT '',
+    right_assignment_version TEXT NOT NULL DEFAULT '',
+    context_identity TEXT NOT NULL,
+    context_start INTEGER NOT NULL,
+    context_end INTEGER NOT NULL,
+    allowed_predicate_metadata JSONB NOT NULL DEFAULT '[]'::jsonb,
+    planning_reason TEXT NOT NULL,
+    cue TEXT NOT NULL DEFAULT '',
+    type_status TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,candidate_policy_version,pair_identity),
+    CHECK(left_occurrence_key < right_occurrence_key),
+    CHECK(left_start >= 0 AND left_end > left_start),
+    CHECK(right_start >= 0 AND right_end > right_start),
+    CHECK(context_start >= 0 AND context_end > context_start)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_pairs_run_status
+    ON shadow_relation_pair_opportunities(run_id,status,pair_identity);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_pairs_cross_policy
+    ON shadow_relation_pair_opportunities(project_id,document_revision_id,pair_identity);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_hypotheses (
+    id TEXT PRIMARY KEY,
+    pair_opportunity_id TEXT NOT NULL REFERENCES shadow_relation_pair_opportunities(id),
+    hypothesis_key TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    subject_occurrence_key TEXT NOT NULL,
+    object_occurrence_key TEXT NOT NULL,
+    evidence_text TEXT NOT NULL DEFAULT '',
+    evidence_start INTEGER,
+    evidence_end INTEGER,
+    classifier_policy_version TEXT NOT NULL,
+    classifier_model_revision TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(
+        pair_opportunity_id,subject_occurrence_key,predicate,
+        object_occurrence_key,hypothesis_key
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_hypotheses_pair
+    ON shadow_relation_hypotheses(pair_opportunity_id,status,predicate);
+"""
+
+
+SHADOW_RELATION_V2_VERIFICATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS shadow_relation_verification_attempts (
+    id TEXT PRIMARY KEY,
+    hypothesis_id TEXT NOT NULL REFERENCES shadow_relation_hypotheses(id),
+    attempt_no INTEGER NOT NULL CHECK(attempt_no > 0),
+    verdict TEXT NOT NULL CHECK(verdict IN (
+        'SUPPORTED','REJECTED','UNCERTAIN','RETRYABLE_FAILED'
+    )),
+    reason_code TEXT NOT NULL,
+    supported_evidence_spans JSONB NOT NULL DEFAULT '[]'::jsonb,
+    independent_call BOOLEAN NOT NULL,
+    verifier_prompt_version TEXT NOT NULL,
+    verifier_schema_version TEXT NOT NULL,
+    verifier_parser_version TEXT NOT NULL,
+    verifier_model_revision TEXT NOT NULL,
+    request_hash TEXT NOT NULL DEFAULT '',
+    response_hash TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(hypothesis_id,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_verification_verdict
+    ON shadow_relation_verification_attempts(hypothesis_id,verdict,attempt_no);
+"""
+
+
+SHADOW_RELATION_V2_NORMALIZATION_SQL = r"""
+CREATE TABLE IF NOT EXISTS shadow_relation_normalized_facts (
+    id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    semantic_fact_key TEXT NOT NULL,
+    subject_canonical_id TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object_canonical_id TEXT NOT NULL,
+    is_symmetric BOOLEAN NOT NULL DEFAULT FALSE,
+    is_reflexive BOOLEAN NOT NULL DEFAULT FALSE,
+    is_review_only BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(project_id,semantic_fact_key)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_facts_endpoints
+    ON shadow_relation_normalized_facts(
+        project_id,subject_canonical_id,predicate,object_canonical_id
+    );
+
+CREATE TABLE IF NOT EXISTS shadow_relation_fact_memberships (
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id),
+    fact_id TEXT NOT NULL REFERENCES shadow_relation_normalized_facts(id),
+    input_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'NORMALIZED','REVIEW_ONLY','ELIGIBLE','STALE','CONFLICT'
+    )),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(run_id,fact_id)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_fact_evidence (
+    id TEXT PRIMARY KEY,
+    fact_id TEXT NOT NULL REFERENCES shadow_relation_normalized_facts(id),
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id),
+    evidence_key TEXT NOT NULL,
+    document_revision_id TEXT NOT NULL,
+    subject_occurrence_key TEXT NOT NULL,
+    object_occurrence_key TEXT NOT NULL,
+    evidence_spans JSONB NOT NULL,
+    hypothesis_id TEXT NOT NULL REFERENCES shadow_relation_hypotheses(id),
+    verification_attempt_id TEXT NOT NULL
+        REFERENCES shadow_relation_verification_attempts(id),
+    provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(fact_id,evidence_key)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_evidence_run
+    ON shadow_relation_fact_evidence(run_id,fact_id);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_fact_collapse_audit (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id),
+    fact_id TEXT NOT NULL REFERENCES shadow_relation_normalized_facts(id),
+    hypothesis_id TEXT NOT NULL REFERENCES shadow_relation_hypotheses(id),
+    reason_code TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,fact_id,hypothesis_id,reason_code)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_fact_conflicts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id),
+    pair_identity TEXT NOT NULL,
+    hypothesis_id TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,hypothesis_id,reason_code)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_legacy_duplicate_audit (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    legacy_group_key TEXT NOT NULL,
+    duplicate_count INTEGER NOT NULL,
+    assertion_ids JSONB NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(project_id,legacy_group_key)
+);
+INSERT INTO shadow_relation_legacy_duplicate_audit(
+    project_id,legacy_group_key,duplicate_count,assertion_ids
+)
+SELECT project_id,
+       md5(
+           project_id::text||':'||source_entity_id::text||':'||
+           relation_type||':'||target_entity_id::text
+       ),
+       COUNT(*)::integer,
+       jsonb_agg(id ORDER BY id)
+FROM relation_assertions
+WHERE is_deleted=FALSE
+GROUP BY project_id,source_entity_id,relation_type,target_entity_id
+HAVING COUNT(*)>1
+ON CONFLICT(project_id,legacy_group_key) DO NOTHING;
+"""
+
+
+SHADOW_RELATION_V2_FRESHNESS_SQL = r"""
+ALTER TABLE policy_snapshots
+    ADD COLUMN IF NOT EXISTS materialization_fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE policy_snapshots
+    ADD COLUMN IF NOT EXISTS freshness_components JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE policy_snapshots
+    ADD COLUMN IF NOT EXISTS stale_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS shadow_relation_current_fingerprints (
+    project_id BIGINT PRIMARY KEY REFERENCES projects(id),
+    current_fingerprint TEXT NOT NULL,
+    components JSONB NOT NULL,
+    source_generation BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION kf_block_shadow_relation_product_write()
+RETURNS trigger AS $$
+BEGIN
+    IF NULLIF(
+        current_setting('knowledge_forge.shadow_relation_v2_run_id',TRUE),
+        ''
+    ) IS NOT NULL THEN
+        RAISE EXCEPTION 'Shadow relation v2 cannot write product table %',TG_TABLE_NAME
+            USING ERRCODE='object_not_in_prerequisite_state';
+    END IF;
+    RETURN COALESCE(NEW,OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_relation_assertions ON relation_assertions;
+CREATE TRIGGER trg_shadow_v2_block_relation_assertions
+    BEFORE INSERT OR UPDATE OR DELETE ON relation_assertions
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_relation_projections ON canonical_relation_projections;
+CREATE TRIGGER trg_shadow_v2_block_relation_projections
+    BEFORE INSERT OR UPDATE OR DELETE ON canonical_relation_projections
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_vectors ON vector_embeddings;
+CREATE TRIGGER trg_shadow_v2_block_vectors
+    BEFORE INSERT OR UPDATE OR DELETE ON vector_embeddings
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_indexing_outbox ON indexing_failures;
+CREATE TRIGGER trg_shadow_v2_block_indexing_outbox
+    BEFORE INSERT OR UPDATE OR DELETE ON indexing_failures
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_mentions ON entity_mentions;
+CREATE TRIGGER trg_shadow_v2_block_mentions
+    BEFORE INSERT OR UPDATE OR DELETE ON entity_mentions
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_assignments ON entity_assignments;
+CREATE TRIGGER trg_shadow_v2_block_assignments
+    BEFORE INSERT OR UPDATE OR DELETE ON entity_assignments
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_aliases ON canonical_entity_aliases;
+CREATE TRIGGER trg_shadow_v2_block_aliases
+    BEFORE INSERT OR UPDATE OR DELETE ON canonical_entity_aliases
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+DROP TRIGGER IF EXISTS trg_shadow_v2_block_project_state ON projects;
+CREATE TRIGGER trg_shadow_v2_block_project_state
+    BEFORE INSERT OR UPDATE OR DELETE ON projects
+    FOR EACH ROW EXECUTE FUNCTION kf_block_shadow_relation_product_write();
+"""
+
+
+SHADOW_RELATION_V2_GOLD_SQL = r"""
+CREATE TABLE IF NOT EXISTS shadow_relation_gold_pair_decisions (
+    gold_manifest_id TEXT NOT NULL REFERENCES gold_manifests(id),
+    pair_id TEXT NOT NULL,
+    split TEXT NOT NULL CHECK(split IN ('dev','holdout')),
+    document_revision_id TEXT NOT NULL,
+    document_content_hash TEXT NOT NULL,
+    left_occurrence_id TEXT NOT NULL,
+    left_span JSONB NOT NULL,
+    left_canonical_id TEXT NOT NULL,
+    right_occurrence_id TEXT NOT NULL,
+    right_span JSONB NOT NULL,
+    right_canonical_id TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN (
+        'NO_RELATION','OTHER_UNSUPPORTED','HAS_RELATION'
+    )),
+    evidence_spans JSONB NOT NULL DEFAULT '[]'::jsonb,
+    unsupported_description TEXT NOT NULL DEFAULT '',
+    critical BOOLEAN NOT NULL DEFAULT FALSE,
+    annotator TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    reviewed_at TIMESTAMPTZ NOT NULL,
+    adjudication_status TEXT NOT NULL CHECK(adjudication_status='adjudicated'),
+    payload_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(gold_manifest_id,pair_id)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_gold_facts (
+    id TEXT PRIMARY KEY,
+    gold_manifest_id TEXT NOT NULL REFERENCES gold_manifests(id),
+    pair_id TEXT NOT NULL,
+    subject_occurrence_id TEXT NOT NULL,
+    subject_canonical_id TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object_occurrence_id TEXT NOT NULL,
+    object_canonical_id TEXT NOT NULL,
+    evidence_spans JSONB NOT NULL,
+    critical BOOLEAN NOT NULL DEFAULT FALSE,
+    adjudication_status TEXT NOT NULL CHECK(adjudication_status='adjudicated'),
+    payload_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(
+        gold_manifest_id,pair_id,subject_occurrence_id,predicate,
+        object_occurrence_id,payload_hash
+    ),
+    FOREIGN KEY(gold_manifest_id,pair_id)
+        REFERENCES shadow_relation_gold_pair_decisions(gold_manifest_id,pair_id)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_prediction_adjudications (
+    id TEXT PRIMARY KEY,
+    gold_manifest_id TEXT NOT NULL REFERENCES gold_manifests(id),
+    snapshot_id TEXT NOT NULL REFERENCES policy_snapshots(id),
+    prediction_id TEXT NOT NULL,
+    semantic_fact_key TEXT NOT NULL,
+    correct BOOLEAN NOT NULL,
+    critical_error BOOLEAN NOT NULL DEFAULT FALSE,
+    annotator TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    reviewed_at TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    payload_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(gold_manifest_id,snapshot_id,prediction_id)
+);
+"""
+
+
+SHADOW_RELATION_V2_EXECUTION_SQL = r"""
+ALTER TABLE shadow_relation_v2_runs
+    ADD COLUMN IF NOT EXISTS fingerprint_components JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS shadow_relation_classification_attempts (
+    id TEXT PRIMARY KEY,
+    pair_opportunity_id TEXT NOT NULL REFERENCES shadow_relation_pair_opportunities(id),
+    attempt_no INTEGER NOT NULL CHECK(attempt_no > 0),
+    status TEXT NOT NULL CHECK(status IN (
+        'accepted','retryable_failed','permanent_failed','superseded'
+    )),
+    request_hash TEXT NOT NULL,
+    response_hash TEXT NOT NULL DEFAULT '',
+    classifier_prompt_version TEXT NOT NULL,
+    classifier_schema_version TEXT NOT NULL,
+    classifier_parser_version TEXT NOT NULL,
+    classifier_model_revision TEXT NOT NULL,
+    error_message TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(pair_opportunity_id,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_classification_attempts_pair
+    ON shadow_relation_classification_attempts(pair_opportunity_id,status,attempt_no);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_hypothesis_validations (
+    hypothesis_id TEXT PRIMARY KEY REFERENCES shadow_relation_hypotheses(id),
+    status TEXT NOT NULL CHECK(status IN ('PASS','REVIEW_ONLY','REJECTED')),
+    reason_code TEXT NOT NULL,
+    predicate_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE shadow_relation_fact_evidence
+    DROP CONSTRAINT IF EXISTS shadow_relation_fact_evidence_fact_id_evidence_key_key;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname='uq_shadow_relation_fact_evidence_run'
+          AND conrelid='shadow_relation_fact_evidence'::regclass
+    ) THEN
+        ALTER TABLE shadow_relation_fact_evidence
+            ADD CONSTRAINT uq_shadow_relation_fact_evidence_run
+            UNIQUE(run_id,fact_id,evidence_key);
+    END IF;
+END
+$$;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1446,6 +1844,36 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Permit leased graph generations for project strategy namespaces",
         sql=STRATEGY_GRAPH_LEASE_NAMESPACE_SQL,
         startup_safe=True,
+    ),
+    Migration(
+        version="0014_shadow_relation_v2_ledger",
+        description="Persist unordered mention-pair opportunities and multi-hypothesis lineage",
+        sql=SHADOW_RELATION_V2_LEDGER_SQL,
+    ),
+    Migration(
+        version="0015_shadow_relation_v2_verification",
+        description="Persist independent append-only relation verification attempts",
+        sql=SHADOW_RELATION_V2_VERIFICATION_SQL,
+    ),
+    Migration(
+        version="0016_shadow_relation_v2_normalization",
+        description="Normalize verified facts, retain evidence, and audit legacy duplicates",
+        sql=SHADOW_RELATION_V2_NORMALIZATION_SQL,
+    ),
+    Migration(
+        version="0017_shadow_relation_v2_freshness",
+        description="Bind relation materialization freshness and block Shadow product writes",
+        sql=SHADOW_RELATION_V2_FRESHNESS_SQL,
+    ),
+    Migration(
+        version="0018_shadow_relation_v2_gold",
+        description="Persist pair-level Gold, fact positives, and prediction adjudication",
+        sql=SHADOW_RELATION_V2_GOLD_SQL,
+    ),
+    Migration(
+        version="0019_shadow_relation_v2_execution",
+        description="Persist classifier attempts, rule validation, and retry-safe run evidence",
+        sql=SHADOW_RELATION_V2_EXECUTION_SQL,
     ),
 )
 

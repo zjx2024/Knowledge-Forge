@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -33,6 +33,722 @@ def canonical_json(value: Any) -> str:
 
 def canonical_digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _first_value(item: dict[str, Any], *names: str, default: Any = "") -> Any:
+    for name in names:
+        value = item.get(name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def canonical_relation_fact_key(item: dict[str, Any]) -> tuple[str, ...]:
+    """Return a cross-run semantic identity without provenance or internal IDs."""
+
+    project_scope = _first_value(
+        item, "gold_universe", "project_scope", "project_key", "project_id",
+    )
+    subject = _first_value(
+        item, "subject_canonical_id", "source_canonical_id", "subject", "source",
+    )
+    predicate = _first_value(item, "canonical_predicate", "predicate", "relation_type")
+    object_ = _first_value(
+        item, "object_canonical_id", "target_canonical_id", "object", "target",
+    )
+    direction = str(_first_value(item, "canonical_direction", "direction", default="forward"))
+    if direction.lower() in {"reversed", "reverse"}:
+        subject, object_ = object_, subject
+        direction = "forward"
+    elif direction.lower() == "symmetric":
+        subject, object_ = sorted((str(subject), str(object_)))
+        direction = "symmetric"
+    return tuple(map(str, (project_scope, subject, predicate, object_, direction)))
+
+
+def occurrence_relation_assertion_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Return a strict occurrence/evidence identity layered over the semantic fact."""
+
+    return (
+        *canonical_relation_fact_key(item),
+        _first_value(item, "gold_document_key", "document_id"),
+        _first_value(
+            item, "document_revision_id", "revision_id", "content_hash",
+        ),
+        _first_value(item, "chunk_id"),
+        _first_value(item, "subject_occurrence_id", "subject_mention_id", "source_mention_id"),
+        _first_value(item, "subject_start", "source_start", "source_mention_start"),
+        _first_value(item, "subject_end", "source_end", "source_mention_end"),
+        _first_value(item, "object_occurrence_id", "object_mention_id", "target_mention_id"),
+        _first_value(item, "object_start", "target_start", "target_mention_start"),
+        _first_value(item, "object_end", "target_end", "target_mention_end"),
+        _first_value(item, "gold_evidence_id", "evidence_start"),
+        _first_value(item, "evidence_end"),
+        _first_value(item, "evidence_hash", "evidence_text", "evidence"),
+    )
+
+
+def _multiset_relation_metrics(
+    gold: list[dict[str, Any]],
+    predicted: list[dict[str, Any]],
+    *,
+    key: Any,
+) -> dict[str, Any]:
+    gold_counts = Counter(key(item) for item in gold)
+    predicted_counts = Counter(key(item) for item in predicted)
+    true_positive = sum(
+        min(count, predicted_counts.get(identity, 0))
+        for identity, count in gold_counts.items()
+    )
+    predicted_total = sum(predicted_counts.values())
+    gold_total = sum(gold_counts.values())
+    precision = true_positive / predicted_total if predicted_total else float(not gold_total)
+    recall = true_positive / gold_total if gold_total else float(not predicted_total)
+    return {
+        "true_positive": true_positive,
+        "false_positive": predicted_total - true_positive,
+        "false_negative": gold_total - true_positive,
+        "predicted": predicted_total,
+        "gold": gold_total,
+        "unique_predicted": len(predicted_counts),
+        "unique_gold": len(gold_counts),
+        "exact_duplicates": sum(max(0, count - 1) for count in predicted_counts.values()),
+        "precision": precision,
+        "recall": recall,
+        "f1": (
+            2 * precision * recall / (precision + recall)
+            if precision + recall else 0.0
+        ),
+    }
+
+
+def evaluate_shadow_relation_quality(
+    *,
+    gold: list[dict[str, Any]] | None,
+    predicted: list[dict[str, Any]],
+    snapshot_current: bool,
+) -> dict[str, Any]:
+    """Evaluate Shadow output without treating output volume as Gold quality."""
+
+    blocking_reasons = [] if snapshot_current else ["stale_snapshot"]
+    if gold is None:
+        blocking_reasons.append("human_gold_unavailable")
+        unavailable = {
+            "true_positive": None,
+            "false_positive": None,
+            "false_negative": None,
+            "predicted": len(predicted),
+            "gold": None,
+            "unique_predicted": len({
+                canonical_relation_fact_key(item) for item in predicted
+            }),
+            "unique_gold": None,
+            "exact_duplicates": sum(
+                max(0, count - 1)
+                for count in Counter(
+                    canonical_relation_fact_key(item) for item in predicted
+                ).values()
+            ),
+            "precision": None,
+            "recall": None,
+            "f1": None,
+        }
+        return {
+            "gold_status": "unavailable",
+            "canonical": unavailable,
+            "occurrence": {
+                **unavailable,
+                "unique_predicted": len({
+                    occurrence_relation_assertion_key(item) for item in predicted
+                }),
+            },
+            "production_eligible": False,
+            "blocking_reasons": sorted(set(blocking_reasons)),
+        }
+    return {
+        "gold_status": "available",
+        "canonical": _multiset_relation_metrics(
+            gold, predicted, key=canonical_relation_fact_key,
+        ),
+        "occurrence": _multiset_relation_metrics(
+            gold, predicted, key=occurrence_relation_assertion_key,
+        ),
+        "production_eligible": not blocking_reasons,
+        "blocking_reasons": sorted(set(blocking_reasons)),
+    }
+
+
+def relation_layer_funnel(
+    *,
+    pair_opportunities: list[dict[str, Any]],
+    hypotheses: list[dict[str, Any]],
+    verification_attempts: list[dict[str, Any]],
+    normalized_facts: list[dict[str, Any]],
+    published_facts: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Report distinct pair, hypothesis, verifier, fact and publication layers."""
+
+    pair_statuses = Counter(
+        str(item.get("terminal_status") or item.get("status") or "").upper()
+        for item in pair_opportunities
+    )
+    verdicts = Counter(
+        str(item.get("verdict") or item.get("status") or "").upper()
+        for item in verification_attempts
+    )
+    return {
+        "pair_opportunities_total": len(pair_opportunities),
+        "pair_opportunities_classified": sum(
+            pair_statuses[value]
+            for value in (
+                "HYPOTHESES",
+                "HAS_RELATION",
+                "NO_RELATION",
+                "OTHER_UNSUPPORTED",
+                "CLASSIFIED",
+            )
+        ),
+        "pair_no_relation": pair_statuses["NO_RELATION"],
+        "pair_other_unsupported": pair_statuses["OTHER_UNSUPPORTED"],
+        "pair_deferred_budget": pair_statuses["DEFERRED_BUDGET"],
+        "pair_failed": sum(
+            pair_statuses[value]
+            for value in (
+                "FAILED",
+                "CLASSIFICATION_RETRYABLE_FAILED",
+                "CLASSIFICATION_PERMANENT_FAILED",
+            )
+        ),
+        "hypotheses_total": len(hypotheses),
+        "hypotheses_rule_valid": sum(
+            bool(item.get("rule_valid")) for item in hypotheses
+        ),
+        "hypotheses_verifier_supported": verdicts["SUPPORTED"],
+        "hypotheses_verifier_rejected": verdicts["REJECTED"] + verdicts["CONTRADICTED"],
+        "hypotheses_verifier_uncertain": (
+            verdicts["UNCERTAIN"] + verdicts["INSUFFICIENT_EVIDENCE"]
+        ),
+        "hypotheses_retryable_failed": (
+            verdicts["RETRYABLE_FAILED"] + verdicts["FAILED"]
+        ),
+        "facts_after_normalization": len(normalized_facts),
+        "facts_duplicate_collapsed": sum(
+            int(item.get("duplicate_collapsed") or 0) for item in normalized_facts
+        ),
+        "facts_review_only": sum(
+            bool(item.get("review_only")) for item in normalized_facts
+        ),
+        "facts_materialization_eligible": sum(
+            bool(item.get("materialization_eligible")) for item in normalized_facts
+        ),
+        "facts_published": len(published_facts),
+    }
+
+
+def validate_relation_gold(
+    manifest: dict[str, Any],
+    pair_decisions: list[dict[str, Any]],
+    fact_positives: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate frozen human relation Gold with separate pair and fact labels."""
+
+    for field in (
+        "dataset", "version", "frozen_at", "holdout_content_hash",
+        "precision_adjudication_universe",
+    ):
+        if not manifest.get(field):
+            raise GoldManifestError(f"relation Gold manifest missing {field}")
+    if len(str(manifest["holdout_content_hash"])) != 64:
+        raise GoldManifestError("relation Gold holdout hash is invalid")
+    if not pair_decisions:
+        raise GoldManifestError("relation Gold requires pair decisions")
+    pair_map: dict[str, dict[str, Any]] = {}
+    human_valid = True
+    for item in pair_decisions:
+        pair_id = str(item.get("pair_id") or "")
+        if not pair_id or pair_id in pair_map:
+            raise GoldManifestError("relation Gold pair ids are missing or duplicated")
+        if str(item.get("dataset") or "") != str(manifest["dataset"]) or str(
+            item.get("dataset_version") or ""
+        ) != str(manifest["version"]):
+            raise GoldManifestError("relation Gold dataset/version mismatch")
+        if item.get("split") not in {"dev", "holdout"}:
+            raise GoldManifestError("relation Gold split must be dev or holdout")
+        decision = str(item.get("decision") or "")
+        if decision not in {"NO_RELATION", "OTHER_UNSUPPORTED", "HAS_RELATION"}:
+            raise GoldManifestError("relation Gold pair decision is invalid")
+        for side in ("left", "right"):
+            span = item.get(f"{side}_span")
+            if (
+                not item.get(f"{side}_occurrence_id")
+                or not item.get(f"{side}_canonical_id")
+                or not isinstance(span, list)
+                or len(span) != 2
+                or int(span[0]) < 0
+                or int(span[1]) <= int(span[0])
+            ):
+                raise GoldManifestError("relation Gold occurrence/span is invalid")
+        human = str(item.get("label_source") or "").lower() in {
+            "human", "human_reviewed", "independent_human",
+        }
+        adjudicated = (
+            str(item.get("adjudication_status") or "") == "adjudicated"
+            and bool(item.get("annotator"))
+            and bool(item.get("reviewer"))
+            and bool(item.get("reviewed_at"))
+        )
+        human_valid = human_valid and human and adjudicated
+        if not human or not adjudicated:
+            raise GoldManifestError(
+                "relation Gold requires independent human adjudication"
+            )
+        pair_map[pair_id] = item
+
+    facts_by_pair: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for fact in fact_positives:
+        pair_id = str(fact.get("pair_id") or "")
+        if pair_id not in pair_map:
+            raise GoldManifestError("relation fact Gold references unknown pair")
+        if pair_map[pair_id]["decision"] != "HAS_RELATION":
+            raise GoldManifestError(
+                f"{pair_map[pair_id]['decision']} pair cannot contain positive fact"
+            )
+        if not all(
+            fact.get(field) not in {None, ""}
+            for field in (
+                "subject_occurrence_id", "subject_canonical_id", "predicate",
+                "object_occurrence_id", "object_canonical_id",
+                "evidence_start", "evidence_end", "adjudication_status",
+            )
+        ):
+            raise GoldManifestError("relation fact Gold is incomplete")
+        if (
+            int(fact["evidence_start"]) < 0
+            or int(fact["evidence_end"]) <= int(fact["evidence_start"])
+            or fact.get("adjudication_status") != "adjudicated"
+        ):
+            raise GoldManifestError("relation fact Gold evidence/adjudication is invalid")
+        facts_by_pair[pair_id].append(fact)
+    for pair_id, pair in pair_map.items():
+        facts = facts_by_pair.get(pair_id, [])
+        if pair["decision"] == "HAS_RELATION" and not facts:
+            raise GoldManifestError("HAS_RELATION pair requires positive fact Gold")
+        if pair["decision"] == "NO_RELATION" and facts:
+            raise GoldManifestError("NO_RELATION pair cannot contain positive fact Gold")
+        if pair["decision"] == "OTHER_UNSUPPORTED" and facts:
+            raise GoldManifestError(
+                "OTHER_UNSUPPORTED pair cannot contain current-Schema fact Gold"
+            )
+    approval = manifest.get("trusted_approval") or {}
+    production_valid = bool(
+        manifest.get("level") == "release"
+        and manifest.get("recall_universe_complete")
+        and human_valid
+        and approval.get("approval_id")
+        and approval.get("approved_at")
+        and len(set(approval.get("signers") or [])) >= 2
+    )
+    return {
+        "engineering_valid": True,
+        "production_valid": production_valid,
+        "dataset": str(manifest["dataset"]),
+        "version": str(manifest["version"]),
+        "pair_gold_hash": canonical_digest(sorted(
+            pair_decisions, key=lambda item: str(item["pair_id"]),
+        )),
+        "fact_gold_hash": canonical_digest(sorted(
+            fact_positives,
+            key=lambda item: (
+                str(item["pair_id"]),
+                canonical_relation_fact_key(item),
+                occurrence_relation_assertion_key(item),
+            ),
+        )),
+        "pairs": len(pair_decisions),
+        "positive_facts": len(fact_positives),
+        "recall_universe_complete": bool(
+            manifest.get("recall_universe_complete")
+        ),
+        "precision_adjudication_universe": str(
+            manifest["precision_adjudication_universe"]
+        ),
+    }
+
+
+def _unavailable_relation_gold_report(predicted: int) -> dict[str, Any]:
+    unavailable = {
+        "true_positive": None,
+        "false_positive": None,
+        "false_negative": None,
+        "predicted": predicted,
+        "gold": None,
+        "unique_predicted": None,
+        "unique_gold": None,
+        "exact_duplicates": None,
+        "precision": None,
+        "recall": None,
+        "f1": None,
+    }
+    return {
+        "gold_status": "unavailable",
+        "precision_status": "unavailable",
+        "strict": unavailable,
+        "canonical": dict(unavailable),
+        "endpoint_recall": None,
+        "pair_coverage": None,
+        "hypothesis_recall": None,
+        "verifier_recall": None,
+        "production_eligible": False,
+        "blocking_reasons": ["human_gold_unavailable"],
+    }
+
+
+def _decision_prf(
+    gold_by_pair: Mapping[str, str],
+    predicted_by_pair: Mapping[str, str],
+    decision: str,
+) -> dict[str, Any]:
+    gold_ids = {
+        pair_id for pair_id, value in gold_by_pair.items() if value == decision
+    }
+    predicted_ids = {
+        pair_id for pair_id, value in predicted_by_pair.items() if value == decision
+    }
+    return _prf(
+        len(gold_ids & predicted_ids),
+        len(predicted_ids),
+        len(gold_ids),
+    )
+
+
+def evaluate_relation_gold_run(
+    *,
+    manifest_report: dict[str, Any] | None,
+    pair_gold: list[dict[str, Any]] | None,
+    fact_gold: list[dict[str, Any]] | None,
+    run: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate endpoint→pair→hypothesis→verifier→fact layers on frozen Gold."""
+
+    predictions = list(run.get("facts") or [])
+    if manifest_report is None or pair_gold is None or fact_gold is None:
+        return _unavailable_relation_gold_report(len(predictions))
+    if not manifest_report.get("engineering_valid"):
+        raise GoldManifestError("relation Gold manifest is not engineering-valid")
+    gold_facts = list(fact_gold)
+    strict_raw = _multiset_relation_metrics(
+        gold_facts, predictions, key=occurrence_relation_assertion_key,
+    )
+    canonical_raw = _multiset_relation_metrics(
+        gold_facts, predictions, key=canonical_relation_fact_key,
+    )
+    prediction_ids = [str(item.get("prediction_id") or "") for item in predictions]
+    adjudications = {
+        str(item.get("prediction_id") or ""): bool(item.get("correct"))
+        for item in run.get("prediction_adjudications") or []
+        if item.get("prediction_id")
+    }
+    unadjudicated = [
+        prediction_id for prediction_id in prediction_ids
+        if not prediction_id or prediction_id not in adjudications
+    ]
+    precision_available = not unadjudicated
+
+    def final_metrics(raw: dict[str, Any]) -> dict[str, Any]:
+        result = dict(raw)
+        if not precision_available:
+            result["precision"] = None
+            result["f1"] = None
+            return result
+        predicted_total = int(raw["predicted"])
+        true_positive = int(raw["true_positive"])
+        precision = (
+            true_positive / predicted_total
+            if predicted_total else float(not raw["gold"])
+        )
+        result["precision"] = precision
+        result["f1"] = (
+            2 * precision * float(raw["recall"])
+            / (precision + float(raw["recall"]))
+            if precision + float(raw["recall"]) else 0.0
+        )
+        return result
+
+    strict = final_metrics(strict_raw)
+    canonical = final_metrics(canonical_raw)
+    positive_pair_ids = {str(item["pair_id"]) for item in gold_facts}
+    gold_occurrences = {
+        str(item[field])
+        for item in gold_facts
+        for field in ("subject_occurrence_id", "object_occurrence_id")
+    }
+    predicted_occurrences = {
+        str(
+            item.get("occurrence_key")
+            or item.get("mention_key")
+            or item.get("mention_id")
+            or ""
+        )
+        for item in run.get("mention_occurrences") or []
+    }
+    pair_ids = {
+        str(item.get("pair_identity") or item.get("pair_id") or "")
+        for item in run.get("pair_opportunities") or []
+    }
+    gold_hypotheses = {
+        (
+            str(item["pair_id"]),
+            str(item["subject_occurrence_id"]),
+            str(item["predicate"]),
+            str(item["object_occurrence_id"]),
+        )
+        for item in gold_facts
+    }
+    predicted_hypothesis_values = {
+        (
+            str(item.get("pair_identity") or item.get("pair_id") or ""),
+            str(item.get("subject_occurrence_key")
+                or item.get("subject_occurrence_id") or ""),
+            str(item.get("predicate") or ""),
+            str(item.get("object_occurrence_key")
+                or item.get("object_occurrence_id") or ""),
+        ): str(item.get("hypothesis_id") or "")
+        for item in run.get("hypotheses") or []
+    }
+    supported_hypothesis_ids = {
+        str(item.get("hypothesis_id") or "")
+        for item in run.get("verification_attempts") or []
+        if str(item.get("verdict") or "").upper() == "SUPPORTED"
+    }
+    predicted_pair_decisions = {
+        str(item.get("pair_identity") or item.get("pair_id") or ""): (
+            "HAS_RELATION"
+            if str(item.get("decision") or "") == "HYPOTHESES"
+            else str(item.get("decision") or "")
+        )
+        for item in run.get("pair_decisions") or []
+    }
+    gold_pair_decisions = {
+        str(item["pair_id"]): str(item["decision"]) for item in pair_gold
+    }
+    predicates = sorted({
+        str(item.get("predicate") or "") for item in gold_facts + predictions
+        if item.get("predicate")
+    })
+    per_predicate = {}
+    for predicate in predicates:
+        per_predicate[predicate] = _multiset_relation_metrics(
+            [item for item in gold_facts if item.get("predicate") == predicate],
+            [item for item in predictions if item.get("predicate") == predicate],
+            key=canonical_relation_fact_key,
+        )
+    related_classified = sum(
+        str(item.get("predicate") or "") == "related_to"
+        for item in run.get("hypotheses") or []
+    )
+    related_review = sum(
+        str(item.get("predicate") or "") == "related_to"
+        for item in run.get("review_facts") or []
+    )
+    related_published = sum(
+        str(item.get("predicate") or "") == "related_to"
+        for item in (run.get("published_facts") or predictions)
+    )
+    invalid_evidence = sum(
+        item.get("evidence_start") is None
+        or item.get("evidence_end") is None
+        or not (item.get("evidence_text") or item.get("evidence"))
+        for item in predictions
+    )
+    normalization = dict(run.get("normalization_metrics") or {})
+    blocking_reasons = []
+    if unadjudicated:
+        blocking_reasons.append("unadjudicated_predictions")
+    if run.get("stale"):
+        blocking_reasons.append("stale_snapshot")
+    endpoint_matches = len(gold_occurrences & predicted_occurrences)
+    hypothesis_matches = gold_hypotheses & set(predicted_hypothesis_values)
+    verifier_matches = sum(
+        bool(predicted_hypothesis_values[value] in supported_hypothesis_ids)
+        for value in hypothesis_matches
+    )
+    return {
+        "gold_status": "available",
+        "precision_status": "available" if precision_available else "unavailable",
+        "strict": strict,
+        "canonical": canonical,
+        "endpoint_recall": (
+            endpoint_matches / len(gold_occurrences)
+            if gold_occurrences else 1.0
+        ),
+        "pair_coverage": (
+            len(positive_pair_ids & pair_ids) / len(positive_pair_ids)
+            if positive_pair_ids else 1.0
+        ),
+        "hypothesis_recall": (
+            len(hypothesis_matches) / len(gold_hypotheses)
+            if gold_hypotheses else 1.0
+        ),
+        "verifier_recall": (
+            verifier_matches / len(gold_hypotheses)
+            if gold_hypotheses else 1.0
+        ),
+        "predicate_metrics": per_predicate,
+        "direction_accuracy": (
+            strict_raw["true_positive"] / canonical_raw["true_positive"]
+            if canonical_raw["true_positive"] else float(not gold_facts)
+        ),
+        "exact_evidence_coverage": strict_raw["recall"],
+        "pair_decisions": {
+            decision: _decision_prf(
+                gold_pair_decisions, predicted_pair_decisions, decision,
+            )
+            for decision in ("NO_RELATION", "OTHER_UNSUPPORTED", "HAS_RELATION")
+        },
+        "related_to": {
+            "classified": related_classified,
+            "review": related_review,
+            "published": related_published,
+        },
+        "normalization": normalization,
+        "safety": {
+            "stale_published": int(bool(run.get("stale") and predictions)),
+            "unverified_published": int(run.get("unverified_published") or 0),
+            "invalid_evidence_published": invalid_evidence,
+            "related_to_published": related_published,
+            "other_unsupported_published": sum(
+                str(item.get("predicate") or "") == "OTHER_UNSUPPORTED"
+                for item in predictions
+            ),
+            "cannot_link_violations": int(
+                run.get("cannot_link_violations") or 0
+            ),
+            "all_pairs_terminal": bool(run.get("all_pairs_terminal")),
+        },
+        "cost": dict(run.get("cost") or {}),
+        "production_eligible": bool(
+            manifest_report.get("production_valid")
+            and precision_available
+            and not blocking_reasons
+        ),
+        "blocking_reasons": blocking_reasons,
+        "denominators": {
+            "gold_pairs": len(pair_gold),
+            "gold_positive_facts": len(gold_facts),
+            "predicted_facts": len(predictions),
+            "unadjudicated_predictions": len(unadjudicated),
+        },
+    }
+
+
+def evaluate_relation_release_gate_v2(
+    *,
+    control: dict[str, Any],
+    treatment: dict[str, Any],
+    manifest_report: dict[str, Any],
+    release_policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed on safety, precision and actual Gold-recall improvement."""
+
+    failed: set[str] = set()
+    required_policy = {
+        "version",
+        "relation_precision_noninferiority_delta",
+        "minimum_gold_facts",
+        "confidence_method",
+    }
+    if any(
+        key not in release_policy or release_policy.get(key) in {None, ""}
+        for key in required_policy
+    ):
+        failed.add("release_policy_incomplete")
+    if not manifest_report.get("production_valid"):
+        failed.add("human_gold")
+    minimum = int(release_policy.get("minimum_gold_facts") or 0)
+    if int(treatment.get("denominators", {}).get("gold_positive_facts") or 0) < minimum:
+        failed.add("minimum_gold_facts")
+    if treatment.get("strict", {}).get("precision") is None:
+        failed.add("strict_precision_unavailable")
+    else:
+        delta = float(
+            release_policy.get("relation_precision_noninferiority_delta") or 0
+        )
+        control_precision = control.get("strict", {}).get("precision")
+        if (
+            control_precision is None
+            or float(treatment["strict"]["precision"]) + delta
+            < float(control_precision)
+        ):
+            failed.add("strict_precision_noninferiority")
+    hard_safety = {
+        "stale_published": "stale_published",
+        "unverified_published": "unverified_published",
+        "invalid_evidence_published": "invalid_evidence_published",
+        "related_to_published": "related_to_published",
+        "other_unsupported_published": "other_unsupported_published",
+        "cannot_link_violations": "cannot_link_violations",
+    }
+    safety = treatment.get("safety") or {}
+    for field, gate in hard_safety.items():
+        if int(safety.get(field) or 0):
+            failed.add(gate)
+    if not safety.get("all_pairs_terminal"):
+        failed.add("pair_ledger_incomplete")
+    normalization = treatment.get("normalization") or {}
+    for field, gate in (
+        ("exact_duplicates_remaining", "exact_duplicates"),
+        (
+            "symmetric_inverse_duplicates_remaining",
+            "symmetric_inverse_duplicates",
+        ),
+        ("unsupported_reverse_conflicts", "unsupported_reverse_conflicts"),
+        ("illegal_self_loops", "illegal_self_loops"),
+    ):
+        if int(normalization.get(field) or 0):
+            failed.add(gate)
+    if float(treatment.get("pair_coverage") or 0) < float(
+        control.get("pair_coverage") or 0
+    ):
+        failed.add("pair_coverage_regression")
+    if int(treatment.get("strict", {}).get("true_positive") or 0) < int(
+        control.get("strict", {}).get("true_positive") or 0
+    ):
+        failed.add("baseline_gold_fact_retention")
+    control_recall = control.get("strict", {}).get("recall")
+    treatment_recall = treatment.get("strict", {}).get("recall")
+    goal_met = bool(
+        control_recall is not None
+        and treatment_recall is not None
+        and float(treatment_recall) > float(control_recall)
+    )
+    if not goal_met:
+        failed.add("gold_recall_not_improved")
+    engineering_failures = {
+        "stale_published",
+        "unverified_published",
+        "invalid_evidence_published",
+        "related_to_published",
+        "other_unsupported_published",
+        "cannot_link_violations",
+        "pair_ledger_incomplete",
+        "exact_duplicates",
+        "symmetric_inverse_duplicates",
+        "unsupported_reverse_conflicts",
+        "illegal_self_loops",
+    }
+    engineering_complete = not bool(failed & engineering_failures)
+    production_approved = not failed
+    return {
+        "status": (
+            "production_approved"
+            if production_approved else "engineering_complete"
+        ),
+        "engineering_complete": engineering_complete,
+        "goal_met": goal_met,
+        "production_approved": production_approved,
+        "failed_gates": sorted(failed),
+        "release_policy_version": str(release_policy.get("version") or ""),
+    }
 
 
 def _prf(true_positive: int, predicted: int, gold: int) -> dict[str, float | int]:
@@ -499,31 +1215,25 @@ def evaluate_entity_pair_constraints(
 
 
 def _relation_key(item: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        item.get("document_id"), item.get("revision_id") or item.get("content_hash"),
-        item.get("chunk_id"),
-        item.get("subject_mention_id") or item.get("source_mention_id") or item.get("source"),
-        item.get("subject_canonical_id") or item.get("source_canonical_id") or item.get("source"),
-        item.get("predicate"),
-        item.get("object_mention_id") or item.get("target_mention_id") or item.get("target"),
-        item.get("object_canonical_id") or item.get("target_canonical_id") or item.get("target"),
-        item.get("direction") or "forward", item.get("evidence_text") or item.get("evidence") or "",
-        item.get("evidence_start"), item.get("evidence_end"),
-        item.get("snapshot_id"), item.get("policy_hash") or item.get("policy_version"),
-    )
+    return occurrence_relation_assertion_key(item)
 
 
 def evaluate_relations(gold: list[dict[str, Any]], predicted: list[dict[str, Any]]) -> dict[str, Any]:
-    gold_keys, predicted_keys = set(map(_relation_key, gold)), set(map(_relation_key, predicted))
+    strict = _multiset_relation_metrics(gold, predicted, key=_relation_key)
+    canonical = _multiset_relation_metrics(
+        gold, predicted, key=canonical_relation_fact_key,
+    )
     precise_evidence = sum(
         item.get("evidence_start") is not None and item.get("evidence_end") is not None
         for item in predicted
     )
     return {
-        "strict": _prf(len(gold_keys & predicted_keys), len(predicted_keys), len(gold_keys)),
+        "strict": strict,
+        "canonical": canonical,
         "evidence_coverage": precise_evidence / len(predicted) if predicted else 1.0,
         "evidence_exactness": (
-            len(gold_keys & predicted_keys) / precise_evidence if precise_evidence else float(not gold_keys)
+            strict["true_positive"] / precise_evidence
+            if precise_evidence else float(not gold)
         ),
     }
 

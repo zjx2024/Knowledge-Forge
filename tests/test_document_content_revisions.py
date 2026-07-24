@@ -281,6 +281,12 @@ def test_bootstrap_is_restart_safe_after_revision_migration():
             {"version": "0011_graphrag_reports_global_search", "count": 1},
             {"version": "0012_multi_strategy_construction", "count": 1},
             {"version": "0013_strategy_graph_lease_namespace", "count": 1},
+            {"version": "0014_shadow_relation_v2_ledger", "count": 1},
+            {"version": "0015_shadow_relation_v2_verification", "count": 1},
+            {"version": "0016_shadow_relation_v2_normalization", "count": 1},
+            {"version": "0017_shadow_relation_v2_freshness", "count": 1},
+            {"version": "0018_shadow_relation_v2_gold", "count": 1},
+            {"version": "0019_shadow_relation_v2_execution", "count": 1},
         ]
         assert conn.execute(
             "SELECT to_regclass('uq_chunks_revision_key') AS index_name"
