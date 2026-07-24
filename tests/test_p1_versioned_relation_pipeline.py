@@ -10,6 +10,8 @@ from knowledge_forge.graph_policy import graph_policy_hash
 from knowledge_forge.policy import CONTROL_POLICY_SET, P1_RELATION_SHADOW_POLICY_SET
 from knowledge_forge.relation_pipeline import (
     NO_RELATION,
+    RelationCandidate,
+    RelationPlan,
     RelationBatchValidationError,
     VersionedRelationPipeline,
 )
@@ -95,6 +97,291 @@ def test_base_schema_wildcard_matches_multiple_concrete_entity_types() -> None:
         ("Organization", "Product"),
         ("Product", "Organization"),
     }
+
+
+def test_relation_planner_rejects_pairs_already_resolved_to_same_entity() -> None:
+    entities = [
+        {**_entities()[0], "canonical_id": "canonical-shared"},
+        {**_entities()[1], "canonical_id": "canonical-shared"},
+    ]
+
+    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+        project_scope="project-1",
+        chunk_key="same-canonical",
+        content="Alpha uses Beta.",
+        entities=entities,
+        logical_schema=_schema(),
+    )
+
+    assert plan.raw_pairs == 2
+    assert plan.qualified_count == 0
+    assert plan.blocked_pairs == 2
+    assert plan.candidates == []
+    assert plan.overflow == []
+
+
+def test_dense_entity_list_without_relation_cue_does_not_create_cartesian_candidates() -> None:
+    names = ["Brazil", "France", "Germany", "India", "Japan", "Mexico", "Peru", "Spain"]
+    content = ", ".join(names) + "."
+    entities = []
+    cursor = 0
+    for index, name in enumerate(names):
+        start = content.index(name, cursor)
+        cursor = start + len(name)
+        entities.append({
+            "mention_id": f"m{index}",
+            "mention_key": f"key-{index}",
+            "surface": name,
+            "name": name,
+            "type": "Location",
+            "mention_start": start,
+            "mention_end": start + len(name),
+            "confidence": 0.95,
+            "canonical_id": f"canonical-{index}",
+            "evidence": content,
+        })
+
+    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+        project_scope="project-1",
+        chunk_key="dense-list",
+        content=content,
+        entities=entities,
+        logical_schema={
+            "relation_types": [{
+                "name": "related_to",
+                "source_types": ["Location"],
+                "target_types": ["Location"],
+                "symmetric": True,
+            }],
+        },
+    )
+
+    assert plan.raw_pairs == len(names) * (len(names) - 1)
+    assert plan.qualified_count == 0
+    assert plan.blocked_pairs == plan.raw_pairs
+    assert plan.candidates == []
+    assert plan.overflow == []
+
+
+def test_relation_cue_outside_endpoint_span_does_not_qualify_list_pairs() -> None:
+    content = (
+        "Global end uses were estimated as follows: batteries, 87%; ceramics and glass, "
+        "5%; lubricating greases, 2%; air treatment, 1%; medical, 1%."
+    )
+    names = ["ceramics", "lubricating greases", "air treatment", "medical"]
+    entities = []
+    for index, name in enumerate(names):
+        start = content.index(name)
+        entities.append({
+            "mention_id": f"m{index}",
+            "mention_key": f"key-{index}",
+            "surface": name,
+            "name": name,
+            "type": "Product",
+            "mention_start": start,
+            "mention_end": start + len(name),
+            "confidence": 0.95,
+            "canonical_id": f"canonical-{index}",
+            "evidence": content,
+        })
+
+    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+        project_scope="project-1",
+        chunk_key="misleading-context-cue",
+        content=content,
+        entities=entities,
+        logical_schema={
+            "relation_types": [{
+                "name": "uses",
+                "source_types": ["Product"],
+                "target_types": ["Product"],
+            }],
+        },
+    )
+
+    assert plan.qualified_count == 0
+    assert plan.candidates == []
+
+
+def test_dense_sentence_with_explicit_relation_cue_remains_eligible() -> None:
+    content = "A relates B relates C relates D relates E relates F relates G."
+    entities = []
+    cursor = 0
+    for index, name in enumerate("ABCDEFG"):
+        start = content.index(name, cursor)
+        cursor = start + len(name)
+        entities.append({
+            "mention_id": f"m{index}",
+            "mention_key": f"key-{index}",
+            "surface": name,
+            "name": name,
+            "type": "GenericEntity",
+            "mention_start": start,
+            "mention_end": start + len(name),
+            "confidence": 0.95,
+            "canonical_id": f"canonical-{index}",
+            "evidence": content,
+        })
+
+    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+        project_scope="project-1",
+        chunk_key="dense-cue",
+        content=content,
+        entities=entities,
+        logical_schema={
+            "relation_types": [{
+                "name": "related_to",
+                "source_types": ["GenericEntity"],
+                "target_types": ["GenericEntity"],
+                "symmetric": True,
+            }],
+        },
+    )
+
+    assert plan.qualified_count == len(entities) * (len(entities) - 1) // 2
+    assert plan.candidates
+
+
+def test_relation_batches_do_not_mix_different_predicate_contracts() -> None:
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Alpha uses Beta in Paris."
+    common = {
+        "source_mention_id": "m1",
+        "target_mention_id": "m2",
+        "source_mention_key": "k1",
+        "target_mention_key": "k2",
+        "source_name": "Alpha",
+        "target_name": "Beta",
+        "source_type": "Organization",
+        "target_type": "Product",
+        "context_id": "ctx",
+        "sentence_start": 0,
+        "sentence_end": 0,
+        "context_start_char": 0,
+        "context_end_char": len(content),
+        "source_start_char": 0,
+        "source_end_char": 5,
+        "target_start_char": 11,
+        "target_end_char": 15,
+    }
+    candidates = [
+        RelationCandidate(
+            candidate_id="candidate-general",
+            allowed_predicates=("related_to", "uses"),
+            allowed_directions=("as_is", "as_is"),
+            **common,
+        ),
+        RelationCandidate(
+            candidate_id="candidate-location",
+            allowed_predicates=("related_to", "located_in"),
+            allowed_directions=("as_is", "as_is"),
+            **common,
+        ),
+    ]
+    plan = RelationPlan(
+        policy_set=dict(P1_RELATION_SHADOW_POLICY_SET),
+        raw_pairs=2,
+        blocked_pairs=0,
+        candidates=candidates,
+        qualified_count=2,
+    )
+
+    batches = pipeline.build_batches(
+        plan,
+        content=content,
+        logical_schema={
+            "relation_types": [
+                {"name": "related_to", "source_types": ["*"], "target_types": ["*"]},
+                {"name": "uses", "source_types": ["*"], "target_types": ["*"]},
+                {"name": "located_in", "source_types": ["*"], "target_types": ["Location"]},
+            ],
+        },
+        candidate_budget_tokens=2048,
+        output_token_reserve=512,
+        max_candidates_per_batch=8,
+    )
+
+    assert [batch.candidate_ids for batch in batches] == [
+        ["candidate-general"],
+        ["candidate-location"],
+    ]
+
+
+def test_relation_batches_do_not_mix_different_evidence_contexts() -> None:
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Alpha uses Beta. Gamma uses Delta."
+    common = {
+        "allowed_predicates": ("related_to", "uses"),
+        "allowed_directions": ("as_is", "as_is"),
+        "sentence_start": 0,
+        "sentence_end": 0,
+    }
+    candidates = [
+        RelationCandidate(
+            candidate_id="candidate-first",
+            source_mention_id="m1",
+            target_mention_id="m2",
+            source_mention_key="k1",
+            target_mention_key="k2",
+            source_name="Alpha",
+            target_name="Beta",
+            source_type="Organization",
+            target_type="Product",
+            context_id="ctx-first",
+            context_start_char=0,
+            context_end_char=16,
+            source_start_char=0,
+            source_end_char=5,
+            target_start_char=11,
+            target_end_char=15,
+            **common,
+        ),
+        RelationCandidate(
+            candidate_id="candidate-second",
+            source_mention_id="m3",
+            target_mention_id="m4",
+            source_mention_key="k3",
+            target_mention_key="k4",
+            source_name="Gamma",
+            target_name="Delta",
+            source_type="Organization",
+            target_type="Product",
+            context_id="ctx-second",
+            context_start_char=17,
+            context_end_char=len(content),
+            source_start_char=17,
+            source_end_char=22,
+            target_start_char=28,
+            target_end_char=33,
+            **common,
+        ),
+    ]
+    plan = RelationPlan(
+        policy_set=dict(P1_RELATION_SHADOW_POLICY_SET),
+        raw_pairs=2,
+        blocked_pairs=0,
+        candidates=candidates,
+        qualified_count=2,
+    )
+
+    batches = pipeline.build_batches(
+        plan,
+        content=content,
+        logical_schema={
+            "relation_types": [
+                {"name": "related_to", "source_types": ["*"], "target_types": ["*"]},
+                {"name": "uses", "source_types": ["*"], "target_types": ["*"]},
+            ],
+        },
+        candidate_budget_tokens=2048,
+        output_token_reserve=512,
+        max_candidates_per_batch=8,
+    )
+
+    assert [batch.candidate_ids for batch in batches] == [
+        ["candidate-first"],
+        ["candidate-second"],
+    ]
 
 
 def test_relation_planner_checks_only_sentence_local_pairs_without_changing_denominator(

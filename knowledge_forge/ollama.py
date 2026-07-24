@@ -38,11 +38,14 @@ class TokenEstimator(Protocol):
 class ConservativeTokenEstimator:
     """Replaceable tokenizer-free fallback for mixed CJK and ASCII text."""
 
-    name = "conservative-cjk-ascii-v1"
+    name = "conservative-cjk-ascii-v2"
 
     def estimate(self, text: str) -> int:
         cjk = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
-        return max(1, cjk + math.ceil(max(0, len(text) - cjk) / 4))
+        # JSON schemas and mixed technical text tokenize much more densely than
+        # natural English under Qwen. Two non-CJK characters per token keeps
+        # request admission conservative without changing the Ollama runner.
+        return max(1, cjk + math.ceil(max(0, len(text) - cjk) / 2))
 
 
 @dataclass(frozen=True)

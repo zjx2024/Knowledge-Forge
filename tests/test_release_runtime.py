@@ -88,10 +88,14 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
 
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert '"127.0.0.1:5433:5432"' in compose
-    assert '"127.0.0.1:8011:8011"' in compose
-    assert '"127.0.0.1:8010:8010"' in compose
+    assert '"8011:8011"' in compose
+    assert '"8010:8010"' in compose
     assert "CONSTRAINTS_FILE: constraints-gpu.txt" in compose
     assert "DOCLING_REQUIREMENTS: requirements-docling-gpu.txt" in compose
+    assert "knowledge-forge-init:" in compose
+    assert 'user: "0:0"' in compose
+    assert "chown -R 10001:10001 /app/KnowledgeFiles /home/knowledgeforge/.cache" in compose
+    assert "condition: service_completed_successfully" in compose
 
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert (

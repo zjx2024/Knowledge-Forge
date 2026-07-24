@@ -59,12 +59,13 @@ def test_confidence_zero_is_preserved_for_mentions_candidates_and_relations():
     connection = RecordingConnection()
     database = database_with_connection(connection)
     database.add_entity_mention({
-        "project_id": 1, "document_id": 2, "chunk_id": 3, "canonical_entity_id": 4,
+        "project_id": 1, "document_id": 2, "revision_id": "revision-2",
+        "chunk_id": 3, "canonical_entity_id": 4,
         "mention_text": "Alpha", "normalized_name": "alpha", "entity_type": "Organization",
         "confidence": 0,
     })
     mention_insert = connection.calls[0]
-    assert mention_insert[1][9] == 0
+    assert mention_insert[1][10] == 0
 
     connection.calls.clear()
     database.upsert_relation_candidate({

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 
+from knowledge_forge.database import Database
 from knowledge_forge.entity_shadow import ShadowEntityResolver
 from knowledge_forge.migrations import MIGRATIONS
 from knowledge_forge.service import KnowledgeForgeService
@@ -19,6 +20,12 @@ class _CountingModels:
     def review(self, *_args, **_kwargs):
         self.review_calls += 1
         return None
+
+
+class _FailingReviewModels(_CountingModels):
+    def review(self, *_args, **_kwargs):
+        self.review_calls += 1
+        raise RuntimeError("Ollama response was truncated by output length")
 
 
 class _ShadowCandidates:
@@ -72,6 +79,21 @@ def test_entity_shadow_pipeline_reads_active_chunks_not_formal_mentions():
     assert "schemas.extract_entities_only" in source
     assert "schemas.extract_chunk" not in source
     assert "list_document_mentions" not in source
+
+
+def test_entity_shadow_pipeline_requeues_terminal_work_on_explicit_retry():
+    source = inspect.getsource(KnowledgeForgeService.build_entity_shadow_namespace)
+
+    assert "requeue_terminal_entity_shadow_work" in source
+    assert source.index("requeue_terminal_entity_shadow_work") < source.index("while True")
+
+
+def test_entity_shadow_claim_recovers_expired_final_attempt_without_consuming_another_attempt():
+    source = inspect.getsource(Database.claim_entity_shadow_work)
+
+    assert "(status IN ('pending','retryable_failed') AND attempt<max_attempts)" in source
+    assert "OR (status='leased' AND lease_expires_at<NOW())" in source
+    assert "CASE WHEN work.status='leased' THEN work.attempt" in source
 
 
 def test_entity_shadow_migration_persists_independent_audit_and_work_state():
@@ -221,6 +243,34 @@ def test_shadow_candidate_reranking_is_hard_bounded():
     assert len(seen) == 4
     assert len([item for item in store.candidate_rows if item["stage"] == "retrieval"]) <= 20
     assert len([item for item in store.candidate_rows if item["stage"] == "reranker"]) <= 4
+
+
+def test_optional_llm_review_failure_fails_closed_to_new_canonical():
+    candidate = {
+        "canonical_key": "c-acme",
+        "name": "Acme Holdings",
+        "normalized_name": "acme holdings",
+        "primary_type": "Organization",
+        "aliases": [],
+        "lexical_score": 0.80,
+        "vector_score": 0.80,
+    }
+    models = _FailingReviewModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns",
+        policy_version="p2",
+        store=_ShadowCandidates(lexical=[candidate], vector=[candidate]),
+        models=models,
+        reranker=lambda _mention, _rows: [0.80],
+        auto_merge_threshold=0.99,
+        review_threshold=0.60,
+    )
+
+    result = resolver.resolve(_mention(surface="Acme", normalized_surface="acme"))
+
+    assert result["decision"] == "new_canonical"
+    assert result["canonical_key"] != "c-acme"
+    assert models.review_calls == 1
 
 
 def test_candidate_recall_keeps_gold_inside_bounded_retrieval_audit():

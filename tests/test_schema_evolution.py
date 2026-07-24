@@ -4,6 +4,7 @@ from knowledge_forge.schema_evolution import (
     SchemaEvolutionService,
 )
 from knowledge_forge.config import Config
+from knowledge_forge.ollama import OllamaProtocolError
 
 
 def _chunk(key, section, text, vector):
@@ -277,8 +278,15 @@ def test_extract_chunk_rejects_entity_without_source_evidence(monkeypatch):
 def test_entity_only_schema_requires_integer_mention_offsets_and_calls_only_json_chat_once():
     entity_schema = ENTITY_ONLY_EXTRACTION_FORMAT["properties"]["entities"]["items"]
     assert {"mention_start", "mention_end"} <= set(entity_schema["required"])
+    assert set(entity_schema["required"]) == {
+        "id", "name", "type", "mention_start", "mention_end", "confidence",
+    }
     assert entity_schema["properties"]["mention_start"] == {"type": "integer"}
     assert entity_schema["properties"]["mention_end"] == {"type": "integer"}
+    assert (
+        ENTITY_ONLY_EXTRACTION_FORMAT["properties"]["entities"]["maxItems"]
+        == Config.entity_only_max_items_per_segment
+    )
 
     class SpyOllama:
         def __init__(self):
@@ -320,9 +328,244 @@ def test_entity_only_schema_requires_integer_mention_offsets_and_calls_only_json
 
     assert len(ollama.calls) == 1
     assert ollama.calls[0]["schema"] is ENTITY_ONLY_EXTRACTION_FORMAT
+    assert ollama.calls[0]["max_output_tokens"] == Config.entity_only_max_output_tokens
+    assert "Return an empty entities array only" in ollama.calls[0]["system"]
     assert result["relations"] == []
     assert result["_diagnostics"]["llm_calls"] == 1
     assert result["_diagnostics"]["verification_llm_calls"] == 0
+
+
+def test_entity_only_accepts_compact_items_protocol_without_relaxing_span_validation():
+    class CompactItemsOllama:
+        def json_chat(self, **_kwargs):
+            return {
+                "items": [
+                    {
+                        "name": "United States",
+                        "type": "Location",
+                        "mention_start": 0,
+                        "mention_end": 13,
+                    },
+                    {
+                        "name": "cobalt",
+                        "type": "Product",
+                        "mention_start": 47,
+                        "mention_end": 53,
+                    },
+                    {
+                        "name": "wrong span",
+                        "type": "Product",
+                        "mention_start": 14,
+                        "mention_end": 19,
+                    },
+                ]
+            }
+
+    source = "United States produces about 1 million tons of cobalt."
+    service = SchemaEvolutionService.__new__(SchemaEvolutionService)
+    service.ollama = CompactItemsOllama()
+    result = service.extract_entities_only(
+        {"llm_model": "test", "model_max_tokens": 8192},
+        {"schema_json": BASE_SCHEMA},
+        {"content": source, "metadata": {}},
+    )
+
+    assert [(item["id"], item["name"]) for item in result["entities"]] == [
+        ("entity_0001", "United States"),
+        ("entity_0002", "cobalt"),
+    ]
+    assert result["entities"][0]["confidence"] == 0.5
+    assert result["_diagnostics"]["rejected_entities"] == 1
+
+
+def test_entity_only_splits_recoverable_overflow_and_restores_source_offsets():
+    class OverflowThenSplitOllama:
+        def __init__(self):
+            self.calls = []
+
+        def json_chat(self, **kwargs):
+            source = kwargs["prompt"].split("Source text:\n", 1)[1]
+            self.calls.append(source)
+            if len(self.calls) == 1:
+                raise OllamaProtocolError("Ollama response was truncated by output length")
+            if "Beta" not in source:
+                return {"items": [{
+                    "name": "Alpha",
+                    "type": "Person",
+                    "mention_start": source.index("Alpha"),
+                    "mention_end": source.index("Alpha") + 5,
+                }]}
+            return {"items": [{
+                "name": "Paris",
+                "type": "Location",
+                "mention_start": source.index("Paris"),
+                "mention_end": source.index("Paris") + 5,
+            }]}
+
+    source = ("Alpha works for Acme. " * 20) + ("Beta visits Paris. " * 20)
+    ollama = OverflowThenSplitOllama()
+    service = SchemaEvolutionService(None, ollama)
+    result = service.extract_entities_only(
+        {"llm_model": "test", "model_max_tokens": 8192},
+        {"schema_json": BASE_SCHEMA},
+        {"content": source, "metadata": {}},
+    )
+
+    assert len(ollama.calls) >= 3
+    assert all(len(call) < len(source) for call in ollama.calls[1:])
+    assert result["_diagnostics"]["segmented_fallback"] is True
+    assert result["_diagnostics"]["llm_calls"] == 3
+    assert [(item["name"], item["mention_start"], item["mention_end"]) for item in result["entities"]] == [
+        ("Alpha", 0, 5),
+        ("Paris", source.index("Paris", len(source) // 2), source.index("Paris", len(source) // 2) + 5),
+    ]
+
+
+def test_entity_only_short_overflow_uses_bounded_json_fallback():
+    class ShortOverflowOllama:
+        def __init__(self):
+            self.calls = []
+
+        def json_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise OllamaProtocolError("Ollama response was truncated by output length")
+            return {"items": [{
+                "name": "Paris",
+                "type": "Location",
+                "mention_start": 0,
+                "mention_end": 5,
+            }]}
+
+    ollama = ShortOverflowOllama()
+    service = SchemaEvolutionService(None, ollama)
+    result = service.extract_entities_only(
+        {"llm_model": "test", "model_max_tokens": 8192},
+        {"schema_json": BASE_SCHEMA},
+        {"content": "Paris.", "metadata": {}},
+    )
+
+    assert len(ollama.calls) == 2
+    assert ollama.calls[0]["schema"] is ENTITY_ONLY_EXTRACTION_FORMAT
+    assert ollama.calls[1]["schema"] is None
+    assert ollama.calls[1]["temperature"] == 0
+    assert result["entities"][0]["name"] == "Paris"
+    assert result["_diagnostics"]["llm_calls"] == 2
+
+
+def test_entity_only_medium_overflow_splits_before_unstructured_fallback():
+    class MediumOverflowOllama:
+        def __init__(self):
+            self.calls = []
+
+        def json_chat(self, **kwargs):
+            source = kwargs["prompt"].split("Source text:\n", 1)[1]
+            self.calls.append(kwargs)
+            if len(source) > 80:
+                raise OllamaProtocolError("Ollama response was truncated by output length")
+            name = "Chile" if "Chile" in source else "Argentina"
+            start = source.index(name)
+            return {"items": [{
+                "name": name,
+                "type": "Location",
+                "mention_start": start,
+                "mention_end": start + len(name),
+            }]}
+
+    source = (
+        "Projects in Chile lower EV battery recycling costs. "
+        "Other import sources include Argentina."
+    )
+    ollama = MediumOverflowOllama()
+    result = SchemaEvolutionService(None, ollama).extract_entities_only(
+        {"llm_model": "test", "model_max_tokens": 8192},
+        {"schema_json": BASE_SCHEMA},
+        {"content": source, "metadata": {}},
+    )
+
+    assert len(ollama.calls) == 3
+    assert all(call["schema"] is ENTITY_ONLY_EXTRACTION_FORMAT for call in ollama.calls)
+    assert {item["name"] for item in result["entities"]} == {"Chile", "Argentina"}
+    assert result["_diagnostics"]["segmented_fallback"] is True
+
+
+def test_entity_only_proactively_segments_large_source_and_preserves_offsets(monkeypatch):
+    monkeypatch.setattr(Config, "entity_only_segment_max_chars", 256)
+
+    class SegmentedOllama:
+        def __init__(self):
+            self.calls = []
+
+        def json_chat(self, **kwargs):
+            source = kwargs["prompt"].split("Source text:\n", 1)[1]
+            self.calls.append(source)
+            name = "Alpha" if "Alpha" in source else "Paris"
+            start = source.index(name)
+            return {"items": [{
+                "name": name,
+                "type": "Organization" if name == "Alpha" else "Location",
+                "mention_start": start,
+                "mention_end": start + len(name),
+            }]}
+
+    source = ("Alpha builds systems. " * 20) + ("Paris hosts teams. " * 20)
+    ollama = SegmentedOllama()
+    result = SchemaEvolutionService(None, ollama).extract_entities_only(
+        {"llm_model": "test", "model_max_tokens": 8192},
+        {"schema_json": BASE_SCHEMA},
+        {"content": source, "metadata": {}},
+    )
+
+    assert len(ollama.calls) >= 2
+    assert all(len(call) <= 256 for call in ollama.calls)
+    assert result["_diagnostics"]["segmented_fallback"] is True
+    assert all(
+        source[item["mention_start"]:item["mention_end"]] == item["name"]
+        for item in result["entities"]
+    )
+
+
+def test_entity_only_splits_again_when_schema_item_cap_is_reached(monkeypatch):
+    monkeypatch.setattr(Config, "entity_only_segment_max_chars", 4096)
+    monkeypatch.setattr(Config, "entity_only_max_items_per_segment", 2)
+
+    class CappedOllama:
+        def __init__(self):
+            self.calls = []
+
+        def json_chat(self, **kwargs):
+            source = kwargs["prompt"].split("Source text:\n", 1)[1]
+            self.calls.append(source)
+            if len(self.calls) == 1:
+                return {"items": [
+                    {"name": "Alpha", "type": "Organization", "mention_start": 0, "mention_end": 5},
+                    {"name": "Alpha", "type": "Organization", "mention_start": 0, "mention_end": 5},
+                ]}
+            rows = []
+            for name, entity_type in (("Alpha", "Organization"), ("Paris", "Location")):
+                if name not in source:
+                    continue
+                start = source.index(name)
+                rows.append({
+                    "name": name,
+                    "type": entity_type,
+                    "mention_start": start,
+                    "mention_end": start + len(name),
+                })
+            return {"items": rows}
+
+    source = ("Alpha builds systems. " * 20) + ("Paris hosts teams. " * 20)
+    ollama = CappedOllama()
+    result = SchemaEvolutionService(None, ollama).extract_entities_only(
+        {"llm_model": "test", "model_max_tokens": 8192},
+        {"schema_json": BASE_SCHEMA},
+        {"content": source, "metadata": {}},
+    )
+
+    assert len(ollama.calls) >= 3
+    assert all(len(call) < len(source) for call in ollama.calls[1:])
+    assert result["_diagnostics"]["segmented_fallback"] is True
+    assert {item["name"] for item in result["entities"]} == {"Alpha", "Paris"}
 
 
 class SequentialExtractionOllama:

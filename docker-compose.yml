@@ -17,6 +17,23 @@ services:
       timeout: 5s
       retries: 20
 
+  knowledge-forge-init:
+    image: knowledge-forge:latest
+    container_name: knowledge-forge-init
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /app/KnowledgeFiles/docs /app/KnowledgeFiles/chunks
+        /app/KnowledgeFiles/media /app/KnowledgeFiles/.trash
+        /home/knowledgeforge/.cache &&
+        chown -R 10001:10001 /app/KnowledgeFiles /home/knowledgeforge/.cache
+    volumes:
+      - ./KnowledgeFiles:/app/KnowledgeFiles
+      - knowledge-forge-docling-cache:/home/knowledgeforge/.cache
+    restart: "no"
+
   knowledge-forge:
     build:
       context: .
@@ -39,9 +56,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      knowledge-forge-init:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:8011:8011"
-      - "127.0.0.1:8010:8010"
+      - "8011:8011"
+      - "8010:8010"
     volumes:
       - ./KnowledgeFiles:/app/KnowledgeFiles
       - knowledge-forge-docling-cache:/home/knowledgeforge/.cache

@@ -14,7 +14,7 @@ from typing import Any
 
 from .config import Config
 from .database import Database
-from .ollama import OllamaClient
+from .ollama import OllamaClient, OllamaProtocolError
 from .observability import gauge, increment
 from .relation_verification import (
     LLM_VERIFIED,
@@ -86,12 +86,23 @@ EXTRACTION_FORMAT = {
     "required": ["entities", "relations"],
 }
 
-_ENTITY_ONLY_ITEM_FORMAT = copy.deepcopy(EXTRACTION_FORMAT["properties"]["entities"]["items"])
-_ENTITY_ONLY_ITEM_FORMAT["properties"]["mention_start"] = {"type": "integer"}
-_ENTITY_ONLY_ITEM_FORMAT["properties"]["mention_end"] = {"type": "integer"}
-_ENTITY_ONLY_ITEM_FORMAT["required"] = [
-    *_ENTITY_ONLY_ITEM_FORMAT["required"], "mention_start", "mention_end",
-]
+_ENTITY_ONLY_ITEM_FORMAT = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "mention_start": {"type": "integer"},
+        "mention_end": {"type": "integer"},
+        "confidence": {"type": "number"},
+        "aliases": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "string"},
+    },
+    "required": [
+        "id", "name", "type", "mention_start", "mention_end", "confidence",
+    ],
+}
 
 ENTITY_ONLY_EXTRACTION_FORMAT = {
     "type": "object",
@@ -100,9 +111,19 @@ ENTITY_ONLY_EXTRACTION_FORMAT = {
         "entities": {
             **EXTRACTION_FORMAT["properties"]["entities"],
             "items": _ENTITY_ONLY_ITEM_FORMAT,
+            "maxItems": Config.entity_only_max_items_per_segment,
         },
     },
     "required": ["entities"],
+}
+
+RELATION_ONLY_EXTRACTION_FORMAT = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "relations": copy.deepcopy(EXTRACTION_FORMAT["properties"]["relations"]),
+    },
+    "required": ["relations"],
 }
 
 
@@ -1340,6 +1361,7 @@ class SchemaEvolutionService:
                 ))
             return []
 
+        reviewed = self._normalize_relation_verifier_response(reviewed, batch)
         raw_decisions = reviewed.get("decisions") if isinstance(reviewed, dict) else None
         allowed_keys = {"candidate_id", "verdict", "corrected_type", "orientation", "evidence", "reason"}
         required_keys = {"candidate_id", "verdict", "orientation", "evidence", "reason"}
@@ -1400,6 +1422,98 @@ class SchemaEvolutionService:
                 error_category="invalid_decision" if error else "",
             ))
         return missing
+
+    @staticmethod
+    def _normalize_relation_verifier_response(
+        reviewed: Any,
+        batch: list[dict[str, Any]],
+    ) -> Any:
+        """Normalize bounded Ollama schema variants without weakening evidence checks.
+
+        Some runners return a root array as ``items`` or key decisions by candidate
+        ID even when given the strict JSON schema.  Only known field/orientation
+        aliases are repaired here.  A supported verdict may reuse the candidate's
+        already source-backed evidence, which still has to pass the exact-quote and
+        endpoint checks in ``_apply_relation_decision``.
+        """
+
+        if not isinstance(reviewed, dict):
+            return reviewed
+        expected = {
+            str(relation.get("candidate_id") or ""): relation for relation in batch
+        }
+        raw = reviewed.get("decisions")
+        keyed = False
+        if raw is not None and set(reviewed) != {"decisions"}:
+            return reviewed
+        if raw is None and isinstance(reviewed.get("items"), list):
+            if set(reviewed) != {"items"}:
+                return reviewed
+            raw = reviewed["items"]
+        elif raw is None and reviewed and set(reviewed).issubset(expected):
+            if all(isinstance(value, dict) for value in reviewed.values()):
+                raw = reviewed
+                keyed = True
+        if raw is None:
+            return reviewed
+
+        if keyed:
+            values = [
+                {"candidate_id": candidate_id, **dict(decision)}
+                for candidate_id, decision in raw.items()
+            ]
+        elif isinstance(raw, list):
+            values = raw
+        else:
+            return reviewed
+
+        allowed_input_keys = {
+            "candidate_id", "verdict", "decision", "corrected_type",
+            "orientation", "evidence", "reason",
+        }
+        orientation_aliases = {
+            "as_is": "as_is",
+            "not_reversed": "as_is",
+            "endpoints are not reversed": "as_is",
+            "reversed": "reversed",
+            "endpoints are reversed": "reversed",
+        }
+        normalized: list[dict[str, Any]] = []
+        for value in values:
+            if not isinstance(value, dict) or bool(set(value) - allowed_input_keys):
+                return reviewed
+            candidate_id = str(value.get("candidate_id") or "")
+            relation = expected.get(candidate_id)
+            verdict = str(value.get("verdict") or value.get("decision") or "")
+            orientation_raw = str(value.get("orientation") or "")
+            orientation_key = " ".join(
+                orientation_raw.strip().lower().replace("-", "_").split()
+            ).rstrip(".")
+            orientation = orientation_aliases.get(orientation_key, orientation_raw)
+            evidence = value.get("evidence")
+            if evidence is None and relation is not None:
+                evidence = (
+                    str(relation.get("evidence_text") or "")
+                    if verdict == "supported" else ""
+                )
+            reason = value.get("reason")
+            if reason is None and verdict in RELATION_VERDICTS:
+                reason = (
+                    "verifier returned supported; reused source-backed candidate evidence"
+                    if verdict == "supported"
+                    else f"verifier returned {verdict} without an explicit reason"
+                )
+            item = {
+                "candidate_id": candidate_id,
+                "verdict": verdict,
+                "orientation": orientation,
+                "evidence": evidence,
+                "reason": reason,
+            }
+            if "corrected_type" in value:
+                item["corrected_type"] = value["corrected_type"]
+            normalized.append(item)
+        return {"decisions": normalized}
 
     @staticmethod
     def _relation_review_payload(
@@ -1537,32 +1651,57 @@ class SchemaEvolutionService:
             "section": _chunk_section(chunk),
             "chunk_key": _chunk_key(chunk),
         }
-        primary = self.ollama.json_chat(
-            model=model,
-            system=(
-                "Extract a concise knowledge graph using only facts explicitly stated in the source text. "
-                "Every entity and relation must include an exact evidence quote copied from the source. "
-                "Every entity must include exact half-open mention_start/mention_end offsets; every relation "
-                "must include exact half-open evidence_start/evidence_end offsets. "
-                "Entity ids are local unique ids and every relation endpoint must reference one of them. "
-                "Do not create entities absent from the text, and do not infer relations from co-occurrence. "
-                "Prefer specific allowed types; use GenericEntity or related_to only when the text supports the fact but not a specific type."
-            ),
-            prompt=(
-                f"Entity schema:\n{json.dumps(entity_schema, ensure_ascii=False)}\n\n"
-                f"Relation schema:\n{json.dumps(relation_schema, ensure_ascii=False)}\n\n"
-                "Read-only context metadata (never extract entities or evidence from it):\n"
-                f"{json.dumps(metadata_context, ensure_ascii=False)}\n\nSource text:\n{content}"
-            ),
-            schema=EXTRACTION_FORMAT,
-            context_budget_tokens=int(project.get("model_max_tokens") or 32768),
-            max_output_tokens=Config.extraction_max_output_tokens,
-        )
+        primary_calls = 1
+        primary_fallback = False
+        try:
+            primary = self.ollama.json_chat(
+                model=model,
+                system=(
+                    "Extract a concise knowledge graph using only facts explicitly stated in the source text. "
+                    "Every entity and relation must include an exact evidence quote copied from the source. "
+                    "Every entity must include exact half-open mention_start/mention_end offsets; every relation "
+                    "must include exact half-open evidence_start/evidence_end offsets. "
+                    "Entity ids are local unique ids and every relation endpoint must reference one of them. "
+                    "Do not create entities absent from the text, and do not infer relations from co-occurrence. "
+                    "Prefer specific allowed types; use GenericEntity or related_to only when the text supports the fact but not a specific type."
+                ),
+                prompt=(
+                    f"Entity schema:\n{json.dumps(entity_schema, ensure_ascii=False)}\n\n"
+                    f"Relation schema:\n{json.dumps(relation_schema, ensure_ascii=False)}\n\n"
+                    "Read-only context metadata (never extract entities or evidence from it):\n"
+                    f"{json.dumps(metadata_context, ensure_ascii=False)}\n\nSource text:\n{content}"
+                ),
+                schema=EXTRACTION_FORMAT,
+                context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                max_output_tokens=Config.extraction_max_output_tokens,
+            )
+        except OllamaProtocolError as exc:
+            if "truncated by output length" not in str(exc):
+                raise
+            primary_calls += 1
+            primary_fallback = True
+            entity_only = self.ollama.json_chat(
+                model=model,
+                system=(
+                    "The previous combined graph response exceeded the output budget. Extract only "
+                    "source-backed entity mentions now. Preserve distinct occurrences and return exact "
+                    "half-open mention/evidence offsets. Do not output relations."
+                ),
+                prompt=(
+                    f"Entity schema:\n{json.dumps(entity_schema, ensure_ascii=False)}\n\n"
+                    f"Source text:\n{content}"
+                ),
+                schema=ENTITY_ONLY_EXTRACTION_FORMAT,
+                context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                max_output_tokens=Config.extraction_max_output_tokens,
+            )
+            primary = {"entities": entity_only.get("entities") or [], "relations": []}
         extraction = self._sanitize_extraction(primary, content, logical)
         diagnostics = {
             **(extraction.pop("_diagnostics", {})),
-            "llm_calls": 1,
+            "llm_calls": primary_calls,
             "gleaning_used": False,
+            "primary_truncation_fallback": primary_fallback,
         }
         extracted_entities = extraction.get("entities") or []
         extracted_relations = extraction.get("relations") or []
@@ -1577,24 +1716,38 @@ class SchemaEvolutionService:
         diagnostics["relation_candidates"] = len(relation_candidates)
         if self._needs_gleaning(chunk, extraction, relation_candidates):
             try:
+                relation_only = bool(extracted_entities and relation_candidates)
                 supplement_raw = self.ollama.json_chat(
                     model=model,
                     system=(
+                        "Extract only explicit relations between the supplied entity ids. Return no entities. "
+                        "Use only allowed relation types and candidate pairs. Each relation requires an exact "
+                        "source quote and exact half-open evidence offsets. Do not infer from co-occurrence."
+                        if relation_only else
                         "Perform one targeted second-pass knowledge graph extraction. Return only facts missed by the first pass. "
                         "Repeat endpoint entities needed by a new relation. Every item requires an exact source quote. "
                         "Do not add facts based only on co-occurrence."
                     ),
                     prompt=(
+                        f"Relation schema:\n{json.dumps(relation_schema, ensure_ascii=False)}\n\n"
+                        f"Known entities:\n{json.dumps([{'id': item['id'], 'name': item['name'], 'type': item['type'], 'mention_start': item.get('mention_start'), 'mention_end': item.get('mention_end')} for item in extracted_entities], ensure_ascii=False)}\n\n"
+                        f"Candidate entity pairs:\n{json.dumps(relation_candidates, ensure_ascii=False)}\n\n"
+                        f"Source text:\n{content}"
+                        if relation_only else
                         f"Schema:\n{json.dumps(logical, ensure_ascii=False)}\n\n"
                         f"First-pass result:\n{json.dumps(extraction, ensure_ascii=False)}\n\nSource text:\n{content}"
                         f"\n\nLocally generated candidate entity pairs:\n"
                         f"{json.dumps(relation_candidates, ensure_ascii=False)}"
                     ),
-                    schema=EXTRACTION_FORMAT,
+                    schema=RELATION_ONLY_EXTRACTION_FORMAT if relation_only else EXTRACTION_FORMAT,
                     context_budget_tokens=int(project.get("model_max_tokens") or 32768),
                     max_output_tokens=Config.extraction_max_output_tokens,
                 )
-                supplement = self._sanitize_extraction(supplement_raw, content, logical)
+                supplement_payload = (
+                    {"entities": extracted_entities, "relations": supplement_raw.get("relations") or []}
+                    if relation_only else supplement_raw
+                )
+                supplement = self._sanitize_extraction(supplement_payload, content, logical)
                 supplement_diagnostics = supplement.pop("_diagnostics", {})
                 extraction = self._merge_extractions(extraction, supplement)
                 diagnostics.update({
@@ -1645,32 +1798,141 @@ class SchemaEvolutionService:
         logical = schema_record["schema_json"]
         content, body_start = _chunk_body_with_offset(chunk)
         model = project.get("llm_model") or Config.default_llm_model
-        raw = self.ollama.json_chat(
-            model=model,
-            system=(
-                "Extract only source-backed entity mentions. Preserve every distinct occurrence, "
-                "including repeated surface forms. Return exact half-open mention/evidence offsets "
-                "for every entity. Do not extract or infer relations."
-            ),
-            prompt=(
-                f"Entity schema:\n{json.dumps(logical.get('entity_types') or [], ensure_ascii=False)}"
-                f"\n\nSource text:\n{content}"
-            ),
-            schema=ENTITY_ONLY_EXTRACTION_FORMAT,
-            context_budget_tokens=int(project.get("model_max_tokens") or 32768),
-            max_output_tokens=Config.extraction_max_output_tokens,
+        system = (
+            "Extract every explicit, source-backed entity mention: named people, organizations, "
+            "locations, products, materials, technologies, processes, standards, events, and "
+            "other reusable concrete concepts allowed by the entity schema. Preserve repeated "
+            "occurrences. The name must be the exact source substring and mention_start/end must "
+            "be its exact Unicode half-open offsets in Source text. Keep the JSON compact; omit "
+            "optional aliases and evidence unless they add source-backed information. Do not "
+            "extract or infer relations. Return an empty entities array only when the Source text "
+            "truly contains no concrete entity mention."
         )
+        entity_schema = json.dumps(logical.get("entity_types") or [], ensure_ascii=False)
+        llm_calls = 0
+        segmented_fallback = False
+        segment_max_chars = Config.entity_only_segment_max_chars
+        segment_max_items = Config.entity_only_max_items_per_segment
+
+        def split_index(value: str) -> int:
+            midpoint = len(value) // 2
+            minimum = min(512, max(1, len(value) // 4))
+            boundaries = [
+                end for _start, end, _sentence in split_sentences(value)
+                if minimum <= end <= len(value) - minimum
+            ]
+            if boundaries:
+                return min(boundaries, key=lambda end: abs(end - midpoint))
+            for distance in range(0, max(midpoint, len(value) - midpoint)):
+                for candidate in (midpoint + distance, midpoint - distance):
+                    if minimum <= candidate <= len(value) - minimum and value[candidate].isspace():
+                        return candidate
+            return midpoint
+
+        def request_segment(
+            segment: str,
+            offset: int = 0,
+            depth: int = 0,
+        ) -> list[dict[str, Any]]:
+            nonlocal llm_calls, segmented_fallback
+            if len(segment) > segment_max_chars:
+                boundary = split_index(segment)
+                if 0 < boundary < len(segment):
+                    segmented_fallback = True
+                    return [
+                        *request_segment(segment[:boundary], offset, depth + 1),
+                        *request_segment(segment[boundary:], offset + boundary, depth + 1),
+                    ]
+            llm_calls += 1
+            try:
+                raw = self.ollama.json_chat(
+                    model=model,
+                    system=system,
+                    prompt=f"Entity schema:\n{entity_schema}\n\nSource text:\n{segment}",
+                    schema=ENTITY_ONLY_EXTRACTION_FORMAT,
+                    context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                    max_output_tokens=Config.entity_only_max_output_tokens,
+                )
+            except OllamaProtocolError as exc:
+                recoverable = (
+                    "truncated by output length" in str(exc)
+                    or "prompt token estimate underestimated" in str(exc)
+                )
+                if not recoverable:
+                    raise
+                boundary = split_index(segment)
+                if (
+                    depth < 8
+                    and len(segment) > 64
+                    and 0 < boundary < len(segment)
+                ):
+                    segmented_fallback = True
+                    return [
+                        *request_segment(segment[:boundary], offset, depth + 1),
+                        *request_segment(segment[boundary:], offset + boundary, depth + 1),
+                    ]
+                else:
+                    llm_calls += 1
+                    raw = self.ollama.json_chat(
+                        model=model,
+                        system=system + " Return one compact JSON array of entity objects.",
+                        prompt=f"Entity schema:\n{entity_schema}\n\nSource text:\n{segment}",
+                        schema=None,
+                        temperature=0,
+                        context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                        max_output_tokens=min(Config.entity_only_max_output_tokens, 4096),
+                    )
+            raw_rows = self._flat_extraction(raw).get("entities") or []
+            if (
+                len(raw_rows) >= segment_max_items
+                and len(segment) >= 256
+                and depth < 6
+            ):
+                boundary = split_index(segment)
+                if 0 < boundary < len(segment):
+                    segmented_fallback = True
+                    return [
+                        *request_segment(segment[:boundary], offset, depth + 1),
+                        *request_segment(segment[boundary:], offset + boundary, depth + 1),
+                    ]
+            rows: list[dict[str, Any]] = []
+            for item in raw_rows:
+                if not isinstance(item, dict):
+                    continue
+                normalized = dict(item)
+                for start_key, end_key in (
+                    ("mention_start", "mention_end"),
+                    ("evidence_start", "evidence_end"),
+                ):
+                    if normalized.get(start_key) is not None:
+                        normalized[start_key] = int(normalized[start_key]) + offset
+                    if normalized.get(end_key) is not None:
+                        normalized[end_key] = int(normalized[end_key]) + offset
+                rows.append(normalized)
+            return rows
+
+        raw_entities = request_segment(content)
+        entity_rows: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_entities, start=1):
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized["id"] = f"entity_{index:04d}"
+            if normalized.get("confidence") is None:
+                normalized["confidence"] = 0.5
+            entity_rows.append(normalized)
         extraction = self._sanitize_extraction(
-            {"entities": raw.get("entities") or [], "relations": []}, content, logical,
+            {"entities": entity_rows, "relations": []}, content, logical,
         )
         extraction["relations"] = []
         extraction["_verification_events"] = []
         extraction["_diagnostics"] = {
             **extraction.get("_diagnostics", {}),
-            "llm_calls": 1,
+            "llm_calls": llm_calls,
             "entity_only": True,
             "gleaning_used": False,
             "verification_llm_calls": 0,
+            "segmented_fallback": segmented_fallback,
         }
         for entity in extraction.get("entities") or []:
             for key in ("evidence_start", "evidence_end", "mention_start", "mention_end"):

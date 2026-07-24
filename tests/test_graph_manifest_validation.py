@@ -71,6 +71,13 @@ def test_graph_namespace_manifest_and_lease_are_versioned_migration_facts():
     assert "graph_content_manifests" in migration.sql
     assert "graph_leases" in migration.sql
 
+    strategy_migration = next(
+        item for item in MIGRATIONS
+        if item.version == "0013_strategy_graph_lease_namespace"
+    )
+    assert "DROP CONSTRAINT IF EXISTS graph_leases_project_id_namespace_id_fkey" in strategy_migration.sql
+    assert "DROP CONSTRAINT IF EXISTS graph_content_manifests_project_id_namespace_id_fkey" in strategy_migration.sql
+
 
 @pytest.mark.integration
 def test_disposable_postgres_graph_lease_is_exclusive_recoverable_and_generation_scoped():
@@ -89,6 +96,7 @@ def test_disposable_postgres_graph_lease_is_exclusive_recoverable_and_generation
     database = Database(TestConfig)
     database.bootstrap()
     project = database.create_project("graph-lease", "", None, None)
+    database.ensure_project_strategy_graphs(project["id"])
     first = database.acquire_graph_lease(
         project["id"], project["graph_namespace_id"], 0, "worker-a", ttl_seconds=30,
     )
@@ -127,5 +135,26 @@ def test_disposable_postgres_graph_lease_is_exclusive_recoverable_and_generation
         namespace_id=project["graph_namespace_id"],
         lease_token=second["lease_token"],
         manifest_digest=manifest["content_digest"], empty=True,
+        stats={"documents": 0, "chunks": 0, "entities": 0, "relations": 0},
     )
     assert completed is not None
+    stable_graph = database.get_project_strategy_graph(project["id"], "stable")
+    assert stable_graph and stable_graph["status"] == "empty"
+    assert stable_graph["ready_generation"] == 0
+    assert stable_graph["stats"] == {
+        "documents": 0, "chunks": 0, "entities": 0, "relations": 0,
+    }
+
+    strategy_graph = next(
+        item for item in database.ensure_project_strategy_graphs(project["id"])
+        if item["strategy_key"] == "enhanced_shadow"
+    )
+    strategy_graph = database.start_strategy_graph_rebuild(
+        project["id"], "enhanced_shadow",
+    )
+    strategy_lease = database.acquire_graph_lease(
+        project["id"], strategy_graph["namespace_id"], strategy_graph["generation"],
+        "strategy-worker", ttl_seconds=30,
+    )
+    assert strategy_lease["namespace_id"] == strategy_graph["namespace_id"]
+    database.release_graph_lease(strategy_lease["id"], strategy_lease["lease_token"])

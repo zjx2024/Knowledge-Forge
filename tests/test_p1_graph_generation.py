@@ -270,6 +270,25 @@ def test_outbox_poll_is_due_only_and_bounded():
     database_for(connection).list_pending_indexing_failures(7, limit=25)
 
     statement, params = connection.calls[0]
-    assert "next_attempt_at<=NOW()" in statement
+    assert "failure.status='pending'" in statement
+    assert "failure.next_attempt_at<=NOW()" in statement
     assert "LIMIT %s" in statement
     assert params == (7, "relation", 25)
+
+
+def test_document_embedding_query_qualifies_joined_columns():
+    class EmbeddingConnection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params=None):
+            self.calls.append((str(statement), tuple(params or ())))
+            return Row(rows=[])
+
+    connection = EmbeddingConnection()
+    database_for(connection).list_document_embeddings(8, "chunk", "embed")
+
+    statement, params = connection.calls[0]
+    assert "SELECT v.id,v.project_id,v.document_id,v.chunk_id" in statement
+    assert "ORDER BY v.chunk_id,v.id" in statement
+    assert params == (8, "chunk", "embed")

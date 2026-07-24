@@ -1256,6 +1256,126 @@ CREATE INDEX idx_graphrag_global_search_project
 """
 
 
+MULTI_STRATEGY_CONSTRUCTION_SQL = r"""
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS strategy_key TEXT NOT NULL DEFAULT 'stable';
+CREATE INDEX IF NOT EXISTS idx_jobs_project_strategy
+    ON jobs(project_id,strategy_key,updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_document_strategy
+    ON jobs(document_id,strategy_key,updated_at DESC)
+    WHERE document_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS document_strategy_builds (
+    project_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    strategy_key TEXT NOT NULL CHECK (strategy_key IN ('stable','enhanced_shadow')),
+    status TEXT NOT NULL DEFAULT 'uploaded' CHECK (
+        status IN ('uploaded','queued','processing','indexed','failed','cancelled','deleted')
+    ),
+    content_revision_id TEXT REFERENCES document_content_revisions(revision_id),
+    latest_job_id TEXT REFERENCES jobs(id),
+    stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(document_id,strategy_key),
+    CONSTRAINT fk_document_strategy_document
+        FOREIGN KEY(document_id,project_id) REFERENCES documents(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_document_strategy_project
+    ON document_strategy_builds(project_id,strategy_key,status,updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS project_strategy_graphs (
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    strategy_key TEXT NOT NULL CHECK (strategy_key IN ('stable','enhanced_shadow')),
+    namespace_id TEXT NOT NULL UNIQUE,
+    generation BIGINT NOT NULL DEFAULT 0,
+    ready_generation BIGINT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'empty' CHECK (
+        status IN ('empty','stale','rebuilding','ready','failed')
+    ),
+    error_message TEXT NOT NULL DEFAULT '',
+    policy_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_expires_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(project_id,strategy_key)
+);
+CREATE INDEX IF NOT EXISTS idx_project_strategy_graph_status
+    ON project_strategy_graphs(project_id,status,updated_at DESC);
+
+INSERT INTO document_strategy_builds(
+    project_id,document_id,strategy_key,status,content_revision_id,stats,error_message,
+    started_at,completed_at,updated_at
+)
+SELECT d.project_id,d.id,'stable',
+       CASE
+           WHEN d.is_deleted THEN 'deleted'
+           WHEN d.status='indexed' THEN 'indexed'
+           WHEN d.status='processing' THEN 'processing'
+           WHEN d.status='failed' THEN 'failed'
+           ELSE 'uploaded'
+       END,
+       d.active_revision_id,
+       jsonb_build_object(
+           'section_count',COALESCE((d.metadata->>'section_count')::integer,0),
+           'chunk_count',COALESCE((d.metadata->>'chunk_count')::integer,0),
+           'entity_mentions',COALESCE((d.metadata->>'entity_mentions')::integer,0),
+           'relations',COALESCE((d.metadata->>'relations')::integer,0)
+       ),
+       COALESCE(d.error_message,''),
+       d.uploaded_at,
+       CASE WHEN d.status='indexed' THEN COALESCE(d.indexed_at,d.updated_at) ELSE NULL END,
+       d.updated_at
+FROM documents d
+ON CONFLICT(document_id,strategy_key) DO NOTHING;
+
+INSERT INTO project_strategy_graphs(
+    project_id,strategy_key,namespace_id,generation,ready_generation,status,
+    error_message,policy_summary,updated_at
+)
+SELECT p.id,'stable',p.graph_namespace_id,p.graph_generation,p.graph_ready_generation,
+       p.graph_status,COALESCE(p.graph_error,''),
+       jsonb_build_object(
+           'policy_version',COALESCE(p.graph_policy_version,''),
+           'policy_hash',COALESCE(p.graph_policy_hash,'')
+       ),p.updated_at
+FROM projects p
+ON CONFLICT(project_id,strategy_key) DO UPDATE SET
+    namespace_id=EXCLUDED.namespace_id,
+    generation=EXCLUDED.generation,
+    ready_generation=EXCLUDED.ready_generation,
+    status=EXCLUDED.status,
+    error_message=EXCLUDED.error_message,
+    policy_summary=EXCLUDED.policy_summary,
+    updated_at=EXCLUDED.updated_at;
+
+INSERT INTO project_strategy_graphs(project_id,strategy_key,namespace_id,status,policy_summary)
+SELECT p.id,'enhanced_shadow',
+       (SUBSTRING(md5('knowledge-forge:'||p.graph_namespace_id||':enhanced-shadow'),1,8)||'-'||
+        SUBSTRING(md5('knowledge-forge:'||p.graph_namespace_id||':enhanced-shadow'),9,4)||'-'||
+        SUBSTRING(md5('knowledge-forge:'||p.graph_namespace_id||':enhanced-shadow'),13,4)||'-'||
+        SUBSTRING(md5('knowledge-forge:'||p.graph_namespace_id||':enhanced-shadow'),17,4)||'-'||
+        SUBSTRING(md5('knowledge-forge:'||p.graph_namespace_id||':enhanced-shadow'),21,12)),
+       'empty',
+       jsonb_build_object('mode','shadow','production_approved',FALSE)
+FROM projects p
+ON CONFLICT(project_id,strategy_key) DO NOTHING;
+"""
+
+
+STRATEGY_GRAPH_LEASE_NAMESPACE_SQL = r"""
+-- A strategy graph owns a namespace through project_strategy_graphs rather than
+-- projects.graph_namespace_id. Project ownership is still enforced by the
+-- existing project_id foreign keys and by Database.acquire_graph_lease().
+ALTER TABLE graph_content_manifests
+    DROP CONSTRAINT IF EXISTS graph_content_manifests_project_id_namespace_id_fkey;
+ALTER TABLE graph_leases
+    DROP CONSTRAINT IF EXISTS graph_leases_project_id_namespace_id_fkey;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1313,6 +1433,18 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0011_graphrag_reports_global_search",
         description="Persist snapshot-bound community reports and opt-in global search shadow",
         sql=GRAPHRAG_REPORTS_SEARCH_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0012_multi_strategy_construction",
+        description="Isolate per-strategy document builds, jobs, and graph namespaces",
+        sql=MULTI_STRATEGY_CONSTRUCTION_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0013_strategy_graph_lease_namespace",
+        description="Permit leased graph generations for project strategy namespaces",
+        sql=STRATEGY_GRAPH_LEASE_NAMESPACE_SQL,
         startup_safe=True,
     ),
 )

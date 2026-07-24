@@ -28,7 +28,7 @@ CONTROL_POLICY_SET: Mapping[str, str] = MappingProxyType({
 
 P1_RELATION_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
     **CONTROL_POLICY_SET,
-    "relation_candidate_policy_version": "relation-candidate-p1-shadow-v1",
+    "relation_candidate_policy_version": "relation-candidate-p1-shadow-v4",
     "relation_classifier_policy_version": "relation-classifier-p1-shadow-v1",
     "verification_policy_version": "relation-classifier-p1-shadow-v1",
 })

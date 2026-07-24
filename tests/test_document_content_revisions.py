@@ -62,6 +62,19 @@ def test_revision_audit_retention_cleanup_is_opt_in():
     assert Config.indexing_failure_cleanup_enabled is False
 
 
+def test_stable_ingestion_drops_building_context_before_graph_publication():
+    import inspect
+
+    from knowledge_forge.service import KnowledgeForgeService
+
+    source = inspect.getsource(KnowledgeForgeService._ingest_document)
+    activation = source.index("self.db.finalize_document_graph_facts(")
+    release = source.index("revision_scope.__exit__(None, None, None)", activation)
+    publication = source.index("self._rebuild_at_quiescence(", release)
+
+    assert activation < release < publication
+
+
 @pytest.mark.integration
 def test_revisioned_reingestion_preserves_audit_and_rejects_stale_workers():
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
@@ -266,6 +279,8 @@ def test_bootstrap_is_restart_safe_after_revision_migration():
             {"version": "0009_policy_snapshot_coverage", "count": 1},
             {"version": "0010_graphrag_communities", "count": 1},
             {"version": "0011_graphrag_reports_global_search", "count": 1},
+            {"version": "0012_multi_strategy_construction", "count": 1},
+            {"version": "0013_strategy_graph_lease_namespace", "count": 1},
         ]
         assert conn.execute(
             "SELECT to_regclass('uq_chunks_revision_key') AS index_name"

@@ -24,6 +24,16 @@ _RELATION_CUE = re.compile(
     r"depends?|relates?|works? for|is a)\b|导致|使用|包含|属于|位于|支持|依赖|生产|关联",
     re.IGNORECASE,
 )
+_DENSE_SENTENCE_ENTITY_THRESHOLD = 6
+
+
+def _looks_like_enumeration(text: str, entity_count: int) -> bool:
+    if entity_count < 4:
+        return False
+    return (
+        text.count(";") + text.count("；") >= 2
+        or text.count(",") + text.count("，") >= 4
+    )
 
 
 class RelationBatchValidationError(ValueError):
@@ -243,6 +253,8 @@ class VersionedRelationPipeline:
             for target_index in target_indexes:
                 pair_checks += 1
                 target = fixed[target_index]
+                if source["canonical_id"] == target["canonical_id"]:
+                    continue
                 source_id = str(source["mention_id"])
                 target_id = str(target["mention_id"])
                 left_index, right_index = source_sentence, locations[target_index]
@@ -282,8 +294,32 @@ class VersionedRelationPipeline:
                     continue
                 context_start, context_end = sorted((left_index, right_index))
                 context = " ".join(item[2] for item in sentences[context_start:context_end + 1])
-                if sentence_distance > sentence_window or (
-                    sentence_distance > 0 and not _RELATION_CUE.search(context)
+                pair_start = min(
+                    int(source["mention_start"]),
+                    int(target["mention_start"]),
+                )
+                pair_end = max(
+                    int(source["mention_end"]),
+                    int(target["mention_end"]),
+                )
+                has_relation_cue = bool(_RELATION_CUE.search(content[pair_start:pair_end]))
+                dense_same_sentence = (
+                    sentence_distance == 0
+                    and len(sentence_buckets[source_sentence])
+                    >= _DENSE_SENTENCE_ENTITY_THRESHOLD
+                )
+                list_like_same_sentence = (
+                    sentence_distance == 0
+                    and _looks_like_enumeration(
+                        sentences[source_sentence][2],
+                        len(sentence_buckets[source_sentence]),
+                    )
+                )
+                if (
+                    sentence_distance > sentence_window
+                    or (sentence_distance > 0 and not has_relation_cue)
+                    or (dense_same_sentence and not has_relation_cue)
+                    or (list_like_same_sentence and not has_relation_cue)
                 ):
                     continue
                 material = "\x1f".join((
@@ -318,7 +354,7 @@ class VersionedRelationPipeline:
                         sentence_distance,
                         int(source_type == "GenericEntity")
                         + int(target_type == "GenericEntity"),
-                        0 if _RELATION_CUE.search(context) else 1,
+                        0 if has_relation_cue else 1,
                         char_distance,
                         -float(source.get("confidence") or 0.0)
                         - float(target.get("confidence") or 0.0),
@@ -376,6 +412,30 @@ class VersionedRelationPipeline:
         }
         batches: list[RelationBatch] = []
         pending: list[RelationCandidate] = []
+        pending_signature: tuple[
+            tuple[tuple[str, str], ...],
+            str,
+            int,
+            int,
+        ] | None = None
+
+        def batch_signature(candidate: RelationCandidate) -> tuple[
+            tuple[tuple[str, str], ...],
+            str,
+            int,
+            int,
+        ]:
+            contract = tuple(zip(
+                candidate.allowed_predicates,
+                candidate.allowed_directions,
+                strict=True,
+            ))
+            return (
+                contract,
+                candidate.context_id,
+                candidate.context_start_char,
+                candidate.context_end_char,
+            )
 
         def render(values: Iterable[RelationCandidate]) -> str:
             selected = list(values)
@@ -411,6 +471,7 @@ class VersionedRelationPipeline:
             )
 
         def flush() -> None:
+            nonlocal pending_signature
             if not pending:
                 return
             prompt = render(pending)
@@ -423,8 +484,12 @@ class VersionedRelationPipeline:
                 output_token_reserve=output_token_reserve,
             ))
             pending.clear()
+            pending_signature = None
 
         for candidate in plan.candidates:
+            candidate_signature = batch_signature(candidate)
+            if pending and candidate_signature != pending_signature:
+                flush()
             proposed = [*pending, candidate]
             proposed_tokens = estimate_tokens(render(proposed))
             if proposed_tokens > candidate_budget_tokens or len(proposed) > max_candidates_per_batch:
@@ -436,6 +501,7 @@ class VersionedRelationPipeline:
                     })
                     continue
             pending.append(candidate)
+            pending_signature = candidate_signature
         flush()
         return batches
 
@@ -520,6 +586,231 @@ class VersionedRelationPipeline:
                 evidence_hash=evidence_hash, reason=reason,
             ))
         return result
+
+    @staticmethod
+    def _decision_response_schema(
+        candidates: list[RelationCandidate],
+        *,
+        content: str,
+    ) -> dict[str, Any]:
+        candidate_ids = [item.candidate_id for item in candidates]
+        return {
+            "type": "object",
+            "properties": {
+                item.candidate_id: {
+                    "type": "object",
+                    "properties": {
+                        "predicate": {
+                            "type": "string",
+                            "enum": [NO_RELATION, *dict.fromkeys(item.allowed_predicates)],
+                        },
+                        "direction": {
+                            "type": "string",
+                            "enum": sorted(ALLOWED_DIRECTIONS),
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "enum": [
+                                "",
+                                content[item.context_start_char:item.context_end_char],
+                            ],
+                            "description": (
+                                "Empty for NO_RELATION; otherwise the complete, exact "
+                                "SOURCE_CONTEXT text containing both endpoints."
+                            ),
+                        },
+                        "evidence_start": {
+                            "type": ["integer", "null"],
+                            "enum": [None, item.context_start_char],
+                            "description": (
+                                "Absolute zero-based half-open offset in the full chunk "
+                                "content; content[evidence_start:evidence_end] must equal "
+                                "evidence."
+                            ),
+                        },
+                        "evidence_end": {
+                            "type": ["integer", "null"],
+                            "enum": [None, item.context_end_char],
+                            "description": (
+                                "Absolute zero-based half-open offset in the full chunk "
+                                "content; content[evidence_start:evidence_end] must equal "
+                                "evidence."
+                            ),
+                        },
+                        "reason": {"type": "string", "minLength": 1},
+                    },
+                    "required": [
+                        "predicate",
+                        "direction",
+                        "evidence",
+                        "evidence_start",
+                        "evidence_end",
+                        "reason",
+                    ],
+                    "additionalProperties": False,
+                }
+                for item in candidates
+            },
+            "required": candidate_ids,
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _decision_system_prompt(candidate_count: int) -> str:
+        return (
+            "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
+            "Return one root JSON object keyed directly by candidate_id, with exactly "
+            f"{candidate_count} required keys; do not add a decisions wrapper. "
+            "For every key, always return predicate, direction, evidence, evidence_start, "
+            "evidence_end, and a concise non-empty reason. "
+            "For each candidate, use only one of that candidate's allowed_predicates. "
+            "Use an allowed predicate only when an exact quote proves endpoints, meaning "
+            "and direction. For a positive relation, copy the candidate's complete "
+            "SOURCE_CONTEXT text as evidence and use that context's absolute start/end "
+            "offsets. Otherwise return predicate NO_RELATION, direction as_is, empty "
+            "evidence, null offsets, and a concise reason."
+        )
+
+    @staticmethod
+    def _normalize_model_decisions(
+        candidates: list[RelationCandidate],
+        raw: Any,
+    ) -> list[dict[str, Any]]:
+        expected_ids = [item.candidate_id for item in candidates]
+        decisions = None
+        if isinstance(raw, dict):
+            decisions = raw.get("decisions")
+            if decisions is None and isinstance(raw.get("items"), list):
+                decisions = raw["items"]
+            if decisions is None and set(raw) == set(expected_ids):
+                decisions = raw
+            if (
+                decisions is None
+                and len(expected_ids) == 1
+                and {"predicate", "direction", "evidence", "reason"} <= set(raw)
+            ):
+                decisions = {expected_ids[0]: raw}
+            if decisions is None and len(expected_ids) == 1 and len(raw) == 1:
+                only_value = next(iter(raw.values()))
+                if (
+                    isinstance(only_value, dict)
+                    and {"predicate", "direction", "evidence", "reason"} <= set(only_value)
+                ):
+                    decisions = {expected_ids[0]: only_value}
+        if isinstance(decisions, list):
+            return decisions
+        if not isinstance(decisions, dict):
+            raise RelationBatchValidationError(
+                "relation response must be an array or an object keyed by candidate_id"
+            )
+        actual_ids = set(decisions)
+        if actual_ids != set(expected_ids):
+            missing = sorted(set(expected_ids) - actual_ids)
+            unknown = sorted(actual_ids - set(expected_ids))
+            raise RelationBatchValidationError(
+                f"decision candidate keys mismatch: missing={missing}, unknown={unknown}"
+            )
+        normalized = []
+        for candidate_id in expected_ids:
+            value = decisions[candidate_id]
+            if not isinstance(value, dict):
+                raise RelationBatchValidationError(
+                    f"decision must be an object: {candidate_id}"
+                )
+            normalized.append({"candidate_id": candidate_id, **value})
+        return normalized
+
+    @staticmethod
+    def _canonicalize_context_evidence_offsets(
+        candidates: list[RelationCandidate],
+        decisions: list[dict[str, Any]],
+        *,
+        content: str,
+    ) -> list[dict[str, Any]]:
+        """Repair only offsets that are provable from an exact frozen context quote."""
+
+        candidate_map = {item.candidate_id: item for item in candidates}
+        normalized: list[dict[str, Any]] = []
+        for raw in decisions:
+            decision = dict(raw)
+            candidate = candidate_map.get(str(decision.get("candidate_id") or ""))
+            if candidate is None or str(decision.get("predicate") or "") == NO_RELATION:
+                normalized.append(decision)
+                continue
+            evidence = str(decision.get("evidence") or "")
+            if (
+                not evidence
+                or candidate.source_name not in evidence
+                or candidate.target_name not in evidence
+            ):
+                normalized.append(decision)
+                continue
+            context = content[
+                candidate.context_start_char:candidate.context_end_char
+            ]
+            occurrences = [
+                match.start() for match in re.finditer(re.escape(evidence), context)
+            ]
+            if len(occurrences) != 1:
+                normalized.append(decision)
+                continue
+            expected_start = candidate.context_start_char + occurrences[0]
+            expected_end = expected_start + len(evidence)
+            if (
+                decision.get("evidence_start") != expected_start
+                or decision.get("evidence_end") != expected_end
+            ):
+                increment("relation_evidence_offset_repairs")
+                decision["evidence_start"] = expected_start
+                decision["evidence_end"] = expected_end
+            normalized.append(decision)
+        return normalized
+
+    def _fail_close_unsafe_model_decisions(
+        self,
+        candidates: list[RelationCandidate],
+        decisions: list[dict[str, Any]],
+        *,
+        content: str,
+        logical_schema: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Turn an unsafe model positive into a conservative explicit negative."""
+
+        candidate_map = {item.candidate_id: item for item in candidates}
+        normalized: list[dict[str, Any]] = []
+        for raw in decisions:
+            decision = dict(raw)
+            candidate = candidate_map.get(str(decision.get("candidate_id") or ""))
+            if candidate is None:
+                normalized.append(decision)
+                continue
+            if str(decision.get("predicate") or "") == NO_RELATION:
+                decision.update({
+                    "direction": "as_is",
+                    "evidence": "",
+                    "evidence_start": None,
+                    "evidence_end": None,
+                    "reason": str(decision.get("reason") or "no supported relation"),
+                })
+                normalized.append(decision)
+                continue
+            try:
+                self.validate_decisions(
+                    [candidate], [decision],
+                    content=content, logical_schema=logical_schema,
+                )
+            except RelationBatchValidationError as exc:
+                increment("relation_unsafe_positive_fail_closed")
+                decision.update({
+                    "predicate": NO_RELATION,
+                    "direction": "as_is",
+                    "evidence": "",
+                    "evidence_start": None,
+                    "evidence_end": None,
+                    "reason": f"fail-closed model positive: {exc}",
+                })
+            normalized.append(decision)
+        return normalized
 
     def classify_shadow(
         self,
@@ -607,56 +898,37 @@ class VersionedRelationPipeline:
         decisions: list[dict[str, Any]] = []
         batch_audit: list[dict[str, Any]] = []
         candidate_map = {item.candidate_id: item for item in plan.candidates}
-        response_schema = {
-            "type": "object",
-            "properties": {
-                "decisions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "candidate_id": {"type": "string"},
-                            "predicate": {"type": "string"},
-                            "direction": {"type": "string"},
-                            "evidence": {"type": "string"},
-                            "evidence_start": {"type": ["integer", "null"]},
-                            "evidence_end": {"type": ["integer", "null"]},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["candidate_id", "predicate", "direction", "evidence", "reason"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["decisions"],
-            "additionalProperties": False,
-        }
         for batch in batches:
             metrics["model_calls"] += 1
             increment("relation_classifier_batches")
             metrics["input_tokens"] += batch.estimated_input_tokens
+            selected = [candidate_map[candidate_id] for candidate_id in batch.candidate_ids]
             try:
                 raw = classifier.json_chat(
                     model=model,
-                    system=(
-                        "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
-                        "Return exactly one decision per candidate_id. Use an allowed predicate only when "
-                        "an exact quote proves endpoints, meaning and direction; otherwise return NO_RELATION."
-                    ),
+                    system=self._decision_system_prompt(len(selected)),
                     prompt=batch.prompt,
-                    schema=response_schema,
+                    schema=self._decision_response_schema(selected, content=content),
                     temperature=0,
                     context_budget_tokens=context_budget_tokens,
                     max_output_tokens=batch.output_token_reserve,
                     safety_margin_tokens=Config.relation_classifier_safety_margin,
                 )
+                normalized = self._canonicalize_context_evidence_offsets(
+                    selected,
+                    self._normalize_model_decisions(selected, raw),
+                    content=content,
+                )
+                normalized = self._fail_close_unsafe_model_decisions(
+                    selected, normalized,
+                    content=content, logical_schema=logical_schema,
+                )
                 metrics["output_tokens"] += estimate_tokens(
                     json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
                 )
-                selected = [candidate_map[candidate_id] for candidate_id in batch.candidate_ids]
                 validated = self.validate_decisions(
                     selected,
-                    raw.get("decisions") if isinstance(raw, dict) else None,
+                    normalized,
                     content=content,
                     logical_schema=logical_schema,
                 )
@@ -786,42 +1058,12 @@ class VersionedRelationPipeline:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Classify exactly one persisted work item and strictly verify completeness."""
 
-        response_schema = {
-            "type": "object",
-            "properties": {
-                "decisions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "candidate_id": {"type": "string"},
-                            "predicate": {"type": "string"},
-                            "direction": {"type": "string"},
-                            "evidence": {"type": "string"},
-                            "evidence_start": {"type": ["integer", "null"]},
-                            "evidence_end": {"type": ["integer", "null"]},
-                            "reason": {"type": "string"},
-                        },
-                        "required": [
-                            "candidate_id", "predicate", "direction", "evidence", "reason",
-                        ],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["decisions"],
-            "additionalProperties": False,
-        }
+        response_schema = self._decision_response_schema(candidates, content=content)
         increment("relation_classifier_batches")
         try:
             raw = classifier.json_chat(
                 model=model,
-                system=(
-                    "Classify every admitted relation candidate from SOURCE_CONTEXTS only. "
-                    "Return exactly one decision per candidate_id. Use an allowed predicate only when "
-                    "an exact quote proves endpoints, meaning and direction; otherwise return NO_RELATION. "
-                    "When evidence text occurs more than once, return its exact half-open character offsets."
-                ),
+                system=self._decision_system_prompt(len(candidates)),
                 prompt=batch.prompt,
                 schema=response_schema,
                 temperature=0,
@@ -829,9 +1071,18 @@ class VersionedRelationPipeline:
                 max_output_tokens=batch.output_token_reserve,
                 safety_margin_tokens=Config.relation_classifier_safety_margin,
             )
+            normalized = self._canonicalize_context_evidence_offsets(
+                candidates,
+                self._normalize_model_decisions(candidates, raw),
+                content=content,
+            )
+            normalized = self._fail_close_unsafe_model_decisions(
+                candidates, normalized,
+                content=content, logical_schema=logical_schema,
+            )
             validated = self.validate_decisions(
                 candidates,
-                raw.get("decisions") if isinstance(raw, dict) else None,
+                normalized,
                 content=content,
                 logical_schema=logical_schema,
             )

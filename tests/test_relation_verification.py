@@ -192,6 +192,39 @@ def test_supported_relation_with_exact_evidence_is_publishable(monkeypatch):
     assert is_publishable_relation(relation["verification_status"], relation["metadata"])
 
 
+def test_ollama_root_array_aliases_reuse_only_source_backed_candidate_evidence(monkeypatch):
+    def aliased(values):
+        return {"items": [{
+            "candidate_id": values[0]["candidate_id"],
+            "decision": "supported",
+            "corrected_type": values[0]["proposed_type"],
+            "orientation": "not_reversed",
+        }]}
+
+    result = run_extract(monkeypatch, ScriptedVerifier(extraction(), [aliased]))
+    relation = result["relations"][0]
+    assert relation["verification_status"] == "llm_verified"
+    assert relation["evidence_text"] == "Alpha produces Beta."
+    assert relation["orientation"] == "as_is"
+
+
+def test_ollama_candidate_keyed_negative_alias_remains_quarantined(monkeypatch):
+    def aliased(values):
+        return {
+            values[0]["candidate_id"]: {
+                "decision": "insufficient_evidence",
+                "corrected_type": values[0]["proposed_type"],
+                "orientation": "endpoints are not reversed",
+            },
+        }
+
+    result = run_extract(monkeypatch, ScriptedVerifier(extraction(), [aliased]))
+    relation = result["relations"][0]
+    assert relation["verification_status"] == "uncertain"
+    assert result["_diagnostics"]["verifier_failures"] == 0
+    assert result["_diagnostics"]["published"] == 0
+
+
 def test_supported_relation_may_omit_corrected_type(monkeypatch):
     def without_correction(values):
         item = decision(values[0])

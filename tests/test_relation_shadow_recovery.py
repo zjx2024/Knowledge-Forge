@@ -10,6 +10,7 @@ import pytest
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
+from knowledge_forge.config import Config
 from knowledge_forge.database import Database, SCHEMA_SQL
 from knowledge_forge.migrations import MIGRATIONS, MigrationRunner
 from knowledge_forge.policy import P1_RELATION_SHADOW_POLICY_SET
@@ -193,6 +194,152 @@ def test_evidence_offsets_are_half_open_and_must_match_source_exactly():
         )
 
 
+def test_classifier_repairs_offsets_only_for_exact_frozen_context_quote():
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Alpha produces Beta." + (" " * 18)
+    relation_candidate = candidate()
+    raw = [{
+        "candidate_id": relation_candidate.candidate_id,
+        "predicate": "produces",
+        "direction": "as_is",
+        "evidence": content,
+        "evidence_start": relation_candidate.source_start_char,
+        "evidence_end": relation_candidate.target_end_char,
+        "reason": "explicit",
+    }]
+
+    repaired = pipeline._canonicalize_context_evidence_offsets(
+        [relation_candidate], raw, content=content,
+    )
+
+    assert repaired[0]["evidence_start"] == relation_candidate.context_start_char
+    assert repaired[0]["evidence_end"] == relation_candidate.context_end_char
+    assert raw[0]["evidence_start"] == relation_candidate.source_start_char
+    decision = pipeline.validate_decisions(
+        [relation_candidate], repaired, content=content,
+        logical_schema={"relation_types": [{"name": "produces"}]},
+    )[0]
+    assert decision.evidence_start == relation_candidate.context_start_char
+    assert decision.evidence_end == relation_candidate.context_end_char
+
+
+def test_classifier_repairs_uniquely_locatable_partial_context_quote():
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Prefix. Alpha produces Beta. Suffix."
+    evidence = "Alpha produces Beta."
+    relation_candidate = candidate()
+    relation_candidate = RelationCandidate(
+        **{
+            **relation_candidate.__dict__,
+            "context_start_char": 0,
+            "context_end_char": len(content),
+            "source_start_char": content.index("Alpha"),
+            "source_end_char": content.index("Alpha") + len("Alpha"),
+            "target_start_char": content.index("Beta"),
+            "target_end_char": content.index("Beta") + len("Beta"),
+        },
+    )
+    repaired = pipeline._canonicalize_context_evidence_offsets(
+        [relation_candidate],
+        [{
+            "candidate_id": relation_candidate.candidate_id,
+            "predicate": "produces",
+            "direction": "as_is",
+            "evidence": evidence,
+            "evidence_start": 0,
+            "evidence_end": len(content),
+            "reason": "explicit",
+        }],
+        content=content,
+    )
+
+    assert repaired[0]["evidence_start"] == content.index(evidence)
+    assert repaired[0]["evidence_end"] == content.index(evidence) + len(evidence)
+
+
+def test_flat_singleton_relation_response_is_unambiguous_but_multi_candidate_is_not():
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    raw = {
+        "predicate": "produces",
+        "direction": "as_is",
+        "evidence": "Alpha produces Beta.",
+        "evidence_start": 0,
+        "evidence_end": len("Alpha produces Beta."),
+        "reason": "explicit",
+    }
+
+    normalized = pipeline._normalize_model_decisions([candidate()], raw)
+
+    assert normalized == [{"candidate_id": "candidate-1", **raw}]
+    with pytest.raises(RelationBatchValidationError, match="array or an object"):
+        pipeline._normalize_model_decisions(
+            [
+                candidate(),
+                RelationCandidate(**{**candidate().__dict__, "candidate_id": "candidate-2"}),
+            ],
+            raw,
+        )
+
+
+def test_singleton_relation_response_repairs_one_mangled_dynamic_key():
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    decision = {
+        "predicate": "produces",
+        "direction": "as_is",
+        "evidence": "Alpha produces Beta.",
+        "evidence_start": 0,
+        "evidence_end": len("Alpha produces Beta."),
+        "reason": "explicit",
+    }
+
+    normalized = pipeline._normalize_model_decisions(
+        [candidate()], {"candidate-1-with-missing-characters": decision},
+    )
+
+    assert normalized == [{"candidate_id": "candidate-1", **decision}]
+    with pytest.raises(RelationBatchValidationError, match="array or an object"):
+        pipeline._normalize_model_decisions(
+            [
+                candidate(),
+                RelationCandidate(**{**candidate().__dict__, "candidate_id": "candidate-2"}),
+            ],
+            {"candidate-1-with-missing-characters": decision},
+        )
+
+
+def test_unsafe_model_positive_is_conservatively_classified_as_no_relation():
+    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    content = "Alpha produces Beta." + (" " * 18)
+    relation_candidate = candidate()
+    unsafe = [{
+        "candidate_id": relation_candidate.candidate_id,
+        "predicate": "located_in",
+        "direction": "as_is",
+        "evidence": content,
+        "evidence_start": 0,
+        "evidence_end": len(content),
+        "reason": "unsupported model assertion",
+    }]
+
+    normalized = pipeline._fail_close_unsafe_model_decisions(
+        [relation_candidate], unsafe,
+        content=content,
+        logical_schema={"relation_types": [{"name": "produces"}]},
+    )
+
+    assert normalized[0]["predicate"] == "NO_RELATION"
+    assert normalized[0]["direction"] == "as_is"
+    assert normalized[0]["evidence"] == ""
+    assert normalized[0]["evidence_start"] is None
+    assert "predicate is not allowed" in normalized[0]["reason"]
+    assert unsafe[0]["predicate"] == "located_in"
+    decision = pipeline.validate_decisions(
+        [relation_candidate], normalized, content=content,
+        logical_schema={"relation_types": [{"name": "produces"}]},
+    )[0]
+    assert decision.predicate == "NO_RELATION"
+
+
 def test_p2_control_protocol_preserves_mention_identity_and_exact_half_open_positions():
     pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
     content = "Alpha produces Beta. Alpha is archived."
@@ -266,6 +413,240 @@ def test_p2_control_protocol_preserves_mention_identity_and_exact_half_open_posi
     )
     assert invalid.candidates == []
     assert invalid.raw_pairs == 0
+
+
+def test_entity_shadow_assignments_are_attached_before_relation_planning():
+    raw_entities = [
+        {
+            "mention_id": "raw-alpha",
+            "mention_key": "original-alpha-key",
+            "surface": "Alpha",
+            "type": "Organization",
+            "mention_start": 0,
+            "mention_end": 5,
+            "confidence": 0.9,
+        },
+        {
+            "mention_id": "raw-beta",
+            "surface": "Beta",
+            "type": "Product",
+            "mention_start": 15,
+            "mention_end": 19,
+            "confidence": 0.9,
+        },
+        {
+            "mention_id": "raw-rejected",
+            "surface": "Rejected",
+            "type": "GenericEntity",
+            "mention_start": 20,
+            "mention_end": 28,
+            "confidence": 0.2,
+        },
+    ]
+
+    resolved = KnowledgeForgeService._relation_entities_with_canonicals(
+        raw_entities,
+        {
+            "raw-alpha": "mention-alpha",
+            "raw-beta": "mention-beta",
+        },
+        {
+            "mention-alpha": "canonical-alpha",
+            "mention-beta": "canonical-beta",
+        },
+    )
+
+    assert resolved == [
+        {
+            **raw_entities[0],
+            "mention_id": "mention-alpha",
+            "mention_key": "original-alpha-key",
+            "canonical_id": "canonical-alpha",
+        },
+        {
+            **raw_entities[1],
+            "mention_id": "mention-beta",
+            "mention_key": "mention-beta",
+            "canonical_id": "canonical-beta",
+        },
+    ]
+
+
+def test_shadow_relation_endpoint_accepts_raw_or_normalized_mention_id():
+    raw_to_mention = {"raw-alpha": "mention-alpha"}
+    canonical_by_mention = {"mention-alpha": "canonical-alpha"}
+
+    assert KnowledgeForgeService._shadow_relation_mention_id(
+        "raw-alpha", raw_to_mention, canonical_by_mention,
+    ) == "mention-alpha"
+    assert KnowledgeForgeService._shadow_relation_mention_id(
+        "mention-alpha", raw_to_mention, canonical_by_mention,
+    ) == "mention-alpha"
+    assert KnowledgeForgeService._shadow_relation_mention_id(
+        "missing", raw_to_mention, canonical_by_mention,
+    ) == ""
+
+
+def test_relation_shadow_run_identity_changes_with_candidate_input():
+    first = KnowledgeForgeService._relation_shadow_run_id(
+        3, 5, "revision-1", 7, "policy-hash", "input-a",
+    )
+    repeated = KnowledgeForgeService._relation_shadow_run_id(
+        3, 5, "revision-1", 7, "policy-hash", "input-a",
+    )
+    changed = KnowledgeForgeService._relation_shadow_run_id(
+        3, 5, "revision-1", 7, "policy-hash", "input-b",
+    )
+
+    assert first == repeated
+    assert first != changed
+    assert first.startswith("relshadow_")
+
+
+def test_relation_shadow_input_fingerprint_includes_canonical_endpoints():
+    candidate = {
+        "candidate_id": "candidate-1",
+        "source_mention_id": "mention-a",
+        "target_mention_id": "mention-b",
+        "source_canonical_id": "canonical-a",
+        "target_canonical_id": "canonical-b",
+    }
+    first = KnowledgeForgeService._relation_shadow_input_fingerprint(
+        revision_id="revision-1",
+        chunk_id=7,
+        content="Alpha produces Beta.",
+        schema_version=1,
+        treatment_hash="policy-hash",
+        candidate_map={"candidate-1": candidate},
+    )
+    changed = KnowledgeForgeService._relation_shadow_input_fingerprint(
+        revision_id="revision-1",
+        chunk_id=7,
+        content="Alpha produces Beta.",
+        schema_version=1,
+        treatment_hash="policy-hash",
+        candidate_map={
+            "candidate-1": {
+                **candidate,
+                "source_canonical_id": "canonical-a-v2",
+            },
+        },
+    )
+
+    assert changed != first
+
+
+def test_relation_classifier_defaults_leave_room_for_complete_json(monkeypatch):
+    monkeypatch.delenv("RELATION_CLASSIFIER_OUTPUT_RESERVE", raising=False)
+    monkeypatch.delenv("RELATION_CLASSIFIER_MAX_CANDIDATES", raising=False)
+
+    assert Config.relation_classifier_output_reserve >= 2048
+    assert Config.relation_classifier_max_candidates <= 8
+
+
+def test_relation_decision_schema_requires_exact_candidate_mapping():
+    relation_candidate = candidate()
+    content = "Alpha produces Beta." + ("x" * 18)
+    schema = VersionedRelationPipeline._decision_response_schema(
+        [relation_candidate],
+        content=content,
+    )
+
+    assert schema["type"] == "object"
+    assert schema["required"] == [
+        relation_candidate.candidate_id,
+    ]
+    assert list(schema["properties"]) == [relation_candidate.candidate_id]
+    assert schema["additionalProperties"] is False
+    decision_schema = schema["properties"][relation_candidate.candidate_id]
+    assert set(decision_schema["required"]) == {
+        "predicate",
+        "direction",
+        "evidence",
+        "evidence_start",
+        "evidence_end",
+        "reason",
+    }
+    assert "NO_RELATION" in decision_schema["properties"]["predicate"]["enum"]
+    assert decision_schema["properties"]["direction"]["enum"] == [
+        "as_is",
+        "reversed",
+        "symmetric",
+    ]
+    assert "absolute zero-based half-open offset" in (
+        decision_schema["properties"]["evidence_start"]["description"].lower()
+    )
+    assert "full chunk content" in (
+        decision_schema["properties"]["evidence_end"]["description"].lower()
+    )
+    assert decision_schema["properties"]["evidence"]["enum"] == [
+        "",
+        content,
+    ]
+    assert decision_schema["properties"]["evidence_start"]["enum"] == [
+        None,
+        0,
+    ]
+    assert decision_schema["properties"]["evidence_end"]["enum"] == [
+        None,
+        len(content),
+    ]
+
+
+def test_relation_model_decision_mapping_normalizes_to_strict_array():
+    relation_candidate = candidate()
+    normalized = VersionedRelationPipeline._normalize_model_decisions(
+        [relation_candidate],
+        {
+            "decisions": {
+                relation_candidate.candidate_id: {
+                    "predicate": "NO_RELATION",
+                    "direction": "as_is",
+                    "evidence": "",
+                    "reason": "not stated",
+                },
+            },
+        },
+    )
+
+    assert normalized == [{
+        "candidate_id": relation_candidate.candidate_id,
+        "predicate": "NO_RELATION",
+        "direction": "as_is",
+        "evidence": "",
+        "reason": "not stated",
+    }]
+
+
+def test_relation_model_decision_array_remains_compatible_with_strict_verifier():
+    relation_candidate = candidate()
+    decisions = [{
+        "candidate_id": relation_candidate.candidate_id,
+        "predicate": "NO_RELATION",
+        "direction": "as_is",
+        "evidence": "",
+        "reason": "not stated",
+    }]
+
+    assert VersionedRelationPipeline._normalize_model_decisions(
+        [relation_candidate], {"decisions": decisions},
+    ) == decisions
+
+
+def test_relation_root_candidate_mapping_matches_ollama_structured_output():
+    relation_candidate = candidate()
+    raw = {
+        relation_candidate.candidate_id: {
+            "predicate": "NO_RELATION",
+            "direction": "as_is",
+            "evidence": "",
+            "reason": "not stated",
+        },
+    }
+
+    assert VersionedRelationPipeline._normalize_model_decisions(
+        [relation_candidate], raw,
+    )[0]["candidate_id"] == relation_candidate.candidate_id
 
 
 def test_relation_only_snapshot_passes_strict_control_protocol_and_maps_canonical_by_key():
@@ -452,7 +833,7 @@ def test_relation_candidate_limits_are_deterministic_and_conserve_overflow(monke
     monkeypatch.setattr("knowledge_forge.relation_pipeline.Config.relation_max_candidates_per_chunk", 5)
     monkeypatch.setattr("knowledge_forge.relation_pipeline.Config.relation_max_char_distance", 384)
     pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
-    content = "A links B links C links D links E links F."
+    content = "A relates B relates C relates D relates E relates F."
     entities = []
     cursor = 0
     for name in "ABCDEF":
@@ -673,16 +1054,44 @@ def test_relation_shadow_queue_recovers_leases_retries_and_late_workers_without_
         rows = database.list_relation_shadow_work(shadow_run_id)
         assert [row["status"] for row in rows] == ["completed", "completed"]
         assert all(float(row["accepted_latency_ms"] or 0) >= 0 for row in rows)
+        persisted_candidate = {
+            **candidate().__dict__,
+            "chunk_id": chunk_id,
+        }
+        persisted_decision = {
+            "candidate_id": "candidate-1",
+            "predicate": "produces",
+            "direction": "as_is",
+            "evidence": "Alpha produces Beta.",
+            "evidence_start": 0,
+            "evidence_end": 20,
+            "evidence_hash": hashlib.sha256(
+                b"Alpha produces Beta."
+            ).hexdigest(),
+            "reason": "explicit statement",
+            "status": "classified",
+        }
         result = database.finish_relation_shadow_run(
-            shadow_run_id, candidates=[], decisions=[],
+            shadow_run_id,
+            candidates=[persisted_candidate],
+            decisions=[persisted_decision],
             metrics={"classified": 2, "model_calls": 4},
         )
         repeated = database.finish_relation_shadow_run(
-            shadow_run_id, candidates=[], decisions=[],
+            shadow_run_id,
+            candidates=[persisted_candidate],
+            decisions=[persisted_decision],
             metrics={"classified": 2, "model_calls": 4},
         )
         assert result["artifact_hash"] == repeated["artifact_hash"]
         assert result["snapshot_complete"] is True
+        with database.connection() as conn:
+            persisted = conn.execute(
+                """SELECT allowed_predicates FROM relation_shadow_decisions
+                   WHERE shadow_run_id=%s AND candidate_id='candidate-1'""",
+                (shadow_run_id,),
+            ).fetchone()
+        assert persisted["allowed_predicates"] == ["produces"]
 
         terminal_run_id = f"terminal-shadow-run-{suffix}"
         database.start_relation_shadow_run({

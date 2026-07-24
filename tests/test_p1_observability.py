@@ -3,6 +3,8 @@ import json
 from benchmarks.build_annotation_bundle import build_review_queue
 from benchmarks.benchmark_kg_construction import relation_scenario
 
+from knowledge_forge import database as database_module
+from knowledge_forge.database import Database
 from knowledge_forge.observability import (
     InstrumentedConnection,
     current_metrics,
@@ -74,8 +76,11 @@ def test_ollama_transport_counts_logical_http_inputs_and_repairs(monkeypatch):
 
 
 class RawResult:
+    def __init__(self, value=None):
+        self.value = value or {"value": 1}
+
     def fetchone(self):
-        return {"value": 1}
+        return self.value
 
 
 class RawConnection:
@@ -93,6 +98,24 @@ def test_database_proxy_counts_the_real_execute_boundary():
         result = InstrumentedConnection(raw).execute("SELECT %s", (1,))
         assert result.fetchone() == {"value": 1}
     assert raw.calls == [("SELECT %s", (1,))]
+    assert metrics.snapshot()["counters"]["db_statement_count"] == 1
+
+
+def test_column_discovery_unwraps_instrumented_database_connection(monkeypatch):
+    class ColumnConnection(RawConnection):
+        def execute(self, statement, params=None):
+            self.calls.append((statement, params))
+            return RawResult({"present": True})
+
+    raw = ColumnConnection()
+    monkeypatch.setattr(database_module.psycopg, "Connection", ColumnConnection)
+
+    with metrics_scope("db") as metrics:
+        assert Database._column_exists(
+            InstrumentedConnection(raw), "relation_assertions", "revision_id",
+        )
+
+    assert raw.calls[0][1] == ("relation_assertions", "revision_id")
     assert metrics.snapshot()["counters"]["db_statement_count"] == 1
 
 

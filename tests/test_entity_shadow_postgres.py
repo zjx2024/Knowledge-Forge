@@ -214,3 +214,125 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
         assert namespace["expected_work_items"] == namespace["completed_work_items"] == 2
         assert namespace["failed_work_items"] == 0
     assert after == before
+
+
+@pytest.mark.integration
+def test_failed_entity_shadow_attempt_removes_only_its_partial_artifacts():
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
+    database = _database(dsn)
+    database.bootstrap()
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        project_id = int(conn.execute(
+            """INSERT INTO projects(
+               project_key,name,llm_model,embedding_model,active_schema_version)
+               VALUES('entity-shadow-retry','Entity Shadow Retry','fake-llm','fake-embed',1)
+               RETURNING id"""
+        ).fetchone()["id"])
+        first_document = _seed_document(conn, project_id, 1, "Shared entity appears first.")
+        retry_document = _seed_document(conn, project_id, 2, "Shared and stale entities.")
+        first_chunk = conn.execute(
+            "SELECT * FROM chunks WHERE document_id=%s", (first_document,),
+        ).fetchone()
+        retry_chunk = conn.execute(
+            "SELECT * FROM chunks WHERE document_id=%s", (retry_document,),
+        ).fetchone()
+
+    namespace_id = "entity-shadow-retry-namespace"
+    database.create_entity_shadow_namespace(
+        project_id, namespace_id, {"mode": "shadow"},
+        [first_document, retry_document],
+    )
+    database.seed_entity_shadow_work_items(namespace_id, [{
+        "id": "entity-shadow-retry-work",
+        "project_id": project_id,
+        "document_id": retry_document,
+        "revision_id": retry_chunk["revision_id"],
+        "chunk_id": retry_chunk["id"],
+        "input_fingerprint": "retry-fingerprint",
+    }])
+    leased = database.claim_entity_shadow_work(namespace_id, "retry-test")
+    assert leased is not None
+
+    with database.connection() as conn:
+        conn.execute(
+            """INSERT INTO entity_shadow_mentions(
+               namespace_id,mention_key,project_id,document_id,revision_id,chunk_id,
+               surface,normalized_surface,evidence_text,evidence_start,evidence_end,
+               confidence,extraction_policy_version)
+               VALUES
+               (%s,'mention-old',%s,%s,%s,%s,'Shared','shared','Shared',0,6,0.9,'v1'),
+               (%s,'mention-retry',%s,%s,%s,%s,'Shared','shared','Shared',0,6,0.9,'v1'),
+               (%s,'mention-stale',%s,%s,%s,%s,'Stale','stale','Stale',11,16,0.8,'v1')""",
+            (
+                namespace_id, project_id, first_document,
+                first_chunk["revision_id"], first_chunk["id"],
+                namespace_id, project_id, retry_document,
+                retry_chunk["revision_id"], retry_chunk["id"],
+                namespace_id, project_id, retry_document,
+                retry_chunk["revision_id"], retry_chunk["id"],
+            ),
+        )
+        conn.execute(
+            """INSERT INTO entity_shadow_canonicals(
+               namespace_id,canonical_key,name,normalized_name,primary_type,source_count)
+               VALUES(%s,'canonical-shared','Shared','shared','Concept',2),
+                     (%s,'canonical-orphan','Stale','stale','Concept',1)""",
+            (namespace_id, namespace_id),
+        )
+        conn.execute(
+            """INSERT INTO entity_shadow_assignments(
+               namespace_id,mention_key,canonical_key,document_id,chunk_id,revision_id,
+               entity_type,policy_version)
+               VALUES
+               (%s,'mention-old','canonical-shared',%s,%s,%s,'Concept','v1'),
+               (%s,'mention-retry','canonical-shared',%s,%s,%s,'Concept','v1'),
+               (%s,'mention-stale','canonical-orphan',%s,%s,%s,'Concept','v1')""",
+            (
+                namespace_id, first_document, first_chunk["id"], first_chunk["revision_id"],
+                namespace_id, retry_document, retry_chunk["id"], retry_chunk["revision_id"],
+                namespace_id, retry_document, retry_chunk["id"], retry_chunk["revision_id"],
+            ),
+        )
+        conn.execute(
+            """INSERT INTO entity_shadow_aliases(
+               namespace_id,canonical_key,mention_key,alias,normalized_alias,
+               alias_kind,confidence,policy_version)
+               VALUES
+               (%s,'canonical-shared','mention-old','Shared','shared','mention',0.9,'v1'),
+               (%s,'canonical-shared','mention-retry','Shared','shared','mention',0.9,'v1'),
+               (%s,'canonical-orphan','mention-stale','Stale','stale','mention',0.8,'v1')""",
+            (namespace_id, namespace_id, namespace_id),
+        )
+
+    status = database.fail_entity_shadow_work(
+        str(leased["id"]), str(leased["lease_token"]), "simulated retry",
+    )
+
+    assert status == "retryable_failed"
+    with database.connection() as conn:
+        mentions = conn.execute(
+            """SELECT mention_key FROM entity_shadow_mentions
+               WHERE namespace_id=%s ORDER BY mention_key""",
+            (namespace_id,),
+        ).fetchall()
+        assignments = conn.execute(
+            """SELECT mention_key,canonical_key FROM entity_shadow_assignments
+               WHERE namespace_id=%s ORDER BY mention_key""",
+            (namespace_id,),
+        ).fetchall()
+        canonicals = conn.execute(
+            """SELECT canonical_key,source_count FROM entity_shadow_canonicals
+               WHERE namespace_id=%s ORDER BY canonical_key""",
+            (namespace_id,),
+        ).fetchall()
+    assert mentions == [{"mention_key": "mention-old"}]
+    assert assignments == [{
+        "mention_key": "mention-old",
+        "canonical_key": "canonical-shared",
+    }]
+    assert canonicals == [{
+        "canonical_key": "canonical-shared",
+        "source_count": 1,
+    }]

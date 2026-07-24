@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from typing import Any, Iterable
 
@@ -13,6 +14,8 @@ from .entity_identity import (
     normalize_name,
     types_are_compatible,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseShadowStore:
@@ -56,7 +59,7 @@ class ShadowModelGateway:
         *,
         llm_model: str,
         context_budget_tokens: int,
-        max_output_tokens: int = 384,
+        max_output_tokens: int = 512,
     ):
         self.ollama = ollama
         self.llm_model = llm_model
@@ -95,19 +98,27 @@ class ShadowModelGateway:
                 "scores": item.get("resolution_scores") or {},
             } for item in candidates],
         }
-        result = self.ollama.json_chat(
-            model=self.llm_model,
-            system=(
-                "Conservatively decide whether an exact source mention and one bounded candidate "
-                "refer to the same real-world entity. Related entities, conflicting identifiers, "
-                "versions and homonyms must remain separate. Return only schema-valid JSON."
-            ),
-            prompt=json.dumps(payload, ensure_ascii=False),
-            schema=schema,
-            temperature=0,
-            context_budget_tokens=self.context_budget_tokens,
-            max_output_tokens=self.max_output_tokens,
-        )
+        try:
+            result = self.ollama.json_chat(
+                model=self.llm_model,
+                system=(
+                    "Conservatively decide whether an exact source mention and one bounded "
+                    "candidate refer to the same real-world entity. Related entities, "
+                    "conflicting identifiers, versions and homonyms must remain separate. "
+                    "Return only schema-valid JSON."
+                ),
+                prompt=json.dumps(payload, ensure_ascii=False),
+                schema=schema,
+                temperature=0,
+                context_budget_tokens=self.context_budget_tokens,
+                max_output_tokens=self.max_output_tokens,
+            )
+        except Exception as exc:
+            # Review is an optional merge accelerator. Fail closed so a malformed,
+            # truncated or unavailable review can never create an unsafe merge or
+            # abort an otherwise complete entity snapshot.
+            logger.warning("entity shadow LLM review skipped: %s", exc)
+            return None
         if result.get("decision") != "merge":
             return None
         return result
@@ -375,7 +386,11 @@ class ShadowEntityResolver:
                 "candidates": ranked,
             }
         if best and float(best["resolution_scores"]["combined"]) >= self.review_threshold:
-            reviewed = self.models.review(mention, selected)
+            try:
+                reviewed = self.models.review(mention, selected)
+            except Exception as exc:
+                logger.warning("entity shadow candidate review skipped: %s", exc)
+                reviewed = None
             reviewed_key = str((reviewed or {}).get("canonical_key") or "")
             reviewed_candidate = next(
                 (item for item in selected if str(item["canonical_key"]) == reviewed_key),

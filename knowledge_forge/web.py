@@ -17,6 +17,12 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .config import Config
 from .chunking import CHUNK_STRATEGY_OPTIONS, PARSER_OPTIONS, docling_available, validate_processing_request
+from .construction_strategies import (
+    ENHANCED_SHADOW_STRATEGY,
+    STABLE_STRATEGY,
+    normalize_strategy,
+    strategy_options,
+)
 from .graph_policy import GraphNotReadyError, is_current_graph
 from .service import KnowledgeForgeService, TreatmentMaterializationRequired
 from .runtime_safety import validate_runtime_config
@@ -59,57 +65,165 @@ def _notice(kind: str, text: str) -> str:
     return f'<div class="notice {"success" if good else "error"}"><b>{"✓" if good else "!"}</b>{_esc(text)}</div>'
 
 
-STATUS_NAMES = {"uploaded": "已上传", "processing": "处理中", "indexed": "已入库", "failed": "失败", "deleted": "已删除"}
+STATUS_NAMES = {
+    "uploaded": "待构建", "queued": "排队中", "processing": "处理中",
+    "indexed": "已入库", "failed": "失败", "cancelled": "已取消", "deleted": "已删除",
+}
 STAGE_NAMES = {
     "uploaded": "等待处理", "structure": "结构解析中", "structure_ready": "结构解析完成",
     "chunking": "知识分块中", "chunk_ready": "知识分块完成", "graph": "知识图谱构建中",
     "completed": "全部完成", "failed": "处理失败",
 }
+def _strategy_statistics(
+    project_id: int, strategy_key: str, graph_state: dict | None,
+) -> dict[str, int]:
+    if SERVICE.db.count_documents(project_id) == 0:
+        return {"documents": 0, "chunks": 0, "entities": 0, "relations": 0}
+    if strategy_key == STABLE_STRATEGY:
+        return SERVICE.db.statistics(project_id)
+    stats = (graph_state or {}).get("stats") or {}
+    return {
+        "documents": int(stats.get("documents") or 0),
+        "chunks": int(stats.get("chunks") or 0),
+        "entities": int(stats.get("entities") or 0),
+        "relations": int(stats.get("relations") or 0),
+    }
 
 
-def render_page(project_id: int | None, message: tuple[str, str] | None = None) -> str:
+def _document_rows(documents: list[dict], strategy_key: str) -> str:
+    rows: list[str] = []
+    for item in documents:
+        document_id = int(item["id"])
+        status = str(item.get("strategy_status") or "uploaded")
+        stable_ready = bool(item.get("active_revision_id")) and item.get("status") == "indexed"
+        if strategy_key == STABLE_STRATEGY:
+            stage = STAGE_NAMES.get(
+                item.get("processing_stage"), item.get("processing_stage") or "等待构建",
+            )
+        elif not stable_ready:
+            stage = "等待文档预处理与增强实验构建"
+        else:
+            stage = "增强实验已就绪" if status == "indexed" else "等待增强实验构建"
+        error = str(item.get("strategy_error_message") or "")
+        rows.append(
+            f"""<tr><td><strong>{_esc(item['original_filename'])}</strong></td>
+            <td>{item['file_size_bytes']/1024:.1f} KB</td><td>
+              <span class="status status-{_esc(status)}" data-document-status="{document_id}">{_esc(STATUS_NAMES.get(status,status))}</span>
+              <small data-stage-label="{document_id}">{_esc(stage)}</small>
+              {f'<small>{_esc(item.get("effective_parser"))} · {_esc(item.get("effective_chunk_strategy"))}</small>' if item.get('effective_parser') else ''}
+              {f'<small class="failure">{_esc(error)}</small>' if error else ''}
+            </td><td>{_time(item.get('strategy_updated_at') or item['updated_at'])}</td>
+            <td class="actions"><button class="button small secondary" type="button" data-view-structure="{document_id}"{' disabled' if not item.get('structure_ready_at') else ''}>结构块</button>
+              <button class="button small secondary" type="button" data-view-chunks="{document_id}"{' disabled' if not item.get('chunks_ready_at') else ''}>Chunk 分片</button>
+              <a class="button small secondary" href="/api/documents/{document_id}/download">下载</a>
+              <button class="icon-button danger" title="删除文档" data-delete="{document_id}">×</button>
+            </td></tr>"""
+        )
+    return "".join(rows) or '<tr><td colspan="5" class="empty">该项目尚未上传文档。</td></tr>'
+
+
+def _construction_controls(
+    *,
+    project_id: int,
+    strategy_key: str,
+    strategy_select: str,
+    latest_job_id: str,
+    latest_batch_id: str,
+    active_job_id: str,
+) -> str:
+    disabled = " disabled" if active_job_id else ""
+    return f"""<div class="construction-controls">
+      <form method="get"><input type="hidden" name="project" value="{_esc(project_id)}">
+        <label><span>构建方案</span><select name="strategy" onchange="this.form.submit()">{strategy_select}</select></label></form>
+      <button class="button secondary" id="prepare-project-documents" data-prepare-project="{_esc(project_id)}" type="button"
+        title="生成结构块、Chunk 分片、向量索引和 Schema，不抽取实体关系，也不更新知识图谱"{disabled}>预处理文档</button>
+      <button class="button secondary" id="build-project-knowledge" data-build-project="{_esc(project_id)}" type="button"{disabled}>构建知识</button>
+      <button class="button secondary" id="view-ingestion-log" data-view-job-log data-job="{_esc(latest_job_id)}"
+        data-batch="{_esc(latest_batch_id)}"{' disabled' if not latest_job_id else ''}>查看知识构建日志</button>
+    </div>"""
+
+
+def render_page(
+    project_id: int | None,
+    strategy_key: str = STABLE_STRATEGY,
+    message: tuple[str, str] | None = None,
+) -> str:
+    try:
+        strategy_key = normalize_strategy(strategy_key)
+    except ValueError:
+        strategy_key = STABLE_STRATEGY
     projects, models = SERVICE.db.list_projects(), SERVICE.db.list_models()
     current = next((item for item in projects if item["id"] == project_id), None) or (projects[0] if projects else None)
-    documents = SERVICE.db.list_documents(int(current["id"])) if current else []
-    statistics = SERVICE.db.statistics(int(current["id"])) if current else {"documents": 0, "chunks": 0, "entities": 0, "relations": 0}
+    if current:
+        SERVICE.db.ensure_project_strategy_graphs(int(current["id"]))
+    graph_state = SERVICE.db.get_project_strategy_graph(int(current["id"]), strategy_key) if current else None
+    documents = SERVICE.db.list_documents(int(current["id"]), strategy_key) if current else []
+    statistics = _strategy_statistics(int(current["id"]), strategy_key, graph_state) if current else {"documents": 0, "chunks": 0, "entities": 0, "relations": 0}
     schema = SERVICE.db.get_active_schema(int(current["id"])) if current else None
-    latest_job = SERVICE.latest_job(int(current["id"]), "ingestion") if current else None
-    active_job = SERVICE.latest_active_job(int(current["id"])) if current else None
+    def newest(*jobs):
+        values = [item for item in jobs if item]
+        return max(
+            values,
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            default=None,
+        )
+
+    latest_job = newest(
+        SERVICE.latest_job(int(current["id"]), "ingestion", strategy_key) if current else None,
+        SERVICE.latest_job(int(current["id"]), "content_preparation") if current else None,
+    )
+    active_job = newest(
+        SERVICE.latest_active_job(int(current["id"]), "ingestion", strategy_key) if current else None,
+        SERVICE.latest_active_job(int(current["id"]), "content_preparation") if current else None,
+    )
     latest_job_id = str(latest_job["id"]) if latest_job else ""
+    latest_batch_id = str((latest_job.get("metadata") or {}).get("batch_id") or "") if latest_job else ""
     active_job_id = str(active_job["id"]) if active_job else ""
     active_job_kind = str(active_job["kind"]) if active_job_id else ""
+    active_batch_id = str((active_job.get("metadata") or {}).get("batch_id") or "") if active_job_kind in {"ingestion", "content_preparation"} else ""
     schema_summary = "尚未初始化"
     if schema:
         data = schema["schema_json"]
         schema_summary = f"v{schema['version']} · {len(data.get('entity_types',[]))} 类实体 · {len(data.get('relation_types',[]))} 类关系"
     options = "".join(f'<option value="{item["id"]}"{" selected" if current and item["id"] == current["id"] else ""}>{_esc(item["name"])}</option>' for item in projects) or '<option value="">暂无项目</option>'
-    rows = "".join(
-        f"""<tr><td><strong>{_esc(item['original_filename'])}</strong></td>
-        <td>{item['file_size_bytes']/1024:.1f} KB</td><td><span class="status status-{_esc(item['status'])}">{STATUS_NAMES.get(item['status'],_esc(item['status']))}</span>
-        <small data-stage-label="{item['id']}">{_esc(STAGE_NAMES.get(item.get('processing_stage'), item.get('processing_stage') or '等待处理'))}</small>
-        {f'<small>{_esc(item.get("effective_parser"))} · {_esc(item.get("effective_chunk_strategy"))}</small>' if item.get('effective_parser') else ''}
-        {f'<small class="failure">{_esc(item.get("error_message"))}</small>' if item.get('error_message') else ''}</td><td>{_time(item['updated_at'])}</td>
-        <td class="actions"><button class="button small secondary" type="button" data-view-structure="{item['id']}"{' disabled' if item.get('status') in ('uploaded','deleted') or not item.get('structure_ready_at') else ''}>结构块</button>
-        <button class="button small secondary" type="button" data-view-chunks="{item['id']}"{' disabled' if item.get('status') in ('uploaded','deleted') or not item.get('chunks_ready_at') else ''}>Chunk 分片</button>
-        <a class="button small secondary" href="/api/documents/{item['id']}/download">下载</a><button class="icon-button danger" title="删除文档" data-delete="{item['id']}">×</button></td></tr>"""
-        for item in documents
-    ) or '<tr><td colspan="5" class="empty">该项目尚未上传文档。</td></tr>'
+    rows = _document_rows(documents, strategy_key)
+    strategy_select = "".join(
+        f'<option value="{_esc(item.key)}"{" selected" if item.key == strategy_key else ""}>{_esc(item.label)}</option>'
+        for item in strategy_options()
+    )
     current_block = ""
     settings_button = ""
     settings_dialog = ""
     if current:
-        graph_enabled = is_current_graph(current) and not active_job_id
-        graph_status = str(current.get("graph_status") or "empty")
-        graph_retry = "" if graph_enabled or active_job_id else (
+        graph_status = str((graph_state or {}).get("status") or "empty")
+        graph_enabled = (
+            (
+                is_current_graph(current)
+                if strategy_key == STABLE_STRATEGY
+                else graph_status == "ready" and int((graph_state or {}).get("generation") or 0)
+                == int((graph_state or {}).get("ready_generation") or 0)
+            )
+            and not active_job_id
+        )
+        graph_retry = "" if strategy_key != STABLE_STRATEGY or graph_enabled or active_job_id else (
             f'<button class="button secondary" type="button" data-rebuild-graph="{_esc(current["id"])}">重建知识图谱</button>'
         )
+        construction_controls = _construction_controls(
+            project_id=int(current["id"]),
+            strategy_key=strategy_key,
+            strategy_select=strategy_select,
+            latest_job_id=latest_job_id,
+            latest_batch_id=latest_batch_id,
+            active_job_id=active_job_id,
+        )
         current_block = f"""
-        <div class="workspace-section graph-summary"><div class="stats"><div><b>{statistics['documents']}</b><span>文档</span></div><div><b>{statistics['chunks']}</b><span>知识块</span></div>
-          <div><b>{statistics['entities']}</b><span>实体</span></div><div><b>{statistics['relations']}</b><span>关系</span></div></div>
-        <div class="stats-actions"><span class="schema-chip">{_esc(schema_summary)}</span>
-          <span class="schema-chip">图谱：{_esc(graph_status)}</span>{graph_retry}
-          <button class="button secondary" type="button" data-reassess-schema="{_esc(current['id'])}"{' disabled' if active_job_id else ''}>重新评估 Schema</button>
-          <a id="view-knowledge-graph" class="button secondary{' disabled-link' if not graph_enabled else ''}" href="/graph/view?project={_esc(current['id'])}" target="_blank" rel="noopener noreferrer" aria-disabled="{'false' if graph_enabled else 'true'}">查看知识图谱</a></div></div>"""
+        <div class="workspace-section graph-summary"><div class="stats"><div><b data-stat="documents">{statistics['documents']}</b><span>文档</span></div><div><b data-stat="chunks">{statistics['chunks']}</b><span>知识块</span></div>
+          <div><b data-stat="entities">{statistics['entities']}</b><span>实体</span></div><div><b data-stat="relations">{statistics['relations']}</b><span>关系</span></div></div>
+        <div class="stats-actions"><div class="schema-actions"><span class="schema-chip">{_esc(schema_summary)}</span>
+          <button class="button secondary" type="button" data-reassess-schema="{_esc(current['id'])}"{' disabled' if active_job_id or strategy_key != STABLE_STRATEGY else ''}>重新评估 Schema</button></div>
+          {construction_controls}
+          <div class="graph-actions">{graph_retry}
+          <a id="view-knowledge-graph" class="button secondary{' disabled-link' if not graph_enabled else ''}" href="/graph/view?project={_esc(current['id'])}&strategy={_esc(strategy_key)}" target="_blank" rel="noopener noreferrer" aria-disabled="{'false' if graph_enabled else 'true'}">查看知识图谱</a></div></div></div>"""
         settings_button = '<button class="button secondary" type="button" id="open-project-settings">项目设置</button>'
         settings_dialog = f"""
         <dialog id="project-settings-dialog"><div class="dialog-heading"><div><h2>项目设置</h2><p>设置当前项目使用的模型、项目上下文预算和单切片上限；不会修改 Ollama 全局上下文。</p></div>
@@ -134,12 +248,13 @@ def render_page(project_id: int | None, message: tuple[str, str] | None = None) 
     <title>Knowledge Forge</title><style>{CSS}</style></head><body><main class="shell">
     <header><div><h1>Knowledge Forge</h1><p>通用知识库与知识图谱构建平台</p></div></header>{notice}
     <section class="panel project-panel"><div class="section-heading project-heading"><h2>项目空间</h2>
-      <div class="project-picker"><form method="get"><select name="project" aria-label="选择当前项目" onchange="this.form.submit()">{options}</select></form>
+      <div class="project-picker"><form method="get"><input type="hidden" name="strategy" value="{_esc(strategy_key)}"><select name="project" aria-label="选择当前项目" onchange="this.form.submit()">{options}</select></form>
         {settings_button}<button class="button primary" type="button" id="open-create-project">新建项目</button></div></div>
       <div class="workspace-section" {'' if current else 'hidden'}><div class="section-heading"><div><h2>知识库构建</h2><p>上传后执行章节切分、向量索引、Schema 评估、实体归一与图谱写入。</p></div>
-      <div class="section-actions"><button class="button secondary" id="view-ingestion-log" data-view-job-log data-job="{_esc(latest_job_id)}"{' disabled' if not latest_job_id else ''}>查看知识构建日志</button></div></div>
+      </div></div>
       <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form processing-form"><input type="hidden" name="project_id" value="{_esc(current['id'] if current else '')}">
-        <div class="upload-line"><input id="upload-files" type="file" name="files" multiple accept=".docx,.pdf,.md,.markdown,.txt,.xlsx,.xls,.csv" required><button class="button primary" type="submit">上传解析</button></div>
+        <input type="hidden" name="strategy_key" value="{_esc(strategy_key)}">
+        <div class="upload-line"><input id="upload-files" type="file" name="files" multiple accept=".docx,.pdf,.md,.markdown,.txt,.xlsx,.xls,.csv" required><button class="button primary" type="submit">上传文件</button></div>
         <p class="upload-help">支持多文件上传，单个文件最大 {Config.upload_max_bytes // (1024 * 1024)} MB。</p>
         <details class="processing-options"><summary>解析与分块设置</summary>
           <div id="processing-selects" class="form-grid compact">
@@ -149,8 +264,8 @@ def render_page(project_id: int | None, message: tuple[str, str] | None = None) 
           <p id="processing-hint" class="muted">选择文件后会检查解析器和分块策略的兼容性。</p>
         </details>
       </form>
-      <div id="task-box" class="task-box"{job_hidden} data-job="{_esc(active_job_id)}" data-kind="{_esc(active_job_kind)}">
-        <div class="task-head"><b id="task-title">后台任务</b><span id="task-status">等待</span></div>
+      <div id="task-box" class="task-box"{job_hidden} data-job="{_esc(active_job_id)}" data-batch="{_esc(active_batch_id)}" data-kind="{_esc(active_job_kind)}">
+        <div class="task-head"><b id="task-title">后台任务</b><span><span id="task-status">等待</span><span id="task-duration" class="task-duration">用时 00:00</span></span></div>
         <div id="task-steps" class="task-steps">
           <div class="task-step" data-subtask="structure"><div class="task-step-head"><span>结构解析</span><b data-subtask-status>等待</b></div><div class="progress"><i data-subtask-bar></i></div></div>
           <div class="task-step" data-subtask="chunking"><div class="task-step-head"><span>分块及向量索引</span><b data-subtask-status>等待</b></div><div class="progress"><i data-subtask-bar></i></div></div>
@@ -222,7 +337,7 @@ def render_page(project_id: int | None, message: tuple[str, str] | None = None) 
         <button id="chunk-next" class="button small secondary" type="button">下一页</button></div></div>
       <div class="dialog-actions"><button class="button secondary" type="button" data-close-chunks>关闭</button></div>
     </dialog>
-    </main><script>window.KF={{projectId:{int(current['id']) if current else 0},docling:{str(docling_available()).lower()}}};{SCRIPT}</script></body></html>"""
+    </main><script>window.KF={{projectId:{int(current['id']) if current else 0},strategyKey:{json.dumps(strategy_key)},docling:{str(docling_available()).lower()}}};{SCRIPT}</script></body></html>"""
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -255,10 +370,27 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             project_id = self._project(); params = parse_qs(parsed.query); text = params.get("message", [""])[0]
-            self._respond(200, render_page(project_id, (params.get("kind", [""])[0], text) if text else None),
+            strategy_key = params.get("strategy", [STABLE_STRATEGY])[0]
+            self._respond(200, render_page(
+                              project_id, strategy_key,
+                              (params.get("kind", [""])[0], text) if text else None),
                           cookie=f"knowledge_forge_project={project_id}; Path=/; SameSite=Lax" if project_id else ""); return
         if parsed.path.startswith("/api/jobs/"):
             job = SERVICE.get_job(parsed.path.rsplit("/", 1)[-1]); self._json(200 if job else 404, job or {"error": "任务不存在"}); return
+        if parsed.path.startswith("/api/job-batches/"):
+            batch = SERVICE.get_ingestion_batch(parsed.path.rsplit("/", 1)[-1])
+            self._json(200 if batch else 404, batch or {"error": "任务批次不存在"}); return
+        match = re.fullmatch(r"/api/projects/(\d+)/statistics", parsed.path)
+        if match:
+            project_id = int(match.group(1))
+            if not SERVICE.db.get_project(project_id):
+                self._json(404, {"error": "项目不存在"})
+            else:
+                strategy_key = parse_qs(parsed.query).get("strategy", [STABLE_STRATEGY])[0]
+                strategy_key = normalize_strategy(strategy_key)
+                graph_state = SERVICE.db.get_project_strategy_graph(project_id, strategy_key)
+                self._json(200, _strategy_statistics(project_id, strategy_key, graph_state))
+            return
         match = re.fullmatch(r"/api/documents/(\d+)/structure", parsed.path)
         if match:
             try: self._json(200, SERVICE.document_structure(int(match.group(1))))
@@ -291,8 +423,15 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/graph/view":
             try:
-                project_id = int(parse_qs(parsed.query).get("project", ["0"])[0])
-                self._redirect(SERVICE.hubble_project_url(project_id), project_id)
+                params = parse_qs(parsed.query)
+                project_id = int(params.get("project", ["0"])[0])
+                strategy_key = params.get("strategy", [STABLE_STRATEGY])[0]
+                graph_url = (
+                    SERVICE.hubble_project_url(project_id)
+                    if strategy_key == STABLE_STRATEGY
+                    else SERVICE.hubble_project_url(project_id, strategy_key)
+                )
+                self._redirect(graph_url, project_id)
             except GraphNotReadyError as exc:
                 self._respond(HTTPStatus.CONFLICT, str(exc), "text/plain; charset=utf-8")
             except Exception as exc:
@@ -320,7 +459,28 @@ class AppHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/models/sync":
                 models = SERVICE.sync_ollama_models(); self._json(200, {"ok": True, "count": len(models), "models": models}); return
             match = re.fullmatch(r"/api/documents/(\d+)/ingest", parsed.path)
-            if match: self._json(202, {"ok": True, "job_id": SERVICE.submit_ingestion(int(match.group(1)))}); return
+            if match:
+                strategy_key = parse_qs(parsed.query).get("strategy", [STABLE_STRATEGY])[0]
+                self._json(202, {
+                    "ok": True,
+                    "job_id": SERVICE.submit_ingestion(
+                        int(match.group(1)), strategy_key=strategy_key,
+                    ),
+                })
+                return
+            match = re.fullmatch(r"/api/projects/(\d+)/ingest", parsed.path)
+            if match:
+                strategy_key = parse_qs(parsed.query).get("strategy", [STABLE_STRATEGY])[0]
+                result = SERVICE.submit_project_ingestion(
+                    int(match.group(1)), strategy_key=strategy_key,
+                )
+                self._json(202, {"ok": True, **result})
+                return
+            match = re.fullmatch(r"/api/projects/(\d+)/prepare", parsed.path)
+            if match:
+                result = SERVICE.submit_project_preparation(int(match.group(1)))
+                self._json(202, {"ok": True, **result})
+                return
             match = re.fullmatch(r"/api/documents/(\d+)/delete", parsed.path)
             if match:
                 job_id = SERVICE.delete_document(int(match.group(1)))
@@ -366,10 +526,13 @@ class AppHandler(BaseHTTPRequestHandler):
         uploaded = [SERVICE.save_upload(project_id, item.filename, item.file.read(),
                     requested_parser=requested_parser, requested_strategy=requested_strategy) for item in entries]
         if not uploaded: raise ValueError("请至少选择一个文件")
-        for document in uploaded:
-            SERVICE.submit_ingestion(int(document["id"]))
+        strategy_key = normalize_strategy(form.getfirst("strategy_key", STABLE_STRATEGY))
         names = "、".join(str(document["original_filename"]) for document in uploaded)
-        self._redirect(f"/?kind=ok&message={quote('已上传并提交解析：'+names)}", project_id)
+        self._redirect(
+            f"/?project={project_id}&strategy={quote(strategy_key)}&kind=ok&message="
+            f"{quote('已上传：'+names)}",
+            project_id,
+        )
 
     def _download_document(self, document_id: int) -> None:
         document = SERVICE.db.get_document(document_id)
@@ -417,20 +580,20 @@ def serve() -> None:
 
 
 CSS = r"""
-:root{font-family:Arial,"Microsoft YaHei",sans-serif;color:#13243b;background:#f3f7fb}*{box-sizing:border-box}body{margin:0}.shell{max-width:1180px;margin:30px auto;padding:0 20px 40px}header,.section-heading,.project-picker,.header-actions,.section-actions,.task-head,.dialog-heading{display:flex;align-items:center;gap:12px}header,.section-heading,.task-head,.dialog-heading{justify-content:space-between}header{margin-bottom:18px}h1,h2{margin:0}h1{font-size:27px}h2{font-size:19px}p{color:#5d7088;margin:7px 0 0;line-height:1.5}.panel{background:#fff;border:1px solid #d5e0ed;border-radius:8px;padding:22px;margin-bottom:16px;box-shadow:0 10px 24px rgba(26,61,101,.05)}.project-panel{background:#fff}.project-heading{margin:20px 0 4px}.project-heading h2{font-size:23px}.workspace-section{border-top:1px solid #dce5ee;margin-top:22px;padding-top:22px}.button,.icon-button{border:0;background:#30445f;color:#fff;padding:9px 14px;border-radius:6px;font-size:14px;cursor:pointer;text-decoration:none;white-space:nowrap}.button:hover{background:#20324c}.button.primary{background:#2677d8}.button.secondary{background:#fff;color:#263f60;border:1px solid #c4d2e1}.button.small{padding:7px 10px}.button:disabled{cursor:not-allowed;opacity:1}.button.secondary:disabled{background:#eef2f6;color:#98a5b5;border-color:#d8e0e9}.icon-button{width:34px;height:34px;padding:0;font-size:22px}.danger{background:#df3038}.header-actions{justify-content:flex-end}label{color:#354963;font-size:14px;display:flex;flex-direction:column;gap:7px}input,select,textarea{width:100%;border:1px solid #bfd0e2;border-radius:6px;padding:9px 10px;color:#172b47;background:#fff;font:inherit}select{min-width:240px}.project-picker{margin:0}.project-picker form{margin:0}.project-picker select{width:min(430px,100%)}.project-picker select,.project-picker .button{font-size:16px;min-height:42px}.project-meta{display:flex;align-items:center;flex-wrap:wrap;gap:20px;color:#58708c;font-size:13px;padding:8px 0}.project-meta b{color:#263f60}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}.stats div{border-left:3px solid #2f7bd4;background:#f8fbff;padding:10px 14px}.stats b{display:block;font-size:20px}.stats span{font-size:12px;color:#6d7f93}.stats-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px}summary{color:#1769c2;font-weight:700;cursor:pointer}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px;margin-top:14px;max-width:850px}.wide,.form-actions{grid-column:1/-1}.compact{max-width:700px}.settings-toolbar{display:flex;justify-content:flex-end;margin-top:14px}.refresh-button{background:#fff;color:#263f60;border:1px solid #c4d2e1;font-size:21px;line-height:1}.refresh-button:hover{background:#edf4fb}.upload-form,.search-form{display:flex;gap:10px;align-items:center;margin-top:17px}.upload-form input,.search-form input{flex:1}.task-box{margin-top:18px;background:#101c2e;color:#d9e8fb;padding:14px;border-radius:6px}.task-box pre{margin:10px 0 0;max-height:260px;overflow:auto;white-space:pre-wrap;font:13px/1.5 monospace}.progress{height:5px;background:#263951;margin-top:10px}.progress i{display:block;height:100%;width:0;background:#4fa3ff;transition:width .25s}.schema-chip{display:inline-flex;align-items:center;color:#315a83;background:#eaf3fc;padding:6px 9px;border-radius:4px;font-size:13px;line-height:1}.notice{position:fixed;top:18px;right:18px;z-index:1100;max-width:min(430px,calc(100vw - 36px));padding:12px 14px;border-radius:6px;display:flex;gap:9px;align-items:center;box-shadow:0 12px 30px rgba(20,42,70,.2);transition:opacity .25s,transform .25s}.notice.toast-hide{opacity:0;transform:translateY(-8px);pointer-events:none}.notice b{display:grid;place-items:center;flex:0 0 20px;width:20px;height:20px;border-radius:50%;color:#fff}.notice.success{background:#effaf2;color:#176a35;border:1px solid #9fdbaf}.notice.success b{background:#23a453}.notice.error{background:#fff3f3;color:#9c262d;border:1px solid #f0b1b4}.notice.error b{background:#d4383f}dialog{width:min(720px,calc(100% - 28px));border:1px solid #cbd8e6;border-radius:8px;padding:22px;color:#13243b;box-shadow:0 22px 60px rgba(15,35,60,.24)}dialog::backdrop{background:rgba(20,36,58,.46)}dialog .form-grid{max-width:none}.dialog-actions{display:flex;justify-content:flex-end;gap:10px}.log-dialog{width:min(900px,calc(100% - 28px))}.history-log{min-height:220px;max-height:60vh;overflow:auto;padding:16px;border-radius:6px;background:#101c2e;color:#d9e8fb;white-space:pre-wrap;font:13px/1.55 monospace}.job-log-error{margin:14px 0;padding:10px 12px;border:1px solid #f0b1b4;border-radius:6px;background:#fff3f3;color:#9c262d}.table-wrap{overflow:auto;border:1px solid #d6e1ec;border-radius:6px;margin-top:16px}table{width:100%;border-collapse:collapse;min-width:760px}th,td{padding:12px;text-align:left;border-bottom:1px solid #e1e9f1;vertical-align:middle}th{background:#f6f9fc;color:#39516e;font-size:14px}td small{display:block;color:#6b7e93;margin-top:5px;max-width:390px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.actions{position:sticky;right:0;background:#fff;white-space:nowrap;text-align:center;min-width:270px}.actions .button,.actions .icon-button{display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;height:34px}.actions>*+*{margin-left:6px}th.actions{background:#f6f9fc;text-align:center}.status{display:inline-block;padding:4px 8px;border-radius:14px;background:#e8edf3;color:#42566f;font-size:13px}.status-indexed{background:#e8f7ec;color:#20773b}.status-failed{background:#fff0f0;color:#b72d35}.status-processing{background:#fff7df;color:#926a00}.failure{color:#b72d35!important}.empty{text-align:center;color:#74869b;padding:30px}.result-group{margin-top:18px}.result-card{border-top:1px solid #dce5ee;padding:12px 2px}.result-card h3{font-size:15px;margin:0 0 7px}.result-card p{font-size:14px;color:#354963;white-space:pre-wrap}.score{font-size:12px;color:#1b6bc1}.relation{font-weight:700;color:#315a83}.muted{color:#718398;font-size:13px}
-.project-heading{margin:0 0 18px}.project-heading h2{font-size:24px}.project-heading .project-picker select,.project-heading .project-picker .button{font-size:17px}
-.stats-actions{justify-content:flex-start}.stats-actions .schema-chip{margin-right:auto;padding:9px 12px;font-size:16px;font-weight:700}
-.dialog-title-actions{display:flex;align-items:center;gap:8px}.model-sync-status{margin:14px 0 0;font-size:14px}.model-sync-status.success{color:#20773b}.model-sync-status.failure{color:#b72d35}.field-help{display:block;min-height:18px;color:#6b7e93;font-size:12px;line-height:1.5}.field-help.failure{color:#b72d35}
+:root{font-family:Arial,"Microsoft YaHei",sans-serif;color:#13243b;background:#f3f7fb}*{box-sizing:border-box}body{margin:0}.shell{max-width:1180px;margin:30px auto;padding:0 20px 40px}header,.section-heading,.project-picker,.header-actions,.section-actions,.task-head,.dialog-heading{display:flex;align-items:center;gap:12px}header,.section-heading,.task-head,.dialog-heading{justify-content:space-between}header{margin-bottom:18px}h1,h2{margin:0}h1{font-size:27px}h2{font-size:19px}p{color:#5d7088;margin:7px 0 0;line-height:1.5}.panel{background:#fff;border:1px solid #d5e0ed;border-radius:8px;padding:22px;margin-bottom:16px;box-shadow:0 10px 24px rgba(26,61,101,.05)}.project-panel{background:#fff}.project-heading{margin:20px 0 4px}.project-heading h2{font-size:23px}.workspace-section{border-top:1px solid #dce5ee;margin-top:22px;padding-top:22px}.button,.icon-button{border:0;background:#30445f;color:#fff;padding:9px 14px;border-radius:6px;font-size:14px;cursor:pointer;text-decoration:none;white-space:nowrap}.button:hover{background:#20324c}.button.primary{background:#2677d8}.button.secondary{background:#fff;color:#263f60;border:1px solid #c4d2e1}.button.small{padding:7px 10px}.button:disabled{cursor:not-allowed;opacity:1}.button.secondary:disabled{background:#eef2f6;color:#98a5b5;border-color:#d8e0e9}.icon-button{width:34px;height:34px;padding:0;font-size:22px}.danger{background:#df3038}.header-actions{justify-content:flex-end}label{color:#354963;font-size:14px;display:flex;flex-direction:column;gap:7px}input,select,textarea{width:100%;border:1px solid #bfd0e2;border-radius:6px;padding:9px 10px;color:#172b47;background:#fff;font:inherit}select{min-width:240px}.project-picker{margin:0}.project-picker form{margin:0}.project-picker select{width:min(430px,100%)}.project-picker select,.project-picker .button{font-size:16px;min-height:42px}.project-meta{display:flex;align-items:center;flex-wrap:wrap;gap:20px;color:#58708c;font-size:13px;padding:8px 0}.project-meta b{color:#263f60}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}.stats div{border-left:3px solid #2f7bd4;background:#f8fbff;padding:10px 14px}.stats b{display:block;font-size:20px}.stats span{font-size:12px;color:#6d7f93}.stats-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px}summary{color:#1769c2;font-weight:700;cursor:pointer}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px;margin-top:14px;max-width:850px}.wide,.form-actions{grid-column:1/-1}.compact{max-width:700px}.settings-toolbar{display:flex;justify-content:flex-end;margin-top:14px}.refresh-button{background:#fff;color:#263f60;border:1px solid #c4d2e1;font-size:21px;line-height:1}.refresh-button:hover{background:#edf4fb}.upload-form,.search-form{display:flex;gap:10px;align-items:center;margin-top:17px}.upload-form input,.search-form input{flex:1}.task-box{margin-top:18px;background:#101c2e;color:#d9e8fb;padding:14px;border-radius:6px}.task-box pre{margin:10px 0 0;max-height:260px;overflow:auto;white-space:pre-wrap;font:13px/1.5 monospace}.progress{height:5px;background:#263951;margin-top:10px}.progress i{display:block;height:100%;width:0;background:#4fa3ff;transition:width .25s}.schema-chip{display:inline-flex;align-items:center;color:#315a83;background:#eaf3fc;padding:6px 9px;border-radius:4px;font-size:13px;line-height:1}.notice{position:fixed;top:18px;right:18px;z-index:1100;max-width:min(430px,calc(100vw - 36px));padding:12px 14px;border-radius:6px;display:flex;gap:9px;align-items:center;box-shadow:0 12px 30px rgba(20,42,70,.2);transition:opacity .25s,transform .25s}.notice.toast-hide{opacity:0;transform:translateY(-8px);pointer-events:none}.notice b{display:grid;place-items:center;flex:0 0 20px;width:20px;height:20px;border-radius:50%;color:#fff}.notice.success{background:#effaf2;color:#176a35;border:1px solid #9fdbaf}.notice.success b{background:#23a453}.notice.error{background:#fff3f3;color:#9c262d;border:1px solid #f0b1b4}.notice.error b{background:#d4383f}dialog{width:min(720px,calc(100% - 28px));border:1px solid #cbd8e6;border-radius:8px;padding:22px;color:#13243b;box-shadow:0 22px 60px rgba(15,35,60,.24)}dialog::backdrop{background:rgba(20,36,58,.46)}dialog .form-grid{max-width:none}.dialog-actions{display:flex;justify-content:flex-end;gap:10px}.log-dialog{width:min(900px,calc(100% - 28px))}.history-log{min-height:220px;max-height:60vh;overflow:auto;padding:16px;border-radius:6px;background:#101c2e;color:#d9e8fb;white-space:pre-wrap;font:13px/1.55 monospace}.job-log-error{margin:14px 0;padding:10px 12px;border:1px solid #f0b1b4;border-radius:6px;background:#fff3f3;color:#9c262d}.table-wrap{overflow:auto;border:1px solid #d6e1ec;border-radius:6px;margin-top:16px}table{width:100%;border-collapse:collapse;min-width:980px}th,td{padding:12px;text-align:left;border-bottom:1px solid #e1e9f1;vertical-align:middle}th{background:#f6f9fc;color:#39516e;font-size:14px}td small{display:block;color:#6b7e93;margin-top:5px;max-width:390px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.actions{position:sticky;right:0;background:#fff;white-space:nowrap;text-align:center;min-width:390px}.actions .button,.actions .icon-button{display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;height:34px}.actions>*+*{margin-left:6px}th.actions{background:#f6f9fc;text-align:center}.status{display:inline-block;padding:4px 8px;border-radius:14px;background:#e8edf3;color:#42566f;font-size:13px}.status-indexed{background:#e8f7ec;color:#20773b}.status-failed{background:#fff0f0;color:#b72d35}.status-processing{background:#fff7df;color:#926a00}.failure{color:#b72d35!important}.empty{text-align:center;color:#74869b;padding:30px}.result-group{margin-top:18px}.result-card{border-top:1px solid #dce5ee;padding:12px 2px}.result-card h3{font-size:15px;margin:0 0 7px}.result-card p{font-size:14px;color:#354963;white-space:pre-wrap}.score{font-size:12px;color:#1b6bc1}.relation{font-weight:700;color:#315a83}.muted{color:#718398;font-size:13px}
+.task-box pre{max-height:320px}.task-head>span{display:flex;align-items:center;gap:12px}.task-duration{color:#9eb3cc;font-variant-numeric:tabular-nums}.project-heading{margin:0 0 18px}.project-heading h2{font-size:24px}.project-heading .project-picker select,.project-heading .project-picker .button{font-size:17px}
+.stats-actions{justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto;padding-bottom:2px}.schema-actions,.graph-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}.stats-actions .schema-chip{padding:9px 12px;font-size:16px;font-weight:700}
+.dialog-title-actions{display:flex;align-items:center;gap:8px}.model-sync-status{margin:14px 0 0;font-size:14px}.model-sync-status.success{color:#20773b}.model-sync-status.failure{color:#b72d35}.field-help{display:block;min-height:18px;color:#6b7e93;font-size:12px;line-height:1.5}.field-help.failure{color:#b72d35}.construction-controls{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex:1 1 auto;flex-wrap:nowrap;margin:0}.construction-controls form{margin:0}.construction-controls label{flex-direction:row;align-items:center;gap:8px;white-space:nowrap}.construction-controls select{min-width:160px;padding:8px 10px}
 .delete-progress-dialog{width:min(520px,calc(100% - 28px))}.delete-progress-body{display:flex;align-items:center;gap:16px;margin:22px 0 16px;padding:16px;border:1px solid #d6e1ec;border-radius:6px;background:#f8fbff}.delete-progress-body p{margin-top:4px}.delete-spinner{flex:0 0 30px;width:30px;height:30px;border:3px solid #cfdae7;border-top-color:#2677d8;border-radius:50%;animation:delete-spin .8s linear infinite}.delete-result{display:grid;place-items:center;flex:0 0 30px;width:30px;height:30px;border-radius:50%;color:#fff;font-size:20px;font-weight:700}.delete-result.success{background:#23a453}.delete-result.failure{background:#d4383f}.delete-progress-bar{margin:0 0 18px}.delete-progress-bar i{background:#2677d8}.deleting-row{opacity:.48;pointer-events:none}@keyframes delete-spin{to{transform:rotate(360deg)}}
 .processing-form{display:flex;flex-direction:column;align-items:stretch}.upload-line{display:flex;align-items:center;gap:10px}.upload-line input{flex:1}.upload-help{margin:7px 0 0;color:#6b7e93;font-size:13px}.processing-options{border:1px solid #d7e2ed;border-radius:6px;padding:10px 12px;background:#f8fbff}.processing-options summary{font-size:14px}.processing-options .form-grid{margin-top:12px;max-width:none}.processing-options .muted{margin-top:10px}
 .task-steps{display:grid;gap:10px;margin-top:12px}.task-step{display:grid;grid-template-columns:210px minmax(180px,1fr);align-items:center;gap:14px}.task-step-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px}.task-step-head span{color:#d9e8fb}.task-step-head b{color:#8fa5bd;font-weight:400;white-space:nowrap}.task-step .progress{margin:0;height:7px;border-radius:5px;overflow:hidden}.task-step.running .task-step-head b{color:#72b8ff}.task-step.completed .task-step-head b{color:#75d69a}.task-step.completed .progress i{background:#38ae68}.task-step.failed .task-step-head b,.task-step.cancelled .task-step-head b{color:#ff9297}.task-step.failed .progress i,.task-step.cancelled .progress i{background:#df5960}
-.disabled-link{opacity:.45;pointer-events:none;cursor:not-allowed}.chunk-badges{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:9px}.chunk-badge{padding:3px 7px;border-radius:4px;background:#eef3f8;color:#496079;font-size:12px}.chunk-badge.graph{background:#e8f7ec;color:#20773b}.chunk-badge.skipped{background:#fff3df;color:#8b6400}
+.disabled-link{opacity:.45;pointer-events:none;cursor:not-allowed}.status-queued{background:#eef3ff;color:#315a83}.status-cancelled{background:#f1f3f5;color:#667789}.chunk-badges{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:9px}.chunk-badge{padding:3px 7px;border-radius:4px;background:#eef3f8;color:#496079;font-size:12px}.chunk-badge.graph{background:#e8f7ec;color:#20773b}.chunk-badge.skipped{background:#fff3df;color:#8b6400}
 .structure-dialog{width:min(980px,calc(100% - 28px))}.structure-tools{display:grid;grid-template-columns:minmax(0,1fr) 210px;gap:10px;margin:16px 0}.structure-tools select{min-width:0}.structure-list{max-height:58vh;overflow:auto;border:1px solid #d6e1ec;border-radius:6px}.structure-row{padding:14px 16px;border-bottom:1px solid #e1e9f1}.structure-row:last-child{border-bottom:0}.structure-row-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:9px}.structure-row-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px;color:#637891;font-size:12px}.block-type{display:inline-block;padding:3px 7px;border-radius:4px;background:#eaf3fc;color:#245d94;font-weight:700}.structure-text{margin:0;color:#243a55;white-space:pre-wrap;word-break:break-word;font:14px/1.65 Arial,"Microsoft YaHei",sans-serif}.structure-metadata{margin-top:10px}.structure-metadata summary{font-size:12px;font-weight:400}.structure-metadata pre{margin:8px 0 0;padding:10px;background:#f6f9fc;border-radius:4px;overflow:auto;font-size:12px}.structure-pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:14px 0}.structure-pager>div{display:flex;gap:8px}
-@media(max-width:760px){.shell{margin:16px auto;padding:0 10px 24px}header,.section-heading,.project-picker,.upload-form,.search-form{align-items:stretch;flex-direction:column}.project-picker label{min-width:0}.form-grid,.structure-tools{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.stats-actions{align-items:stretch;flex-direction:column}.stats-actions .schema-chip{margin-right:0;justify-content:center}.stats-actions .button{width:100%}.panel{padding:16px}.task-step{grid-template-columns:1fr;gap:5px}}
+@media(max-width:760px){.shell{margin:16px auto;padding:0 10px 24px}header,.section-heading,.project-picker,.upload-form,.search-form{align-items:stretch;flex-direction:column}.project-picker label{min-width:0}.form-grid,.structure-tools{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.construction-controls,.stats-actions,.schema-actions,.graph-actions{align-items:stretch;flex-direction:column}.construction-controls{flex-wrap:wrap}.construction-controls form,.construction-controls .button,.stats-actions .button{width:100%}.construction-controls label{align-items:stretch;flex-direction:column}.construction-controls select{min-width:0}.stats-actions .schema-chip{justify-content:center}.panel{padding:16px}.task-step{grid-template-columns:1fr;gap:5px}}
 """
 
 SCRIPT = r"""
-const box=document.querySelector('#task-box'),log=document.querySelector('#task-log'),taskStatus=document.querySelector('#task-status'),taskSteps=document.querySelector('#task-steps');
+const box=document.querySelector('#task-box'),log=document.querySelector('#task-log'),taskStatus=document.querySelector('#task-status'),taskDuration=document.querySelector('#task-duration'),taskSteps=document.querySelector('#task-steps');
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const ingestionLogButton=document.querySelector('#view-ingestion-log'),taskTitle=document.querySelector('#task-title');
 const stageLabels={structure:'结构解析中',structure_ready:'结构解析完成',chunking:'知识分块中',chunk_ready:'知识分块完成',graph:'知识图谱构建中',completed:'全部完成',failed:'处理失败'};
@@ -439,10 +602,15 @@ const taskStatusLabels={queued:'排队中',running:'执行中',completed:'已完
 const clampProgress=value=>Math.max(0,Math.min(100,Math.round(Number(value)||0)));
 function legacySubtasks(job){const p=clampProgress(job.progress),step=(status,progress,detail='')=>({status,progress:clampProgress(progress),detail});const result={structure:step('waiting',0),chunking:step('waiting',0),schema_base:step('waiting',0),extraction:step('waiting',0),graph_sync:step('waiting',0)};if(job.kind==='graph_sync'){result.graph_sync=step(job.status==='completed'?'completed':job.status==='failed'?'failed':'running',p);return result}if(job.kind==='schema_reassessment'){result.schema_base=step(job.status==='completed'?'completed':job.status==='failed'?'failed':'running',p,'重新评估');return result}result.structure=p>=18?step('completed',100):step('running',p/18*100);if(p>=20)result.chunking=p>=42?step('completed',100):step('running',(p-20)/22*100);if(p>=44)result.schema_base=p>=50?step('completed',100):step('running',(p-44)/6*100);if(p>=52)result.extraction=p>=90?step('completed',100):step('running',(p-52)/38*100);if(p>=92)result.graph_sync=p>=96?step('completed',100):step('running',(p-92)/4*100);if(job.status==='completed')for(const key of Object.keys(result))result[key]=step('completed',100,result[key].detail);return result}
 function jobSubtasks(job){const stored=job.metadata?.subtasks;if(!stored||typeof stored!=='object')return legacySubtasks(job);return {...legacySubtasks({kind:job.kind,status:'queued',progress:0}),...stored}}
-function renderSubtasks(job){const subtasks=jobSubtasks(job);if(taskStatus)taskStatus.textContent=taskStatusLabels[job.status]||job.status||'等待';for(const row of taskSteps?.querySelectorAll('[data-subtask]')||[]){const key=row.dataset.subtask;row.hidden=job.kind==='document_cleanup'||(job.kind==='schema_reassessment'&&key!=='schema_base');const data=subtasks[key]||{status:'waiting',progress:0,detail:''},progress=clampProgress(data.progress),status=data.status||'waiting',label=row.querySelector('[data-subtask-status]'),bar=row.querySelector('[data-subtask-bar]');row.className='task-step '+status;if(label){if(status==='completed')label.textContent='已完成'+(data.detail?' · '+data.detail:'');else if(status==='failed')label.textContent='失败'+(data.detail?' · '+data.detail:'');else if(status==='cancelled')label.textContent='已取消';else if(status==='running')label.textContent=progress+'%'+(data.detail?' · '+data.detail:'');else label.textContent='等待'}if(bar)bar.style.width=progress+'%'}}
-function applyJobReadiness(job){const metadata=job.metadata||{},documentId=job.document_id||metadata.document_id;if(documentId){const structure=document.querySelector('[data-view-structure="'+documentId+'"]'),chunks=document.querySelector('[data-view-chunks="'+documentId+'"]'),label=document.querySelector('[data-stage-label="'+documentId+'"]');if(structure&&metadata.structure_ready)structure.disabled=false;if(chunks&&metadata.chunks_ready)chunks.disabled=false;if(label&&metadata.stage)label.textContent=stageLabels[metadata.stage]||metadata.stage}const graph=document.querySelector('#view-knowledge-graph');if(graph&&metadata.graph_ready){graph.classList.remove('disabled-link');graph.setAttribute('aria-disabled','false')}}
-function monitor(id,kind=''){if(!id)return;box.hidden=false;box.dataset.job=id;box.dataset.kind=kind;const target=kind==='ingestion'?ingestionLogButton:null;if(target){target.dataset.job=id;target.disabled=false}if(taskTitle)taskTitle.textContent=kind==='graph_sync'?'知识图谱同步':kind==='schema_reassessment'?'Schema 重新评估':kind==='document_cleanup'?'文档清理':'知识库构建';const tick=async()=>{const res=await fetch('/api/jobs/'+id),job=await res.json();log.textContent=(job.log||[]).join('\n');renderSubtasks(job);applyJobReadiness(job);if(['completed','failed','cancelled'].includes(job.status)){setTimeout(()=>location.reload(),900);return}setTimeout(tick,800)};tick()}
-if(box?.dataset.job)monitor(box.dataset.job,box.dataset.kind||'');
+function renderSubtasks(job){const subtasks=jobSubtasks(job);if(taskStatus)taskStatus.textContent=taskStatusLabels[job.status]||job.status||'等待';for(const row of taskSteps?.querySelectorAll('[data-subtask]')||[]){const key=row.dataset.subtask;row.hidden=job.kind==='document_cleanup'||(job.kind==='schema_reassessment'&&key!=='schema_base')||(job.kind==='content_preparation'&&['extraction','graph_sync'].includes(key));const data=subtasks[key]||{status:'waiting',progress:0,detail:''},progress=clampProgress(data.progress),status=data.status||'waiting',label=row.querySelector('[data-subtask-status]'),bar=row.querySelector('[data-subtask-bar]');row.className='task-step '+status;if(label){if(status==='completed')label.textContent='已完成'+(data.detail?' · '+data.detail:'');else if(status==='failed')label.textContent='失败'+(data.detail?' · '+data.detail:'');else if(status==='cancelled')label.textContent='已取消';else if(status==='running')label.textContent=progress+'%'+(data.detail?' · '+data.detail:'');else label.textContent='等待'}if(bar)bar.style.width=progress+'%'}}
+function formatDuration(seconds){const value=Math.max(0,Math.floor(Number(seconds)||0)),hours=Math.floor(value/3600),minutes=Math.floor(value%3600/60),secs=value%60;return(hours?String(hours).padStart(2,'0')+':':'')+String(minutes).padStart(2,'0')+':'+String(secs).padStart(2,'0')}
+let lastStatisticsRefresh=0;
+async function refreshStatistics(force=false){if(!window.KF.projectId||(!force&&Date.now()-lastStatisticsRefresh<2000))return;lastStatisticsRefresh=Date.now();try{const response=await fetch('/api/projects/'+window.KF.projectId+'/statistics?strategy='+encodeURIComponent(window.KF.strategyKey)),data=await response.json();if(!response.ok)return;for(const key of ['documents','chunks','entities','relations']){const target=document.querySelector('[data-stat="'+key+'"]');if(target)target.textContent=Number(data[key]||0).toLocaleString()}}catch(_error){}}
+function applyJobReadiness(job){const metadata=job.metadata||{},documentId=job.document_id||metadata.document_id;if(documentId){const structure=document.querySelector('[data-view-structure="'+documentId+'"]'),chunks=document.querySelector('[data-view-chunks="'+documentId+'"]'),label=document.querySelector('[data-stage-label="'+documentId+'"]'),status=document.querySelector('[data-document-status="'+documentId+'"]');if(structure&&metadata.structure_ready)structure.disabled=false;if(chunks&&metadata.chunks_ready)chunks.disabled=false;if(label&&metadata.stage)label.textContent=stageLabels[metadata.stage]||metadata.stage;if(status){let state=job.status==='completed'?'indexed':job.status==='failed'?'failed':job.status==='running'?'processing':'uploaded',text={uploaded:'已上传',processing:'处理中',indexed:'已入库',failed:'失败'}[state];if(job.kind==='content_preparation'){state=job.status==='failed'?'failed':job.status==='running'?'processing':'uploaded';text=job.status==='completed'?'预处理完成':job.status==='failed'?'预处理失败':job.status==='running'?'预处理中':'等待预处理'}status.className='status status-'+state;status.textContent=text||job.status}}const graph=document.querySelector('#view-knowledge-graph');if(graph&&metadata.graph_ready){graph.classList.remove('disabled-link');graph.setAttribute('aria-disabled','false')}}
+function monitor(id,kind='',batch=''){if(!id)return;box.hidden=false;box.dataset.job=id;box.dataset.batch=batch;box.dataset.kind=kind;const target=['ingestion','content_preparation'].includes(kind)?ingestionLogButton:null;if(target){target.dataset.job=id;target.dataset.batch=batch;target.disabled=false}if(taskTitle)taskTitle.textContent=kind==='graph_sync'?'知识图谱同步':kind==='schema_reassessment'?'Schema 重新评估':kind==='document_cleanup'?'文档清理':kind==='content_preparation'?'文档预处理':'知识库构建';const tick=async()=>{try{const endpoint=batch?'/api/job-batches/'+batch:'/api/jobs/'+id,res=await fetch(endpoint),job=await res.json();if(!res.ok)throw new Error(job.error||'任务状态读取失败');const keepBottom=log.scrollHeight-log.scrollTop-log.clientHeight<36;log.textContent=(job.log||[]).join('\n');if(keepBottom)log.scrollTop=log.scrollHeight;renderSubtasks(job);if(taskDuration)taskDuration.textContent='用时 '+formatDuration(job.elapsed_seconds);for(const item of job.jobs||[job])applyJobReadiness(item);await refreshStatistics();if(['completed','failed','cancelled'].includes(job.status)){setTimeout(()=>location.reload(),900);return}}catch(error){if(taskStatus)taskStatus.textContent='状态读取失败';if(log)log.textContent+='\n'+(error.message||'任务状态读取失败')}setTimeout(tick,800)};tick()}
+if(box?.dataset.job)monitor(box.dataset.job,box.dataset.kind||'',box.dataset.batch||'');
+document.querySelector('#build-project-knowledge')?.addEventListener('click',async event=>{const button=event.currentTarget;if(fileInput?.files?.length){alert('请先上传当前已选择的文件，再执行知识构建。');return}button.disabled=true;const original=button.textContent;button.textContent='提交中...';try{const response=await fetch('/api/projects/'+button.dataset.buildProject+'/ingest?strategy='+encodeURIComponent(window.KF.strategyKey),{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'知识构建提交失败');for(const status of document.querySelectorAll('[data-document-status]')){if(!status.classList.contains('status-indexed')){status.className='status status-queued';status.textContent='排队中'}}monitor(data.job_id,'ingestion',data.batch_id||'')}catch(error){alert(error.message||'知识构建提交失败');button.disabled=false;button.textContent=original}});
+document.querySelector('#prepare-project-documents')?.addEventListener('click',async event=>{const button=event.currentTarget;if(fileInput?.files?.length){alert('请先上传当前已选择的文件，再执行预处理。');return}button.disabled=true;const original=button.textContent;button.textContent='提交中...';try{const response=await fetch('/api/projects/'+button.dataset.prepareProject+'/prepare',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'文档预处理提交失败');monitor(data.job_id,'content_preparation',data.batch_id||'')}catch(error){alert(error.message||'文档预处理提交失败');button.disabled=false;button.textContent=original}});
 const deleteDialog=document.querySelector('#delete-progress-dialog'),deleteSpinner=document.querySelector('#delete-progress-spinner'),deleteResult=document.querySelector('#delete-progress-result'),deleteTitle=document.querySelector('#delete-progress-title'),deleteMessage=document.querySelector('#delete-progress-message'),deleteDetail=document.querySelector('#delete-progress-detail'),deleteBar=document.querySelector('#delete-progress-bar'),deleteClose=document.querySelector('#delete-progress-close');let deletePollTimer=null;
 function updateDeleteProgress(progress,title,detail){deleteBar.style.width=clampProgress(progress)+'%';deleteTitle.textContent=title;deleteDetail.textContent=detail||''}
 function finishDeleteProgress(success,title,detail){deleteSpinner.hidden=true;deleteResult.hidden=false;deleteResult.className='delete-result '+(success?'success':'failure');deleteResult.textContent=success?'✓':'!';updateDeleteProgress(100,title,detail);deleteClose.disabled=false;if(success)setTimeout(()=>location.reload(),1300)}
@@ -476,8 +644,8 @@ processingSelects?.querySelectorAll('select').forEach(select=>select.addEventLis
 const jobDialog=document.querySelector('#job-log-dialog'),jobHistory=document.querySelector('#job-history-log'),jobSummary=document.querySelector('#job-log-summary'),jobError=document.querySelector('#job-log-error');
 const jobStatus={queued:'排队中',running:'执行中',completed:'已完成',failed:'失败',cancelled:'已取消'};
 function jobStageSummary(job){const key=job.metadata?.active_subtask,step=jobSubtasks(job)[key];if(!key||!step)return'';const suffix=step.status==='completed'?'已完成':step.status==='running'?clampProgress(step.progress)+'%':step.status==='failed'?'失败':step.status==='cancelled'?'已取消':'等待';return(subtaskLabels[key]||key)+' · '+suffix+(step.detail?' · '+step.detail:'')}
-async function showJobLog(id){if(!id)return;jobDialog?.showModal();jobSummary.textContent='正在读取任务日志...';jobHistory.textContent='';jobError.hidden=true;const response=await fetch('/api/jobs/'+id),job=await response.json();if(!response.ok){jobSummary.textContent='日志读取失败';jobError.textContent=job.error||'任务不存在';jobError.hidden=false;return}const degraded=Number(job.metadata?.extraction_errors||0),stageSummary=jobStageSummary(job);jobSummary.textContent=(jobStatus[job.status]||job.status)+(stageSummary?' · '+stageSummary:'')+(degraded?' · '+degraded+' 个知识块已降级':'');jobHistory.textContent=(job.log||[]).join('\n')||'该任务暂无日志。';if(job.error_message){jobError.textContent=job.error_message;jobError.hidden=false}}
-document.querySelectorAll('[data-view-job-log]').forEach(button=>button.addEventListener('click',()=>showJobLog(button.dataset.job)));
+async function showJobLog(id,batch=''){if(!id)return;jobDialog?.showModal();jobSummary.textContent='正在读取任务日志...';jobHistory.textContent='';jobError.hidden=true;const endpoint=batch?'/api/job-batches/'+batch:'/api/jobs/'+id,response=await fetch(endpoint),job=await response.json();if(!response.ok){jobSummary.textContent='日志读取失败';jobError.textContent=job.error||'任务不存在';jobError.hidden=false;return}const degraded=Number(job.metadata?.extraction_errors||0),stageSummary=jobStageSummary(job),count=Number(job.document_count||0);jobSummary.textContent=(jobStatus[job.status]||job.status)+(count?' · '+count+' 个文档':'')+' · 用时 '+formatDuration(job.elapsed_seconds)+(stageSummary?' · '+stageSummary:'')+(degraded?' · '+degraded+' 个知识块已降级':'');jobHistory.textContent=(job.log||[]).join('\n')||'该任务暂无日志。';if(job.error_message){jobError.textContent=job.error_message;jobError.hidden=false}}
+document.querySelectorAll('[data-view-job-log]').forEach(button=>button.addEventListener('click',()=>showJobLog(button.dataset.job,button.dataset.batch||'')));
 document.querySelectorAll('[data-close-job-log]').forEach(button=>button.addEventListener('click',()=>jobDialog?.close()));
 jobDialog?.addEventListener('click',event=>{if(event.target===jobDialog)jobDialog.close()});
 const structureDialog=document.querySelector('#structure-dialog'),structureSummary=document.querySelector('#structure-summary'),structureError=document.querySelector('#structure-error'),structureTools=document.querySelector('#structure-tools'),structureList=document.querySelector('#structure-list'),structureSearch=document.querySelector('#structure-search'),structureType=document.querySelector('#structure-type'),structurePager=document.querySelector('#structure-pager'),structureRange=document.querySelector('#structure-range'),structurePrev=document.querySelector('#structure-prev'),structureNext=document.querySelector('#structure-next');

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import logging
 from datetime import datetime, timezone
@@ -24,6 +25,27 @@ logging.getLogger("client").setLevel(logging.CRITICAL)
 
 
 class HugeGraphStore:
+    INDEX_DEFINITIONS = (
+        ("kfDocumentByNamespace", "V", "KFDocument", "kf_namespace_id"),
+        ("kfDocumentByProject", "V", "KFDocument", "kf_project_id"),
+        ("kfDocumentByDocument", "V", "KFDocument", "kf_doc_id"),
+        ("kfChunkByNamespace", "V", "KFChunk", "kf_namespace_id"),
+        ("kfChunkByProject", "V", "KFChunk", "kf_project_id"),
+        ("kfChunkByDocument", "V", "KFChunk", "kf_doc_id"),
+        ("kfEntityByNamespace", "V", "KFEntity", "kf_namespace_id"),
+        ("kfEntityByProject", "V", "KFEntity", "kf_project_id"),
+        ("kfEntityByName", "V", "KFEntity", "kf_normalized_name"),
+        ("kfContainsByNamespace", "E", "kf_contains", "kf_namespace_id"),
+        ("kfContainsByProject", "E", "kf_contains", "kf_project_id"),
+        ("kfContainsByDocument", "E", "kf_contains", "kf_doc_id"),
+        ("kfMentionByNamespace", "E", "kf_mentions", "kf_namespace_id"),
+        ("kfMentionByProject", "E", "kf_mentions", "kf_project_id"),
+        ("kfMentionByDocument", "E", "kf_mentions", "kf_doc_id"),
+        ("kfRelationByNamespace", "E", "kf_related", "kf_namespace_id"),
+        ("kfRelationByProject", "E", "kf_related", "kf_project_id"),
+        ("kfRelationByDocument", "E", "kf_related", "kf_doc_id"),
+    )
+
     def __init__(self, database: Database):
         self.db = database
         self._writer_records: dict[tuple[str, int], GraphManifestAccumulator] = {}
@@ -44,6 +66,29 @@ class HugeGraphStore:
         response.raise_for_status()
         return response.json().get("graphs") or []
 
+    @staticmethod
+    def _append_missing_label_properties(
+        schema: Any,
+        *,
+        label_type: str,
+        label: str,
+        properties: list[str],
+    ) -> list[str]:
+        """Upgrade an existing label while keeping its historical records valid."""
+
+        getter = schema.getVertexLabel if label_type == "vertex" else schema.getEdgeLabel
+        existing = getter(label)
+        if isinstance(existing, dict):
+            current = set(existing.get("properties") or [])
+        else:
+            current = set(getattr(existing, "properties", None) or [])
+        missing = [name for name in properties if name not in current]
+        if not missing:
+            return []
+        builder = schema.vertexLabel(label) if label_type == "vertex" else schema.edgeLabel(label)
+        builder.properties(*missing).nullableKeys(*missing).append()
+        return missing
+
     def ensure_schema(self) -> dict[str, Any]:
         if Config.hugegraph_graph not in self.available_graphs():
             raise RuntimeError(
@@ -58,6 +103,7 @@ class HugeGraphStore:
             "kf_normalized_name": "text", "kf_entity_type": "text", "kf_relation_type": "text",
             "kf_description": "text", "kf_source_url": "text", "kf_schema_version": "int",
             "kf_confidence": "double", "kf_updated_at": "text",
+            "kf_strategy_key": "text",
         }
         for name, kind in props.items():
             builder = schema.propertyKey(name)
@@ -68,43 +114,41 @@ class HugeGraphStore:
 
         common = [
             "kf_namespace_id", "kf_graph_generation", "kf_policy_hash",
-            "kf_project_id", "kf_project_key", "kf_updated_at",
+            "kf_project_id", "kf_project_key", "kf_updated_at", "kf_strategy_key",
         ]
         document_props = [*common, "kf_doc_id", "kf_name", "kf_source_url", "kf_schema_version"]
         chunk_props = [*common, "kf_doc_id", "kf_chunk_id", "kf_name", "kf_source_url", "kf_schema_version"]
         entity_props = [*common, "kf_entity_id", "kf_name", "kf_normalized_name", "kf_entity_type", "kf_description", "kf_schema_version"]
         for label, values, nullable in [
-            ("KFDocument", document_props, ["kf_source_url"]),
-            ("KFChunk", chunk_props, ["kf_name", "kf_source_url"]),
-            ("KFEntity", entity_props, ["kf_description"]),
+            ("KFDocument", document_props, ["kf_source_url", "kf_strategy_key"]),
+            ("KFChunk", chunk_props, ["kf_name", "kf_source_url", "kf_strategy_key"]),
+            ("KFEntity", entity_props, ["kf_description", "kf_strategy_key"]),
         ]:
             schema.vertexLabel(label).properties(*values).nullableKeys(*nullable).useCustomizeStringId().ifNotExist().create()
+            self._append_missing_label_properties(
+                schema, label_type="vertex", label=label, properties=values,
+            )
 
         edge_common = [
             "kf_namespace_id", "kf_graph_generation", "kf_policy_hash",
             "kf_project_id", "kf_project_key", "kf_doc_id", "kf_updated_at",
+            "kf_strategy_key",
         ]
-        schema.edgeLabel("kf_contains").sourceLabel("KFDocument").targetLabel("KFChunk").properties(*edge_common).nullableKeys("kf_doc_id").ifNotExist().create()
+        schema.edgeLabel("kf_contains").sourceLabel("KFDocument").targetLabel("KFChunk").properties(*edge_common).nullableKeys("kf_doc_id", "kf_strategy_key").ifNotExist().create()
         mention_props = [*edge_common, "kf_chunk_id", "kf_mention_id", "kf_confidence", "kf_description"]
-        schema.edgeLabel("kf_mentions").sourceLabel("KFChunk").targetLabel("KFEntity").properties(*mention_props).nullableKeys("kf_description").multiTimes().sortKeys("kf_mention_id").ifNotExist().create()
+        schema.edgeLabel("kf_mentions").sourceLabel("KFChunk").targetLabel("KFEntity").properties(*mention_props).nullableKeys("kf_description", "kf_strategy_key").multiTimes().sortKeys("kf_mention_id").ifNotExist().create()
         relation_props = [*edge_common, "kf_chunk_id", "kf_assertion_id", "kf_relation_type", "kf_description", "kf_confidence", "kf_schema_version"]
-        schema.edgeLabel("kf_related").sourceLabel("KFEntity").targetLabel("KFEntity").properties(*relation_props).nullableKeys("kf_description").multiTimes().sortKeys("kf_assertion_id").ifNotExist().create()
+        schema.edgeLabel("kf_related").sourceLabel("KFEntity").targetLabel("KFEntity").properties(*relation_props).nullableKeys("kf_description", "kf_strategy_key").multiTimes().sortKeys("kf_assertion_id").ifNotExist().create()
+        for label, values in [
+            ("kf_contains", edge_common),
+            ("kf_mentions", mention_props),
+            ("kf_related", relation_props),
+        ]:
+            self._append_missing_label_properties(
+                schema, label_type="edge", label=label, properties=values,
+            )
 
-        indexes = [
-            ("kfDocumentByNamespace", "V", "KFDocument", "kf_namespace_id"),
-            ("kfDocumentByProject", "V", "KFDocument", "kf_project_id"),
-            ("kfDocumentByDocument", "V", "KFDocument", "kf_doc_id"),
-            ("kfChunkByNamespace", "V", "KFChunk", "kf_namespace_id"),
-            ("kfChunkByProject", "V", "KFChunk", "kf_project_id"),
-            ("kfChunkByDocument", "V", "KFChunk", "kf_doc_id"),
-            ("kfEntityByNamespace", "V", "KFEntity", "kf_namespace_id"),
-            ("kfEntityByProject", "V", "KFEntity", "kf_project_id"),
-            ("kfEntityByName", "V", "KFEntity", "kf_normalized_name"),
-            ("kfRelationByNamespace", "E", "kf_related", "kf_namespace_id"),
-            ("kfRelationByProject", "E", "kf_related", "kf_project_id"),
-            ("kfRelationByDocument", "E", "kf_related", "kf_doc_id"),
-        ]
-        for name, on, label, prop in indexes:
+        for name, on, label, prop in self.INDEX_DEFINITIONS:
             builder = schema.indexLabel(name)
             (builder.onV(label) if on == "V" else builder.onE(label)).by(prop).secondary().ifNotExist().create()
         return {"graph": Config.hugegraph_graph, "vertex_labels": 3, "edge_labels": 3}
@@ -120,6 +164,15 @@ class HugeGraphStore:
     @staticmethod
     def entity_vertex_id(namespace_id: str, entity_id: int) -> str:
         return f"kf:entity:{namespace_id}:{entity_id}"
+
+    @staticmethod
+    def shadow_entity_vertex_id(namespace_id: str, canonical_key: str) -> str:
+        digest = hashlib.sha256(str(canonical_key).encode("utf-8")).hexdigest()
+        return f"kf:shadow-entity:{namespace_id}:{digest}"
+
+    @staticmethod
+    def _stable_int(value: str) -> int:
+        return int(hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:7], 16)
 
     def _validate_mutation(
         self, project: dict[str, Any], mutation: GraphMutationContext | None,
@@ -169,6 +222,7 @@ class HugeGraphStore:
         """Read every matching edge through HugeGraph's cursor pagination."""
         page = None
         seen_pages: set[str] = set()
+        seen_ids: set[str] = set()
         while True:
             result = graph.getEdgeByPage(
                 **conditions,
@@ -181,7 +235,13 @@ class HugeGraphStore:
                 items, next_page = result
             else:
                 items, next_page = result, None
-            yield from items or []
+            for item in items or []:
+                item_id = str(getattr(item, "id", ""))
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+                yield item
             if not next_page:
                 return
             marker = str(next_page)
@@ -195,6 +255,7 @@ class HugeGraphStore:
         """Read every matching vertex through HugeGraph's cursor pagination."""
         page = None
         seen_pages: set[str] = set()
+        seen_ids: set[str] = set()
         while True:
             result = graph.getVertexByPage(
                 label=label,
@@ -208,7 +269,13 @@ class HugeGraphStore:
                 items, next_page = result
             else:
                 items, next_page = result, None
-            yield from items or []
+            for item in items or []:
+                item_id = str(getattr(item, "id", ""))
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+                yield item
             if not next_page:
                 return
             marker = str(next_page)
@@ -257,6 +324,7 @@ class HugeGraphStore:
             "kf_namespace_id": namespace, "kf_graph_generation": mutation.generation,
             "kf_policy_hash": mutation.policy_hash, "kf_project_id": project_id,
             "kf_project_key": project["project_key"], "kf_updated_at": self._now(),
+            "kf_strategy_key": str(project.get("_strategy_key") or "stable"),
         }
         doc_vertex_id = self.document_vertex_id(namespace, document_id)
         doc_properties = {**common, "kf_doc_id": document_id,
@@ -292,7 +360,8 @@ class HugeGraphStore:
         common = {"kf_namespace_id": namespace, "kf_graph_generation": mutation.generation,
             "kf_policy_hash": mutation.policy_hash, "kf_project_id": project_id,
             "kf_project_key": project["project_key"], "kf_doc_id": document_id,
-            "kf_updated_at": self._now()}
+            "kf_updated_at": self._now(),
+            "kf_strategy_key": str(project.get("_strategy_key") or "stable")}
         mentions = self.db.list_document_mentions(document_id)
         relations = self.db.list_document_relations(document_id)
         entities = {int(item["canonical_entity_id"]): item for item in mentions}
@@ -301,6 +370,7 @@ class HugeGraphStore:
             entity_properties = {"kf_namespace_id": namespace,
                 "kf_graph_generation": mutation.generation, "kf_policy_hash": mutation.policy_hash,
                 "kf_project_id": project_id, "kf_project_key": project["project_key"],
+                "kf_strategy_key": str(project.get("_strategy_key") or "stable"),
                 "kf_entity_id": entity_id, "kf_name": mention["name"], "kf_normalized_name": mention["normalized_name"],
                 "kf_entity_type": mention["entity_type"], "kf_description": mention.get("description") or "",
                 "kf_schema_version": int(project.get("active_schema_version") or 1), "kf_updated_at": self._now()}
@@ -376,6 +446,128 @@ class HugeGraphStore:
             for vertex in self._iter_vertices(graph, label, {"kf_namespace_id": namespace}):
                 graph.removeVertexById(vertex.id)
 
+    def replace_strategy_snapshot(
+        self,
+        project: dict[str, Any],
+        documents: list[dict[str, Any]],
+        chunks_by_document: dict[int, list[dict[str, Any]]],
+        shadow_snapshot: dict[str, Any],
+        *,
+        strategy_key: str,
+        mutation: GraphMutationContext,
+    ) -> dict[str, int]:
+        """Replace one isolated strategy graph from a complete shadow snapshot."""
+
+        scoped_project = {
+            **project,
+            "graph_namespace_id": mutation.namespace_id,
+            "graph_generation": mutation.generation,
+            "_strategy_key": strategy_key,
+        }
+        self._validate_mutation(scoped_project, mutation)
+        self.ensure_schema()
+        self.delete_project(scoped_project, mutation=mutation)
+        graph = self.client().graph()
+        counts = {
+            "documents": 0, "chunks": 0, "entities": 0,
+            "mentions": 0, "relations": 0,
+        }
+        for document in documents:
+            written = self._write_document_snapshot(
+                graph, scoped_project, document,
+                chunks_by_document.get(int(document["id"]), []), mutation,
+            )
+            counts["documents"] += int(written["documents"])
+            counts["chunks"] += int(written["chunks"])
+
+        namespace = mutation.namespace_id
+        common = {
+            "kf_namespace_id": namespace,
+            "kf_graph_generation": mutation.generation,
+            "kf_policy_hash": mutation.policy_hash,
+            "kf_project_id": int(project["id"]),
+            "kf_project_key": project["project_key"],
+            "kf_strategy_key": strategy_key,
+            "kf_updated_at": self._now(),
+        }
+        canonicals = shadow_snapshot.get("canonicals") or []
+        assignments = {
+            str(item["mention_key"]): str(item["canonical_key"])
+            for item in shadow_snapshot.get("assignments") or []
+        }
+        for canonical in canonicals:
+            canonical_key = str(canonical["canonical_key"])
+            vertex_id = self.shadow_entity_vertex_id(namespace, canonical_key)
+            metadata = canonical.get("metadata") or {}
+            properties = {
+                **common,
+                "kf_entity_id": self._stable_int(canonical_key),
+                "kf_name": str(canonical.get("name") or canonical_key),
+                "kf_normalized_name": str(canonical.get("normalized_name") or ""),
+                "kf_entity_type": str(canonical.get("primary_type") or "GenericEntity"),
+                "kf_description": str(metadata.get("description") or ""),
+                "kf_schema_version": int(project.get("active_schema_version") or 1),
+            }
+            self._upsert_vertex(graph, "KFEntity", vertex_id, properties)
+            self._record_writer(mutation, {
+                "kind": "vertex", "label": "KFEntity", "logical_id": vertex_id,
+                "properties": self._manifest_properties(properties),
+            })
+            counts["entities"] += 1
+
+        for mention in shadow_snapshot.get("mentions") or []:
+            mention_key = str(mention["mention_key"])
+            canonical_key = assignments.get(mention_key)
+            if not canonical_key:
+                raise RuntimeError(f"shadow mention 缺少 canonical assignment: {mention_key}")
+            source = self.chunk_vertex_id(namespace, int(mention["chunk_id"]))
+            target = self.shadow_entity_vertex_id(namespace, canonical_key)
+            properties = {
+                **common,
+                "kf_doc_id": int(mention["document_id"]),
+                "kf_chunk_id": int(mention["chunk_id"]),
+                "kf_mention_id": self._stable_int(mention_key),
+                "kf_confidence": float(mention.get("confidence") or 0.0),
+                "kf_description": str(mention.get("evidence_text") or ""),
+            }
+            graph.addEdge("kf_mentions", source, target, properties)
+            self._record_writer(mutation, {
+                "kind": "edge", "label": "kf_mentions",
+                "logical_id": f"shadow-mention:{mention_key}",
+                "source": source, "target": target, "direction": "out-in",
+                "properties": self._manifest_properties(properties),
+            })
+            counts["mentions"] += 1
+
+        for relation in shadow_snapshot.get("relation_endpoints") or []:
+            relation_key = str(relation["relation_key"])
+            source = self.shadow_entity_vertex_id(
+                namespace, str(relation["source_canonical_key"]),
+            )
+            target = self.shadow_entity_vertex_id(
+                namespace, str(relation["target_canonical_key"]),
+            )
+            metadata = relation.get("metadata") or {}
+            properties = {
+                **common,
+                "kf_doc_id": int(relation["document_id"]),
+                "kf_chunk_id": int(relation["chunk_id"]),
+                "kf_assertion_id": self._stable_int(relation_key),
+                "kf_relation_type": str(relation.get("relation_type") or "related_to"),
+                "kf_description": str(relation.get("evidence_text") or ""),
+                "kf_confidence": float(metadata.get("confidence") or 1.0),
+                "kf_schema_version": int(project.get("active_schema_version") or 1),
+            }
+            graph.addEdge("kf_related", source, target, properties)
+            self._record_writer(mutation, {
+                "kind": "edge", "label": "kf_related",
+                "logical_id": f"shadow-relation:{relation_key}",
+                "source": source, "target": target, "direction": "out-in",
+                "properties": self._manifest_properties(properties),
+            })
+            counts["relations"] += 1
+        return counts
+
     def _purge_document_graph(
         self, graph, namespace_id: str, document_id: int, keep_document: bool,
     ) -> None:
@@ -427,6 +619,7 @@ class HugeGraphStore:
                 "kf_namespace_id": namespace, "kf_graph_generation": mutation.generation,
                 "kf_policy_hash": mutation.policy_hash, "kf_project_id": project_id,
                 "kf_project_key": project["project_key"],
+                "kf_strategy_key": str(project.get("_strategy_key") or "stable"),
             }
             doc_id = self.document_vertex_id(namespace, document_id)
             add({"kind": "vertex", "label": "KFDocument", "logical_id": doc_id,

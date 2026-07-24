@@ -70,6 +70,15 @@ class Config:
     relation_review_max_output_tokens = int(os.getenv("RELATION_REVIEW_MAX_OUTPUT_TOKENS", "2048"))
     schema_review_max_output_tokens = int(os.getenv("SCHEMA_REVIEW_MAX_OUTPUT_TOKENS", "2048"))
     extraction_max_output_tokens = int(os.getenv("EXTRACTION_MAX_OUTPUT_TOKENS", "4096"))
+    entity_only_max_output_tokens = int(
+        os.getenv("ENTITY_ONLY_MAX_OUTPUT_TOKENS", "8192")
+    )
+    entity_only_segment_max_chars = max(
+        256, int(os.getenv("ENTITY_ONLY_SEGMENT_MAX_CHARS", "900"))
+    )
+    entity_only_max_items_per_segment = max(
+        8, int(os.getenv("ENTITY_ONLY_MAX_ITEMS_PER_SEGMENT", "48"))
+    )
     image_analysis_max_output_tokens = int(os.getenv("IMAGE_ANALYSIS_MAX_OUTPUT_TOKENS", "2048"))
     default_llm_model = os.getenv("DEFAULT_LLM_MODEL", "qwen3.6:latest")
     default_embedding_model = os.getenv("DEFAULT_EMBEDDING_MODEL", "bge-m3:latest")
@@ -181,13 +190,13 @@ class Config:
         "1", "true", "yes", "on",
     }
     relation_classifier_output_reserve = max(
-        128, int(os.getenv("RELATION_CLASSIFIER_OUTPUT_RESERVE", "512")),
+        128, int(os.getenv("RELATION_CLASSIFIER_OUTPUT_RESERVE", "2048")),
     )
     relation_classifier_safety_margin = max(
         128, int(os.getenv("RELATION_CLASSIFIER_SAFETY_MARGIN", "512")),
     )
     relation_classifier_max_candidates = max(
-        1, int(os.getenv("RELATION_CLASSIFIER_MAX_CANDIDATES", "32")),
+        1, min(32, int(os.getenv("RELATION_CLASSIFIER_MAX_CANDIDATES", "8"))),
     )
     relation_shadow_max_attempts = max(
         1, min(20, int(os.getenv("RELATION_SHADOW_MAX_ATTEMPTS", "3"))),

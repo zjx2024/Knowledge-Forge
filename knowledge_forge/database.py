@@ -20,6 +20,11 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from .config import Config
+from .construction_strategies import (
+    ENHANCED_SHADOW_STRATEGY,
+    STABLE_STRATEGY,
+    normalize_strategy,
+)
 from .entity_identity import normalize_name
 from .graph_manifest import GRAPH_MANIFEST_PROTOCOL
 from .graph_policy import (
@@ -766,7 +771,10 @@ class Database:
 
     @staticmethod
     def _column_exists(conn: psycopg.Connection, table: str, column: str) -> bool:
-        if not isinstance(conn, psycopg.Connection):
+        raw_connection = (
+            conn._connection if isinstance(conn, InstrumentedConnection) else conn
+        )
+        if not isinstance(raw_connection, psycopg.Connection):
             return False
         row = conn.execute(
             """SELECT EXISTS(
@@ -1122,6 +1130,7 @@ class Database:
         lease_token: str,
         manifest_digest: str,
         empty: bool = False,
+        stats: dict[str, int] | None = None,
     ) -> dict[str, Any] | None:
         """Publish a rebuild only if its immutable generation is still current."""
 
@@ -1149,7 +1158,7 @@ class Database:
                 or any(row["protocol"] != GRAPH_MANIFEST_PROTOCOL for row in manifests)
             ):
                 return None
-            return conn.execute(
+            project = conn.execute(
                 """UPDATE projects
                    SET graph_status=%s,graph_policy_version=%s,graph_policy_hash=%s,
                        active_policy_hash=%s,
@@ -1168,6 +1177,39 @@ class Database:
                     namespace_id,
                 ),
             ).fetchone()
+            if not project:
+                return None
+            strategy_status = "empty" if empty else "ready"
+            conn.execute(
+                """UPDATE project_strategy_graphs
+                   SET namespace_id=%s,generation=%s,ready_generation=%s,status=%s,
+                       error_message='',stats=COALESCE(%s::jsonb,stats),
+                       policy_summary=policy_summary ||
+                           jsonb_build_object(
+                               'policy_version',%s::text,
+                               'policy_hash',%s::text,
+                               'production_approved',TRUE
+                           ),
+                       updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s""",
+                (
+                    namespace_id,
+                    target_generation,
+                    target_generation,
+                    strategy_status,
+                    self._json(stats) if stats is not None else None,
+                    GRAPH_POLICY_VERSION,
+                    policy_hash,
+                    project_id,
+                    STABLE_STRATEGY,
+                ),
+            )
+            conn.execute(
+                """UPDATE documents SET graph_ready_at=NOW(),updated_at=NOW()
+                   WHERE project_id=%s AND status='indexed' AND is_deleted=FALSE""",
+                (project_id,),
+            )
+            return project
 
     def acquire_graph_lease(
         self, project_id: int, namespace_id: str, graph_generation: int,
@@ -1182,9 +1224,22 @@ class Database:
                 """SELECT graph_namespace_id,graph_generation FROM projects
                    WHERE id=%s AND is_deleted=FALSE FOR UPDATE""", (project_id,),
             ).fetchone()
-            if not project or str(project["graph_namespace_id"]) != str(namespace_id):
+            if not project:
+                raise RuntimeError("graph lease project does not exist")
+            owner_generation: int | None = None
+            if str(project["graph_namespace_id"]) == str(namespace_id):
+                owner_generation = int(project["graph_generation"])
+            else:
+                strategy_graph = conn.execute(
+                    """SELECT generation FROM project_strategy_graphs
+                       WHERE project_id=%s AND namespace_id=%s FOR UPDATE""",
+                    (project_id, namespace_id),
+                ).fetchone()
+                if strategy_graph:
+                    owner_generation = int(strategy_graph["generation"])
+            if owner_generation is None:
                 raise RuntimeError("graph lease namespace does not own project")
-            if int(project["graph_generation"]) != int(graph_generation):
+            if owner_generation != int(graph_generation):
                 raise RuntimeError("graph lease generation is stale")
             conn.execute(
                 """UPDATE graph_leases SET status='superseded',released_at=NOW()
@@ -1367,15 +1422,289 @@ class Database:
         with self.connection() as conn:
             return conn.execute("SELECT * FROM documents WHERE project_id=%s AND doc_hash=%s", (project_id, doc_hash)).fetchone()
 
-    def list_documents(self, project_id: int | None = None) -> list[dict[str, Any]]:
+    def list_documents(
+        self,
+        project_id: int | None = None,
+        strategy_key: str = "",
+    ) -> list[dict[str, Any]]:
         condition, params = "d.is_deleted=FALSE", []
         if project_id:
             condition += " AND d.project_id=%s"; params.append(project_id)
+        strategy = normalize_strategy(strategy_key) if strategy_key else STABLE_STRATEGY
+        params.insert(0, strategy)
         with self.connection() as conn:
             return conn.execute(
-                f"""SELECT d.*,p.name AS project_name FROM documents d JOIN projects p ON p.id=d.project_id
+                f"""SELECT d.*,p.name AS project_name,
+                    COALESCE(build.status,'uploaded') AS strategy_status,
+                    COALESCE(build.error_message,'') AS strategy_error_message,
+                    COALESCE(build.stats,'{{}}'::jsonb) AS strategy_stats,
+                    build.latest_job_id AS strategy_job_id,
+                    build.content_revision_id AS strategy_revision_id,
+                    build.started_at AS strategy_started_at,
+                    build.completed_at AS strategy_completed_at,
+                    build.updated_at AS strategy_updated_at
+                FROM documents d JOIN projects p ON p.id=d.project_id
+                LEFT JOIN document_strategy_builds build
+                  ON build.document_id=d.id AND build.strategy_key=%s
                 WHERE {condition} ORDER BY d.updated_at DESC,d.id DESC""", params
             ).fetchall()
+
+    def ensure_project_strategy_graphs(self, project_id: int) -> list[dict[str, Any]]:
+        """Create the two durable graph scopes for a newly created project."""
+
+        with self.connection() as conn:
+            project = conn.execute(
+                "SELECT * FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            conn.execute(
+                """INSERT INTO project_strategy_graphs(
+                       project_id,strategy_key,namespace_id,generation,ready_generation,
+                       status,error_message,policy_summary,updated_at)
+                   VALUES(%s,'stable',%s,%s,%s,%s,%s,%s::jsonb,NOW())
+                   ON CONFLICT(project_id,strategy_key) DO UPDATE SET
+                     namespace_id=EXCLUDED.namespace_id,generation=EXCLUDED.generation,
+                     ready_generation=EXCLUDED.ready_generation,status=EXCLUDED.status,
+                     error_message=EXCLUDED.error_message,
+                     policy_summary=EXCLUDED.policy_summary,updated_at=NOW()""",
+                (
+                    project_id, project["graph_namespace_id"], project["graph_generation"],
+                    project["graph_ready_generation"], project["graph_status"],
+                    project.get("graph_error") or "",
+                    self._json({
+                        "policy_version": project.get("graph_policy_version") or "",
+                        "policy_hash": project.get("graph_policy_hash") or "",
+                        "production_approved": True,
+                    }),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO project_strategy_graphs(
+                       project_id,strategy_key,namespace_id,status,policy_summary)
+                   VALUES(%s,'enhanced_shadow',%s,'empty',%s::jsonb)
+                   ON CONFLICT(project_id,strategy_key) DO NOTHING""",
+                (
+                    project_id,
+                    str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"knowledge-forge:{project['graph_namespace_id']}:enhanced-shadow",
+                    )),
+                    self._json({"mode": "shadow", "production_approved": False}),
+                ),
+            )
+            conn.execute(
+                """UPDATE project_strategy_graphs graph
+                   SET stats='{}'::jsonb,updated_at=NOW()
+                   WHERE graph.project_id=%s
+                     AND NOT EXISTS(
+                         SELECT 1 FROM documents active_document
+                         WHERE active_document.project_id=graph.project_id
+                           AND active_document.is_deleted=FALSE
+                     )
+                     AND graph.stats<>'{}'::jsonb""",
+                (project_id,),
+            )
+            return conn.execute(
+                """SELECT * FROM project_strategy_graphs
+                   WHERE project_id=%s ORDER BY strategy_key""",
+                (project_id,),
+            ).fetchall()
+
+    def ensure_document_strategy_builds(
+        self, document_id: int, *, reset: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Ensure each strategy has an independent state row for the source file."""
+
+        with self.connection() as conn:
+            document = conn.execute(
+                "SELECT project_id FROM documents WHERE id=%s FOR UPDATE", (document_id,),
+            ).fetchone()
+            if not document:
+                raise LookupError("文档不存在")
+            for strategy in ("stable", "enhanced_shadow"):
+                conn.execute(
+                    """INSERT INTO document_strategy_builds(
+                           project_id,document_id,strategy_key,status,error_message,stats)
+                       VALUES(%s,%s,%s,'uploaded','','{}'::jsonb)
+                       ON CONFLICT(document_id,strategy_key) DO UPDATE SET
+                         status=CASE WHEN %s THEN 'uploaded'
+                                     ELSE document_strategy_builds.status END,
+                         content_revision_id=CASE WHEN %s THEN NULL
+                                                  ELSE document_strategy_builds.content_revision_id END,
+                         latest_job_id=CASE WHEN %s THEN NULL
+                                            ELSE document_strategy_builds.latest_job_id END,
+                         stats=CASE WHEN %s THEN '{}'::jsonb ELSE document_strategy_builds.stats END,
+                         error_message=CASE WHEN %s THEN ''
+                                            ELSE document_strategy_builds.error_message END,
+                         started_at=CASE WHEN %s THEN NULL ELSE document_strategy_builds.started_at END,
+                         completed_at=CASE WHEN %s THEN NULL ELSE document_strategy_builds.completed_at END,
+                         updated_at=NOW()""",
+                    (
+                        document["project_id"], document_id, strategy,
+                        reset, reset, reset, reset, reset, reset, reset,
+                    ),
+                )
+            return conn.execute(
+                """SELECT * FROM document_strategy_builds
+                   WHERE document_id=%s ORDER BY strategy_key""",
+                (document_id,),
+            ).fetchall()
+
+    def get_document_strategy_build(
+        self, document_id: int, strategy_key: str,
+    ) -> dict[str, Any] | None:
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM document_strategy_builds
+                   WHERE document_id=%s AND strategy_key=%s""",
+                (document_id, strategy_key),
+            ).fetchone()
+
+    def update_document_strategy_build(
+        self, document_id: int, strategy_key: str, **values: Any,
+    ) -> dict[str, Any]:
+        strategy_key = normalize_strategy(strategy_key)
+        allowed = {
+            "status", "content_revision_id", "latest_job_id", "stats",
+            "error_message", "started_at", "completed_at",
+        }
+        fields = [name for name in values if name in allowed]
+        if not fields:
+            row = self.get_document_strategy_build(document_id, strategy_key)
+            if not row:
+                raise LookupError("文档策略状态不存在")
+            return row
+        assignments = ",".join(
+            f"{name}={'%s::jsonb' if name == 'stats' else '%s'}" for name in fields
+        )
+        params = [
+            self._json(values[name]) if name == "stats" and not isinstance(values[name], str)
+            else values[name]
+            for name in fields
+        ]
+        with self.connection() as conn:
+            row = conn.execute(
+                f"""UPDATE document_strategy_builds SET {assignments},updated_at=NOW()
+                    WHERE document_id=%s AND strategy_key=%s RETURNING *""",
+                (*params, document_id, strategy_key),
+            ).fetchone()
+            if not row:
+                raise LookupError("文档策略状态不存在")
+            return row
+
+    def get_project_strategy_graph(
+        self, project_id: int, strategy_key: str,
+    ) -> dict[str, Any] | None:
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM project_strategy_graphs
+                   WHERE project_id=%s AND strategy_key=%s""",
+                (project_id, strategy_key),
+            ).fetchone()
+
+    def mark_strategy_graph_stale(
+        self, project_id: int, strategy_key: str, reason: str,
+    ) -> dict[str, Any]:
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE project_strategy_graphs
+                   SET generation=generation+1,status='stale',error_message=%s,
+                       lease_token='',lease_expires_at=NULL,updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s RETURNING *""",
+                (reason or "策略事实已更新，等待重建", project_id, strategy_key),
+            ).fetchone()
+            if not row:
+                raise LookupError("项目策略图状态不存在")
+            return row
+
+    def invalidate_enhanced_strategy_for_document(
+        self, document_id: int, *, reason: str,
+    ) -> None:
+        """Invalidate derived shadow results before the stable revision changes.
+
+        The enhanced strategy is a project-wide snapshot over stable revisions.  A
+        stable rebuild of one source therefore invalidates every document status
+        in that snapshot and any previously published enhanced project graph.
+        Empty graphs stay empty so a first baseline build is not presented as a
+        failed or stale experiment.
+        """
+
+        with self.connection() as conn:
+            document = conn.execute(
+                "SELECT project_id FROM documents WHERE id=%s AND is_deleted=FALSE",
+                (document_id,),
+            ).fetchone()
+            if not document:
+                raise LookupError("文档不存在或已删除")
+            conn.execute(
+                """UPDATE document_strategy_builds
+                   SET status='uploaded',content_revision_id=NULL,
+                       stats='{}'::jsonb,error_message='',started_at=NULL,
+                       completed_at=NULL,updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s AND status<>'deleted'""",
+                (document["project_id"], ENHANCED_SHADOW_STRATEGY),
+            )
+            conn.execute(
+                """UPDATE project_strategy_graphs
+                   SET generation=generation+1,status='stale',error_message=%s,
+                       lease_token='',lease_expires_at=NULL,updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s AND status<>'empty'""",
+                (
+                    reason or "稳定基线已更新，增强实验需要重新构建",
+                    document["project_id"], ENHANCED_SHADOW_STRATEGY,
+                ),
+            )
+
+    def start_strategy_graph_rebuild(
+        self, project_id: int, strategy_key: str,
+    ) -> dict[str, Any]:
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE project_strategy_graphs SET status='rebuilding',error_message='',
+                       updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s RETURNING *""",
+                (project_id, strategy_key),
+            ).fetchone()
+            if not row:
+                raise LookupError("项目策略图状态不存在")
+            return row
+
+    def complete_strategy_graph_rebuild(
+        self, project_id: int, strategy_key: str, generation: int,
+        *, stats: dict[str, Any], policy_summary: dict[str, Any], empty: bool = False,
+    ) -> dict[str, Any] | None:
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE project_strategy_graphs SET status=%s,ready_generation=%s,
+                       error_message='',stats=%s::jsonb,policy_summary=%s::jsonb,
+                       updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s AND generation=%s
+                   RETURNING *""",
+                (
+                    "empty" if empty else "ready", generation, self._json(stats),
+                    self._json(policy_summary), project_id, strategy_key, generation,
+                ),
+            ).fetchone()
+
+    def fail_strategy_graph_rebuild(
+        self, project_id: int, strategy_key: str, generation: int, error: str,
+    ) -> dict[str, Any] | None:
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE project_strategy_graphs SET status='failed',error_message=%s,
+                       updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s AND generation=%s
+                   RETURNING *""",
+                (error[:2000], project_id, strategy_key, generation),
+            ).fetchone()
 
     def count_documents(self, project_id: int) -> int:
         with self.connection() as conn:
@@ -1531,6 +1860,11 @@ class Database:
         """Atomically publish a complete revision and advance the graph generation."""
 
         document_values = dict(document_values or {})
+        # Revision publication owns these fields. Callers may still send the
+        # legacy content_version value, but it must never produce a duplicate
+        # assignment in the UPDATE statement.
+        for reserved in ("active_revision_id", "content_version", "updated_at"):
+            document_values.pop(reserved, None)
         json_fields = {"metadata", "chunk_config", "parse_quality"}
         with self.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (document_id,))
@@ -1681,6 +2015,12 @@ class Database:
                 WHERE id=%s AND is_deleted=FALSE RETURNING *""", (document_id,)
             ).fetchone()
             if row:
+                conn.execute(
+                    """UPDATE document_strategy_builds
+                       SET status='deleted',error_message='',completed_at=NOW(),updated_at=NOW()
+                       WHERE document_id=%s""",
+                    (document_id,),
+                )
                 self._retire_orphan_entities(
                     conn, project_id=int(scope["project_id"]), entity_ids=affected_ids,
                 )
@@ -1690,6 +2030,22 @@ class Database:
                            graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
                        WHERE id=%s AND is_deleted=FALSE""",
                     (GRAPH_STALE, "项目文档已删除，图谱正在重新收敛", row["project_id"]),
+                )
+                conn.execute(
+                    """UPDATE project_strategy_graphs
+                       SET generation=generation+1,status='stale',
+                           stats=CASE WHEN NOT EXISTS(
+                               SELECT 1 FROM documents active_document
+                               WHERE active_document.project_id=%s
+                                 AND active_document.is_deleted=FALSE
+                           ) THEN '{}'::jsonb ELSE stats END,
+                           error_message=%s,lease_token='',lease_expires_at=NULL,updated_at=NOW()
+                       WHERE project_id=%s""",
+                    (
+                        row["project_id"],
+                        "项目文档已删除，当前方案图谱需要重新构建",
+                        row["project_id"],
+                    ),
                 )
             return row
 
@@ -1784,8 +2140,14 @@ class Database:
         with self.connection() as conn:
             return conn.execute(
                 """SELECT c.*,s.title AS section_title FROM chunks c LEFT JOIN sections s ON s.id=c.section_id
-                JOIN documents d ON d.id=c.document_id AND d.active_revision_id=c.revision_id
+                JOIN documents d ON d.id=c.document_id
                 WHERE c.document_id=%s AND c.is_deleted=FALSE AND d.is_deleted=FALSE
+                AND c.revision_id=COALESCE(
+                    (SELECT revision.revision_id FROM document_content_revisions revision
+                     WHERE revision.document_id=d.id AND revision.status='building'
+                     ORDER BY revision.content_version DESC,revision.created_at DESC LIMIT 1),
+                    d.active_revision_id
+                )
                 ORDER BY c.chunk_index,c.id""", (document_id,)
             ).fetchall()
 
@@ -2020,7 +2382,7 @@ class Database:
                        document.is_deleted=FALSE
                        AND document.active_revision_id=failure.revision_id
                    ))
-                   AND status='pending' AND next_attempt_at<=NOW()
+                   AND failure.status='pending' AND failure.next_attempt_at<=NOW()
                    ORDER BY failure.next_attempt_at,failure.id LIMIT %s""",
                 (project_id, object_type, page_size),
             ).fetchall()
@@ -2089,13 +2451,13 @@ class Database:
     ) -> list[dict[str, Any]]:
         with self.connection() as conn:
             return conn.execute(
-                """SELECT id,project_id,document_id,chunk_id,object_type,object_key,content,
-                          model_name,embedding,dimension,metadata
+                """SELECT v.id,v.project_id,v.document_id,v.chunk_id,v.object_type,
+                          v.object_key,v.content,v.model_name,v.embedding,v.dimension,v.metadata
                    FROM vector_embeddings v JOIN documents d
                      ON d.id=v.document_id AND d.active_revision_id=v.revision_id
                    WHERE v.document_id=%s AND v.object_type=%s AND v.model_name=%s
                      AND v.is_deleted=FALSE AND d.is_deleted=FALSE
-                   ORDER BY chunk_id,id""",
+                   ORDER BY v.chunk_id,v.id""",
                 (document_id, object_type, model_name),
             ).fetchall()
 
@@ -2150,10 +2512,23 @@ class Database:
             ).fetchone()
             return float(row["score"]) if row and row.get("score") is not None else None
 
-    def create_job(self, kind: str, project_id: int | None = None, document_id: int | None = None) -> dict[str, Any]:
+    def create_job(
+        self,
+        kind: str,
+        project_id: int | None = None,
+        document_id: int | None = None,
+        *,
+        metadata: dict[str, Any] | None = None,
+        strategy_key: str = STABLE_STRATEGY,
+    ) -> dict[str, Any]:
+        strategy_key = normalize_strategy(strategy_key)
         job_id = uuid.uuid4().hex
         with self.connection() as conn:
-            return conn.execute("INSERT INTO jobs(id,kind,project_id,document_id) VALUES(%s,%s,%s,%s) RETURNING *", (job_id,kind,project_id,document_id)).fetchone()
+            return conn.execute(
+                """INSERT INTO jobs(id,kind,project_id,document_id,metadata,strategy_key)
+                   VALUES(%s,%s,%s,%s,%s::jsonb,%s) RETURNING *""",
+                (job_id, kind, project_id, document_id, self._json(metadata), strategy_key),
+            ).fetchone()
 
     def create_graph_rebuild_job(self, project_id: int) -> dict[str, Any]:
         """Queue or coalesce one rebuild at the project's current generation."""
@@ -2254,6 +2629,27 @@ class Database:
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self.connection() as conn: return conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
 
+    def list_ingestion_batch_jobs(
+        self, batch_id: str, strategy_key: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return every document job submitted by one multi-file upload."""
+
+        params: list[Any] = [batch_id]
+        condition = (
+            "j.kind IN ('ingestion','content_preparation') "
+            "AND j.metadata->>'batch_id'=%s"
+        )
+        if strategy_key:
+            condition += " AND j.strategy_key=%s"
+            params.append(normalize_strategy(strategy_key))
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT j.*,d.original_filename AS document_name
+                   FROM jobs j LEFT JOIN documents d ON d.id=j.document_id
+                   WHERE """ + condition + " ORDER BY j.created_at,j.id",
+                params,
+            ).fetchall()
+
     def cancel_document_jobs(self, document_id: int, reason: str = "文档已删除，任务已取消") -> int:
         """Cancel queued/running ingestion work before document cleanup starts."""
         with self.connection() as conn:
@@ -2262,6 +2658,19 @@ class Database:
                 WHERE document_id=%s AND status IN ('queued','running') FOR UPDATE""",
                 (document_id,),
             ).fetchall()
+            for row in rows:
+                logs = [*list(row.get("log") or []), reason]
+                metadata = {
+                    **(row.get("metadata") if isinstance(row.get("metadata"), dict) else {}),
+                    "stage": "cancelled",
+                    "cancelled_by_document_delete": True,
+                }
+                conn.execute(
+                    """UPDATE jobs SET status='cancelled',log=%s::jsonb,metadata=%s::jsonb,
+                    error_message=NULL,updated_at=NOW(),completed_at=NOW() WHERE id=%s""",
+                    (self._json(logs), self._json(metadata), row["id"]),
+                )
+            return len(rows)
 
     def list_revision_chunks(self, document_id: int, revision_id: str) -> list[dict[str, Any]]:
         """Read an immutable historical revision without consulting the active pointer."""
@@ -2331,19 +2740,6 @@ class Database:
                    WHERE snapshot_id=%s ORDER BY created_at DESC LIMIT 1""",
                 (snapshot_id,),
             ).fetchone()
-            for row in rows:
-                logs = [*list(row.get("log") or []), reason]
-                metadata = {
-                    **(row.get("metadata") if isinstance(row.get("metadata"), dict) else {}),
-                    "stage": "cancelled",
-                    "cancelled_by_document_delete": True,
-                }
-                conn.execute(
-                    """UPDATE jobs SET status='cancelled',log=%s::jsonb,metadata=%s::jsonb,
-                    error_message=NULL,updated_at=NOW(),completed_at=NOW() WHERE id=%s""",
-                    (self._json(logs), self._json(metadata), row["id"]),
-                )
-            return len(rows)
 
     def cancel_project_jobs(self, project_id: int, kinds: list[str], reason: str) -> int:
         """Cancel selected project-wide work whose input snapshot is no longer valid."""
@@ -2376,21 +2772,31 @@ class Database:
                 ORDER BY created_at,id"""
             ).fetchall()
 
-    def latest_job(self, project_id: int, kind: str = "") -> dict[str, Any] | None:
+    def latest_job(
+        self, project_id: int, kind: str = "", strategy_key: str = "",
+    ) -> dict[str, Any] | None:
         query = "SELECT * FROM jobs WHERE project_id=%s"
         params: list[Any] = [project_id]
         if kind:
             query += " AND kind=%s"
             params.append(kind)
+        if strategy_key:
+            query += " AND strategy_key=%s"
+            params.append(normalize_strategy(strategy_key))
         with self.connection() as conn:
             return conn.execute(query + " ORDER BY updated_at DESC LIMIT 1", params).fetchone()
 
-    def latest_active_job(self, project_id: int, kind: str = "") -> dict[str, Any] | None:
+    def latest_active_job(
+        self, project_id: int, kind: str = "", strategy_key: str = "",
+    ) -> dict[str, Any] | None:
         query = "SELECT * FROM jobs WHERE project_id=%s AND status IN ('queued','running')"
         params: list[Any] = [project_id]
         if kind:
             query += " AND kind=%s"
             params.append(kind)
+        if strategy_key:
+            query += " AND strategy_key=%s"
+            params.append(normalize_strategy(strategy_key))
         query += " ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
         with self.connection() as conn:
             return conn.execute(query, params).fetchone()
@@ -2871,16 +3277,16 @@ class Database:
         mention_key = self._mention_conflict_key(values)
         with self.connection() as conn:
             row = conn.execute(
-                """INSERT INTO entity_mentions(project_id,document_id,chunk_id,
+                """INSERT INTO entity_mentions(project_id,document_id,revision_id,chunk_id,
                 canonical_entity_id,mention_key,mention_text,normalized_name,entity_type,
                 description,confidence,extraction_version,evidence_text,evidence_start,evidence_end,metadata)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                 ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
                 DO UPDATE SET canonical_entity_id=EXCLUDED.canonical_entity_id,
                 description=EXCLUDED.description,
                 confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,evidence_start=EXCLUDED.evidence_start,
                 evidence_end=EXCLUDED.evidence_end,metadata=EXCLUDED.metadata,is_deleted=FALSE,updated_at=NOW() RETURNING *""",
-                (values["project_id"],values["document_id"],values["chunk_id"],
+                (values["project_id"],values["document_id"],values["revision_id"],values["chunk_id"],
                  values["canonical_entity_id"],mention_key,
                  values["mention_text"],values["normalized_name"],values["entity_type"],
                  values.get("description") or "",0.5 if values.get("confidence") is None
@@ -2889,11 +3295,15 @@ class Database:
                  values.get("evidence_end"),self._json(values.get("metadata"))),
             ).fetchone()
             conn.execute(
-                """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
-                   VALUES(%s,%s,%s)
+                """INSERT INTO canonical_entity_documents(
+                       project_id,canonical_entity_id,document_id,revision_id)
+                   VALUES(%s,%s,%s,%s)
                    ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE
                    SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
-                (values["project_id"], values["canonical_entity_id"], values["document_id"]),
+                (
+                    values["project_id"], values["canonical_entity_id"],
+                    values["document_id"], values["revision_id"],
+                ),
             )
             self._refresh_entity_source_counts(
                 conn, int(values["project_id"]), [int(values["canonical_entity_id"])],
@@ -2904,10 +3314,11 @@ class Database:
         mention_key = self._mention_conflict_key(values)
         with self.connection() as conn:
             return conn.execute(
-                """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,
+                """INSERT INTO entity_resolution_decisions(
+                project_id,document_id,revision_id,chunk_id,
                 canonical_entity_id,mention_key,mention_text,normalized_name,entity_type,
                 decision,candidate_entity_ids,scores,reason,model_name,metadata)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
                 ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
                 DO UPDATE SET
                 canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
@@ -2915,7 +3326,8 @@ class Database:
                 reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
                 is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                 (
-                    values["project_id"], values["document_id"], values["chunk_id"],
+                    values["project_id"], values["document_id"], values["revision_id"],
+                    values["chunk_id"],
                     values["canonical_entity_id"], mention_key,
                     values["mention_text"], values["normalized_name"], values["entity_type"],
                     values["decision"], values.get("candidate_entity_ids") or [],
@@ -2958,6 +3370,27 @@ class Database:
 
         if not mentions:
             return []
+        revision_context = self._revision_context.get() or {}
+        context_revision_id = str(revision_context.get("revision_id") or "")
+        mentions = [
+            {
+                **item,
+                "revision_id": str(item.get("revision_id") or context_revision_id),
+            }
+            for item in mentions
+        ]
+        decisions = [
+            {
+                **item,
+                "revision_id": str(item.get("revision_id") or context_revision_id),
+            }
+            for item in decisions
+        ]
+        revision_ids = {
+            str(item.get("revision_id") or "") for item in [*mentions, *decisions]
+        }
+        if "" in revision_ids or len(revision_ids) != 1:
+            raise ValueError("实体批次必须绑定同一内容修订")
         project_id = int(mentions[0]["project_id"])
         document_id = int(mentions[0]["document_id"])
         if any(
@@ -2980,10 +3413,11 @@ class Database:
                     values.get("extraction_policy_version") or "entity-extraction-p0-v1"
                 )
                 row = conn.execute(
-                    """INSERT INTO entity_mentions(project_id,document_id,chunk_id,canonical_entity_id,
+                    """INSERT INTO entity_mentions(
+                    project_id,document_id,revision_id,chunk_id,canonical_entity_id,
                     mention_text,normalized_name,entity_type,description,confidence,extraction_version,
                     evidence_text,evidence_start,evidence_end,mention_key,extraction_policy_version,metadata)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                     ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
                     DO UPDATE SET canonical_entity_id=entity_mentions.canonical_entity_id,
                     description=EXCLUDED.description,confidence=EXCLUDED.confidence,
@@ -2995,7 +3429,8 @@ class Database:
                     metadata=EXCLUDED.metadata,
                     is_deleted=FALSE,updated_at=NOW() RETURNING *""",
                     (
-                        values["project_id"], values["document_id"], values["chunk_id"],
+                        values["project_id"], values["document_id"], values["revision_id"],
+                        values["chunk_id"],
                         values["canonical_entity_id"], values["mention_text"], values["normalized_name"],
                         values["entity_type"], values.get("description") or "",
                         0.5 if values.get("confidence") is None else values.get("confidence"),
@@ -3024,15 +3459,16 @@ class Database:
                 )
                 conn.execute(
                     """INSERT INTO entity_type_assertions(
-                       project_id,document_id,chunk_id,mention_id,mention_key,entity_type,
+                        project_id,document_id,revision_id,chunk_id,mention_id,mention_key,entity_type,
                        confidence,evidence_text,evidence_start,evidence_end,policy_version,source,metadata)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'model',%s::jsonb)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'model',%s::jsonb)
                        ON CONFLICT(revision_id,mention_key,entity_type,policy_version,source)
                        DO UPDATE SET confidence=EXCLUDED.confidence,evidence_text=EXCLUDED.evidence_text,
                        evidence_start=EXCLUDED.evidence_start,evidence_end=EXCLUDED.evidence_end,
                        metadata=EXCLUDED.metadata""",
                     (
-                        project_id, document_id, values["chunk_id"], row["id"], mention_key,
+                        project_id, document_id, values["revision_id"], values["chunk_id"],
+                        row["id"], mention_key,
                         values["entity_type"],
                         0.5 if values.get("confidence") is None else values.get("confidence"),
                         values.get("evidence_text") or values.get("mention_text") or "",
@@ -3064,10 +3500,11 @@ class Database:
                     )
             for values in unique_decisions.values():
                 conn.execute(
-                    """INSERT INTO entity_resolution_decisions(project_id,document_id,chunk_id,
+                    """INSERT INTO entity_resolution_decisions(
+                    project_id,document_id,revision_id,chunk_id,
                     canonical_entity_id,mention_text,normalized_name,entity_type,mention_key,decision,
                     candidate_entity_ids,scores,reason,model_name,metadata)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
                     ON CONFLICT(revision_id,mention_key) WHERE mention_key<>'' AND is_deleted=FALSE
                     DO UPDATE SET
                     canonical_entity_id=EXCLUDED.canonical_entity_id,decision=EXCLUDED.decision,
@@ -3075,7 +3512,8 @@ class Database:
                     reason=EXCLUDED.reason,model_name=EXCLUDED.model_name,metadata=EXCLUDED.metadata,
                     is_deleted=FALSE,updated_at=NOW()""",
                     (
-                        values["project_id"], values["document_id"], values["chunk_id"],
+                        values["project_id"], values["document_id"], values["revision_id"],
+                        values["chunk_id"],
                         values["canonical_entity_id"], values["mention_text"], values["normalized_name"],
                         values["entity_type"], values.get("mention_key") or self._stable_mention_key(values),
                         values["decision"], values.get("candidate_entity_ids") or [],
@@ -3085,11 +3523,12 @@ class Database:
                 )
             affected_ids = sorted({int(item["canonical_entity_id"]) for item in mentions})
             conn.execute(
-                """INSERT INTO canonical_entity_documents(project_id,canonical_entity_id,document_id)
-                   SELECT %s,entity_id,%s FROM unnest(%s::bigint[]) AS entity_id
+                """INSERT INTO canonical_entity_documents(
+                       project_id,canonical_entity_id,document_id,revision_id)
+                   SELECT %s,entity_id,%s,%s FROM unnest(%s::bigint[]) AS entity_id
                    ON CONFLICT(revision_id,canonical_entity_id) DO UPDATE
                    SET project_id=EXCLUDED.project_id,is_deleted=FALSE,updated_at=NOW()""",
-                (project_id, document_id, affected_ids),
+                (project_id, document_id, mentions[0]["revision_id"], affected_ids),
             )
             self._refresh_entity_source_counts(conn, project_id, affected_ids)
         return [persisted_by_key[self._mention_conflict_key(item)] for item in mentions]
@@ -3568,7 +4007,8 @@ class Database:
                        output_hash=EXCLUDED.output_hash""",
                     (
                         run_id, decision["candidate_id"], candidate["source_mention_id"],
-                        candidate["target_mention_id"], candidate.get("allowed_predicates") or [],
+                        candidate["target_mention_id"],
+                        list(candidate.get("allowed_predicates") or []),
                         decision["predicate"], decision["direction"], decision.get("evidence") or "",
                         decision.get("reason") or "", decision.get("status") or "classified",
                         decision.get("request_batch_id"), self._json(decision.get("metadata")),
@@ -5237,6 +5677,49 @@ class Database:
             )
             return count
 
+    def requeue_terminal_entity_shadow_work(self, namespace_id: str) -> int:
+        """Requeue a failed snapshot when a new build explicitly retries it."""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT chunk_id FROM entity_shadow_work_items
+                   WHERE namespace_id=%s AND status='terminal_failed'
+                   ORDER BY chunk_id FOR UPDATE""",
+                (namespace_id,),
+            ).fetchall()
+            if not rows:
+                return 0
+            for row in rows:
+                self._clear_entity_shadow_chunk_artifacts(
+                    conn, namespace_id, int(row["chunk_id"]),
+                )
+            reset = conn.execute(
+                """UPDATE entity_shadow_work_items SET
+                   status='pending',attempt=0,lease_owner=NULL,lease_token=NULL,
+                   lease_expires_at=NULL,output_json='{}'::jsonb,output_hash='',
+                   error_message='',completed_at=NULL,updated_at=NOW()
+                   WHERE namespace_id=%s AND status='terminal_failed'
+                   RETURNING id""",
+                (namespace_id,),
+            ).fetchall()
+            counts = conn.execute(
+                """SELECT COUNT(*) AS expected,
+                   COUNT(*) FILTER(WHERE status='completed') AS completed
+                   FROM entity_shadow_work_items WHERE namespace_id=%s""",
+                (namespace_id,),
+            ).fetchone()
+            conn.execute(
+                """UPDATE entity_shadow_namespaces SET status='building',
+                   metrics='{}'::jsonb,error_message='',artifact_hash='',
+                   expected_work_items=%s,completed_work_items=%s,failed_work_items=0,
+                   snapshot_complete=FALSE,completed_at=NULL
+                   WHERE id=%s""",
+                (
+                    int(counts["expected"]), int(counts["completed"]), namespace_id,
+                ),
+            )
+            return len(reset)
+
     def claim_entity_shadow_work(
         self,
         namespace_id: str,
@@ -5249,18 +5732,35 @@ class Database:
             return conn.execute(
                 """WITH candidate AS (
                        SELECT id FROM entity_shadow_work_items
-                       WHERE namespace_id=%s AND attempt<max_attempts AND (
-                         status IN ('pending','retryable_failed')
+                       WHERE namespace_id=%s AND (
+                         (status IN ('pending','retryable_failed') AND attempt<max_attempts)
                          OR (status='leased' AND lease_expires_at<NOW())
                        )
                        ORDER BY document_id,chunk_id,id FOR UPDATE SKIP LOCKED LIMIT 1
                    )
                    UPDATE entity_shadow_work_items work SET
-                     status='leased',attempt=work.attempt+1,lease_owner=%s,lease_token=%s,
+                     status='leased',
+                     attempt=CASE WHEN work.status='leased' THEN work.attempt
+                                  ELSE work.attempt+1 END,
+                     lease_owner=%s,lease_token=%s,
                      lease_expires_at=NOW()+(%s*INTERVAL '1 second'),updated_at=NOW(),
                      error_message=''
                    FROM candidate WHERE work.id=candidate.id RETURNING work.*""",
                 (namespace_id, worker_id, lease_token, max(30, int(lease_seconds))),
+            ).fetchone()
+
+    def entity_shadow_work_summary(self, namespace_id: str) -> dict[str, Any]:
+        """Return durable progress and the first terminal error for one snapshot."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT COUNT(*) AS expected,
+                   COUNT(*) FILTER(WHERE status='completed') AS completed,
+                   COUNT(*) FILTER(WHERE status='terminal_failed') AS failed,
+                   COUNT(*) FILTER(WHERE status NOT IN ('completed','terminal_failed')) AS pending,
+                   MIN(NULLIF(error_message,'')) FILTER(WHERE status='terminal_failed') AS first_error
+                   FROM entity_shadow_work_items WHERE namespace_id=%s""",
+                (namespace_id,),
             ).fetchone()
 
     def complete_entity_shadow_work(
@@ -5294,10 +5794,176 @@ class Database:
                    error_message=%s,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
                    updated_at=NOW()
                    WHERE id=%s AND status='leased' AND lease_token=%s
-                   RETURNING status""",
+                   RETURNING status,namespace_id,chunk_id""",
                 (error[:4000], work_id, lease_token),
             ).fetchone()
+            if row:
+                self._clear_entity_shadow_chunk_artifacts(
+                    conn, str(row["namespace_id"]), int(row["chunk_id"]),
+                )
             return str((row or {}).get("status") or "stale")
+
+    def reset_entity_shadow_chunk_attempt(
+        self,
+        namespace_id: str,
+        chunk_id: int,
+    ) -> dict[str, int]:
+        """Remove partial artifacts before a leased chunk attempt is retried."""
+
+        with self.connection() as conn:
+            return self._clear_entity_shadow_chunk_artifacts(
+                conn, namespace_id, chunk_id,
+            )
+
+    def _clear_entity_shadow_chunk_artifacts(
+        self,
+        conn: Any,
+        namespace_id: str,
+        chunk_id: int,
+    ) -> dict[str, int]:
+        assignment_rows = conn.execute(
+            """SELECT mention_key,canonical_key
+               FROM entity_shadow_assignments
+               WHERE namespace_id=%s AND chunk_id=%s""",
+            (namespace_id, chunk_id),
+        ).fetchall()
+        mention_rows = conn.execute(
+            """SELECT mention_key FROM entity_shadow_mentions
+               WHERE namespace_id=%s AND chunk_id=%s""",
+            (namespace_id, chunk_id),
+        ).fetchall()
+        mention_keys = sorted({
+            str(item["mention_key"]) for item in [*assignment_rows, *mention_rows]
+        })
+        affected_canonicals = sorted({
+            str(item["canonical_key"]) for item in assignment_rows
+        })
+
+        removed_relations = int(conn.execute(
+            """WITH removed AS (
+                 DELETE FROM entity_shadow_relation_endpoints
+                 WHERE namespace_id=%s AND (
+                   chunk_id=%s
+                   OR source_mention_key=ANY(%s)
+                   OR target_mention_key=ANY(%s)
+                 )
+                 RETURNING 1
+               ) SELECT COUNT(*) AS count FROM removed""",
+            (namespace_id, chunk_id, mention_keys, mention_keys),
+        ).fetchone()["count"])
+        if mention_keys:
+            conn.execute(
+                """DELETE FROM entity_shadow_must_links
+                   WHERE namespace_id=%s AND mention_key=ANY(%s)""",
+                (namespace_id, mention_keys),
+            )
+            conn.execute(
+                """DELETE FROM entity_shadow_candidates
+                   WHERE namespace_id=%s AND mention_key=ANY(%s)""",
+                (namespace_id, mention_keys),
+            )
+            conn.execute(
+                """DELETE FROM entity_shadow_aliases
+                   WHERE namespace_id=%s AND mention_key=ANY(%s)""",
+                (namespace_id, mention_keys),
+            )
+            conn.execute(
+                """DELETE FROM entity_shadow_type_assertions
+                   WHERE namespace_id=%s AND mention_key=ANY(%s)""",
+                (namespace_id, mention_keys),
+            )
+            conn.execute(
+                """DELETE FROM entity_shadow_events
+                   WHERE namespace_id=%s AND mention_key=ANY(%s)""",
+                (namespace_id, mention_keys),
+            )
+            conn.execute(
+                """DELETE FROM entity_shadow_assignments
+                   WHERE namespace_id=%s AND mention_key=ANY(%s)""",
+                (namespace_id, mention_keys),
+            )
+        removed_mentions = int(conn.execute(
+            """WITH removed AS (
+                 DELETE FROM entity_shadow_mentions
+                 WHERE namespace_id=%s AND chunk_id=%s
+                 RETURNING 1
+               ) SELECT COUNT(*) AS count FROM removed""",
+            (namespace_id, chunk_id),
+        ).fetchone()["count"])
+        conn.execute(
+            """DELETE FROM entity_shadow_filter_decisions
+               WHERE namespace_id=%s AND chunk_id=%s""",
+            (namespace_id, chunk_id),
+        )
+
+        removed_canonicals = 0
+        if affected_canonicals:
+            orphan_rows = conn.execute(
+                """SELECT canonical.canonical_key
+                   FROM entity_shadow_canonicals canonical
+                   WHERE canonical.namespace_id=%s
+                     AND canonical.canonical_key=ANY(%s)
+                     AND NOT EXISTS (
+                       SELECT 1 FROM entity_shadow_assignments assignment
+                       WHERE assignment.namespace_id=canonical.namespace_id
+                         AND assignment.canonical_key=canonical.canonical_key
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM entity_shadow_must_links link
+                       WHERE link.namespace_id=canonical.namespace_id
+                         AND link.canonical_key=canonical.canonical_key
+                     )""",
+                (namespace_id, affected_canonicals),
+            ).fetchall()
+            orphan_keys = [str(item["canonical_key"]) for item in orphan_rows]
+            if orphan_keys:
+                conn.execute(
+                    """DELETE FROM entity_shadow_relation_endpoints
+                       WHERE namespace_id=%s AND (
+                         source_canonical_key=ANY(%s)
+                         OR target_canonical_key=ANY(%s)
+                       )""",
+                    (namespace_id, orphan_keys, orphan_keys),
+                )
+                conn.execute(
+                    """DELETE FROM entity_shadow_candidates
+                       WHERE namespace_id=%s AND canonical_key=ANY(%s)""",
+                    (namespace_id, orphan_keys),
+                )
+                conn.execute(
+                    """DELETE FROM entity_shadow_aliases
+                       WHERE namespace_id=%s AND canonical_key=ANY(%s)""",
+                    (namespace_id, orphan_keys),
+                )
+                conn.execute(
+                    """DELETE FROM entity_shadow_embeddings
+                       WHERE namespace_id=%s AND canonical_key=ANY(%s)""",
+                    (namespace_id, orphan_keys),
+                )
+                removed_canonicals = int(conn.execute(
+                    """WITH removed AS (
+                         DELETE FROM entity_shadow_canonicals
+                         WHERE namespace_id=%s AND canonical_key=ANY(%s)
+                         RETURNING 1
+                       ) SELECT COUNT(*) AS count FROM removed""",
+                    (namespace_id, orphan_keys),
+                ).fetchone()["count"])
+
+        conn.execute(
+            """UPDATE entity_shadow_canonicals canonical
+               SET source_count=(
+                 SELECT COUNT(*) FROM entity_shadow_assignments assignment
+                 WHERE assignment.namespace_id=canonical.namespace_id
+                   AND assignment.canonical_key=canonical.canonical_key
+               )
+               WHERE canonical.namespace_id=%s""",
+            (namespace_id,),
+        )
+        return {
+            "mentions": removed_mentions,
+            "relations": removed_relations,
+            "canonicals": removed_canonicals,
+        }
 
     def persist_entity_shadow_extraction(
         self,
@@ -5678,7 +6344,8 @@ class Database:
                 """SELECT COUNT(*) AS expected,
                    COUNT(*) FILTER(WHERE status='completed') AS completed,
                    COUNT(*) FILTER(WHERE status='terminal_failed') AS failed,
-                   COUNT(*) FILTER(WHERE status NOT IN ('completed','terminal_failed')) AS pending
+                   COUNT(*) FILTER(WHERE status NOT IN ('completed','terminal_failed')) AS pending,
+                   MIN(NULLIF(error_message,'')) FILTER(WHERE status='terminal_failed') AS first_error
                    FROM entity_shadow_work_items WHERE namespace_id=%s""",
                 (namespace_id,),
             ).fetchone()
@@ -5692,12 +6359,19 @@ class Database:
                 (
                     status, self._json(metrics), artifact_hash, int(counts["expected"]),
                     int(counts["completed"]), int(counts["failed"]), status == "ready",
-                    "" if status == "ready" else "entity shadow work 未全部成功",
+                    "" if status == "ready" else str(
+                        counts.get("first_error") or "entity shadow work 未全部成功"
+                    ),
                     status == "ready", namespace_id,
                 ),
             ).fetchone()
             if status != "ready":
-                raise RuntimeError("entity shadow snapshot 不完整，不能标记 ready")
+                detail = str(counts.get("first_error") or "存在未完成知识块")
+                raise RuntimeError(
+                    "entity shadow snapshot 不完整，不能标记 ready："
+                    f"已完成 {int(counts['completed'])}/{int(counts['expected'])}，"
+                    f"失败 {int(counts['failed'])}；{detail}"
+                )
             return row
 
     def persist_entity_shadow_relation_endpoints(

@@ -13,13 +13,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import requests
 
 from .chunking import ProcessingResult, build_processing_result, parse_document_structure, validate_processing_request
 from .config import Config
+from .construction_strategies import (
+    ENHANCED_SHADOW_STRATEGY,
+    STABLE_STRATEGY,
+    normalize_strategy,
+)
 from .database import Database
 from .entity_resolution import EntityResolver
 from .entity_shadow import DatabaseShadowStore, ShadowEntityResolver, ShadowModelGateway
@@ -74,6 +79,89 @@ class KnowledgeForgeService:
     DEFAULT_MODEL_MAX_TOKENS = 32768
     DEFAULT_CHUNK_MAX_TOKENS = 512
 
+    @staticmethod
+    def _relation_entities_with_canonicals(
+        raw_entities: list[dict[str, Any]],
+        raw_to_mention: dict[str, str],
+        canonical_by_mention: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Attach resolved mention and canonical identities before P1 planning."""
+
+        resolved = []
+        for raw in raw_entities:
+            raw_id = str(raw.get("mention_id") or raw.get("id") or "")
+            mention_id = raw_to_mention.get(raw_id)
+            canonical_id = canonical_by_mention.get(str(mention_id or ""))
+            if not mention_id or not canonical_id:
+                continue
+            resolved.append({
+                **raw,
+                "mention_id": mention_id,
+                "mention_key": str(raw.get("mention_key") or mention_id),
+                "canonical_id": canonical_id,
+            })
+        return resolved
+
+    @staticmethod
+    def _shadow_relation_mention_id(
+        endpoint_id: str,
+        raw_to_mention: dict[str, str],
+        canonical_by_mention: dict[str, str],
+    ) -> str:
+        """Accept relation endpoints before or after mention normalization."""
+
+        if endpoint_id in canonical_by_mention:
+            return endpoint_id
+        mention_id = str(raw_to_mention.get(endpoint_id) or "")
+        return mention_id if mention_id in canonical_by_mention else ""
+
+    @staticmethod
+    def _relation_shadow_run_id(
+        project_id: int,
+        document_id: int,
+        revision_id: str,
+        chunk_id: int,
+        treatment_hash: str,
+        input_fingerprint: str,
+    ) -> str:
+        material = "|".join((
+            str(project_id),
+            str(document_id),
+            revision_id,
+            str(chunk_id),
+            treatment_hash,
+            input_fingerprint,
+        ))
+        return "relshadow_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _relation_shadow_input_fingerprint(
+        *,
+        revision_id: str,
+        chunk_id: int,
+        content: str,
+        schema_version: int,
+        treatment_hash: str,
+        candidate_map: dict[str, dict[str, Any]],
+    ) -> str:
+        """Bind a relation run to complete candidates, including canonical endpoints."""
+
+        payload = {
+            "revision_id": revision_id,
+            "chunk_id": chunk_id,
+            "chunk_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "schema_version": schema_version,
+            "treatment_hash": treatment_hash,
+            "candidates": [
+                candidate_map[candidate_id] for candidate_id in sorted(candidate_map)
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
     def __init__(self, database: Database | None = None):
         self.db = database or Database()
         self.ollama = OllamaClient()
@@ -98,6 +186,7 @@ class KnowledgeForgeService:
         self.db.bootstrap()
         for project in self.db.list_projects():
             self.schemas.ensure_base(int(project["id"]))
+            self.db.ensure_project_strategy_graphs(int(project["id"]))
         try:
             self.graph.ensure_schema()
         except Exception as exc:
@@ -114,7 +203,18 @@ class KnowledgeForgeService:
                 metadata={**(job.get("metadata") or {}), "recovered_after_restart": True},
             )
             if job["kind"] == "ingestion" and job.get("document_id"):
-                self.executor.submit(self._ingest_document, job_id, int(job["document_id"]))
+                strategy_key = normalize_strategy(job.get("strategy_key"))
+                worker = (
+                    self._ingest_enhanced_strategy
+                    if strategy_key == ENHANCED_SHADOW_STRATEGY
+                    else self._ingest_document
+                )
+                self.executor.submit(worker, job_id, int(job["document_id"]))
+                recovered += 1
+            elif job["kind"] == "content_preparation" and job.get("document_id"):
+                self.executor.submit(
+                    self._prepare_document_content, job_id, int(job["document_id"]),
+                )
                 recovered += 1
             elif job["kind"] == "graph_sync" and job.get("project_id"):
                 self.executor.submit(self._sync_project_graph, job_id, int(job["project_id"]))
@@ -239,6 +339,7 @@ class KnowledgeForgeService:
         except Exception as exc:
             LOGGER.warning("Using default project token limits: %s", exc)
         self.schemas.ensure_base(int(project["id"]))
+        self.db.ensure_project_strategy_graphs(int(project["id"]))
         return self.db.get_project(int(project["id"])) or project
 
     def update_project_settings(
@@ -324,29 +425,182 @@ class KnowledgeForgeService:
                 "chunk_config": chunk_config or {},
                 "metadata": {"project_key": project["project_key"]}}
             if existing and existing.get("is_deleted"):
-                return self.db.update_document(int(existing["id"]), **{**values, "status": "uploaded", "error_message": None,
+                restored = self.db.update_document(int(existing["id"]), **{**values, "status": "uploaded", "error_message": None,
                     "is_deleted": False, "deleted_at": None, "indexed_at": None,
                     "active_revision_id": None,
                     "effective_parser": None, "effective_chunk_strategy": None, "parse_quality": {},
                     "routing_reason": None, "processing_stage": "uploaded", "structure_ready_at": None,
                     "chunks_ready_at": None, "graph_ready_at": None})
-            return self.db.create_document(values)
+                self.db.ensure_document_strategy_builds(int(restored["id"]), reset=True)
+                return restored
+            document = self.db.create_document(values)
+            self.db.ensure_document_strategy_builds(int(document["id"]), reset=True)
+            return document
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    def submit_ingestion(self, document_id: int) -> str:
+    def submit_ingestion(
+        self,
+        document_id: int,
+        *,
+        batch_id: str = "",
+        strategy_key: str = STABLE_STRATEGY,
+        target_document_ids: list[int] | None = None,
+    ) -> str:
+        strategy_key = normalize_strategy(strategy_key)
         document = self.db.get_document(document_id)
         if not document: raise LookupError("文档不存在")
-        if document["status"] == "processing": raise ValueError("该文档正在处理")
-        job = self.db.create_job("ingestion", int(document["project_id"]), document_id)
+        target_documents = [document]
+        if strategy_key == ENHANCED_SHADOW_STRATEGY and target_document_ids:
+            target_documents = []
+            for target_id in dict.fromkeys(int(value) for value in target_document_ids):
+                target = self.db.get_document(target_id)
+                if not target or int(target["project_id"]) != int(document["project_id"]):
+                    raise ValueError("增强实验包含不存在或不属于当前项目的文档")
+                target_documents.append(target)
+            if document_id not in {int(item["id"]) for item in target_documents}:
+                target_documents.insert(0, document)
+        self.db.ensure_project_strategy_graphs(int(document["project_id"]))
+        for target in target_documents:
+            self.db.ensure_document_strategy_builds(int(target["id"]))
+        build = self.db.get_document_strategy_build(document_id, strategy_key) or {}
+        if build.get("status") in {"queued", "processing"}:
+            raise ValueError("该文档正在使用当前方案构建")
+        if strategy_key == STABLE_STRATEGY and document["status"] == "processing":
+            raise ValueError("该文档正在处理")
+        if strategy_key == ENHANCED_SHADOW_STRATEGY:
+            active_enhanced = self.db.latest_active_job(
+                int(document["project_id"]), "ingestion", ENHANCED_SHADOW_STRATEGY,
+            )
+            if active_enhanced:
+                raise ValueError("当前项目的增强实验正在构建，请等待任务完成")
+            active_stable = self.db.latest_active_job(
+                int(document["project_id"]), "ingestion", STABLE_STRATEGY,
+            )
+            if active_stable:
+                raise ValueError("当前项目的文档预处理或稳定方案正在构建，请等待任务完成")
+        else:
+            active_enhanced = self.db.latest_active_job(
+                int(document["project_id"]), "ingestion", ENHANCED_SHADOW_STRATEGY,
+            )
+            if active_enhanced:
+                raise ValueError("增强实验正在构建，完成后才能更新稳定基线")
+            self.db.invalidate_enhanced_strategy_for_document(
+                document_id,
+                reason="稳定基线开始重新构建，增强实验结果已失效",
+            )
+        batch_id = batch_id or uuid.uuid4().hex
+        job = self.db.create_job(
+            "ingestion",
+            int(document["project_id"]),
+            document_id,
+            metadata={
+                "batch_id": batch_id,
+                "document_name": document["original_filename"],
+                "strategy_key": strategy_key,
+                "target_document_ids": [int(item["id"]) for item in target_documents],
+                "target_document_names": [str(item["original_filename"]) for item in target_documents],
+            },
+            strategy_key=strategy_key,
+        )
+        for target in target_documents:
+            self.db.update_document_strategy_build(
+                int(target["id"]), strategy_key, status="queued", latest_job_id=str(job["id"]),
+                error_message="", started_at=None, completed_at=None,
+            )
         project = self.db.get_project(int(document["project_id"]))
-        if project and project.get("graph_status") == GRAPH_READY:
+        if strategy_key == STABLE_STRATEGY and project and project.get("graph_status") == GRAPH_READY:
             self.db.set_graph_state(
                 int(document["project_id"]), GRAPH_STALE,
                 error="文档重新入库后图谱需要重建",
             )
-        self.executor.submit(self._ingest_document, job["id"], document_id)
+        if strategy_key == ENHANCED_SHADOW_STRATEGY:
+            self.db.mark_strategy_graph_stale(
+                int(document["project_id"]), strategy_key,
+                "增强实验事实将重新计算",
+            )
+            self.executor.submit(self._ingest_enhanced_strategy, str(job["id"]), document_id)
+        else:
+            self.executor.submit(self._ingest_document, str(job["id"]), document_id)
         return str(job["id"])
+
+    def submit_project_ingestion(
+        self, project_id: int, *, strategy_key: str = STABLE_STRATEGY,
+    ) -> dict[str, Any]:
+        """Build every pending document for one project and construction strategy."""
+
+        strategy_key = normalize_strategy(strategy_key)
+        if not self.db.get_project(project_id):
+            raise LookupError("项目不存在")
+        documents = self.db.list_documents(project_id, strategy_key)
+        pending = [
+            item for item in documents
+            if str(item.get("strategy_status") or "uploaded")
+            not in {"queued", "processing", "indexed", "deleted"}
+        ]
+        if not pending:
+            raise ValueError("当前构建方案没有待处理文档")
+        pending.sort(key=lambda item: int(item["id"]))
+        batch_id = uuid.uuid4().hex
+        if strategy_key == ENHANCED_SHADOW_STRATEGY:
+            job_ids = [self.submit_ingestion(
+                int(pending[0]["id"]), batch_id=batch_id, strategy_key=strategy_key,
+                target_document_ids=[int(item["id"]) for item in pending],
+            )]
+        else:
+            job_ids = [
+                self.submit_ingestion(
+                    int(item["id"]), batch_id=batch_id, strategy_key=strategy_key,
+                )
+                for item in pending
+            ]
+        return {
+            "job_id": job_ids[0],
+            "job_ids": job_ids,
+            "batch_id": batch_id,
+            "document_count": len(pending),
+        }
+
+    def submit_project_preparation(self, project_id: int) -> dict[str, Any]:
+        """Prepare strategy-neutral document content without extracting graph facts."""
+
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        active = self.db.latest_active_job(project_id)
+        if active:
+            raise ValueError("当前项目已有任务正在执行，请等待任务完成")
+        pending: list[dict[str, Any]] = []
+        for document in self.db.list_documents(project_id):
+            manifest = self._document_revision_manifest(document, project)
+            if not self._shared_content_is_current(document, manifest):
+                pending.append(document)
+                continue
+            if not self.db.list_document_chunks(int(document["id"])):
+                pending.append(document)
+        if not pending:
+            raise ValueError("当前项目的文档均已完成预处理")
+        pending.sort(key=lambda item: int(item["id"]))
+        batch_id = uuid.uuid4().hex
+        job_ids: list[str] = []
+        for document in pending:
+            job = self.db.create_job(
+                "content_preparation", project_id, int(document["id"]),
+                metadata={
+                    "batch_id": batch_id,
+                    "document_name": document["original_filename"],
+                    "target_document_ids": [int(document["id"])],
+                },
+            )
+            job_id = str(job["id"])
+            job_ids.append(job_id)
+            self.executor.submit(
+                self._prepare_document_content, job_id, int(document["id"]),
+            )
+        return {
+            "job_id": job_ids[0], "job_ids": job_ids, "batch_id": batch_id,
+            "document_count": len(pending),
+        }
 
     def submit_graph_build(self, project_id: int) -> str:
         if not self.db.get_project(project_id): raise LookupError("项目不存在")
@@ -493,6 +747,7 @@ class KnowledgeForgeService:
         snapshot_id: str = "",
         *,
         snapshot_manifest: dict[str, Any] | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
     ) -> dict[str, Any]:
         """Build an independent span-first P2 treatment from active raw chunks."""
 
@@ -562,14 +817,17 @@ class KnowledgeForgeService:
             "revision_id": str(chunk.get("revision_id") or ""),
             "content_hash": str(chunk.get("content_hash") or ""),
         } for chunk in chunks]
+        code_version = "entity-relation-shadow-v18-root-relation-mapping"
         config_payload = {
             "policy_set": policy_set,
+            "relation_policy_set": dict(P1_RELATION_SHADOW_POLICY_SET),
             "llm_model": llm_model,
             "embedding_model": embedding_model,
             "model_max_tokens": int(project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS),
             "lexical_cap": min(Config.entity_lexical_max_k, Config.entity_lexical_top_k),
             "vector_cap": min(Config.entity_vector_max_k, Config.entity_vector_top_k),
             "reranker_cap": Config.entity_reranker_max_k,
+            "code_version": code_version,
         }
         config_hash = hashlib.sha256(
             json.dumps(config_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -594,10 +852,14 @@ class KnowledgeForgeService:
             model_name=llm_model,
             embedding_model=embedding_model,
             config_hash=config_hash,
-            code_version="entity-shadow-prelive-v1",
+            code_version=code_version,
         )
         if namespace.get("snapshot_complete") and namespace.get("status") == "ready":
-            return {"namespace_id": namespace_id, **self.db.load_entity_shadow_snapshot(namespace_id)}
+            snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+            if progress:
+                total = int(namespace.get("expected_work_items") or len(chunks))
+                progress(total, total, "复用已完成的增强实体关系快照")
+            return {"namespace_id": namespace_id, **snapshot}
 
         work_items = []
         chunk_by_id = {int(item["id"]): item for item in chunks}
@@ -617,6 +879,21 @@ class KnowledgeForgeService:
                 "input_fingerprint": chunk_fingerprint,
             })
         self.db.seed_entity_shadow_work_items(namespace_id, work_items)
+        summary = self.db.entity_shadow_work_summary(namespace_id)
+        retried = 0
+        if int(summary.get("failed") or 0):
+            retried = self.db.requeue_terminal_entity_shadow_work(namespace_id)
+            summary = self.db.entity_shadow_work_summary(namespace_id)
+        if progress and retried:
+            progress(
+                int(summary["completed"]), int(summary["expected"]),
+                f"重新排队 {retried} 个先前终止失败的知识块",
+            )
+        if progress:
+            progress(
+                int(summary["completed"]), int(summary["expected"]),
+                "增强实体关系快照开始处理",
+            )
         extractor = SpanFirstEntityExtractor(policy_set["entity_extraction_policy_version"])
         store = DatabaseShadowStore(self.db)
         model_gateway = ShadowModelGateway(
@@ -661,12 +938,33 @@ class KnowledgeForgeService:
             if not work:
                 break
             chunk = chunk_by_id.get(int(work["chunk_id"]))
+            summary = self.db.entity_shadow_work_summary(namespace_id)
+            if progress:
+                chunk_label = str(
+                    (chunk or {}).get("section_title")
+                    or (chunk or {}).get("chunk_key")
+                    or f"知识块 {work['chunk_id']}"
+                )
+                progress(
+                    int(summary["completed"]), int(summary["expected"]),
+                    f"正在处理 {chunk_label}（第 {int(work['attempt'])}/"
+                    f"{int(work['max_attempts'])} 次）",
+                )
             if not chunk:
-                self.db.fail_entity_shadow_work(
+                status = self.db.fail_entity_shadow_work(
                     str(work["id"]), str(work["lease_token"]), "active Chunk 不存在",
                 )
+                summary = self.db.entity_shadow_work_summary(namespace_id)
+                if progress:
+                    progress(
+                        int(summary["completed"]), int(summary["expected"]),
+                        f"知识块不存在，已标记为 {status}",
+                    )
                 continue
             try:
+                self.db.reset_entity_shadow_chunk_attempt(
+                    namespace_id, int(chunk["id"]),
+                )
                 extraction = self.schemas.extract_entities_only(project, active_schema, chunk)
                 normalized = extractor.normalize(
                     project_scope=str(project.get("project_key") or project_id),
@@ -682,7 +980,7 @@ class KnowledgeForgeService:
                         "input_fingerprint": work["input_fingerprint"],
                         "model_name": llm_model,
                         "config_hash": config_hash,
-                        "code_version": "entity-shadow-prelive-v1",
+                            "code_version": code_version,
                     },
                 } for item in normalized.mentions]
                 assertion_rows = [asdict(item) for item in normalized.type_assertions]
@@ -711,7 +1009,7 @@ class KnowledgeForgeService:
                         str(item.get("name") or ""),
                         int(item["mention_start"]) if item.get("mention_start") is not None else -1,
                         int(item["mention_end"]) if item.get("mention_end") is not None else -1,
-                    ): str(item.get("id") or "")
+                    ): str(item.get("mention_id") or item.get("id") or "")
                     for item in extraction.get("entities") or []
                 }
                 raw_to_mention: dict[str, str] = {}
@@ -810,20 +1108,50 @@ class KnowledgeForgeService:
                     if raw_id:
                         raw_to_mention[raw_id] = item.mention_id
 
+                relation_entities = self._relation_entities_with_canonicals(
+                    list(extraction.get("entities") or []),
+                    raw_to_mention,
+                    canonical_by_mention,
+                )
+                relation_run = self._run_relation_shadow(
+                    namespace_id, project, int(chunk["document_id"]), chunk,
+                    {"entities": relation_entities}, active_schema,
+                    raise_on_failure=True,
+                )
+                if not relation_run.get("coverage_complete"):
+                    raise RuntimeError(
+                        "增强关系抽取覆盖不完整: "
+                        + ", ".join(relation_run.get("coverage_failures") or ["unknown"])
+                    )
+                candidate_by_id = {
+                    str(item["candidate_id"]): item
+                    for item in relation_run.get("candidates") or []
+                }
                 endpoint_rows = []
-                for ordinal, relation in enumerate(extraction.get("relations") or []):
-                    source_mention = raw_to_mention.get(str(relation.get("source") or ""))
-                    target_mention = raw_to_mention.get(str(relation.get("target") or ""))
-                    if not source_mention or not target_mention:
+                for decision in relation_run.get("decisions") or []:
+                    if str(decision.get("predicate") or "") == "NO_RELATION":
                         continue
+                    candidate = candidate_by_id.get(str(decision.get("candidate_id") or ""))
+                    if not candidate:
+                        raise RuntimeError("增强关系决策缺少对应候选")
+                    source_raw = str(candidate.get("source_mention_id") or "")
+                    target_raw = str(candidate.get("target_mention_id") or "")
+                    if str(decision.get("direction") or "as_is") == "reversed":
+                        source_raw, target_raw = target_raw, source_raw
+                    source_mention = self._shadow_relation_mention_id(
+                        source_raw, raw_to_mention, canonical_by_mention,
+                    )
+                    target_mention = self._shadow_relation_mention_id(
+                        target_raw, raw_to_mention, canonical_by_mention,
+                    )
+                    if not source_mention or not target_mention:
+                        raise RuntimeError("增强关系端点无法映射到归一实体提及")
                     source_canonical = canonical_by_mention[source_mention]
                     target_canonical = canonical_by_mention[target_mention]
                     if source_canonical == target_canonical:
                         continue
                     endpoint_rows.append({
-                        "relation_key": str(relation.get("candidate_id") or hashlib.sha256(
-                            f"{work['id']}|{ordinal}|{source_mention}|{target_mention}".encode()
-                        ).hexdigest()),
+                        "relation_key": str(decision["candidate_id"]),
                         "document_id": int(chunk["document_id"]),
                         "revision_id": str(chunk["revision_id"]),
                         "chunk_id": int(chunk["id"]),
@@ -831,13 +1159,15 @@ class KnowledgeForgeService:
                         "target_mention_key": target_mention,
                         "source_canonical_key": source_canonical,
                         "target_canonical_key": target_canonical,
-                        "relation_type": str(relation.get("type") or "related_to"),
-                        "evidence_text": str(relation.get("evidence_text") or ""),
-                        "evidence_start": relation.get("evidence_start"),
-                        "evidence_end": relation.get("evidence_end"),
+                        "relation_type": str(decision.get("predicate") or "related_to"),
+                        "evidence_text": str(decision.get("evidence") or ""),
+                        "evidence_start": candidate.get("evidence_start"),
+                        "evidence_end": candidate.get("evidence_end"),
                         "policy_version": policy_set["relation_candidate_policy_version"],
                         "metadata": {
-                            "verification_status": relation.get("verification_status") or "uncertain",
+                            "verification_status": "classified",
+                            "confidence": 1.0,
+                            "reason": str(decision.get("reason") or ""),
                             "same_entity_snapshot": namespace_id,
                         },
                     })
@@ -854,10 +1184,24 @@ class KnowledgeForgeService:
                     str(work["id"]), str(work["lease_token"]), output, output_hash,
                 ):
                     raise RuntimeError("entity shadow work lease 已失效")
+                summary = self.db.entity_shadow_work_summary(namespace_id)
+                if progress:
+                    progress(
+                        int(summary["completed"]), int(summary["expected"]),
+                        f"知识块完成：{output['mentions']} 个实体提及，"
+                        f"{output['relation_endpoints']} 条关系",
+                    )
             except Exception as exc:
-                self.db.fail_entity_shadow_work(
+                status = self.db.fail_entity_shadow_work(
                     str(work["id"]), str(work["lease_token"]), str(exc),
                 )
+                summary = self.db.entity_shadow_work_summary(namespace_id)
+                if progress:
+                    label = "终止失败" if status == "terminal_failed" else "等待重试"
+                    progress(
+                        int(summary["completed"]), int(summary["expected"]),
+                        f"知识块{label}：{exc}",
+                    )
 
         persisted = self.db.load_entity_shadow_snapshot(namespace_id)
         mention_count = len(self.db.list_entity_shadow_mentions(namespace_id))
@@ -1294,14 +1638,37 @@ class KnowledgeForgeService:
             ').path().limit(500)'
         )
 
-    def hubble_project_url(self, project_id: int) -> str:
+    def hubble_project_url(
+        self, project_id: int, strategy_key: str = STABLE_STRATEGY,
+    ) -> str:
         """Resolve Hubble and prefill a cross-document provenance query."""
+        strategy_key = normalize_strategy(strategy_key)
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
-        if not is_current_graph(project):
+        if strategy_key == STABLE_STRATEGY:
+            if not is_current_graph(project):
+                raise GraphNotReadyError(
+                    project.get("graph_error") or "图谱需要按当前验证策略重建"
+                )
+            strategy_graph = {
+                "namespace_id": project["graph_namespace_id"],
+                "generation": project.get("graph_generation") or 0,
+                "ready_generation": project.get("graph_ready_generation") or 0,
+                "status": project.get("graph_status") or "empty",
+                "error_message": project.get("graph_error") or "",
+            }
+        else:
+            strategy_graph = self.db.get_project_strategy_graph(project_id, strategy_key)
+            if not strategy_graph:
+                raise GraphNotReadyError("当前构建方案尚未初始化")
+        if strategy_key != STABLE_STRATEGY and (
+            strategy_graph.get("status") != "ready"
+            or int(strategy_graph.get("ready_generation") or 0)
+            != int(strategy_graph.get("generation") or 0)
+        ):
             raise GraphNotReadyError(
-                project.get("graph_error") or "图谱需要按当前验证策略重建"
+                strategy_graph.get("error_message") or "当前实验图谱尚未就绪"
             )
         base_url = Config.hugegraph_hubble_url.rstrip("/")
         endpoint = f"{base_url}/api/v1.2/graph-connections"
@@ -1341,7 +1708,7 @@ class KnowledgeForgeService:
             raise RuntimeError(f"Hubble 中没有可用的 {Config.hugegraph_graph} 图连接")
 
         gremlin = self._project_provenance_gremlin(
-            project_id, str(project["graph_namespace_id"]),
+            project_id, str(strategy_graph["namespace_id"]),
         )
         return (
             f"{base_url}/graph-management/{int(connection['id'])}/data-analyze"
@@ -1349,13 +1716,141 @@ class KnowledgeForgeService:
         )
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
-        return self.db.get_job(job_id)
+        return self._job_with_runtime(self.db.get_job(job_id))
 
-    def latest_job(self, project_id: int, kind: str = "") -> dict[str, Any] | None:
-        return self.db.latest_job(project_id, kind)
+    @staticmethod
+    def _job_with_runtime(
+        job: dict[str, Any] | None,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        if not job:
+            return None
+        current = now or datetime.now(timezone.utc)
+        started = job.get("created_at")
+        ended = job.get("completed_at") if job.get("status") in {"completed", "failed", "cancelled"} else current
+        if isinstance(started, str):
+            started = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        if isinstance(ended, str):
+            ended = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+        elapsed = 0
+        if isinstance(started, datetime) and isinstance(ended, datetime):
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if ended.tzinfo is None:
+                ended = ended.replace(tzinfo=timezone.utc)
+            elapsed = max(0, int((ended - started).total_seconds()))
+        return {**job, "elapsed_seconds": elapsed}
 
-    def latest_active_job(self, project_id: int, kind: str = "") -> dict[str, Any] | None:
-        return self.db.latest_active_job(project_id, kind)
+    def get_ingestion_batch(self, batch_id: str) -> dict[str, Any] | None:
+        jobs = [self._job_with_runtime(row) for row in self.db.list_ingestion_batch_jobs(batch_id)]
+        jobs = [row for row in jobs if row]
+        if not jobs:
+            return None
+        kinds = {str(job.get("kind") or "ingestion") for job in jobs}
+        batch_kind = kinds.pop() if len(kinds) == 1 else "ingestion"
+        target_documents: set[int] = set()
+        for job in jobs:
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            target_ids = metadata.get("target_document_ids") or [job.get("document_id")]
+            target_documents.update(int(value) for value in target_ids if value is not None)
+        document_count = len(target_documents) or len(jobs)
+        statuses = [str(row.get("status") or "queued") for row in jobs]
+        terminal = {"completed", "failed", "cancelled"}
+        if any(status == "running" for status in statuses) or (
+            any(status == "queued" for status in statuses)
+            and any(status in terminal for status in statuses)
+        ):
+            status = "running"
+        elif any(status == "queued" for status in statuses):
+            status = "queued"
+        elif any(status == "failed" for status in statuses):
+            status = "failed"
+        elif all(value == "cancelled" for value in statuses):
+            status = "cancelled"
+        else:
+            status = "completed"
+
+        subtasks: dict[str, dict[str, Any]] = {}
+        for key in self.INGESTION_SUBTASKS:
+            values = []
+            for job in jobs:
+                metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+                stored = metadata.get("subtasks") if isinstance(metadata.get("subtasks"), dict) else {}
+                values.append(stored.get(key) if isinstance(stored.get(key), dict) else {
+                    "status": "waiting", "progress": 0, "detail": "",
+                })
+            step_statuses = [str(value.get("status") or "waiting") for value in values]
+            if any(value == "running" for value in step_statuses):
+                step_status = "running"
+            elif any(value == "failed" for value in step_statuses):
+                step_status = "failed"
+            elif all(value == "completed" for value in step_statuses):
+                step_status = "completed"
+            elif all(value in {"completed", "cancelled"} for value in step_statuses):
+                step_status = "cancelled"
+            elif any(value == "completed" for value in step_statuses):
+                step_status = "running"
+            else:
+                step_status = "waiting"
+            completed = sum(value == "completed" for value in step_statuses)
+            completed_documents = (
+                document_count if len(jobs) == 1 and completed else completed
+            )
+            subtasks[key] = {
+                "status": step_status,
+                "progress": int(sum(int(value.get("progress") or 0) for value in values) / len(values)),
+                "detail": f"{completed_documents}/{document_count} 个文档",
+            }
+
+        log: list[str] = []
+        for index, job in enumerate(jobs, start=1):
+            name = str(job.get("document_name") or (job.get("metadata") or {}).get("document_name") or f"文档 {index}")
+            state = {
+                "queued": "排队中", "running": "执行中", "completed": "已完成",
+                "failed": "失败", "cancelled": "已取消",
+            }.get(str(job.get("status") or "queued"), str(job.get("status") or "queued"))
+            log.append(f"===== [{index}/{len(jobs)}] {name} · {state} =====")
+            log.extend(str(line) for line in (job.get("log") or []))
+            if not job.get("log"):
+                log.append("等待开始处理")
+
+        starts = [job.get("created_at") for job in jobs if isinstance(job.get("created_at"), datetime)]
+        elapsed = max(int(job.get("elapsed_seconds") or 0) for job in jobs)
+        if starts:
+            start = min(starts)
+            end = datetime.now(timezone.utc)
+            if all(value in terminal for value in statuses):
+                completed = [job.get("completed_at") for job in jobs if isinstance(job.get("completed_at"), datetime)]
+                if completed:
+                    end = max(completed)
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
+            elapsed = max(0, int((end - start).total_seconds()))
+        return {
+            "id": batch_id,
+            "batch_id": batch_id,
+            "kind": batch_kind,
+            "status": status,
+            "progress": int(sum(int(job.get("progress") or 0) for job in jobs) / len(jobs)),
+            "elapsed_seconds": elapsed,
+            "document_count": document_count,
+            "jobs": jobs,
+            "log": log,
+            "metadata": {"batch_id": batch_id, "subtasks": subtasks},
+        }
+
+    def latest_job(
+        self, project_id: int, kind: str = "", strategy_key: str = "",
+    ) -> dict[str, Any] | None:
+        return self._job_with_runtime(self.db.latest_job(project_id, kind, strategy_key))
+
+    def latest_active_job(
+        self, project_id: int, kind: str = "", strategy_key: str = "",
+    ) -> dict[str, Any] | None:
+        return self._job_with_runtime(self.db.latest_active_job(project_id, kind, strategy_key))
 
     def _document_process_payload(self, document_id: int) -> tuple[dict[str, Any], dict[str, Any], Path]:
         document = self.db.get_document(document_id)
@@ -1443,8 +1938,13 @@ class KnowledgeForgeService:
             for key in cls.INGESTION_SUBTASKS
         }
 
-    def _start_ingestion_job(self, job_id: str, document_id: int) -> None:
-        self.db.begin_graph_mutation(job_id)
+    def _start_ingestion_job(
+        self, job_id: str, document_id: int, *, mutate_graph: bool = True,
+    ) -> None:
+        if mutate_graph:
+            self.db.begin_graph_mutation(job_id)
+        else:
+            self.db.update_job(job_id, status="running")
         subtasks = self._empty_ingestion_subtasks()
         subtasks["structure"] = {"status": "running", "progress": 0, "detail": ""}
         self._job(
@@ -1531,6 +2031,298 @@ class KnowledgeForgeService:
             raise IngestionCancelled("文档处理任务已取消")
         if not self.db.get_document(document_id):
             raise IngestionCancelled("文档已删除")
+
+    def _document_revision_manifest(
+        self, document: dict[str, Any], project: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "content_hash": document["doc_hash"],
+            "source_hash": document["doc_hash"],
+            "config_hash": hashlib.sha256(json.dumps({
+                "requested_parser": document.get("requested_parser") or "auto",
+                "requested_chunk_strategy": document.get("requested_chunk_strategy") or "auto",
+                "chunk_max_tokens": int(
+                    project.get("chunk_max_tokens") or self.DEFAULT_CHUNK_MAX_TOKENS
+                ),
+                "llm_model": project.get("llm_model") or Config.default_llm_model,
+                "embedding_model": (
+                    project.get("embedding_model") or Config.default_embedding_model
+                ),
+            }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+            "policy_hash": graph_policy_hash(
+                {axis: str(project.get(axis) or "") for axis in POLICY_AXES},
+                schema_version=int(project.get("active_schema_version") or 1),
+            ),
+            "document_id": int(document["id"]),
+            "project_id": int(project["id"]),
+        }
+
+    def _shared_content_is_current(
+        self,
+        document: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> bool:
+        revision_id = str(document.get("active_revision_id") or "")
+        if not revision_id:
+            return False
+        revision = self.db.get_document_revision(revision_id)
+        if not revision or str(revision.get("status") or "") != "active":
+            return False
+        return all(
+            str(revision.get(key) or "") == str(manifest.get(key) or "")
+            for key in ("content_hash", "source_hash", "config_hash")
+        )
+
+    def _prepare_shared_content(
+        self,
+        job_id: str,
+        document_id: int,
+        *,
+        mutate_graph: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+        """Prepare one strategy-neutral content revision when none is reusable."""
+
+        document = self.db.get_document(document_id)
+        if not document:
+            raise IngestionCancelled("文档不存在或已删除")
+        project = self.db.get_project(int(document["project_id"]))
+        if not project:
+            raise LookupError("项目不存在")
+        manifest = self._document_revision_manifest(document, project)
+        if self._shared_content_is_current(document, manifest):
+            chunks = self.db.list_document_chunks(document_id)
+            if chunks:
+                subtasks = self._empty_ingestion_subtasks()
+                subtasks["structure"] = {
+                    "status": "completed", "progress": 100, "detail": "复用结构解析结果",
+                }
+                subtasks["chunking"] = {
+                    "status": "completed", "progress": 100,
+                    "detail": f"复用 {len(chunks)} 个知识块与向量",
+                }
+                subtasks["schema_base"] = {
+                    "status": "completed", "progress": 100, "detail": "复用共享 Schema",
+                }
+                self._job(
+                    job_id, "running", 20, "文档预处理结果已就绪，直接进入所选构建方案",
+                    document_id=document_id, stage="graph", active_subtask="schema_base",
+                    subtasks=subtasks, structure_ready=True, chunks_ready=True,
+                    shared_content_reused=True,
+                )
+                return document, project, chunks
+
+        revision: dict[str, Any] | None = None
+        revision_scope: Any = None
+        try:
+            self._start_ingestion_job(job_id, document_id, mutate_graph=mutate_graph)
+            self.db.update_document(
+                document_id, status="processing", error_message=None,
+                processing_stage="structure", structure_ready_at=None,
+                chunks_ready_at=None, graph_ready_at=None,
+            )
+            revision = self.db.begin_document_revision(document_id, job_id, manifest)
+            revision_scope = self.db.content_revision_context(
+                str(revision["revision_id"]), job_id, str(revision["lease_token"]),
+            )
+            revision_scope.__enter__()
+            source_path = Path(document["local_path"])
+            plan, parsed = parse_document_structure(
+                source_path,
+                requested_parser=document.get("requested_parser") or "auto",
+                requested_strategy=document.get("requested_chunk_strategy") or "auto",
+            )
+            media_dir = (
+                Config.media_root
+                / Config.project_storage_key(int(project["id"]), project["name"])
+                / str(document["doc_hash"][:16])
+            )
+
+            def media_progress(index: int, total: int, message: str) -> None:
+                self._assert_ingestion_active(job_id, document_id)
+                self._job_subtask(
+                    job_id, "structure", subtask_status="running",
+                    subtask_progress=20 + int(index / max(1, total) * 55),
+                    detail=f"图片内容 {index}/{total}",
+                    progress=8 + int(index / max(1, total) * 4), log=message,
+                )
+
+            parsed = self.media.enrich(
+                source_path, parsed, project, media_dir, progress=media_progress,
+            )
+            chunk_dir = (
+                Config.chunks_root
+                / Config.project_storage_key(int(project["id"]), project["name"])
+            )
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            payload_path = chunk_dir / f"{document['doc_hash'][:16]}.json"
+            current_metadata = (
+                document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+            )
+            process_metadata = {
+                **current_metadata, "chunk_file": str(payload_path),
+                "media_dir": str(media_dir), "effective_parser": plan.effective_parser,
+                "effective_strategy": plan.effective_strategy,
+            }
+            self._assert_ingestion_active(job_id, document_id)
+            self._write_process_payload(
+                payload_path, document["original_filename"],
+                ProcessingResult(plan, parsed, [], []),
+            )
+            self.db.update_document(
+                document_id, effective_parser=plan.effective_parser,
+                effective_chunk_strategy=plan.effective_strategy,
+                parser_version=parsed.parser_version, parse_quality=parsed.quality,
+                routing_reason=plan.routing_reason, processing_stage="structure_ready",
+                structure_ready_at=datetime.now(timezone.utc), metadata=process_metadata,
+            )
+            self._job_subtask(
+                job_id, "structure", subtask_status="completed", subtask_progress=100,
+                detail=f"{parsed.quality.get('block_count', 0)} 个结构块", progress=18,
+                log=(f"结构解析完成：{parsed.quality.get('text_chars', 0)} 字符、"
+                     f"{parsed.quality.get('block_count', 0)} 个结构块、"
+                     f"{parsed.quality.get('table_count', 0)} 个表格、"
+                     f"{parsed.quality.get('image_count', 0)} 张图片"),
+                stage="structure_ready", structure_ready=True,
+            )
+            self._job_subtask(
+                job_id, "chunking", subtask_status="running", subtask_progress=0,
+                progress=20, log="===== 文档预处理：知识分块与向量索引 =====",
+                stage="chunking",
+            )
+            result = build_processing_result(
+                source_path, plan, parsed, source_name=document["original_filename"],
+                chunk_max_tokens=int(
+                    project.get("chunk_max_tokens") or self.DEFAULT_CHUNK_MAX_TOKENS
+                ),
+            )
+            sections, chunks = result.sections, result.chunks
+            section_values = [{
+                **asdict(item),
+                "content_hash": hashlib.sha256(item.content.encode()).hexdigest(),
+                "metadata": {**item.metadata, "source": document["original_filename"]},
+            } for item in sections]
+            chunk_values = []
+            for item in chunks:
+                value = asdict(item)
+                value["metadata"] = {
+                    **item.metadata, "project_id": str(project["id"]),
+                    "project_key": project["project_key"],
+                    "document_id": str(document["id"]),
+                    "document_name": document["original_filename"],
+                    "document_url": document["storage_path"],
+                    "section_key": item.section_key, "section_title": item.title,
+                    "token_count": item.token_count, "parent_key": item.parent_key,
+                }
+                chunk_values.append(value)
+            self._assert_ingestion_active(job_id, document_id)
+            self._write_process_payload(
+                payload_path, document["original_filename"], result,
+            )
+            stored_chunks = self.db.replace_document_content(
+                document_id, section_values, chunk_values,
+                revision_id=str(revision["revision_id"]), ingestion_run_id=job_id,
+                lease_token=str(revision["lease_token"]), manifest=manifest,
+            )
+            self.db.update_document(
+                document_id, processing_stage="chunk_ready",
+                chunks_ready_at=datetime.now(timezone.utc),
+                metadata={**process_metadata, "section_count": len(sections),
+                          "chunk_count": len(chunks)},
+            )
+            self._job_subtask(
+                job_id, "chunking", subtask_status="running", subtask_progress=60,
+                detail=f"{len(chunks)} 个知识块", progress=32,
+                log=f"已生成 {len(sections)} 个章节和 {len(chunks)} 个知识块",
+                stage="chunk_ready", chunks_ready=True,
+            )
+            self._assert_ingestion_active(job_id, document_id)
+            count = self.vectors.index_chunks(project, document_id, stored_chunks)
+            self._job_subtask(
+                job_id, "chunking", subtask_status="completed", subtask_progress=100,
+                detail=f"{count} 个向量索引", progress=40,
+                log=f"向量索引已生成并保存：{count} 个",
+            )
+            semantic_chunks = [
+                item for item in stored_chunks
+                if (item.get("metadata") or {}).get("chunk_role") != "parent"
+            ]
+            self._job_subtask(
+                job_id, "schema_base", subtask_status="running", subtask_progress=10,
+                progress=42, log="===== 文档预处理：逻辑 Schema =====", stage="schema_base",
+            )
+            schema_record = self.schemas.evaluate_document(
+                project, document_id, semantic_chunks,
+            )
+            self._job_subtask(
+                job_id, "schema_base", subtask_status="completed", subtask_progress=100,
+                detail=f"Schema v{schema_record['version']}", progress=48,
+                log=f"逻辑 Schema v{schema_record['version']} 已就绪",
+            )
+            revision_scope.__exit__(None, None, None)
+            revision_scope = None
+            document_values = {
+                "status": "indexed", "indexed_at": datetime.now(timezone.utc),
+                "error_message": None, "processing_stage": "chunk_ready",
+                "metadata": {
+                    **process_metadata, "section_count": len(sections),
+                    "chunk_count": len(chunks), "schema_version": schema_record["version"],
+                    "shared_content_ready": True,
+                },
+            }
+            document, _ = self.db.activate_document_revision(
+                document_id, str(revision["revision_id"]), job_id,
+                str(revision["lease_token"]),
+                reason="文档预处理结果已更新，策略图谱等待构建",
+                document_values=document_values,
+            )
+            project = self.db.get_project(int(project["id"])) or project
+            return document, project, self.db.list_document_chunks(document_id)
+        except Exception as exc:
+            if revision and revision_scope is not None:
+                self.db.fail_document_revision(
+                    str(revision["revision_id"]), job_id,
+                    str(revision["lease_token"]), str(exc),
+                )
+            current = self.db.get_document(document_id)
+            if current:
+                self.db.update_document(
+                    document_id,
+                    status="indexed" if current.get("active_revision_id") else "failed",
+                    processing_stage="failed", error_message=str(exc),
+                )
+            raise
+        finally:
+            if revision_scope is not None:
+                revision_scope.__exit__(None, None, None)
+
+    @recorded_job("content_preparation")
+    def _prepare_document_content(self, job_id: str, document_id: int) -> None:
+        """Build reusable structure, chunks, vectors and Schema for one document."""
+
+        try:
+            self._prepare_shared_content(job_id, document_id, mutate_graph=False)
+            self._job(
+                job_id, "completed", 100, "文档预处理完成，可选择任一方案构建知识",
+                stage="completed", active_subtask="", structure_ready=True,
+                chunks_ready=True, graph_ready=False,
+            )
+        except IngestionCancelled:
+            self._fail_active_ingestion_subtask(
+                job_id, "文档已删除，预处理任务已取消", cancelled=True,
+            )
+            self.db.update_job(
+                job_id, status="cancelled", progress=100,
+                log="文档已删除，预处理任务已取消",
+                metadata={"stage": "cancelled"},
+            )
+        except Exception as exc:
+            LOGGER.exception("Document preparation failed: %s", document_id)
+            self._fail_active_ingestion_subtask(job_id, str(exc))
+            self.db.update_job(
+                job_id, status="failed", progress=100,
+                log=f"预处理失败：{exc}", error=str(exc),
+                metadata={"stage": "failed"},
+            )
 
     @recorded_job("ingestion")
     def _ingest_document(self, job_id: str, document_id: int) -> None:
@@ -1819,7 +2611,6 @@ class KnowledgeForgeService:
                 "error_message": None,
                 "processing_stage": "completed",
                 "graph_ready_at": None,
-                "content_version": int(document.get("content_version") or 0) + 1,
                 "metadata": {
                     **process_metadata,
                     "section_count": len(sections),
@@ -1845,6 +2636,11 @@ class KnowledgeForgeService:
                     lease_token=str(revision["lease_token"]),
                     **document_values,
                 )
+                # Activation changes this revision from ``building`` to ``active``.
+                # Subsequent graph publication updates active projections and must
+                # therefore run without the now-stale building-lease context.
+                revision_scope.__exit__(None, None, None)
+                revision_scope = None
             else:
                 self.db.update_document(document_id, **document_values)
                 if hasattr(self.db, "mark_graph_stale"):
@@ -1968,6 +2764,240 @@ class KnowledgeForgeService:
         finally:
             if revision_scope is not None:
                 revision_scope.__exit__(None, None, None)
+            try:
+                job = self.db.get_job(job_id) or {}
+                if normalize_strategy(job.get("strategy_key")) == STABLE_STRATEGY:
+                    current_document = self.db.get_document_including_deleted(document_id) or {}
+                    job_status = str(job.get("status") or "failed")
+                    status = {
+                        "queued": "queued", "running": "processing",
+                        "completed": "indexed", "cancelled": "cancelled",
+                    }.get(job_status, "failed")
+                    metadata = current_document.get("metadata") or {}
+                    self.db.update_document_strategy_build(
+                        document_id,
+                        STABLE_STRATEGY,
+                        status="deleted" if current_document.get("is_deleted") else status,
+                        content_revision_id=current_document.get("active_revision_id"),
+                        latest_job_id=job_id,
+                        stats={
+                            "section_count": int(metadata.get("section_count") or 0),
+                            "chunk_count": int(metadata.get("chunk_count") or 0),
+                            "entity_mentions": int(metadata.get("entity_mentions") or 0),
+                            "relations": int(metadata.get("relations") or 0),
+                        },
+                        error_message=str(job.get("error_message") or "") if status == "failed" else "",
+                        started_at=job.get("started_at"),
+                        completed_at=(
+                            datetime.now(timezone.utc)
+                            if status in {"indexed", "failed", "cancelled", "deleted"}
+                            else None
+                        ),
+                    )
+            except Exception:
+                LOGGER.exception("Unable to persist stable strategy build status")
+
+    @recorded_job("enhanced_strategy_ingestion")
+    def _ingest_enhanced_strategy(self, job_id: str, document_id: int) -> None:
+        """Build the isolated P1 relation + P2 entity comparison graph."""
+
+        strategy_key = ENHANCED_SHADOW_STRATEGY
+        lease: dict[str, Any] | None = None
+        state: dict[str, Any] | None = None
+        job = self.db.get_job(job_id) or {}
+        metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        target_document_ids = [
+            int(value) for value in (metadata.get("target_document_ids") or [document_id])
+        ]
+        try:
+            project: dict[str, Any] | None = None
+            for index, target_id in enumerate(target_document_ids, start=1):
+                document = self.db.get_document(target_id)
+                if not document:
+                    raise IngestionCancelled("文档不存在或已删除")
+                self._job(
+                    job_id, "running", max(2, int((index - 1) / len(target_document_ids) * 40)),
+                    f"===== 文档预处理 [{index}/{len(target_document_ids)}] "
+                    f"{document['original_filename']} =====",
+                    active_document_id=target_id,
+                    active_document_index=index,
+                    target_document_count=len(target_document_ids),
+                )
+                self.db.update_document_strategy_build(
+                    target_id, strategy_key, status="processing", latest_job_id=job_id,
+                    error_message="", started_at=datetime.now(timezone.utc), completed_at=None,
+                )
+                document, project, _ = self._prepare_shared_content(job_id, target_id)
+            if project is None:
+                raise RuntimeError("增强实验没有可处理文档")
+            project_id = int(project["id"])
+            self._assert_ingestion_active(job_id, document_id)
+            eligible_documents = [
+                item for item in self.db.list_documents(project_id)
+                if item.get("status") == "indexed" and item.get("active_revision_id")
+                and not item.get("is_deleted")
+            ]
+            if not eligible_documents:
+                raise RuntimeError("项目尚无可用于增强实验的预处理结果")
+            self._job_subtask(
+                job_id, "schema_base", subtask_status="completed", subtask_progress=100,
+                detail=f"{len(eligible_documents)} 个预处理结果", progress=50,
+                log=(
+                    "===== 增强实验：P1 关系 + P2 实体归一 =====\n"
+                    "已冻结文档预处理结果与逻辑 Schema，开始构建隔离实体关系快照"
+                ),
+                stage="graph", strategy_key=strategy_key, graph_ready=False,
+            )
+            self._job_subtask(
+                job_id, "extraction", subtask_status="running", subtask_progress=5,
+                detail="P1/P2 处理中", progress=52,
+            )
+
+            def shadow_progress(done: int, total: int, message: str) -> None:
+                self._assert_ingestion_active(job_id, document_id)
+                ratio = done / max(1, total)
+                self._job_subtask(
+                    job_id, "extraction", subtask_status="running",
+                    subtask_progress=max(5, min(95, 5 + int(ratio * 90))),
+                    detail=f"{done}/{total} 个知识块",
+                    progress=max(52, min(79, 52 + int(ratio * 27))),
+                    log=message,
+                )
+
+            shadow = self.build_entity_shadow_namespace(
+                project_id, progress=shadow_progress,
+            )
+            namespace = shadow.get("namespace") or {}
+            if namespace.get("status") != "ready" or not namespace.get("snapshot_complete"):
+                raise RuntimeError("增强实验快照未完整收敛")
+            shadow["mentions"] = self.db.list_entity_shadow_mentions(shadow["namespace_id"])
+            metrics = namespace.get("metrics") or {}
+            self._job_subtask(
+                job_id, "extraction", subtask_status="completed", subtask_progress=100,
+                detail=(
+                    f"{len(shadow.get('canonicals') or [])} 个实体，"
+                    f"{len(shadow.get('relation_endpoints') or [])} 条关系"
+                ),
+                progress=80,
+                log=(
+                    f"增强实验快照完成：{len(shadow['mentions'])} 个实体提及，"
+                    f"{len(shadow.get('canonicals') or [])} 个规范实体，"
+                    f"{len(shadow.get('relation_endpoints') or [])} 条已复核关系"
+                ),
+            )
+            state = self.db.start_strategy_graph_rebuild(project_id, strategy_key)
+            generation = int(state["generation"])
+            namespace_id = str(state["namespace_id"])
+            policy_hash = hashlib.sha256(json.dumps({
+                "strategy": strategy_key,
+                "entity_policy": dict(P2_ENTITY_SHADOW_POLICY_SET),
+                "relation_policy": dict(P1_RELATION_SHADOW_POLICY_SET),
+                "artifact_hash": namespace.get("artifact_hash") or "",
+            }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            lease = self.db.acquire_graph_lease(
+                project_id, namespace_id, generation,
+                owner=f"strategy:{strategy_key}:{job_id}", ttl_seconds=900,
+            )
+            mutation = GraphMutationContext(
+                namespace_id=namespace_id, project_id=project_id,
+                generation=generation, policy_hash=policy_hash,
+                lease_token=str(lease["lease_token"]),
+            )
+            chunks_by_document = {
+                int(item["id"]): self.db.list_document_chunks(int(item["id"]))
+                for item in eligible_documents
+            }
+            self._job_subtask(
+                job_id, "graph_sync", subtask_status="running", subtask_progress=10,
+                detail="写入隔离图", progress=85,
+            )
+            graph_stats = self.graph.replace_strategy_snapshot(
+                project, eligible_documents, chunks_by_document, shadow,
+                strategy_key=strategy_key, mutation=mutation,
+            )
+            completed = self.db.complete_strategy_graph_rebuild(
+                project_id, strategy_key, generation,
+                stats=graph_stats,
+                policy_summary={
+                    "mode": "shadow", "production_approved": False,
+                    "policy_hash": policy_hash,
+                    "entity_namespace_id": shadow["namespace_id"],
+                    "entity_metrics": metrics,
+                },
+                empty=not graph_stats["documents"],
+            )
+            if not completed:
+                raise RuntimeError("增强实验图代次已过期，拒绝发布就绪状态")
+            now = datetime.now(timezone.utc)
+            for item in eligible_documents:
+                self.db.ensure_document_strategy_builds(int(item["id"]))
+                build_values: dict[str, Any] = {
+                    "status": "indexed",
+                    "content_revision_id": item.get("active_revision_id"),
+                    "stats": {
+                        "entity_mentions": sum(
+                            1 for mention in shadow["mentions"]
+                            if int(mention["document_id"]) == int(item["id"])
+                        ),
+                        "relations": sum(
+                            1 for relation in shadow.get("relation_endpoints") or []
+                            if int(relation["document_id"]) == int(item["id"])
+                        ),
+                        "graph_generation": generation,
+                    },
+                    "error_message": "",
+                    "completed_at": now,
+                }
+                if int(item["id"]) in target_document_ids:
+                    build_values["latest_job_id"] = job_id
+                self.db.update_document_strategy_build(
+                    int(item["id"]), strategy_key, **build_values,
+                )
+            self._job_subtask(
+                job_id, "graph_sync", subtask_status="completed", subtask_progress=100,
+                detail=f"{graph_stats['entities']} 个实体，{graph_stats['relations']} 条关系",
+                progress=100,
+                log=(
+                    f"增强实验隔离图同步完成：{graph_stats['entities']} 个实体，"
+                    f"{graph_stats['relations']} 条关系"
+                ),
+            )
+            self._job(
+                job_id, "completed", 100, "增强实验构建完成（仍保持 shadow，不激活生产）",
+                stage="completed", graph_ready=True, strategy_key=strategy_key,
+                graph_stats=graph_stats, production_approved=False,
+            )
+        except IngestionCancelled as exc:
+            for target_id in target_document_ids:
+                self.db.update_document_strategy_build(
+                    target_id, strategy_key, status="cancelled", latest_job_id=job_id,
+                    error_message=str(exc), completed_at=datetime.now(timezone.utc),
+                )
+            self._fail_active_ingestion_subtask(job_id, str(exc), cancelled=True)
+            self.db.update_job(job_id, status="cancelled", progress=100, log=str(exc), error=str(exc))
+        except Exception as exc:
+            LOGGER.exception("Enhanced strategy ingestion failed: %s", document_id)
+            if state:
+                self.db.fail_strategy_graph_rebuild(
+                    int(state["project_id"]), strategy_key, int(state["generation"]), str(exc),
+                )
+            for target_id in target_document_ids:
+                self.db.update_document_strategy_build(
+                    target_id, strategy_key, status="failed", latest_job_id=job_id,
+                    error_message=str(exc), completed_at=datetime.now(timezone.utc),
+                )
+            self._fail_active_ingestion_subtask(job_id, str(exc))
+            self.db.update_job(
+                job_id, status="failed", progress=100,
+                log=f"增强实验构建失败：{exc}", error=str(exc),
+                metadata={"stage": "failed", "strategy_key": strategy_key},
+            )
+        finally:
+            if lease:
+                try:
+                    self.db.release_graph_lease(str(lease["id"]), str(lease["lease_token"]))
+                except Exception:
+                    LOGGER.exception("Unable to release enhanced strategy graph lease")
 
     @staticmethod
     def _relation_coverage_failures(
@@ -2018,6 +3048,7 @@ class KnowledgeForgeService:
                 "max_candidates": Config.relation_classifier_max_candidates,
                 "output_reserve": Config.relation_classifier_output_reserve,
                 "safety_margin": Config.relation_classifier_safety_margin,
+                "decision_wire_format": "root-candidate-map-v9-singleton-id-repair",
             },
         )
         revision_id = str(chunk.get("revision_id") or "")
@@ -2045,25 +3076,22 @@ class KnowledgeForgeService:
         ]
         candidates = [*admitted_candidates, *overflow_candidates]
         candidate_map = {item["candidate_id"]: item for item in candidates}
-        input_payload = {
-            "revision_id": revision_id,
-            "chunk_id": int(chunk["id"]),
-            "chunk_hash": hashlib.sha256(
-                str(chunk.get("content") or "").encode("utf-8")
-            ).hexdigest(),
-            "schema_version": schema_version,
-            "treatment_hash": treatment_hash,
-            "candidate_ids": sorted(candidate_map),
-        }
-        input_fingerprint = hashlib.sha256(
-            json.dumps(
-                input_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        run_material = (
-            f"{project['id']}|{document_id}|{revision_id}|{chunk['id']}|{treatment_hash}"
+        input_fingerprint = self._relation_shadow_input_fingerprint(
+            revision_id=revision_id,
+            chunk_id=int(chunk["id"]),
+            content=str(chunk.get("content") or ""),
+            schema_version=schema_version,
+            treatment_hash=treatment_hash,
+            candidate_map=candidate_map,
         )
-        run_id = "relshadow_" + hashlib.sha256(run_material.encode("utf-8")).hexdigest()
+        run_id = self._relation_shadow_run_id(
+            int(project["id"]),
+            document_id,
+            revision_id,
+            int(chunk["id"]),
+            treatment_hash,
+            input_fingerprint,
+        )
         started = False
         try:
             self.db.start_relation_shadow_run({
@@ -2073,7 +3101,7 @@ class KnowledgeForgeService:
                 "chunk_id": int(chunk["id"]),
                 "control_policy_hash": GRAPH_POLICY_HASH,
                 "treatment_policy_hash": treatment_hash,
-                "policy_set": P1_RELATION_SHADOW_POLICY_SET,
+                "policy_set": dict(P1_RELATION_SHADOW_POLICY_SET),
                 "input_fingerprint": input_fingerprint,
             })
             started = True
@@ -2398,7 +3426,6 @@ class KnowledgeForgeService:
             self.graph.ensure_schema()
             self.graph.delete_project(project, mutation=mutation)
             written_relations = 0
-            written_entities = 0
             for document in documents:
                 heartbeat()
                 chunks = self.db.list_document_chunks(int(document["id"]))
@@ -2409,7 +3436,6 @@ class KnowledgeForgeService:
                     project, document, mutation=mutation,
                 )
                 written_relations += int(report.get("relations") or 0)
-                written_entities += int(report.get("entities") or 0)
                 heartbeat()
             if documents:
                 self.graph.prune_project_entities(project, mutation=mutation)
@@ -2449,11 +3475,18 @@ class KnowledgeForgeService:
                 project_id, fixed_generation, policy_hash=policy_hash,
                 namespace_id=namespace, lease_token=mutation.lease_token,
                 manifest_digest=expected_manifest["content_digest"], empty=not documents,
+                stats={
+                    "documents": int(graph_stats.get("documents") or 0),
+                    "chunks": int(graph_stats.get("chunks") or 0),
+                    "entities": int(graph_stats.get("entities") or 0),
+                    "relations": graph_relations,
+                },
             )
             if not completed:
                 raise RuntimeError("图谱重建完成时 generation、lease 或 manifest 已过期")
             return {
-                "documents": len(documents), "entities": written_entities,
+                "documents": len(documents),
+                "entities": int(graph_stats.get("entities") or 0),
                 "relations": graph_relations,
             }
         finally:
