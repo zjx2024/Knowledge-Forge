@@ -1,0 +1,644 @@
+{
+  "candidate_status_summary": [
+    {
+      "count": 3,
+      "proposed_relation_type": "part_of",
+      "status": "verification_failed"
+    },
+    {
+      "count": 2,
+      "proposed_relation_type": "",
+      "status": "verification_failed"
+    },
+    {
+      "count": 2,
+      "proposed_relation_type": "located_in",
+      "status": "verification_failed"
+    },
+    {
+      "count": 2,
+      "proposed_relation_type": "produces",
+      "status": "verification_failed"
+    },
+    {
+      "count": 1,
+      "proposed_relation_type": "related_to",
+      "status": "verification_failed"
+    }
+  ],
+  "counts": {
+    "assertions_missing_evidence_text": 6,
+    "assertions_with_graph_edge": 0,
+    "canonical_entities": 169,
+    "entity_mentions": 173,
+    "failed_relation_assertions": 10,
+    "graph_relations": 0,
+    "relation_assertions": 10,
+    "relation_candidates": 10,
+    "verified_relation_assertions": 0
+  },
+  "document_builds": [
+    {
+      "completed_at": "2026-07-27T06:23:08.852834+00:00",
+      "content_revision_id": "revision_b73cb160c0e5e862440505d0c86358df15b08c4a6839b332b7848d543f7993b4",
+      "document_id": 18,
+      "error_message": "",
+      "latest_job_id": "8ce8e1e8eaf8472e9ea627eac8acd0d9",
+      "original_filename": "usgs-lithium-2025.pdf",
+      "project_id": 13,
+      "started_at": null,
+      "stats": {
+        "chunk_count": 8,
+        "entity_mentions": 107,
+        "relations": 2,
+        "section_count": 5
+      },
+      "status": "indexed",
+      "strategy_key": "stable",
+      "updated_at": "2026-07-27T06:23:08.869495+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T06:28:17.514387+00:00",
+      "content_revision_id": "revision_4097a0c5645a2f66e21882ea8caef94a3c97f84f258fc406591ca8aabc0782c5",
+      "document_id": 19,
+      "error_message": "",
+      "latest_job_id": "c4d1ebd2038e4018812db1fd68612cbc",
+      "original_filename": "usgs-cobalt-2025.pdf",
+      "project_id": 13,
+      "started_at": null,
+      "stats": {
+        "chunk_count": 7,
+        "entity_mentions": 66,
+        "relations": 8,
+        "section_count": 5
+      },
+      "status": "indexed",
+      "strategy_key": "stable",
+      "updated_at": "2026-07-27T06:28:17.530964+00:00"
+    }
+  ],
+  "documents": [
+    {
+      "active_revision_id": "revision_b73cb160c0e5e862440505d0c86358df15b08c4a6839b332b7848d543f7993b4",
+      "doc_hash": "7ec5654133aa5ef64fcfd6d4d23ac64a58f06f51bf1231576ebd8f595ad9257b",
+      "file_size_bytes": 746901,
+      "id": 18,
+      "mime_type": "application/pdf",
+      "original_filename": "usgs-lithium-2025.pdf",
+      "status": "indexed"
+    },
+    {
+      "active_revision_id": "revision_4097a0c5645a2f66e21882ea8caef94a3c97f84f258fc406591ca8aabc0782c5",
+      "doc_hash": "2d736a1d4f76a38b067c0b530d2db9121cdfe1d2b9c5b7d5c2343b7e6abc0d92",
+      "file_size_bytes": 764275,
+      "id": 19,
+      "mime_type": "application/pdf",
+      "original_filename": "usgs-cobalt-2025.pdf",
+      "status": "indexed"
+    }
+  ],
+  "entity_type_summary": [
+    {
+      "canonicals": 51,
+      "entity_type": "Product",
+      "mentions": 51
+    },
+    {
+      "canonicals": 43,
+      "entity_type": "GenericEntity",
+      "mentions": 46
+    },
+    {
+      "canonicals": 42,
+      "entity_type": "Location",
+      "mentions": 42
+    },
+    {
+      "canonicals": 19,
+      "entity_type": "Organization",
+      "mentions": 19
+    },
+    {
+      "canonicals": 10,
+      "entity_type": "Event",
+      "mentions": 11
+    },
+    {
+      "canonicals": 2,
+      "entity_type": "Person",
+      "mentions": 2
+    },
+    {
+      "canonicals": 2,
+      "entity_type": "Technology",
+      "mentions": 2
+    }
+  ],
+  "exported_at": "2026-07-27T16:18:37",
+  "note": "Stable graph reports 0 relations. PostgreSQL relation_assertions/candidates are exported separately because all 10 stable relation assertions are verification_failed and have no graph_edge_id.",
+  "project": {
+    "active_schema_version": 1,
+    "embedding_model": "bge-m3:latest",
+    "id": 13,
+    "llm_model": "qwen3.6:latest",
+    "model_max_tokens": 262144,
+    "name": "产业链0724",
+    "project_key": "0724-20260724094211-13"
+  },
+  "recent_stable_jobs": [
+    {
+      "completed_at": "2026-07-27T06:28:17.444733+00:00",
+      "created_at": "2026-07-27T06:17:57.411691+00:00",
+      "document_id": 19,
+      "error_message": null,
+      "id": "c4d1ebd2038e4018812db1fd68612cbc",
+      "kind": "ingestion",
+      "metadata": {
+        "active_subtask": "graph_sync",
+        "batch_id": "d70adefbec464fcd9d3cf51fe5effa70",
+        "chunks_ready": true,
+        "document_id": 19,
+        "document_name": "usgs-cobalt-2025.pdf",
+        "extraction_errors": 0,
+        "gleaning_chunks": 4,
+        "graph_ready": true,
+        "published_to_hugegraph": 0,
+        "rejected_relations": 0,
+        "relation_verification": {
+          "llm_verified": 0,
+          "missing_decisions": 0,
+          "published": 0,
+          "quarantined": 8,
+          "rejected": 0,
+          "retry_count": 0,
+          "rules_verified": 0,
+          "uncertain": 0,
+          "verification_requested": 8,
+          "verifier_failures": 8
+        },
+        "stage": "completed",
+        "strategy_key": "stable",
+        "structure_ready": true,
+        "subtasks": {
+          "chunking": {
+            "detail": "7 个向量索引",
+            "progress": 100,
+            "status": "completed"
+          },
+          "extraction": {
+            "detail": "6/6",
+            "progress": 100,
+            "status": "completed"
+          },
+          "graph_sync": {
+            "detail": "169 个实体，0 条关系",
+            "progress": 100,
+            "status": "completed"
+          },
+          "schema_base": {
+            "detail": "7 个基础知识块",
+            "progress": 100,
+            "status": "completed"
+          },
+          "structure": {
+            "detail": "9 个结构块",
+            "progress": 100,
+            "status": "completed"
+          }
+        },
+        "target_document_ids": [
+          19
+        ],
+        "target_document_names": [
+          "usgs-cobalt-2025.pdf"
+        ],
+        "verified_relations": 0
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-27T06:28:17.444733+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T06:23:08.821350+00:00",
+      "created_at": "2026-07-27T06:17:57.337844+00:00",
+      "document_id": 18,
+      "error_message": null,
+      "id": "8ce8e1e8eaf8472e9ea627eac8acd0d9",
+      "kind": "ingestion",
+      "metadata": {
+        "active_subtask": "graph_sync",
+        "batch_id": "d70adefbec464fcd9d3cf51fe5effa70",
+        "chunks_ready": true,
+        "document_id": 18,
+        "document_name": "usgs-lithium-2025.pdf",
+        "extraction_errors": 0,
+        "graph_ready": false,
+        "graph_rebuild_coalesced": true,
+        "published_to_hugegraph": 0,
+        "relation_verification": {
+          "llm_verified": 0,
+          "missing_decisions": 0,
+          "published": 0,
+          "quarantined": 2,
+          "rejected": 0,
+          "retry_count": 0,
+          "rules_verified": 0,
+          "uncertain": 0,
+          "verification_requested": 2,
+          "verifier_failures": 2
+        },
+        "stage": "completed",
+        "strategy_key": "stable",
+        "structure_ready": true,
+        "subtasks": {
+          "chunking": {
+            "detail": "8 个向量索引",
+            "progress": 100,
+            "status": "completed"
+          },
+          "extraction": {
+            "detail": "7/7",
+            "progress": 100,
+            "status": "completed"
+          },
+          "graph_sync": {
+            "detail": "已合并到批次最终重建",
+            "progress": 100,
+            "status": "completed"
+          },
+          "schema_base": {
+            "detail": "8 个基础知识块",
+            "progress": 100,
+            "status": "completed"
+          },
+          "structure": {
+            "detail": "9 个结构块",
+            "progress": 100,
+            "status": "completed"
+          }
+        },
+        "target_document_ids": [
+          18
+        ],
+        "target_document_names": [
+          "usgs-lithium-2025.pdf"
+        ],
+        "target_generation": 7
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-27T06:23:08.821350+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T03:23:51.561217+00:00",
+      "created_at": "2026-07-27T03:23:50.733595+00:00",
+      "document_id": null,
+      "error_message": null,
+      "id": "a16a86e895c4445abb8902a27a4fef40",
+      "kind": "graph_sync",
+      "metadata": {
+        "graph_ready": true
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": 6,
+      "updated_at": "2026-07-27T03:23:51.561217+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T03:20:46.454442+00:00",
+      "created_at": "2026-07-27T03:20:00.654929+00:00",
+      "document_id": 19,
+      "error_message": null,
+      "id": "fd6f2e1a944c4b92b33e6b95490231d4",
+      "kind": "content_preparation",
+      "metadata": {
+        "active_subtask": "",
+        "batch_id": "f704a5c39fe94a46b7cc100885d1882f",
+        "chunks_ready": true,
+        "document_id": 19,
+        "document_name": "usgs-cobalt-2025.pdf",
+        "graph_ready": false,
+        "stage": "completed",
+        "structure_ready": true,
+        "subtasks": {
+          "chunking": {
+            "detail": "7 个向量索引",
+            "progress": 100,
+            "status": "completed"
+          },
+          "extraction": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "graph_sync": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "schema_base": {
+            "detail": "Schema v1",
+            "progress": 100,
+            "status": "completed"
+          },
+          "structure": {
+            "detail": "9 个结构块",
+            "progress": 100,
+            "status": "completed"
+          }
+        },
+        "target_document_ids": [
+          19
+        ]
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-27T03:20:46.454442+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T03:20:23.989698+00:00",
+      "created_at": "2026-07-27T03:20:00.644992+00:00",
+      "document_id": 18,
+      "error_message": null,
+      "id": "3b63bedec3874a4091da29a20998ecbb",
+      "kind": "content_preparation",
+      "metadata": {
+        "active_subtask": "",
+        "batch_id": "f704a5c39fe94a46b7cc100885d1882f",
+        "chunks_ready": true,
+        "document_id": 18,
+        "document_name": "usgs-lithium-2025.pdf",
+        "graph_ready": false,
+        "stage": "completed",
+        "structure_ready": true,
+        "subtasks": {
+          "chunking": {
+            "detail": "8 个向量索引",
+            "progress": 100,
+            "status": "completed"
+          },
+          "extraction": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "graph_sync": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "schema_base": {
+            "detail": "Schema v1",
+            "progress": 100,
+            "status": "completed"
+          },
+          "structure": {
+            "detail": "9 个结构块",
+            "progress": 100,
+            "status": "completed"
+          }
+        },
+        "target_document_ids": [
+          18
+        ]
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-27T03:20:23.989698+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T03:14:43.618880+00:00",
+      "created_at": "2026-07-27T03:14:43.098796+00:00",
+      "document_id": 18,
+      "error_message": null,
+      "id": "d4f9b24e85d94852ac368c9c1ecb1a12",
+      "kind": "document_cleanup",
+      "metadata": {
+        "document_name": "usgs-lithium-2025.pdf",
+        "stage": "completed"
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-27T03:14:43.618880+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T03:14:39.362949+00:00",
+      "created_at": "2026-07-27T03:14:38.486529+00:00",
+      "document_id": 19,
+      "error_message": null,
+      "id": "b4ccdcdf4265466b8ae358dde78dbf7f",
+      "kind": "document_cleanup",
+      "metadata": {
+        "document_name": "usgs-cobalt-2025.pdf",
+        "stage": "completed"
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-27T03:14:39.362949+00:00"
+    },
+    {
+      "completed_at": "2026-07-27T03:00:17.408167+00:00",
+      "created_at": "2026-07-27T03:00:16.216616+00:00",
+      "document_id": null,
+      "error_message": null,
+      "id": "0036613f05414166b6a17e7e7a40385c",
+      "kind": "graph_sync",
+      "metadata": {
+        "graph_ready": true
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": 2,
+      "updated_at": "2026-07-27T03:00:17.408167+00:00"
+    },
+    {
+      "completed_at": "2026-07-24T09:43:08.728515+00:00",
+      "created_at": "2026-07-24T09:42:49.893971+00:00",
+      "document_id": 19,
+      "error_message": null,
+      "id": "9a4b5cecdda44295924ad9183b1fadcb",
+      "kind": "content_preparation",
+      "metadata": {
+        "active_subtask": "",
+        "batch_id": "4aa252bef93d43a495e352eefd1016f3",
+        "chunks_ready": true,
+        "document_id": 19,
+        "document_name": "usgs-cobalt-2025.pdf",
+        "graph_ready": false,
+        "stage": "completed",
+        "structure_ready": true,
+        "subtasks": {
+          "chunking": {
+            "detail": "7 个向量索引",
+            "progress": 100,
+            "status": "completed"
+          },
+          "extraction": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "graph_sync": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "schema_base": {
+            "detail": "Schema v1",
+            "progress": 100,
+            "status": "completed"
+          },
+          "structure": {
+            "detail": "9 个结构块",
+            "progress": 100,
+            "status": "completed"
+          }
+        },
+        "target_document_ids": [
+          19
+        ]
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-24T09:43:08.728515+00:00"
+    },
+    {
+      "completed_at": "2026-07-24T09:43:00.711391+00:00",
+      "created_at": "2026-07-24T09:42:49.868732+00:00",
+      "document_id": 18,
+      "error_message": null,
+      "id": "0f32137b06e84b4e8e4d469bf2d42645",
+      "kind": "content_preparation",
+      "metadata": {
+        "active_subtask": "",
+        "batch_id": "4aa252bef93d43a495e352eefd1016f3",
+        "chunks_ready": true,
+        "document_id": 18,
+        "document_name": "usgs-lithium-2025.pdf",
+        "graph_ready": false,
+        "stage": "completed",
+        "structure_ready": true,
+        "subtasks": {
+          "chunking": {
+            "detail": "8 个向量索引",
+            "progress": 100,
+            "status": "completed"
+          },
+          "extraction": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "graph_sync": {
+            "detail": "",
+            "progress": 0,
+            "status": "waiting"
+          },
+          "schema_base": {
+            "detail": "Schema v1",
+            "progress": 100,
+            "status": "completed"
+          },
+          "structure": {
+            "detail": "9 个结构块",
+            "progress": 100,
+            "status": "completed"
+          }
+        },
+        "target_document_ids": [
+          18
+        ]
+      },
+      "progress": 100,
+      "project_id": 13,
+      "status": "completed",
+      "strategy_key": "stable",
+      "target_generation": null,
+      "updated_at": "2026-07-24T09:43:00.711391+00:00"
+    }
+  ],
+  "relation_audit": {
+    "assertions_missing_evidence_text": 6,
+    "assertions_with_graph_edge": 0,
+    "failed_assertions": 10,
+    "relation_assertions": 10,
+    "verified_assertions": 0
+  },
+  "relation_status_summary": [
+    {
+      "count": 3,
+      "graph_edges": 0,
+      "relation_type": "part_of",
+      "verification_status": "verification_failed"
+    },
+    {
+      "count": 2,
+      "graph_edges": 0,
+      "relation_type": "",
+      "verification_status": "verification_failed"
+    },
+    {
+      "count": 2,
+      "graph_edges": 0,
+      "relation_type": "located_in",
+      "verification_status": "verification_failed"
+    },
+    {
+      "count": 2,
+      "graph_edges": 0,
+      "relation_type": "produces",
+      "verification_status": "verification_failed"
+    },
+    {
+      "count": 1,
+      "graph_edges": 0,
+      "relation_type": "related_to",
+      "verification_status": "verification_failed"
+    }
+  ],
+  "stable_graph": {
+    "error_message": "",
+    "generation": 8,
+    "namespace_id": "8fc2d670-9f89-45ba-bb60-7043baec23ac",
+    "policy_summary": {
+      "policy_hash": "982b8ee5dc6d1516be559d12c3ad6efc4c024630fe2942bcdf1766611edf1794",
+      "policy_version": "relation-graph-p0-v1",
+      "production_approved": true
+    },
+    "ready_generation": 8,
+    "stats": {
+      "chunks": 15,
+      "documents": 2,
+      "entities": 169,
+      "relations": 0
+    },
+    "status": "ready",
+    "strategy_key": "stable",
+    "updated_at": "2026-07-27T06:45:54.620589+00:00"
+  }
+}
