@@ -52,6 +52,10 @@ from .policy import POLICY_AXES, P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW
 from .quality import canonical_digest
 from .release_gate import ALLOWED_EVALUATOR_VERSIONS, evaluate_frozen_bundle
 from .relation_pipeline import VersionedRelationPipeline
+from .relation_shadow_runtime import (
+    SHADOW_RELATION_V2_POLICY_SET,
+    ShadowRelationV2Runtime,
+)
 from .schema_evolution import SchemaEvolutionService
 from .span_entities import SpanFirstEntityExtractor
 from .vector_store import VectorStore
@@ -460,6 +464,8 @@ class KnowledgeForgeService:
                 target_documents.append(target)
             if document_id not in {int(item["id"]) for item in target_documents}:
                 target_documents.insert(0, document)
+        if strategy_key == ENHANCED_SHADOW_STRATEGY:
+            self.db.assert_shadow_relation_v2_ready()
         self.db.ensure_project_strategy_graphs(int(document["project_id"]))
         for target in target_documents:
             self.db.ensure_document_strategy_builds(int(target["id"]))
@@ -485,10 +491,10 @@ class KnowledgeForgeService:
             )
             if active_enhanced:
                 raise ValueError("增强实验正在构建，完成后才能更新稳定基线")
-            self.db.invalidate_enhanced_strategy_for_document(
-                document_id,
-                reason="稳定基线开始重新构建，增强实验结果已失效",
-            )
+            # Stable and enhanced_shadow are independent construction products.
+            # A stable rebuild must not preemptively mark a ready enhanced
+            # snapshot as stale; source/document mutations have their own
+            # invalidation boundaries.
         batch_id = batch_id or uuid.uuid4().hex
         job = self.db.create_job(
             "ingestion",
@@ -741,6 +747,25 @@ class KnowledgeForgeService:
                 LOGGER.warning("Relation embedding refresh deferred for %s: %s", object_key, exc)
         return failures
 
+    def _run_shadow_relation_v2_namespace(
+        self,
+        *,
+        namespace_id: str,
+        project_id: int,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Invoke the only relation runtime permitted for enhanced_shadow."""
+
+        return ShadowRelationV2Runtime(
+            self.db,
+            self.ollama,
+            default_context_tokens=self.DEFAULT_MODEL_MAX_TOKENS,
+        ).run_namespace(
+            namespace_id=namespace_id,
+            project_id=project_id,
+            progress=progress,
+        )
+
     def build_entity_shadow_namespace(
         self,
         project_id: int,
@@ -817,10 +842,13 @@ class KnowledgeForgeService:
             "revision_id": str(chunk.get("revision_id") or ""),
             "content_hash": str(chunk.get("content_hash") or ""),
         } for chunk in chunks]
-        code_version = "entity-relation-shadow-v18-root-relation-mapping"
+        self.db.assert_shadow_relation_v2_ready()
+        code_version = (
+            "entity-shadow-p2-relation-v2-runtime-v2-predicate-metadata"
+        )
         config_payload = {
             "policy_set": policy_set,
-            "relation_policy_set": dict(P1_RELATION_SHADOW_POLICY_SET),
+            "relation_policy_set": dict(SHADOW_RELATION_V2_POLICY_SET),
             "llm_model": llm_model,
             "embedding_model": embedding_model,
             "model_max_tokens": int(project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS),
@@ -1108,74 +1136,10 @@ class KnowledgeForgeService:
                     if raw_id:
                         raw_to_mention[raw_id] = item.mention_id
 
-                relation_entities = self._relation_entities_with_canonicals(
-                    list(extraction.get("entities") or []),
-                    raw_to_mention,
-                    canonical_by_mention,
-                )
-                relation_run = self._run_relation_shadow(
-                    namespace_id, project, int(chunk["document_id"]), chunk,
-                    {"entities": relation_entities}, active_schema,
-                    raise_on_failure=True,
-                )
-                if not relation_run.get("coverage_complete"):
-                    raise RuntimeError(
-                        "增强关系抽取覆盖不完整: "
-                        + ", ".join(relation_run.get("coverage_failures") or ["unknown"])
-                    )
-                candidate_by_id = {
-                    str(item["candidate_id"]): item
-                    for item in relation_run.get("candidates") or []
-                }
-                endpoint_rows = []
-                for decision in relation_run.get("decisions") or []:
-                    if str(decision.get("predicate") or "") == "NO_RELATION":
-                        continue
-                    candidate = candidate_by_id.get(str(decision.get("candidate_id") or ""))
-                    if not candidate:
-                        raise RuntimeError("增强关系决策缺少对应候选")
-                    source_raw = str(candidate.get("source_mention_id") or "")
-                    target_raw = str(candidate.get("target_mention_id") or "")
-                    if str(decision.get("direction") or "as_is") == "reversed":
-                        source_raw, target_raw = target_raw, source_raw
-                    source_mention = self._shadow_relation_mention_id(
-                        source_raw, raw_to_mention, canonical_by_mention,
-                    )
-                    target_mention = self._shadow_relation_mention_id(
-                        target_raw, raw_to_mention, canonical_by_mention,
-                    )
-                    if not source_mention or not target_mention:
-                        raise RuntimeError("增强关系端点无法映射到归一实体提及")
-                    source_canonical = canonical_by_mention[source_mention]
-                    target_canonical = canonical_by_mention[target_mention]
-                    if source_canonical == target_canonical:
-                        continue
-                    endpoint_rows.append({
-                        "relation_key": str(decision["candidate_id"]),
-                        "document_id": int(chunk["document_id"]),
-                        "revision_id": str(chunk["revision_id"]),
-                        "chunk_id": int(chunk["id"]),
-                        "source_mention_key": source_mention,
-                        "target_mention_key": target_mention,
-                        "source_canonical_key": source_canonical,
-                        "target_canonical_key": target_canonical,
-                        "relation_type": str(decision.get("predicate") or "related_to"),
-                        "evidence_text": str(decision.get("evidence") or ""),
-                        "evidence_start": candidate.get("evidence_start"),
-                        "evidence_end": candidate.get("evidence_end"),
-                        "policy_version": policy_set["relation_candidate_policy_version"],
-                        "metadata": {
-                            "verification_status": "classified",
-                            "confidence": 1.0,
-                            "reason": str(decision.get("reason") or ""),
-                            "same_entity_snapshot": namespace_id,
-                        },
-                    })
-                self.db.persist_entity_shadow_relation_endpoints(namespace_id, endpoint_rows)
                 output = {
                     "mentions": len(normalized.mentions),
                     "rejected": len(normalized.rejected),
-                    "relation_endpoints": len(endpoint_rows),
+                    "relation_endpoints": 0,
                 }
                 output_hash = hashlib.sha256(
                     json.dumps(output, sort_keys=True).encode("utf-8")
@@ -1188,8 +1152,7 @@ class KnowledgeForgeService:
                 if progress:
                     progress(
                         int(summary["completed"]), int(summary["expected"]),
-                        f"知识块完成：{output['mentions']} 个实体提及，"
-                        f"{output['relation_endpoints']} 条关系",
+                        f"知识块实体阶段完成：{output['mentions']} 个实体提及",
                     )
             except Exception as exc:
                 status = self.db.fail_entity_shadow_work(
@@ -1203,6 +1166,11 @@ class KnowledgeForgeService:
                         f"知识块{label}：{exc}",
                     )
 
+        relation_v2 = self._run_shadow_relation_v2_namespace(
+            namespace_id=namespace_id,
+            project_id=project_id,
+            progress=progress,
+        )
         persisted = self.db.load_entity_shadow_snapshot(namespace_id)
         mention_count = len(self.db.list_entity_shadow_mentions(namespace_id))
         canonical_count = len(persisted["canonicals"])
@@ -1230,6 +1198,9 @@ class KnowledgeForgeService:
                 0.0 if not mention_count
                 else max(0.0, 1.0 - (canonical_count / mention_count))
             ),
+            "relation_v2_run_id": relation_v2["run_id"],
+            "relation_v2_fingerprint": relation_v2["input_fingerprint"],
+            "relation_v2": relation_v2["metrics"],
         }
         self.db.finalize_entity_shadow_namespace(
             namespace_id, metrics=metrics, artifact_hash=artifact_hash,
@@ -2796,7 +2767,7 @@ class KnowledgeForgeService:
 
     @recorded_job("enhanced_strategy_ingestion")
     def _ingest_enhanced_strategy(self, job_id: str, document_id: int) -> None:
-        """Build the isolated P1 relation + P2 entity comparison graph."""
+        """Build the isolated Shadow v2 relation + P2 entity comparison graph."""
 
         strategy_key = ENHANCED_SHADOW_STRATEGY
         lease: dict[str, Any] | None = None
@@ -2807,6 +2778,7 @@ class KnowledgeForgeService:
             int(value) for value in (metadata.get("target_document_ids") or [document_id])
         ]
         try:
+            self.db.assert_shadow_relation_v2_ready()
             project: dict[str, Any] | None = None
             for index, target_id in enumerate(target_document_ids, start=1):
                 document = self.db.get_document(target_id)
@@ -2840,14 +2812,14 @@ class KnowledgeForgeService:
                 job_id, "schema_base", subtask_status="completed", subtask_progress=100,
                 detail=f"{len(eligible_documents)} 个预处理结果", progress=50,
                 log=(
-                    "===== 增强实验：P1 关系 + P2 实体归一 =====\n"
+                    "===== 增强实验：Shadow v2 关系 + P2 实体归一 =====\n"
                     "已冻结文档预处理结果与逻辑 Schema，开始构建隔离实体关系快照"
                 ),
                 stage="graph", strategy_key=strategy_key, graph_ready=False,
             )
             self._job_subtask(
                 job_id, "extraction", subtask_status="running", subtask_progress=5,
-                detail="P1/P2 处理中", progress=52,
+                detail="Shadow v2/P2 处理中", progress=52,
             )
 
             def shadow_progress(done: int, total: int, message: str) -> None:
@@ -2879,7 +2851,7 @@ class KnowledgeForgeService:
                 log=(
                     f"增强实验快照完成：{len(shadow['mentions'])} 个实体提及，"
                     f"{len(shadow.get('canonicals') or [])} 个规范实体，"
-                    f"{len(shadow.get('relation_endpoints') or [])} 条已复核关系"
+                    f"{len(shadow.get('relation_endpoints') or [])} 条 v2 可物化关系"
                 ),
             )
             state = self.db.start_strategy_graph_rebuild(project_id, strategy_key)
@@ -2888,7 +2860,9 @@ class KnowledgeForgeService:
             policy_hash = hashlib.sha256(json.dumps({
                 "strategy": strategy_key,
                 "entity_policy": dict(P2_ENTITY_SHADOW_POLICY_SET),
-                "relation_policy": dict(P1_RELATION_SHADOW_POLICY_SET),
+                "relation_policy": dict(SHADOW_RELATION_V2_POLICY_SET),
+                "relation_v2_run_id": metrics.get("relation_v2_run_id") or "",
+                "relation_v2_fingerprint": metrics.get("relation_v2_fingerprint") or "",
                 "artifact_hash": namespace.get("artifact_hash") or "",
             }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
             lease = self.db.acquire_graph_lease(

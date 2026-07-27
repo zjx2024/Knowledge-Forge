@@ -36,7 +36,40 @@ from .value_parsing import coerce_confidence
 LOGGER = logging.getLogger(__name__)
 
 
+def _versioned_relation_policy(
+    name: str,
+    source_types: list[str],
+    target_types: list[str],
+    semantic_definition: str,
+    direction_description: str,
+    *,
+    publish_mode: str = "auto",
+    optional_soft_cues: list[str] | None = None,
+) -> dict[str, Any]:
+    """Describe predicate behavior as data; v2 never branches on ``name``."""
+
+    return {
+        "name": name,
+        "source_types": list(source_types),
+        "target_types": list(target_types),
+        "description": semantic_definition,
+        "semantic_definition": semantic_definition,
+        "domain_types": list(source_types),
+        "range_types": list(target_types),
+        "direction_description": direction_description,
+        "symmetric": False,
+        "inverse_predicate": None,
+        "canonical_orientation": "forward",
+        "publish_mode": publish_mode,
+        "reflexive": False,
+        "positive_examples": [],
+        "negative_examples": [],
+        "optional_soft_cues": list(optional_soft_cues or []),
+    }
+
+
 BASE_SCHEMA: dict[str, Any] = {
+    "version": "general-schema-v2-predicate-policy-v1",
     "name": "Knowledge Forge General Schema",
     "description": "A conservative cross-domain starting schema.",
     "entity_types": [
@@ -49,14 +82,47 @@ BASE_SCHEMA: dict[str, Any] = {
         {"name": "Event", "description": "Event, activity, state change or incident"},
     ],
     "relation_types": [
-        {"name": "related_to", "source_types": ["*"], "target_types": ["*"], "description": "General semantic relation"},
-        {"name": "part_of", "source_types": ["*"], "target_types": ["*"], "description": "Part-whole relation"},
-        {"name": "belongs_to", "source_types": ["*"], "target_types": ["*"], "description": "Membership or ownership"},
-        {"name": "located_in", "source_types": ["*"], "target_types": ["Location"], "description": "Location relation"},
-        {"name": "uses", "source_types": ["*"], "target_types": ["*"], "description": "Use or application"},
-        {"name": "produces", "source_types": ["*"], "target_types": ["*"], "description": "Production or output"},
-        {"name": "depends_on", "source_types": ["*"], "target_types": ["*"], "description": "Dependency"},
-        {"name": "causes", "source_types": ["*"], "target_types": ["*"], "description": "Causal relation"},
+        _versioned_relation_policy(
+            "related_to", ["*"], ["*"], "General semantic relation.",
+            "The subject is semantically related to the object; no inverse role is implied.",
+            publish_mode="review_only",
+            optional_soft_cues=["related", "关联"],
+        ),
+        _versioned_relation_policy(
+            "part_of", ["*"], ["*"], "The subject is a component or part of the object.",
+            "Orient from the part as subject to the whole as object.",
+            optional_soft_cues=["part of", "组成"],
+        ),
+        _versioned_relation_policy(
+            "belongs_to", ["*"], ["*"], "The subject is a member of or owned by the object.",
+            "Orient from the member or owned item to the owning object.",
+            optional_soft_cues=["belongs to", "属于"],
+        ),
+        _versioned_relation_policy(
+            "located_in", ["*"], ["Location"], "The subject is physically or administratively located in the object.",
+            "Orient from the located subject to the containing location.",
+            optional_soft_cues=["located in", "位于"],
+        ),
+        _versioned_relation_policy(
+            "uses", ["*"], ["*"], "The subject applies or consumes the object.",
+            "Orient from the user as subject to the used object.",
+            optional_soft_cues=["uses", "使用"],
+        ),
+        _versioned_relation_policy(
+            "produces", ["*"], ["*"], "The subject creates or outputs the object.",
+            "Orient from the producer as subject to the produced output.",
+            optional_soft_cues=["produces", "生产"],
+        ),
+        _versioned_relation_policy(
+            "depends_on", ["*"], ["*"], "The subject requires the object for operation or existence.",
+            "Orient from the dependent subject to the dependency object.",
+            optional_soft_cues=["depends on", "依赖"],
+        ),
+        _versioned_relation_policy(
+            "causes", ["*"], ["*"], "The subject brings about the object.",
+            "Orient from the cause as subject to the resulting object.",
+            optional_soft_cues=["causes", "导致"],
+        ),
     ],
     "rules": {"directed_relations": True, "preserve_provenance": True, "allow_generic_fallback": True},
 }
@@ -183,11 +249,40 @@ SCHEMA_REVIEW_FORMAT = {
                     "description": {"type": "string"},
                     "source_types": {"type": "array", "items": {"type": "string"}},
                     "target_types": {"type": "array", "items": {"type": "string"}},
+                    "semantic_definition": {"type": "string"},
+                    "domain_types": {"type": "array", "items": {"type": "string"}},
+                    "range_types": {"type": "array", "items": {"type": "string"}},
+                    "direction_description": {"type": "string"},
+                    "symmetric": {"type": "boolean"},
+                    "inverse_predicate": {"type": ["string", "null"]},
+                    "canonical_orientation": {
+                        "type": "string",
+                        "enum": ["forward", "inverse", "symmetric"],
+                    },
+                    "publish_mode": {
+                        "type": "string",
+                        "enum": ["auto", "review_only", "disabled"],
+                    },
+                    "reflexive": {"type": "boolean"},
+                    "positive_examples": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "negative_examples": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "optional_soft_cues": {
+                        "type": "array", "items": {"type": "string"},
+                    },
                     "confidence": {"type": "number"},
                     "evidence_chunks": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": [
-                    "name", "description", "source_types", "target_types", "confidence", "evidence_chunks"
+                    "name", "description", "source_types", "target_types",
+                    "semantic_definition", "domain_types", "range_types",
+                    "direction_description", "symmetric", "inverse_predicate",
+                    "canonical_orientation", "publish_mode", "reflexive",
+                    "positive_examples", "negative_examples",
+                    "optional_soft_cues", "confidence", "evidence_chunks",
                 ],
             },
         },
@@ -535,6 +630,10 @@ class SchemaEvolutionService:
             "You discover reusable logical knowledge graph types from representative document excerpts. "
             "Propose only domain types that are repeatedly useful and missing from the current schema. "
             "Do not model individual names as types. Never remove, rename or redefine existing types. "
+            "Every relation candidate must explicitly define its complete versioned semantic policy: "
+            "semantic definition, domain/range types, direction, symmetry, inverse predicate or null, "
+            "canonical orientation, publish mode, reflexivity, positive/negative examples, and optional "
+            "soft cues. Soft cues are non-binding model hints, never deterministic rules. "
             "Use short English identifiers. Every candidate must cite evidence_chunks using the exact bracketed "
             "chunk keys supplied. Return empty candidate arrays when the general schema is sufficient."
         )
@@ -573,7 +672,8 @@ class SchemaEvolutionService:
                 system=(
                     "You consolidate candidate additions to an existing logical knowledge graph schema. "
                     "Merge synonyms, reject instance names and overly narrow types, preserve all valid evidence chunk keys, "
-                    "and keep only additive reusable types supported by the supplied candidates. Use short English identifiers."
+                    "and keep only additive reusable types supported by the supplied candidates. Preserve every explicit "
+                    "relation policy field; never infer behavior from a predicate name. Use short English identifiers."
                 ),
                 prompt=(
                     f"Current schema:\n{json.dumps(current, ensure_ascii=False)}\n\n"
@@ -652,8 +752,42 @@ class SchemaEvolutionService:
         for item in review.get("relation_type_candidates") or []:
             name = str(item.get("name") or "").strip()
             confidence = coerce_confidence(item.get("confidence"), 0.0)
-            sources = list(dict.fromkeys(str(value) for value in item.get("source_types") or ["*"] if str(value) in allowed_types))
-            targets = list(dict.fromkeys(str(value) for value in item.get("target_types") or ["*"] if str(value) in allowed_types))
+            sources = list(dict.fromkeys(
+                str(value) for value in item.get("source_types") or []
+                if str(value) in allowed_types
+            ))
+            targets = list(dict.fromkeys(
+                str(value) for value in item.get("target_types") or []
+                if str(value) in allowed_types
+            ))
+            domains = list(dict.fromkeys(
+                str(value) for value in item.get("domain_types") or []
+                if str(value) in allowed_types
+            ))
+            ranges = list(dict.fromkeys(
+                str(value) for value in item.get("range_types") or []
+                if str(value) in allowed_types
+            ))
+            semantic_definition = str(
+                item.get("semantic_definition") or ""
+            ).strip()[:1000]
+            direction_description = str(
+                item.get("direction_description") or ""
+            ).strip()[:1000]
+            canonical_orientation = str(
+                item.get("canonical_orientation") or ""
+            ).strip()
+            publish_mode = str(item.get("publish_mode") or "").strip()
+            symmetric = item.get("symmetric")
+            reflexive = item.get("reflexive")
+            inverse_value = item.get("inverse_predicate")
+            inverse_predicate = (
+                str(inverse_value).strip()
+                if isinstance(inverse_value, str) else ""
+            )
+            positive_examples = item.get("positive_examples")
+            negative_examples = item.get("negative_examples")
+            optional_soft_cues = item.get("optional_soft_cues")
             supported, evidence = self._evidence_supported(item, sample_map)
             if (
                 len(accepted_relations) >= Config.schema_max_relation_additions
@@ -662,23 +796,61 @@ class SchemaEvolutionService:
                 or _type_name_exists(name, relation_names)
                 or not sources
                 or not targets
+                or sources != domains
+                or targets != ranges
+                or not semantic_definition
+                or not direction_description
+                or not isinstance(symmetric, bool)
+                or not isinstance(reflexive, bool)
+                or canonical_orientation not in {"forward", "inverse", "symmetric"}
+                or publish_mode not in {"auto", "review_only", "disabled"}
+                or symmetric != (canonical_orientation == "symmetric")
+                or (
+                    canonical_orientation == "inverse"
+                    and (
+                        not inverse_predicate
+                        or inverse_predicate not in relation_names
+                    )
+                )
+                or (symmetric and bool(inverse_predicate))
+                or (
+                    inverse_predicate
+                    and inverse_predicate not in relation_names
+                )
+                or not isinstance(positive_examples, list)
+                or not all(isinstance(value, str) for value in positive_examples)
+                or not isinstance(negative_examples, list)
+                or not all(isinstance(value, str) for value in negative_examples)
+                or not isinstance(optional_soft_cues, list)
+                or not all(isinstance(value, str) for value in optional_soft_cues)
                 or not supported
             ):
                 rejected["relation_types"] += 1
                 continue
             value = {
                 "name": name,
-                "description": str(item.get("description") or "")[:500],
+                "description": str(item.get("description") or semantic_definition)[:500],
                 "source_types": sources,
                 "target_types": targets,
+                "semantic_definition": semantic_definition,
+                "domain_types": domains,
+                "range_types": ranges,
+                "direction_description": direction_description,
+                "symmetric": symmetric,
+                "inverse_predicate": inverse_predicate or None,
+                "canonical_orientation": canonical_orientation,
+                "publish_mode": publish_mode,
+                "reflexive": reflexive,
+                "positive_examples": list(positive_examples),
+                "negative_examples": list(negative_examples),
+                "optional_soft_cues": list(optional_soft_cues),
                 "evidence_chunks": evidence,
                 "confidence": confidence,
             }
             updated["relation_types"].append({
-                "name": name,
-                "description": value["description"],
-                "source_types": sources,
-                "target_types": targets,
+                key: candidate_value
+                for key, candidate_value in value.items()
+                if key not in {"evidence_chunks", "confidence"}
             })
             relation_names.add(name)
             accepted_relations.append(value)

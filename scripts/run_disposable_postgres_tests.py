@@ -46,6 +46,9 @@ def main() -> int:
     environment = {
         **os.environ,
         "KNOWLEDGE_FORGE_TEST_POSTGRES_DSN": context.test_dsn,
+        # Migration-contract tests need to create additional schemas, but only
+        # inside this sentinel-bound random disposable database.
+        "KNOWLEDGE_FORGE_TEST_POSTGRES_ADMIN_DSN": context.target_admin_dsn,
         "KNOWLEDGE_FORGE_TEST_SCHEMA": context.schema,
         "KNOWLEDGE_FORGE_TEST_RUN_ID": context.run_id,
         "KNOWLEDGE_FORGE_TEST_POSTGRES_IDENTITY": context.identity,

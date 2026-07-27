@@ -27,7 +27,7 @@ STRATEGIES = {
     ENHANCED_SHADOW_STRATEGY: ConstructionStrategy(
         key=ENHANCED_SHADOW_STRATEGY,
         label="增强实验",
-        description="基于文档预处理结果运行 P1/P2 隔离对比流程",
+        description="基于文档预处理结果运行 Shadow v2 关系与 P2 实体隔离流程",
         production_approved=False,
     ),
 }

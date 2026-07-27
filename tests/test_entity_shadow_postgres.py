@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -9,6 +11,7 @@ from psycopg.rows import dict_row
 
 from knowledge_forge.database import Database
 from knowledge_forge.service import KnowledgeForgeService
+from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
 class _FakeOllama:
@@ -22,9 +25,22 @@ class _FakeOllama:
         self.embedding_batch_sizes.append(len(texts))
         return [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in texts]
 
-    def json_chat(self, **_kwargs):
+    def json_chat(self, **kwargs):
+        if "classifier" in str(kwargs.get("system") or ""):
+            payload = json.loads(kwargs["prompt"])
+            return {"items": [{
+                "pair_id": pair["pair_id"],
+                "decision": "NO_RELATION",
+                "hypotheses": [],
+                "reason_code": "FIXTURE_NO_RELATION",
+            } for pair in payload["pairs"]]}
+        if "verifier" in str(kwargs.get("system") or ""):
+            raise AssertionError("NO_RELATION fixture must not call verifier")
         self.review_calls += 1
         return {"decision": "separate", "canonical_key": "", "reason": "test"}
+
+    def effective_model_context(self, _model):
+        return SimpleNamespace(digest="sha256:entity-shadow-postgres-fixture")
 
 
 class _FakeSchemas:
@@ -158,7 +174,13 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
             """INSERT INTO graph_schemas(
                project_id,version,status,schema_json,source_document_ids,created_by,applied_at)
                VALUES(%s,1,'active',%s::jsonb,'{}','test',NOW())""",
-            (project_id, '{"entity_types":[],"relation_types":[]}'),
+            (
+                project_id,
+                json.dumps({
+                    "entity_types": [],
+                    **logical_schema(predicate_policy("fixture_rel")),
+                }),
+            ),
         )
         _seed_document(
             conn, project_id, 1,

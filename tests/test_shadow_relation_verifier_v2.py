@@ -14,8 +14,10 @@ from knowledge_forge.relation_shadow_v2 import (
     supported_for_normalization,
     validate_hypothesis,
     verifier_prompt,
+    verifier_response_schema,
     verify_hypothesis,
 )
+from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
 def _mention(key, surface, start, *, entity_type="*", canonical=None):
@@ -32,20 +34,16 @@ def _mention(key, surface, start, *, entity_type="*", canonical=None):
 
 
 def _schema(*predicates):
-    return {
-        "version": 2,
-        "relation_types": list(predicates),
-    }
+    return logical_schema(*predicates)
 
 
 def _predicate(name, *, domain=None, range_=None, **metadata):
-    return {
-        "name": name,
-        "domain": domain or ["*"],
-        "range": range_ or ["*"],
-        "description": f"Definition for {name}",
+    return predicate_policy(
+        name,
+        domain=domain,
+        range_=range_,
         **metadata,
-    }
+    )
 
 
 def _classified(content, mentions, schema, *, predicate, subject, object_, spans=None):
@@ -91,7 +89,7 @@ def _supported(hypothesis):
     }
 
 
-def test_supply_does_not_verify_as_production_without_calling_model() -> None:
+def test_semantic_non_entailment_is_decided_by_independent_verifier() -> None:
     content = "Automotive industry obtains battery material supplies."
     mentions = [
         _mention("auto", "Automotive industry", 0),
@@ -107,20 +105,32 @@ def test_supply_does_not_verify_as_production_without_calling_model() -> None:
         object_="occ-battery",
     )
     calls = []
+    validation = validate_hypothesis(
+        hypothesis, pair, content=content, logical_schema=schema,
+    )
 
     attempt = verify_hypothesis(
         hypothesis,
-        validate_hypothesis(hypothesis, pair, content=content, logical_schema=schema),
+        validation,
         pair,
         content=content,
         logical_schema=schema,
-        verifier=lambda *_args, **_kwargs: calls.append(True),
+        verifier=lambda *_args, **_kwargs: (
+            calls.append(True)
+            or {
+                "hypothesis_id": hypothesis.hypothesis_id,
+                "verdict": "REJECTED",
+                "reason_code": "SEMANTICALLY_NOT_ENTAILED",
+                "supported_evidence_spans": [],
+            }
+        ),
         verifier_model_revision="verifier-model-r1",
     )
 
+    assert validation.status == "PASS"
     assert attempt.verdict == "REJECTED"
-    assert attempt.reason_code == "SUPPLY_IS_NOT_PRODUCTION"
-    assert calls == []
+    assert attempt.reason_code == "SEMANTICALLY_NOT_ENTAILED"
+    assert calls == [True]
 
 
 @pytest.mark.parametrize(
@@ -130,7 +140,7 @@ def test_supply_does_not_verify_as_production_without_calling_model() -> None:
         ("A depends_on B.", "depends_on"),
     ],
 )
-def test_reverse_direction_is_rejected_before_verifier(content, predicate) -> None:
+def test_direction_semantics_are_decided_by_verifier(content, predicate) -> None:
     mentions = [_mention("a", "A", 0), _mention("b", "B", len(content) - 2)]
     schema = _schema(_predicate(predicate))
     pair, hypothesis = _classified(
@@ -142,12 +152,27 @@ def test_reverse_direction_is_rejected_before_verifier(content, predicate) -> No
         object_="occ-a",
     )
 
-    result = validate_hypothesis(
+    validation = validate_hypothesis(
         hypothesis, pair, content=content, logical_schema=schema,
     )
+    attempt = verify_hypothesis(
+        hypothesis,
+        validation,
+        pair,
+        content=content,
+        logical_schema=schema,
+        verifier=lambda *_args: {
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "verdict": "REJECTED",
+            "reason_code": "DIRECTION_NOT_ENTAILED",
+            "supported_evidence_spans": [],
+        },
+        verifier_model_revision="verifier-model-r1",
+    )
 
-    assert result.status == "REJECTED"
-    assert result.reason_code == "DIRECTION_NOT_ENTAILED"
+    assert validation.status == "PASS"
+    assert attempt.verdict == "REJECTED"
+    assert attempt.reason_code == "DIRECTION_NOT_ENTAILED"
 
 
 def test_list_cooccurrence_is_rejected_by_independent_verifier() -> None:
@@ -185,7 +210,9 @@ def test_list_cooccurrence_is_rejected_by_independent_verifier() -> None:
 def test_related_to_contact_cooccurrence_is_review_only_and_never_verified() -> None:
     content = "Contact: Alice; phone: 555-0100."
     mentions = [_mention("alice", "Alice", 9), _mention("phone", "555-0100", 23)]
-    schema = _schema(_predicate("related_to"))
+    schema = _schema(_predicate(
+        "related_to", publish_mode="review_only",
+    ))
     pair, hypothesis = _classified(
         content,
         mentions,
@@ -331,13 +358,15 @@ def test_unknown_specific_type_is_review_only_but_wildcard_can_reach_verifier() 
 
 
 @pytest.mark.parametrize(
-    ("content", "expected"),
+    ("content", "verdict", "reason"),
     [
-        ("Alpha does not use Beta.", "NEGATED"),
-        ("Alpha might use Beta.", "HYPOTHETICAL"),
+        ("Alpha does not use Beta.", "REJECTED", "NEGATED"),
+        ("Alpha might use Beta.", "UNCERTAIN", "HYPOTHETICAL"),
     ],
 )
-def test_negated_and_hypothetical_relations_fail_closed(content, expected) -> None:
+def test_negation_and_modality_are_decided_by_verifier(
+    content, verdict, reason,
+) -> None:
     beta_start = content.index("Beta")
     mentions = [_mention("alpha", "Alpha", 0), _mention("beta", "Beta", beta_start)]
     schema = _schema(_predicate("uses"))
@@ -353,9 +382,24 @@ def test_negated_and_hypothetical_relations_fail_closed(content, expected) -> No
     validation = validate_hypothesis(
         hypothesis, pair, content=content, logical_schema=schema,
     )
+    attempt = verify_hypothesis(
+        hypothesis,
+        validation,
+        pair,
+        content=content,
+        logical_schema=schema,
+        verifier=lambda *_args: {
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "verdict": verdict,
+            "reason_code": reason,
+            "supported_evidence_spans": [],
+        },
+        verifier_model_revision="verifier-model-r1",
+    )
 
-    assert validation.status in {"REJECTED", REVIEW_ONLY}
-    assert validation.reason_code == expected
+    assert validation.status == "PASS"
+    assert attempt.verdict == verdict
+    assert attempt.reason_code == reason
 
 
 @pytest.mark.parametrize(
@@ -391,6 +435,42 @@ def test_verifier_timeout_missing_or_invalid_output_is_retryable_failed(verifier
 
     assert attempt.verdict == RETRYABLE_FAILED
     assert supported_for_normalization(attempt) is False
+
+
+def test_verifier_correlation_is_caller_bound_and_model_cannot_invent_an_id():
+    content = "Alpha uses Beta."
+    mentions = [_mention("alpha", "Alpha", 0), _mention("beta", "Beta", 11)]
+    schema = _schema(_predicate("uses"))
+    pair, hypothesis = _classified(
+        content,
+        mentions,
+        schema,
+        predicate="uses",
+        subject="occ-alpha",
+        object_="occ-beta",
+    )
+    response_contract = verifier_response_schema(hypothesis.hypothesis_id)
+    attempt = verify_hypothesis(
+        hypothesis,
+        validate_hypothesis(
+            hypothesis, pair, content=content, logical_schema=schema,
+        ),
+        pair,
+        content=content,
+        logical_schema=schema,
+        verifier=lambda _prompt, contract: {
+            "verdict": "SUPPORTED",
+            "reason_code": "DIRECTLY_ENTAILED",
+            "supported_evidence_spans": [{"start": 0, "end": len(content)}],
+        },
+        verifier_model_revision="verifier-model-r1",
+    )
+
+    assert "hypothesis_id" not in response_contract["properties"]
+    assert "hypothesis_id" not in response_contract["required"]
+    assert attempt.hypothesis_id == hypothesis.hypothesis_id
+    assert attempt.verdict == SUPPORTED
+    assert attempt.independent_call is True
 
 
 def test_same_pair_hypotheses_are_verified_independently() -> None:

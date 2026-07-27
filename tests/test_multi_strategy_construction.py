@@ -54,6 +54,7 @@ class _StrategyDatabase:
         self.updated: list[tuple[int, str, dict]] = []
         self.invalidated: list[tuple[int, str]] = []
         self.stale: list[tuple[int, str, str]] = []
+        self.shadow_v2_readiness_checks = 0
         self.jobs = {"job-enhanced_shadow": {"id": "job-enhanced_shadow", "metadata": {}}}
         self.revision: dict | None = None
         self.chunks = [{"id": 101, "document_id": 11, "content": "shared"}]
@@ -63,6 +64,10 @@ class _StrategyDatabase:
 
     def ensure_project_strategy_graphs(self, project_id):
         return []
+
+    def assert_shadow_relation_v2_ready(self):
+        self.shadow_v2_readiness_checks += 1
+        return {"migrations": [f"00{value}" for value in range(14, 20)]}
 
     def ensure_document_strategy_builds(self, document_id, reset=False):
         return []
@@ -140,14 +145,15 @@ def test_strategy_registry_is_stable_and_rejects_unknown_values():
         normalize_strategy("typo")
 
 
-def test_stable_rebuild_invalidates_enhanced_snapshot_before_dispatch():
+def test_stable_rebuild_preserves_ready_enhanced_snapshot_before_dispatch():
     database = _StrategyDatabase()
     service = _service(database)
 
     job_id = service.submit_ingestion(11, strategy_key=STABLE_STRATEGY)
 
     assert job_id == "job-stable"
-    assert database.invalidated == [(11, "稳定基线开始重新构建，增强实验结果已失效")]
+    assert database.invalidated == []
+    assert database.builds[ENHANCED_SHADOW_STRATEGY]["status"] == "indexed"
     assert service.executor.calls == [("_ingest_document", (job_id, 11))]
 
 
@@ -191,8 +197,25 @@ def test_enhanced_build_can_prepare_shared_content_without_stable_build():
     job_id = service.submit_ingestion(11, strategy_key=ENHANCED_SHADOW_STRATEGY)
 
     assert job_id == "job-enhanced_shadow"
+    assert database.shadow_v2_readiness_checks == 1
     assert service.executor.calls == [("_ingest_enhanced_strategy", (job_id, 11))]
     assert database.updated[-1][2]["status"] == "queued"
+
+
+def test_enhanced_entry_fails_closed_when_shadow_v2_migrations_are_missing():
+    class MissingMigrationDatabase(_StrategyDatabase):
+        def assert_shadow_relation_v2_ready(self):
+            raise RuntimeError("Shadow relation v2 数据库结构不完整")
+
+    database = MissingMigrationDatabase()
+    service = _service(database)
+
+    with pytest.raises(RuntimeError, match="数据库结构不完整"):
+        service.submit_ingestion(11, strategy_key=ENHANCED_SHADOW_STRATEGY)
+
+    assert service.executor.calls == []
+    assert database.updated == []
+    assert database.stale == []
 
 
 def test_enhanced_project_job_marks_every_target_document_queued():

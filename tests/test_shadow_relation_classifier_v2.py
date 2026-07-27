@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from knowledge_forge.relation_shadow_v2 import (
@@ -12,7 +14,9 @@ from knowledge_forge.relation_shadow_v2 import (
     normalize_predicate_schema,
     parse_classifier_response,
     plan_pair_opportunities,
+    validate_hypothesis,
 )
+from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
 CONTENT = "Acme uses Alloy."
@@ -44,48 +48,44 @@ def _mentions():
 
 
 def _schema():
-    return {
-        "version": 7,
-        "relation_types": [
-            {
-                "name": "uses",
-                "domain": ["Organization"],
-                "range": ["Product"],
-                "description": "The organization uses the product.",
-                "positive_examples": ["Acme uses Alloy."],
-                "negative_examples": ["Alloy uses Acme."],
-                "inverse_of": "used_by",
-                "canonical_forward": "uses",
-            },
-            {
-                "name": "used_by",
-                "domain": ["Product"],
-                "range": ["Organization"],
-                "description": "Inverse of uses.",
-                "inverse_of": "uses",
-                "canonical_forward": "uses",
-            },
-            {
-                "name": "supplies",
-                "domain": ["Organization"],
-                "range": ["Product"],
-                "description": "The organization supplies the product.",
-            },
-            {
-                "name": "related_to",
-                "domain": ["*"],
-                "range": ["*"],
-                "description": "Generic semantic relation.",
-            },
-            {
-                "name": "partners_with",
-                "domain": ["Organization"],
-                "range": ["Organization"],
-                "symmetric": True,
-                "description": "Mutual partnership.",
-            },
-        ],
-    }
+    return logical_schema(
+        predicate_policy(
+            "uses",
+            domain=["Organization"],
+            range_=["Product"],
+            semantic_definition="The organization applies the product.",
+            inverse_predicate="used_by",
+            positive_examples=["Acme applies Alloy."],
+            negative_examples=["Alloy applies Acme."],
+        ),
+        predicate_policy(
+            "used_by",
+            domain=["Product"],
+            range_=["Organization"],
+            semantic_definition="The product is applied by the organization.",
+            inverse_predicate="uses",
+            canonical_orientation="inverse",
+        ),
+        predicate_policy(
+            "supplies",
+            domain=["Organization"],
+            range_=["Product"],
+            semantic_definition="The organization supplies the product.",
+        ),
+        predicate_policy(
+            "related_to",
+            publish_mode="review_only",
+            semantic_definition="Generic semantic relation.",
+        ),
+        predicate_policy(
+            "partners_with",
+            domain=["Organization"],
+            range_=["Organization"],
+            symmetric=True,
+            semantic_definition="Mutual partnership.",
+        ),
+        version="test-schema-v7",
+    )
 
 
 def _opportunity(schema=None, content=CONTENT, mentions=None):
@@ -205,6 +205,43 @@ def test_ordered_endpoint_roles_are_the_only_direction_source() -> None:
     )
 
 
+def test_structural_left_right_roles_bind_to_exact_frozen_occurrences() -> None:
+    pair = _opportunity()
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(pair.pair_identity, hypotheses=[
+            _hypothesis(subject="RIGHT", predicate="used_by", object_="LEFT"),
+        ])]},
+        content=CONTENT,
+        logical_schema=_schema(),
+    )[0].hypotheses[0]
+
+    assert parsed.subject_occurrence_key == pair.right_occurrence_key
+    assert parsed.object_occurrence_key == pair.left_occurrence_key
+
+
+def test_type_incompatible_orientation_is_classified_then_rejected_by_validation() -> None:
+    pair = _opportunity()
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(pair.pair_identity, hypotheses=[
+            _hypothesis(subject="RIGHT", predicate="uses", object_="LEFT"),
+        ])]},
+        content=CONTENT,
+        logical_schema=_schema(),
+    )[0].hypotheses[0]
+
+    validation = validate_hypothesis(
+        parsed,
+        pair,
+        content=CONTENT,
+        logical_schema=_schema(),
+    )
+
+    assert validation.status == "REJECTED"
+    assert validation.reason_code == "TYPE_INCOMPATIBLE"
+
+
 def test_legacy_direction_must_agree_with_endpoint_roles() -> None:
     pair = _opportunity()
     with pytest.raises(ShadowClassificationError, match="direction"):
@@ -249,7 +286,7 @@ def test_symmetric_schema_is_metadata_not_a_second_direction_field() -> None:
     assert not hasattr(parsed[0].hypotheses[0], "direction")
 
 
-def test_related_to_is_shadow_review_only_even_if_active_schema_is_not() -> None:
+def test_publish_mode_metadata_controls_review_only() -> None:
     schema = normalize_predicate_schema(_schema())
     related = schema["related_to"]
 
@@ -318,7 +355,7 @@ def test_invalid_or_unrepairable_classifier_output_fails_closed(raw) -> None:
         )
 
 
-def test_prompt_and_json_schema_version_the_contract_and_hard_negatives() -> None:
+def test_prompt_and_json_schema_version_the_generic_contract() -> None:
     pair = _opportunity()
     prompt = classifier_prompt([pair], content=CONTENT, logical_schema=_schema())
     schema = classifier_response_schema([pair])
@@ -326,12 +363,41 @@ def test_prompt_and_json_schema_version_the_contract_and_hard_negatives() -> Non
     assert all(term in prompt for term in (
         "NO_RELATION",
         "OTHER_UNSUPPORTED",
-        "同一列表",
-        "电话号码",
-        "供应",
-        "生产",
-        "A 使用 B",
-        "A 依赖 B",
+        "semantic_definition",
+        "direction_description",
+        "optional_soft_cues",
+        "不能作为关系、方向或发布的证据",
     ))
-    assert schema["minItems"] == schema["maxItems"] == 1
-    assert "direction" not in schema["items"]["properties"]["hypotheses"]["items"]["properties"]
+    assert all(term not in prompt for term in ("同一列表", "电话号码"))
+    assert schema["properties"]["pair_id"]["type"] == "string"
+    assert schema["properties"]["decision"]["enum"] == [
+        NO_RELATION,
+        OTHER_UNSUPPORTED,
+        HYPOTHESES,
+    ]
+    payload = json.loads(prompt)
+    assert payload["pairs"][0]["left_occurrence_id"] == "LEFT"
+    assert payload["pairs"][0]["right_occurrence_id"] == "RIGHT"
+    endpoint_schema = (
+        schema["properties"]["hypotheses"]["items"]["properties"]
+    )
+    assert endpoint_schema["subject_occurrence_id"]["enum"] == ["LEFT", "RIGHT"]
+    assert endpoint_schema["object_occurrence_id"]["enum"] == ["LEFT", "RIGHT"]
+    assert "direction" not in endpoint_schema
+
+
+def test_multi_pair_schema_uses_decisions_array_wrapper() -> None:
+    pair = _opportunity()
+    second = _opportunity(content=CONTENT, mentions=[
+        {**_mentions()[0], "occurrence_key": "occ-acme-2"},
+        {**_mentions()[1], "occurrence_key": "occ-alloy-2"},
+    ])
+    schema = classifier_response_schema([pair, second])
+
+    decisions_schema = schema["properties"]["decisions"]
+    assert decisions_schema["minItems"] == decisions_schema["maxItems"] == 2
+    assert decisions_schema["items"]["required"] == [
+        "pair_id",
+        "decision",
+        "hypotheses",
+    ]

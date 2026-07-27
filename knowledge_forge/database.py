@@ -72,6 +72,52 @@ class RevisionLeaseLost(StaleContentRevision):
     """The worker no longer owns the revision lease."""
 
 
+SHADOW_RELATION_V2_REQUIRED_MIGRATIONS = (
+    "0014_shadow_relation_v2_ledger",
+    "0015_shadow_relation_v2_verification",
+    "0016_shadow_relation_v2_normalization",
+    "0017_shadow_relation_v2_freshness",
+    "0018_shadow_relation_v2_gold",
+    "0019_shadow_relation_v2_execution",
+)
+
+SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS = {
+    "shadow_relation_v2_runs": {
+        "id", "project_id", "input_fingerprint", "fingerprint_components",
+        "source_generation", "status",
+    },
+    "shadow_relation_pair_opportunities": {
+        "id", "run_id", "pair_identity", "left_occurrence_key",
+        "right_occurrence_key", "status",
+    },
+    "shadow_relation_classification_attempts": {
+        "id", "pair_opportunity_id", "attempt_no", "status",
+    },
+    "shadow_relation_hypotheses": {
+        "id", "pair_opportunity_id", "hypothesis_key", "predicate", "status",
+    },
+    "shadow_relation_hypothesis_validations": {
+        "hypothesis_id", "status", "reason_code",
+    },
+    "shadow_relation_verification_attempts": {
+        "id", "hypothesis_id", "attempt_no", "verdict", "independent_call",
+    },
+    "shadow_relation_normalized_facts": {
+        "id", "project_id", "semantic_fact_key", "predicate",
+    },
+    "shadow_relation_fact_memberships": {
+        "run_id", "fact_id", "input_fingerprint", "status",
+    },
+    "shadow_relation_fact_evidence": {
+        "id", "fact_id", "run_id", "hypothesis_id",
+        "verification_attempt_id", "evidence_spans",
+    },
+    "shadow_relation_current_fingerprints": {
+        "project_id", "current_fingerprint", "components", "source_generation",
+    },
+}
+
+
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -707,6 +753,51 @@ class Database:
             self._migrate_vector_storage(conn)
             self._migrate_entity_aliases(conn)
             self._seed_settings(conn)
+
+    def assert_shadow_relation_v2_ready(self) -> dict[str, Any]:
+        """Fail closed unless every immutable v2 migration and runtime table is present."""
+
+        runner = MigrationRunner()
+        with self.connection() as conn:
+            missing_migrations = [
+                version for version in SHADOW_RELATION_V2_REQUIRED_MIGRATIONS
+                if not runner.is_applied(conn, version)
+            ]
+            missing_tables: list[str] = []
+            missing_columns: dict[str, list[str]] = {}
+            for table, required_columns in SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS.items():
+                relation = conn.execute(
+                    "SELECT to_regclass(%s) AS table_name", (table,),
+                ).fetchone()
+                if not relation or not relation["table_name"]:
+                    missing_tables.append(table)
+                    continue
+                columns = {
+                    str(row["column_name"])
+                    for row in conn.execute(
+                        """SELECT column_name FROM information_schema.columns
+                           WHERE table_schema=current_schema() AND table_name=%s""",
+                        (table,),
+                    ).fetchall()
+                }
+                absent = sorted(required_columns - columns)
+                if absent:
+                    missing_columns[table] = absent
+            if missing_migrations or missing_tables or missing_columns:
+                details = {
+                    "missing_migrations": missing_migrations,
+                    "missing_tables": sorted(missing_tables),
+                    "missing_columns": missing_columns,
+                }
+                raise RuntimeError(
+                    "Shadow relation v2 数据库结构不完整，enhanced_shadow "
+                    "拒绝运行且不会回退旧流程: "
+                    + self._canonical_json(details)
+                )
+            return {
+                "migrations": list(SHADOW_RELATION_V2_REQUIRED_MIGRATIONS),
+                "tables": sorted(SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS),
+            }
 
     @staticmethod
     def _enable_vector_extensions(conn: psycopg.Connection) -> None:
@@ -1625,13 +1716,12 @@ class Database:
     def invalidate_enhanced_strategy_for_document(
         self, document_id: int, *, reason: str,
     ) -> None:
-        """Invalidate derived shadow results before the stable revision changes.
+        """Invalidate derived shadow results for an explicit source mutation.
 
-        The enhanced strategy is a project-wide snapshot over stable revisions.  A
-        stable rebuild of one source therefore invalidates every document status
-        in that snapshot and any previously published enhanced project graph.
-        Empty graphs stay empty so a first baseline build is not presented as a
-        failed or stale experiment.
+        The enhanced strategy is a project-wide snapshot.  Callers use this at
+        document/source mutation boundaries, not merely because a stable
+        strategy rebuild starts.  Empty graphs stay empty so a first baseline
+        build is not presented as a failed or stale experiment.
         """
 
         with self.connection() as conn:

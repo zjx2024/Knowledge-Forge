@@ -77,7 +77,7 @@ def _components():
         },
         "publish_policy": {
             "version": "publish-v2",
-            "related_to": "review-only",
+            "mode_source": "versioned-schema-publish_mode",
             "unsupported": "never-publish",
         },
         "quality_gate": {

@@ -9,6 +9,7 @@ from knowledge_forge.relation_shadow_v2 import (
     parse_classifier_response,
     plan_pair_opportunities,
 )
+from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
 def _mention(key, surface, start, canonical):
@@ -25,13 +26,7 @@ def _mention(key, surface, start, canonical):
 
 
 def _predicate(name, **metadata):
-    return {
-        "name": name,
-        "domain": ["*"],
-        "range": ["*"],
-        "description": name,
-        **metadata,
-    }
+    return predicate_policy(name, **metadata)
 
 
 def _classified(
@@ -43,10 +38,7 @@ def _classified(
     canonicals=("entity-alpha", "entity-beta"),
     run_id="run-1",
 ):
-    schema = schema or {
-        "version": 2,
-        "relation_types": [_predicate("links")],
-    }
+    schema = schema or logical_schema(_predicate("links"))
     beta_start = content.index("Beta")
     mentions = [
         _mention("alpha", "Alpha", content.index("Alpha"), canonicals[0]),
@@ -127,10 +119,7 @@ def test_exact_duplicates_collapse_to_one_fact_and_one_evidence() -> None:
 
 
 def test_symmetric_reverse_hypotheses_collapse_after_endpoint_normalization() -> None:
-    schema = {
-        "version": 2,
-        "relation_types": [_predicate("partners_with", symmetric=True)],
-    }
+    schema = logical_schema(_predicate("partners_with", symmetric=True))
     schema, _, pair, hypotheses = _classified(
         schema=schema,
         hypotheses=[
@@ -160,21 +149,17 @@ def test_symmetric_reverse_hypotheses_collapse_after_endpoint_normalization() ->
 
 
 def test_inverse_predicates_collapse_to_declared_canonical_forward_fact() -> None:
-    schema = {
-        "version": 2,
-        "relation_types": [
-            _predicate(
-                "supplies",
-                inverse_of="is_supplied_by",
-                canonical_forward="supplies",
-            ),
-            _predicate(
-                "is_supplied_by",
-                inverse_of="supplies",
-                canonical_forward="supplies",
-            ),
-        ],
-    }
+    schema = logical_schema(
+        _predicate(
+            "supplies",
+            inverse_predicate="is_supplied_by",
+        ),
+        _predicate(
+            "is_supplied_by",
+            inverse_predicate="supplies",
+            canonical_orientation="inverse",
+        ),
+    )
     schema, _, pair, hypotheses = _classified(
         schema=schema,
         hypotheses=[
@@ -281,10 +266,7 @@ def test_multiple_occurrence_evidence_bind_to_one_semantic_fact() -> None:
 
 
 def test_different_supported_predicates_on_same_pair_are_preserved() -> None:
-    schema = {
-        "version": 2,
-        "relation_types": [_predicate("uses"), _predicate("supplies")],
-    }
+    schema = logical_schema(_predicate("uses"), _predicate("supplies"))
     schema, _, pair, hypotheses = _classified(
         schema=schema,
         hypotheses=[

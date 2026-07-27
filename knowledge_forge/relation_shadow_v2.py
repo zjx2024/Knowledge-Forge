@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import asdict, dataclass, field, replace
 from itertools import combinations
 from typing import Any, Mapping, Sequence
@@ -23,12 +22,12 @@ NO_RELATION = "NO_RELATION"
 OTHER_UNSUPPORTED = "OTHER_UNSUPPORTED"
 HYPOTHESES = "HYPOTHESES"
 
-SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION = "shadow-relation-classifier-prompt-v2"
-SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION = "shadow-relation-classifier-schema-v2"
-SHADOW_RELATION_CLASSIFIER_PARSER_VERSION = "shadow-relation-classifier-parser-v2"
-SHADOW_RELATION_VERIFIER_PROMPT_VERSION = "shadow-relation-verifier-prompt-v2"
-SHADOW_RELATION_VERIFIER_SCHEMA_VERSION = "shadow-relation-verifier-schema-v2"
-SHADOW_RELATION_VERIFIER_PARSER_VERSION = "shadow-relation-verifier-parser-v2"
+SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION = "shadow-relation-classifier-prompt-v9"
+SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION = "shadow-relation-classifier-schema-v6"
+SHADOW_RELATION_CLASSIFIER_PARSER_VERSION = "shadow-relation-classifier-parser-v9"
+SHADOW_RELATION_VERIFIER_PROMPT_VERSION = "shadow-relation-verifier-prompt-v5"
+SHADOW_RELATION_VERIFIER_SCHEMA_VERSION = "shadow-relation-verifier-schema-v4"
+SHADOW_RELATION_VERIFIER_PARSER_VERSION = "shadow-relation-verifier-parser-v4"
 
 PASS = "PASS"
 REVIEW_ONLY = "REVIEW_ONLY"
@@ -38,12 +37,12 @@ UNCERTAIN = "UNCERTAIN"
 RETRYABLE_FAILED = "RETRYABLE_FAILED"
 
 _UNKNOWN_TYPES = {"", "unknown", "genericentity", "unresolved"}
-_RELATION_CUE = re.compile(
-    r"\b(?:uses?|causes?|contains?|includes?|supports?|owns?|produces?|supplies?|"
-    r"located|part of|depends?|works? for|is a)\b|导致|使用|包含|属于|位于|支持|"
-    r"依赖|生产|供应",
-    re.IGNORECASE,
-)
+PUBLISH_AUTO = "auto"
+PUBLISH_REVIEW_ONLY = "review_only"
+PUBLISH_DISABLED = "disabled"
+CANONICAL_FORWARD = "forward"
+CANONICAL_INVERSE = "inverse"
+CANONICAL_SYMMETRIC = "symmetric"
 
 
 def _digest(parts: Sequence[object]) -> str:
@@ -124,18 +123,27 @@ class ShadowClassificationError(ValueError):
 @dataclass(frozen=True)
 class PredicateSpec:
     name: str
-    domain: tuple[str, ...]
-    range: tuple[str, ...]
+    semantic_definition: str
+    domain_types: tuple[str, ...]
+    range_types: tuple[str, ...]
+    direction_description: str
     symmetric: bool
-    inverse_of: str
-    canonical_forward: str
-    publishable: bool
-    review_only: bool
+    inverse_predicate: str
+    canonical_orientation: str
+    publish_mode: str
     reflexive: bool
-    description: str
     positive_examples: tuple[str, ...]
     negative_examples: tuple[str, ...]
+    optional_soft_cues: tuple[str, ...]
     schema_version: str
+
+    @property
+    def review_only(self) -> bool:
+        return self.publish_mode != PUBLISH_AUTO
+
+    @property
+    def publishable(self) -> bool:
+        return self.publish_mode == PUBLISH_AUTO
 
 
 @dataclass(frozen=True)
@@ -274,21 +282,6 @@ class RelationMaterializationDecision:
     freshness: RelationFreshnessDecision
 
 
-def _definition_types(definition: Mapping[str, Any], side: str) -> tuple[str, ...]:
-    keys = (
-        ("domain", "source_types", "source")
-        if side == "source"
-        else ("range", "target_types", "target")
-    )
-    for key in keys:
-        value = definition.get(key)
-        if isinstance(value, str):
-            return (value,)
-        if isinstance(value, list):
-            return tuple(str(item) for item in value)
-    return ("*",)
-
-
 def _type_match(actual: str, expected: tuple[str, ...]) -> bool | None:
     normalized_expected = {str(value).strip().lower() for value in expected}
     if not normalized_expected or "*" in normalized_expected:
@@ -306,18 +299,11 @@ def _predicate_metadata(
 ) -> tuple[tuple[dict[str, Any], ...], str]:
     metadata: list[dict[str, Any]] = []
     observed: list[bool | None] = []
-    for definition in logical_schema.get("relation_types") or []:
-        if not isinstance(definition, Mapping):
-            continue
-        name = str(definition.get("name") or "").strip()
-        if not name:
-            continue
-        domain = _definition_types(definition, "source")
-        range_ = _definition_types(definition, "target")
-        direct_left = _type_match(left_type, domain)
-        direct_right = _type_match(right_type, range_)
-        reverse_left = _type_match(right_type, domain)
-        reverse_right = _type_match(left_type, range_)
+    for name, spec in normalize_predicate_schema(logical_schema).items():
+        direct_left = _type_match(left_type, spec.domain_types)
+        direct_right = _type_match(right_type, spec.range_types)
+        reverse_left = _type_match(right_type, spec.domain_types)
+        reverse_right = _type_match(left_type, spec.range_types)
 
         def combine(first: bool | None, second: bool | None) -> bool | None:
             if first is False or second is False:
@@ -331,15 +317,9 @@ def _predicate_metadata(
         observed.extend((left_to_right, right_to_left))
         if left_to_right is not False or right_to_left is not False:
             metadata.append({
-                "name": name,
-                "domain": list(domain),
-                "range": list(range_),
+                **asdict(spec),
                 "left_to_right": left_to_right,
                 "right_to_left": right_to_left,
-                "symmetric": bool(definition.get("symmetric")),
-                "inverse_of": str(definition.get("inverse_of") or ""),
-                "review_only": bool(definition.get("review_only")),
-                "reflexive": bool(definition.get("reflexive")),
             })
     if any(value is True for value in observed):
         return tuple(metadata), "compatible"
@@ -351,42 +331,162 @@ def _predicate_metadata(
 def normalize_predicate_schema(
     logical_schema: Mapping[str, Any],
 ) -> dict[str, PredicateSpec]:
-    """Normalize relation semantics and apply the Shadow-only related_to policy."""
+    """Validate the complete versioned predicate policy without name defaults."""
 
     schema_version = str(
         logical_schema.get("version")
         or logical_schema.get("schema_version")
-        or "unspecified"
+        or ""
     )
+    if not schema_version:
+        raise ValueError("Shadow v2 Schema requires a version")
+    relation_types = logical_schema.get("relation_types")
+    if not isinstance(relation_types, list) or not relation_types:
+        raise ValueError("Shadow v2 Schema requires relation_types")
     result: dict[str, PredicateSpec] = {}
-    for raw in logical_schema.get("relation_types") or []:
+    required = {
+        "name",
+        "semantic_definition",
+        "domain_types",
+        "range_types",
+        "direction_description",
+        "symmetric",
+        "inverse_predicate",
+        "canonical_orientation",
+        "publish_mode",
+        "positive_examples",
+        "negative_examples",
+        "reflexive",
+    }
+    for index, raw in enumerate(relation_types):
         if not isinstance(raw, Mapping):
-            continue
+            raise ValueError(f"predicate metadata #{index} must be an object")
+        missing = sorted(required - set(raw))
+        if missing:
+            raise ValueError(
+                f"predicate metadata #{index} missing required fields: {missing}"
+            )
         name = str(raw.get("name") or "").strip()
         if not name:
-            continue
-        review_only = bool(raw.get("review_only")) or name == "related_to"
-        publishable = bool(raw.get("publishable", True)) and not review_only
+            raise ValueError(f"predicate metadata #{index} has empty name")
+        if name in result:
+            raise ValueError(f"duplicate predicate metadata: {name}")
+        semantic_definition = str(
+            raw.get("semantic_definition") or ""
+        ).strip()
+        direction_description = str(
+            raw.get("direction_description") or ""
+        ).strip()
+        if not semantic_definition or not direction_description:
+            raise ValueError(
+                f"predicate {name} requires semantic and direction definitions"
+            )
+        domain_types = raw.get("domain_types")
+        range_types = raw.get("range_types")
+        if (
+            not isinstance(domain_types, list)
+            or not domain_types
+            or not all(str(item).strip() for item in domain_types)
+            or not isinstance(range_types, list)
+            or not range_types
+            or not all(str(item).strip() for item in range_types)
+        ):
+            raise ValueError(
+                f"predicate {name} requires non-empty domain_types/range_types"
+            )
+        for field_name in (
+            "positive_examples", "negative_examples", "optional_soft_cues",
+        ):
+            value = raw.get(field_name, [])
+            if (
+                not isinstance(value, list)
+                or not all(isinstance(item, str) for item in value)
+            ):
+                raise ValueError(
+                    f"predicate {name} {field_name} must be a string array"
+                )
+        if not isinstance(raw.get("symmetric"), bool):
+            raise ValueError(f"predicate {name} symmetric must be boolean")
+        if not isinstance(raw.get("reflexive"), bool):
+            raise ValueError(f"predicate {name} reflexive must be boolean")
+        inverse_value = raw.get("inverse_predicate")
+        if inverse_value is not None and not isinstance(inverse_value, str):
+            raise ValueError(
+                f"predicate {name} inverse_predicate must be string or null"
+            )
+        inverse_predicate = str(inverse_value or "").strip()
+        canonical_orientation = str(
+            raw.get("canonical_orientation") or ""
+        )
+        if canonical_orientation not in {
+            CANONICAL_FORWARD, CANONICAL_INVERSE, CANONICAL_SYMMETRIC,
+        }:
+            raise ValueError(
+                f"predicate {name} canonical_orientation is invalid"
+            )
+        publish_mode = str(raw.get("publish_mode") or "")
+        if publish_mode not in {
+            PUBLISH_AUTO, PUBLISH_REVIEW_ONLY, PUBLISH_DISABLED,
+        }:
+            raise ValueError(f"predicate {name} publish_mode is invalid")
+        symmetric = bool(raw["symmetric"])
+        if symmetric != (canonical_orientation == CANONICAL_SYMMETRIC):
+            raise ValueError(
+                f"predicate {name} symmetric/orientation metadata conflicts"
+            )
+        if canonical_orientation == CANONICAL_INVERSE and not inverse_predicate:
+            raise ValueError(
+                f"predicate {name} inverse orientation requires inverse_predicate"
+            )
+        if symmetric and inverse_predicate:
+            raise ValueError(
+                f"predicate {name} symmetric predicate cannot declare inverse"
+            )
         result[name] = PredicateSpec(
             name=name,
-            domain=_definition_types(raw, "source"),
-            range=_definition_types(raw, "target"),
-            symmetric=bool(raw.get("symmetric")),
-            inverse_of=str(raw.get("inverse_of") or raw.get("inverse_predicate") or ""),
-            canonical_forward=str(raw.get("canonical_forward") or name),
-            publishable=publishable,
-            review_only=review_only,
-            reflexive=bool(raw.get("reflexive")),
-            description=str(raw.get("description") or ""),
+            semantic_definition=semantic_definition,
+            domain_types=tuple(str(item) for item in domain_types),
+            range_types=tuple(str(item) for item in range_types),
+            direction_description=direction_description,
+            symmetric=symmetric,
+            inverse_predicate=inverse_predicate,
+            canonical_orientation=canonical_orientation,
+            publish_mode=publish_mode,
+            reflexive=bool(raw["reflexive"]),
             positive_examples=tuple(
-                str(value) for value in raw.get("positive_examples") or []
+                str(value) for value in raw["positive_examples"]
             ),
             negative_examples=tuple(
-                str(value) for value in raw.get("negative_examples") or []
+                str(value) for value in raw["negative_examples"]
+            ),
+            optional_soft_cues=tuple(
+                str(value) for value in raw.get("optional_soft_cues") or []
             ),
             schema_version=schema_version,
         )
+    for spec in result.values():
+        if spec.inverse_predicate and spec.inverse_predicate not in result:
+            raise ValueError(
+                f"predicate {spec.name} references unknown inverse predicate"
+            )
+        if spec.canonical_orientation == CANONICAL_INVERSE:
+            inverse = result[spec.inverse_predicate]
+            if inverse.canonical_orientation != CANONICAL_FORWARD:
+                raise ValueError(
+                    f"predicate {spec.name} inverse target must be canonical forward"
+                )
     return result
+
+
+def predicate_policy_fingerprint_payload(
+    logical_schema: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return every validated behavior field in deterministic predicate order."""
+
+    return {
+        name: asdict(spec)
+        for name, spec in sorted(normalize_predicate_schema(logical_schema).items())
+    }
 
 
 def classifier_response_schema(
@@ -395,60 +495,87 @@ def classifier_response_schema(
     """Return the versioned batch schema; endpoint order is the only direction."""
 
     count = len(opportunities)
-    return {
-        "$id": SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-        "type": "array",
-        "minItems": count,
-        "maxItems": count,
-        "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "pair_id": {"type": "string"},
-                "decision": {
-                    "type": "string",
-                    "enum": [NO_RELATION, OTHER_UNSUPPORTED, HYPOTHESES],
-                },
-                "hypotheses": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "subject_occurrence_id": {"type": "string"},
-                            "predicate": {"type": "string"},
-                            "object_occurrence_id": {"type": "string"},
-                            "evidence_spans": {
-                                "type": "array",
-                                "minItems": 1,
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "start": {"type": "integer", "minimum": 0},
-                                        "end": {"type": "integer", "minimum": 1},
+    decision_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "pair_id": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": [NO_RELATION, OTHER_UNSUPPORTED, HYPOTHESES],
+            },
+            "hypotheses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "subject_occurrence_id": {
+                            "type": "string",
+                            "enum": ["LEFT", "RIGHT"],
+                        },
+                        "predicate": {"type": "string"},
+                        "object_occurrence_id": {
+                            "type": "string",
+                            "enum": ["LEFT", "RIGHT"],
+                        },
+                        "evidence_spans": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "start": {
+                                        "type": "integer",
+                                        "minimum": 0,
                                     },
-                                    "required": ["start", "end"],
+                                    "end": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                    },
                                 },
-                            },
-                            "classifier_confidence": {
-                                "type": "number", "minimum": 0, "maximum": 1,
+                                "required": ["start", "end"],
                             },
                         },
-                        "required": [
-                            "subject_occurrence_id",
-                            "predicate",
-                            "object_occurrence_id",
-                            "evidence_spans",
-                            "classifier_confidence",
-                        ],
+                        "classifier_confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
                     },
+                    "required": [
+                        "subject_occurrence_id",
+                        "predicate",
+                        "object_occurrence_id",
+                        "evidence_spans",
+                        "classifier_confidence",
+                    ],
                 },
-                "evidence_spans": {"type": "array"},
-                "reason_code": {"type": "string"},
             },
-            "required": ["pair_id", "decision", "hypotheses"],
+            "evidence_spans": {"type": "array"},
+            "reason_code": {"type": "string"},
         },
+        "required": ["pair_id", "decision", "hypotheses"],
+    }
+    if count == 1:
+        return {
+            "$id": SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+            **decision_schema,
+        }
+    return {
+        "$id": SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "minItems": count,
+                "maxItems": count,
+                "items": decision_schema,
+            },
+        },
+        "required": ["decisions"],
     }
 
 
@@ -458,7 +585,7 @@ def classifier_prompt(
     content: str,
     logical_schema: Mapping[str, Any],
 ) -> str:
-    """Build the frozen classifier instruction with explicit hard negatives."""
+    """Build a predicate-agnostic classifier request from versioned metadata."""
 
     predicates = {
         name: asdict(spec)
@@ -466,27 +593,63 @@ def classifier_prompt(
     }
     pairs = [{
         "pair_id": item.pair_identity,
-        "left_occurrence_id": item.left_occurrence_key,
-        "right_occurrence_id": item.right_occurrence_key,
+        "left_occurrence_id": "LEFT",
+        "right_occurrence_id": "RIGHT",
         "left_span": list(item.left_span),
         "right_span": list(item.right_span),
+        "left_surface": content[item.left_span[0]:item.left_span[1]],
+        "right_surface": content[item.right_span[0]:item.right_span[1]],
+        "left_type": item.left_type,
+        "right_type": item.right_type,
         "context_span": list(item.context_span),
         "context": content[item.context_span[0]:item.context_span[1]],
         "allowed_predicates": [
             value["name"] for value in item.allowed_predicate_metadata
         ],
+        "soft_cue_matches": list(
+            item.provenance.get("soft_cue_matches") or []
+        ),
     } for item in opportunities]
+    if len(opportunities) == 1:
+        response_shape = (
+            "必须只返回一个 JSON 对象，且该对象只含 pair_id、decision、"
+            "hypotheses，以及可选的 evidence_spans、reason_code。没有关系时"
+            "也必须返回该 pair 的 NO_RELATION 决策对象；不要返回数组、"
+            "decisions、items 或 result。"
+        )
+    else:
+        response_shape = (
+            f"必须只返回一个 JSON 对象，且只含 decisions 字段；decisions 是长度恰好"
+            f"为 {len(opportunities)} 的数组。空 decisions 数组是协议错误；没有关系时"
+            "也必须返回该 pair 的 NO_RELATION 决策对象。每个 decisions 元素只含 "
+            "pair_id、decision、hypotheses，以及可选的 evidence_spans、reason_code。"
+            "不要返回 items、result 或其他包装对象。"
+        )
     instruction = (
         f"contract={SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION}; "
         f"schema={SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION}. "
         "对每个 pair 恰好返回 NO_RELATION、OTHER_UNSUPPORTED 或 HYPOTHESES。"
         "subject_occurrence_id 与 object_occurrence_id 的顺序是方向唯一真相，"
-        "不要输出 direction 字段。一个 pair 可返回多个具体 predicate。"
-        "同一列表出现本身不等于关系；电话号码与联系人字段的结构共现不等于关系。"
-        "获得供应不等于生产。A 使用 B 与 B 使用 A 不同；"
-        "A 依赖 B 与 B 依赖 A 不同。Schema 缺少具体词时返回 "
-        "OTHER_UNSUPPORTED，不要用 related_to 兜底；没有语义关系返回 NO_RELATION。"
+        "且这两个字段只能逐字使用 LEFT 或 RIGHT；不要复制内部 occurrence "
+        "哈希，不要输出 direction 字段。一个 pair 可返回多个具体 predicate。"
+        "只按每个 predicate 的 semantic_definition、direction_description、"
+        "domain_types、range_types 和正反例判断语义及方向。"
+        "optional_soft_cues 只是可配置提示，不能作为关系、方向或发布的证据。"
+        "结构共现本身不等于关系；Schema 无法表示但文本明确表达关系时返回 "
+        "OTHER_UNSUPPORTED；没有语义关系返回 NO_RELATION。"
         "evidence_spans 必须是冻结 context 内的绝对半开区间。"
+        f"{response_shape}"
+        "pair_id 必须逐字复制输入。decision=HYPOTHESES 时，hypotheses 中每个元素"
+        "只含 subject_occurrence_id、predicate、object_occurrence_id、"
+        "evidence_spans、classifier_confidence；evidence_spans 中每项必须是"
+        "{\"start\":整数,\"end\":整数}，且这些 span 必须共同覆盖所选 subject "
+        "与 object 的精确 occurrence span；只覆盖关系词不合格。为避免边界漂移，"
+        "每个 hypothesis 的 evidence_spans 必须直接使用该 pair 的完整 "
+        "context_span，即 [{\"start\":context_span[0],\"end\":context_span[1]}]。"
+        "decision 为 "
+        "NO_RELATION 或 "
+        "OTHER_UNSUPPORTED 时 hypotheses 必须为空数组。不要返回 predicates、"
+        "subject、object、direction、reasoning 或其他包装对象。"
     )
     return json.dumps(
         {
@@ -532,6 +695,8 @@ def _normalize_occurrence(
     opportunity: PairOpportunity,
 ) -> str:
     aliases = {
+        "LEFT": opportunity.left_occurrence_key,
+        "RIGHT": opportunity.right_occurrence_key,
         opportunity.left_occurrence_key: opportunity.left_occurrence_key,
         opportunity.right_occurrence_key: opportunity.right_occurrence_key,
         opportunity.left_mention_id: opportunity.left_occurrence_key,
@@ -630,13 +795,6 @@ def parse_classifier_response(
                 subject == pair.left_occurrence_key
                 and object_ == pair.right_occurrence_key
             )
-            orientation_allowed = metadata.get(
-                "left_to_right" if left_to_right else "right_to_left"
-            )
-            if orientation_allowed is not True:
-                raise ShadowClassificationError(
-                    f"predicate orientation is not type-compatible: {predicate}"
-                )
             legacy_direction = hypothesis.get("direction")
             if legacy_direction is not None:
                 expected_direction = (
@@ -731,47 +889,6 @@ def _spans_cover(
     )
 
 
-def _lexical_validation_reason(
-    hypothesis: RelationHypothesis,
-    opportunity: PairOpportunity,
-    *,
-    content: str,
-) -> tuple[str, str] | None:
-    evidence = " ".join(content[item.start:item.end] for item in hypothesis.evidence_spans)
-    normalized = evidence.casefold()
-    if re.search(r"\b(?:does\s+not|do\s+not|did\s+not|not|never|no longer)\b|未|并未|不再", normalized):
-        return REJECTED, "NEGATED"
-    if re.search(r"\b(?:might|may|could|would|if|hypothetically|plans?\s+to)\b|可能|假设|计划", normalized):
-        return REVIEW_ONLY, "HYPOTHETICAL"
-    if hypothesis.predicate == "produces" and re.search(
-        r"\b(?:supply|supplies|supplied|supplier)\b|供应", normalized,
-    ) and not re.search(r"\bproduc(?:e|es|ed|ing|tion)\b|生产", normalized):
-        return REJECTED, "SUPPLY_IS_NOT_PRODUCTION"
-    cue_patterns = {
-        "uses": r"\buses?\b|使用",
-        "depends_on": r"\bdepends?(?:_on|\s+on)\b|依赖",
-    }
-    cue = cue_patterns.get(hypothesis.predicate)
-    if cue and re.search(cue, evidence, re.IGNORECASE):
-        subject = _occurrence_details(
-            opportunity, hypothesis.subject_occurrence_key, content,
-        )["surface"]
-        object_ = _occurrence_details(
-            opportunity, hypothesis.object_occurrence_key, content,
-        )["surface"]
-        expected = re.compile(
-            re.escape(subject) + r".*?" + cue + r".*?" + re.escape(object_),
-            re.IGNORECASE | re.DOTALL,
-        )
-        opposite = re.compile(
-            re.escape(object_) + r".*?" + cue + r".*?" + re.escape(subject),
-            re.IGNORECASE | re.DOTALL,
-        )
-        if not expected.search(evidence) and opposite.search(evidence):
-            return REJECTED, "DIRECTION_NOT_ENTAILED"
-    return None
-
-
 def validate_hypothesis(
     hypothesis: RelationHypothesis,
     opportunity: PairOpportunity,
@@ -831,23 +948,22 @@ def validate_hypothesis(
         and not spec.reflexive
     ):
         return result(REJECTED, "ILLEGAL_SELF_LOOP")
-    if spec.inverse_of and spec.inverse_of not in schema:
+    if spec.inverse_predicate and spec.inverse_predicate not in schema:
         return result(REJECTED, "INVERSE_METADATA_INVALID")
-    if spec.canonical_forward not in schema:
-        return result(REJECTED, "CANONICAL_FORWARD_INVALID")
-    subject_match = _type_match(str(subject["type"]), spec.domain)
-    object_match = _type_match(str(object_["type"]), spec.range)
+    subject_match = _type_match(
+        str(subject["type"]), spec.domain_types,
+    )
+    object_match = _type_match(
+        str(object_["type"]), spec.range_types,
+    )
     if subject_match is False or object_match is False:
         return result(REJECTED, "TYPE_INCOMPATIBLE")
     if subject_match is None or object_match is None:
         return result(REVIEW_ONLY, "TYPE_UNRESOLVED")
-    if spec.review_only or not spec.publishable:
-        return result(REVIEW_ONLY, "PREDICATE_REVIEW_ONLY")
-    lexical = _lexical_validation_reason(
-        hypothesis, opportunity, content=content,
-    )
-    if lexical:
-        return result(*lexical)
+    if spec.publish_mode == PUBLISH_REVIEW_ONLY:
+        return result(REVIEW_ONLY, "PUBLISH_MODE_REVIEW_ONLY")
+    if spec.publish_mode == PUBLISH_DISABLED:
+        return result(REVIEW_ONLY, "PUBLISH_MODE_DISABLED")
     return result(PASS, "DETERMINISTIC_VALIDATION_PASSED")
 
 
@@ -875,7 +991,14 @@ def verifier_prompt(
                 "Use only the frozen source context. Verify the complete ordered "
                 "(subject,predicate,object) fact, including predicate meaning, roles, "
                 "direction, negation, modality, quotation and exact occurrence alignment. "
-                "Cooccurrence and external knowledge are insufficient."
+                "Cooccurrence and external knowledge are insufficient. The caller binds "
+                "this independent response to the supplied hypothesis_id; do not emit "
+                "or invent a correlation identifier. Return exactly one JSON object "
+                "with only verdict, reason_code, and supported_evidence_spans. verdict "
+                "must be SUPPORTED, REJECTED, or UNCERTAIN. reason_code must be a short "
+                "non-empty code. supported_evidence_spans must contain absolute "
+                "half-open {start,end} spans only when verdict is SUPPORTED, and must "
+                "be an empty array otherwise."
             ),
             "contract_version": SHADOW_RELATION_VERIFIER_PROMPT_VERSION,
             "context": {
@@ -905,7 +1028,6 @@ def verifier_response_schema(hypothesis_id: str) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "hypothesis_id": {"const": hypothesis_id},
             "verdict": {
                 "type": "string",
                 "enum": [SUPPORTED, REJECTED, UNCERTAIN],
@@ -924,8 +1046,7 @@ def verifier_response_schema(hypothesis_id: str) -> dict[str, Any]:
             },
         },
         "required": [
-            "hypothesis_id", "verdict", "reason_code",
-            "supported_evidence_spans",
+            "verdict", "reason_code", "supported_evidence_spans",
         ],
     }
 
@@ -979,8 +1100,12 @@ def _parse_verifier_response(
             raise ShadowClassificationError("verifier returned invalid JSON") from exc
     if not isinstance(raw, Mapping):
         raise ShadowClassificationError("verifier response must be an object")
-    if str(raw.get("hypothesis_id") or "") != hypothesis.hypothesis_id:
-        raise ShadowClassificationError("verifier hypothesis id missing or mismatched")
+    response_hypothesis_id = raw.get("hypothesis_id")
+    if (
+        response_hypothesis_id is not None
+        and str(response_hypothesis_id) != hypothesis.hypothesis_id
+    ):
+        raise ShadowClassificationError("verifier hypothesis id mismatched")
     verdict = str(raw.get("verdict") or "")
     if verdict not in {SUPPORTED, REJECTED, UNCERTAIN}:
         raise ShadowClassificationError("verifier verdict is invalid")
@@ -1107,13 +1232,14 @@ def _canonicalized_fact_parts(
         if hypothesis.object_occurrence_key == opportunity.left_occurrence_key
         else opportunity.right_canonical_id
     )
-    predicate = spec.canonical_forward
-    if predicate != spec.name:
-        if spec.inverse_of != predicate:
-            raise ValueError("canonical-forward requires matching inverse metadata")
+    predicate = spec.name
+    if spec.canonical_orientation == CANONICAL_INVERSE:
+        predicate = spec.inverse_predicate
         subject, object_ = object_, subject
-    if spec.symmetric:
+    elif spec.canonical_orientation == CANONICAL_SYMMETRIC:
         subject, object_ = sorted((subject, object_))
+    elif spec.canonical_orientation != CANONICAL_FORWARD:
+        raise ValueError("unsupported canonical orientation")
     return subject, predicate, object_
 
 
@@ -1243,8 +1369,8 @@ def normalize_verified_hypotheses(
                 object_canonical_id=object_,
                 symmetric=spec.symmetric,
                 reflexive=spec.reflexive,
-                review_only=spec.review_only or not spec.publishable,
-                normalization_eligible=spec.publishable and not spec.review_only,
+                review_only=spec.publish_mode != PUBLISH_AUTO,
+                normalization_eligible=spec.publish_mode == PUBLISH_AUTO,
                 evidence_count=0,
             )
             normalized_mode_by_fact[semantic_key] = bool(
@@ -1325,7 +1451,11 @@ def normalize_verified_hypotheses(
                 == rejected_hypothesis.subject_occurrence_key
             ):
                 spec = schema.get(rejected_hypothesis.predicate)
-                if spec and not spec.symmetric and not spec.inverse_of:
+                if (
+                    spec
+                    and not spec.symmetric
+                    and not spec.inverse_predicate
+                ):
                     conflict_id = "relconflict_" + _digest((
                         rejected_hypothesis.hypothesis_id,
                         "UNSUPPORTED_REVERSE_CONFLICT",
@@ -1461,7 +1591,7 @@ def build_relation_materialization_fingerprint(
             "model", "model_revision",
         ),
         "normalization": ("version", "symmetric_rule", "inverse_rule"),
-        "publish_policy": ("version", "related_to", "unsupported"),
+        "publish_policy": ("version", "mode_source", "unsupported"),
         "quality_gate": (
             "version", "relation_precision_noninferiority_delta",
             "confidence_method", "minimum_gold_facts",
@@ -1525,11 +1655,11 @@ def build_relation_materialization_fingerprint(
         name: _component_hash(value) for name, value in components.items()
     }
     root = _component_hash({
-        "version": "shadow-relation-materialization-fingerprint-v2",
+        "version": "shadow-relation-materialization-fingerprint-v3",
         "component_hashes": component_hashes,
     })
     return RelationMaterializationFingerprint(
-        version="shadow-relation-materialization-fingerprint-v2",
+        version="shadow-relation-materialization-fingerprint-v3",
         root=root,
         components=components,
         component_hashes=component_hashes,
@@ -1623,9 +1753,6 @@ def relation_materialization_decision(
     if (
         fact.review_only
         or not fact.normalization_eligible
-        or fact.predicate in {
-            "related_to", OTHER_UNSUPPORTED, TYPE_UNRESOLVED, UNCERTAIN,
-        }
     ):
         reasons.add("PREDICATE_REVIEW_ONLY")
     if (
@@ -1759,15 +1886,28 @@ def plan_pair_opportunities(
             - (int(right["mention_start"]) + int(right["mention_end"])) // 2
         )
         context_text = content[context_start:context_end]
-        cue_match = _RELATION_CUE.search(context_text)
-        cue = cue_match.group(0) if cue_match else ""
         predicate_metadata, type_status = _predicate_metadata(
             str(left.get("type") or ""),
             str(right.get("type") or ""),
             logical_schema,
         )
+        normalized_context = context_text.casefold()
+        soft_cue_matches = sorted(
+            (
+                {
+                    "predicate": str(metadata["name"]),
+                    "cue": str(cue),
+                }
+                for metadata in predicate_metadata
+                for cue in metadata.get("optional_soft_cues") or []
+                if str(cue).strip()
+                and str(cue).casefold() in normalized_context
+            ),
+            key=lambda item: (item["predicate"], item["cue"]),
+        )
+        cue = str(soft_cue_matches[0]["cue"]) if soft_cue_matches else ""
         status = PENDING_CLASSIFICATION
-        reason = "local_pair_with_relation_cue" if cue else "local_pair_without_explicit_cue"
+        reason = "local_pair_within_structural_window"
         if (
             str(left.get("canonical_id") or "")
             and str(left.get("canonical_id")) == str(right.get("canonical_id") or "")
@@ -1813,6 +1953,7 @@ def plan_pair_opportunities(
             provenance={
                 "sentence_distance": sentence_distance,
                 "character_distance": centre_distance,
+                "soft_cue_matches": soft_cue_matches,
             },
         ))
     planned.sort(key=lambda item: item.pair_identity)

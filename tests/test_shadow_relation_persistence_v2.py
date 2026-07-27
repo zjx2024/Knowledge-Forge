@@ -20,6 +20,7 @@ from knowledge_forge.relation_shadow_v2 import (
     validate_hypothesis,
     verify_hypothesis,
 )
+from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
 def _database(dsn: str) -> Database:
@@ -33,16 +34,14 @@ def _database(dsn: str) -> Database:
 
 
 def _schema() -> dict:
-    return {
-        "version": "schema-v1",
-        "relation_types": [{
-            "name": "uses",
-            "domain": ["Organization"],
-            "range": ["Product"],
-            "canonical_forward": "uses",
-            "publishable": True,
-        }],
-    }
+    return logical_schema(
+        predicate_policy(
+            "uses",
+            domain=["Organization"],
+            range_=["Product"],
+        ),
+        version="schema-v1",
+    )
 
 
 @pytest.mark.integration

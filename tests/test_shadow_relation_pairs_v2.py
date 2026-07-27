@@ -9,6 +9,7 @@ from knowledge_forge.relation_shadow_v2 import (
     TYPE_UNRESOLVED,
     plan_pair_opportunities,
 )
+from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
 def _mention(
@@ -33,11 +34,9 @@ def _mention(
 
 
 def _schema(*definitions):
-    return {"relation_types": list(definitions) or [{
-        "name": "related_to",
-        "domain": ["*"],
-        "range": ["*"],
-    }]}
+    return logical_schema(*(
+        list(definitions) or [predicate_policy("fixture_rel")]
+    ))
 
 
 def _plan(content, mentions, **overrides):
@@ -140,11 +139,11 @@ def test_wildcard_and_unknown_types_are_not_treated_as_incompatible() -> None:
     unresolved = _plan(
         content,
         unknown,
-        logical_schema=_schema({
-            "name": "employs",
-            "domain": ["Organization"],
-            "range": ["Person"],
-        }),
+        logical_schema=_schema(predicate_policy(
+            "employs",
+            domain=["Organization"],
+            range_=["Person"],
+        )),
     ).opportunities[0]
 
     assert wildcard.status == PENDING_CLASSIFICATION
@@ -161,11 +160,11 @@ def test_known_incompatible_types_are_recorded_separately() -> None:
             _mention("a", 0, 5, surface="Alpha", entity_type="Location"),
             _mention("b", 12, 16, surface="Beta", entity_type="Technology"),
         ],
-        logical_schema=_schema({
-            "name": "employs",
-            "domain": ["Organization"],
-            "range": ["Person"],
-        }),
+        logical_schema=_schema(predicate_policy(
+            "employs",
+            domain=["Organization"],
+            range_=["Person"],
+        )),
     )
 
     assert plan.opportunities[0].status == TYPE_INCOMPATIBLE
