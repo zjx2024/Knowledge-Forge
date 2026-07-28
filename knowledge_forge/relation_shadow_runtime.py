@@ -16,6 +16,7 @@ from .shadow_schema_overlay import (
     SHADOW_RELATION_SCHEMA_OVERLAY_VERSION,
     apply_shadow_relation_schema_overlay,
 )
+from .shadow_context import build_shadow_context_manifest
 
 
 CLASSIFIER_ACCEPTED = "ACCEPTED"
@@ -62,6 +63,41 @@ def _safe_json_text(value: Any) -> str:
         return json.dumps(str(value), ensure_ascii=False)
 
 
+def _proposal_found_key(proposal: v2.RelationProposal) -> str:
+    """Key used for relation-only gleaning; independent of pass/retry."""
+
+    return canonical_digest({
+        "subject_occurrence_id": proposal.subject_occurrence_key,
+        "predicate": proposal.predicate,
+        "object_occurrence_id": proposal.object_occurrence_key,
+        "qualifiers": list(proposal.qualifiers),
+    })
+
+
+def _with_direct_proposer_source(
+    opportunity: v2.PairOpportunity,
+) -> v2.PairOpportunity:
+    provenance = dict(opportunity.provenance)
+    provenance.setdefault("planner_status_before_direct_proposer", opportunity.status)
+    provenance.setdefault("source_kind", "v2_pair_planner")
+    provenance.setdefault("source_record_id", opportunity.context_identity)
+    sources = {
+        str(value)
+        for value in provenance.get("candidate_sources", [])
+        if str(value)
+    }
+    if not sources:
+        sources.add(v2.PAIR_PLANNER)
+    sources.add(v2.DIRECT_PROPOSER)
+    provenance["candidate_sources"] = sorted(sources)
+    provenance["direct_proposer_union"] = True
+    return replace(
+        opportunity,
+        status=v2.PENDING_CLASSIFICATION,
+        provenance=provenance,
+    )
+
+
 def _classifier_failure_status(exc: Exception, *, terminal: bool) -> str:
     if terminal:
         return CLASSIFIER_TERMINAL_FAILED
@@ -79,71 +115,45 @@ def _classifier_failure_status(exc: Exception, *, terminal: bool) -> str:
         or "must be" in message
         or "unknown pair ids" in message
         or "duplicate pair ids" in message
+        or "predicate is not allowed" in message
+        or "hypothesis endpoints must be distinct" in message
+        or "positive hypothesis requires evidence" in message
+        or "evidence span is outside frozen context" in message
+        or "classifier confidence is" in message
         or "requires" in message
     ):
         return CLASSIFIER_RETRYABLE_PROTOCOL
     return CLASSIFIER_RETRYABLE_MODEL_ERROR
 
 
-def _terminal_unsupported_decision_for_single_pair(
-    pair: v2.PairOpportunity,
+def _terminal_classifier_fail_closed_decision(
+    opportunity: v2.PairOpportunity,
     exc: Exception | None,
-    raw_response_text: str = "",
-) -> v2.PairClassificationDecision | None:
-    if exc is None or type(exc).__name__ != "ShadowClassificationError":
-        return None
-    message = str(exc).lower()
-    if "missing pair ids" in message and raw_response_text:
-        try:
-            raw = json.loads(raw_response_text)
-        except json.JSONDecodeError:
-            raw = None
-        if isinstance(raw, dict):
-            decision = str(raw.get("decision") or "")
-            hypotheses = raw.get("hypotheses") or []
-            pair_id = str(raw.get("pair_id") or "")
-            if (
-                pair_id == pair.pair_identity
-                and decision in {v2.NO_RELATION, v2.OTHER_UNSUPPORTED}
-                and hypotheses == []
-            ):
-                reason_code = str(raw.get("reason_code") or "")
-                if decision == v2.NO_RELATION and not reason_code.strip():
-                    reason_code = "NO_RELATION_UNSPECIFIED"
-                if decision == v2.OTHER_UNSUPPORTED and not reason_code.strip():
-                    reason_code = "SCHEMA_GAP"
-                return v2.PairClassificationDecision(
-                    pair_identity=pair.pair_identity,
-                    decision=decision,
-                    hypotheses=(),
-                    evidence_spans=(
-                        v2.EvidenceSpan(
-                            start=int(pair.context_span[0]),
-                            end=int(pair.context_span[1]),
-                        ),
-                    ),
-                    reason_code=reason_code,
-                )
-    terminalizable = (
-        "predicate is not allowed" in message
-        or "hypothesis endpoints must be distinct" in message
-        or "positive hypothesis requires evidence" in message
-        or "evidence span is outside frozen context" in message
-        or "classifier confidence is" in message
-    )
-    if not terminalizable:
-        return None
+) -> v2.PairClassificationDecision:
+    """Return a non-publishable terminal decision for one unclassifiable pair.
+
+    The parser remains strict, but the runtime should not let one malformed
+    single-pair model response abort the whole enhanced Shadow run. This is a
+    fail-closed ledger state: no hypotheses are emitted, the verifier is not
+    invoked for this pair, and no normalized fact can be materialized from it.
+    """
+
+    reason_code = "CLASSIFIER_TERMINAL_PROTOCOL_FAILURE"
+    if exc is not None and "budget" in type(exc).__name__.lower():
+        reason_code = "CLASSIFIER_TERMINAL_BUDGET_FAILURE"
+    elif exc is not None and "timeout" in type(exc).__name__.lower():
+        reason_code = "CLASSIFIER_TERMINAL_TIMEOUT"
     return v2.PairClassificationDecision(
-        pair_identity=pair.pair_identity,
+        pair_identity=opportunity.pair_identity,
         decision=v2.OTHER_UNSUPPORTED,
         hypotheses=(),
         evidence_spans=(
             v2.EvidenceSpan(
-                start=int(pair.context_span[0]),
-                end=int(pair.context_span[1]),
+                start=int(opportunity.context_span[0]),
+                end=int(opportunity.context_span[1]),
             ),
         ),
-        reason_code="SCHEMA_GAP",
+        reason_code=reason_code,
     )
 
 
@@ -225,6 +235,77 @@ class ShadowRelationV2Runtime:
             int(item.get("chunk_index") or 0),
             int(item["id"]),
         ))
+        chunks_by_document: dict[int, list[dict[str, Any]]] = {}
+        for chunk in chunks:
+            chunks_by_document.setdefault(int(chunk["document_id"]), []).append(chunk)
+
+        def load_processing_payload(document: dict[str, Any]) -> dict[str, Any] | None:
+            loader = getattr(
+                self.db, "get_shadow_document_processing_payload", None,
+            )
+            if not callable(loader):
+                return None
+            payload = loader(document)
+            return payload if isinstance(payload, dict) else None
+
+        shadow_context = build_shadow_context_manifest(
+            namespace_id=f"relation-shadow:{project_id}:{namespace_id}",
+            documents=documents,
+            chunks_by_document=chunks_by_document,
+            payload_loader=load_processing_payload,
+        )
+        chunk_by_id = {int(item["id"]): item for item in chunks}
+        relation_chunks: list[dict[str, Any]] = []
+        source_context_rows: list[dict[str, Any]] = []
+        for unit in shadow_context.context_units:
+            structure = dict(unit.structure or {})
+            chunk_id = int(structure.get("chunk_id") or 0)
+            source_chunk = chunk_by_id.get(chunk_id)
+            if source_chunk is None:
+                if unit.structure_quality != "legacy_chunk_local":
+                    raise RuntimeError(
+                        "Shadow relation v2 structured context cannot be "
+                        "mapped to frozen chunk mentions"
+                    )
+                continue
+            relation_chunks.append({
+                **source_chunk,
+                "chunk_key": unit.context_id,
+                "content": unit.rendered_text,
+                "shadow_context_id": unit.context_id,
+                "shadow_context_kind": unit.context_kind,
+                "shadow_context_quality": unit.structure_quality,
+                "shadow_context_rendered_hash": unit.rendered_hash,
+                "shadow_source_map": [asdict(item) for item in unit.source_map],
+                "shadow_structure": structure,
+            })
+            source_context_rows.append({
+                "context_identity": unit.context_id,
+                "project_id": int(project_id),
+                "document_id": int(source_chunk.get("document_id") or 0),
+                "document_revision_id": str(
+                    source_chunk.get("revision_id")
+                    or unit.document_revision_id
+                ),
+                "chunk_id": int(source_chunk["id"]),
+                "chunk_key": str(unit.context_id),
+                "context_kind": unit.context_kind,
+                "context_start": 0,
+                "context_end": len(unit.rendered_text),
+                "content_hash": unit.rendered_hash,
+                "structure_artifact_hash": shadow_context.artifact_hash,
+                "parser_version": str(unit.structure.get("parser_version") or ""),
+                "payload": {
+                    "context_id": unit.context_id,
+                    "namespace_id": unit.namespace_id,
+                    "rendered_hash": unit.rendered_hash,
+                    "source_block_keys": list(unit.source_block_keys),
+                    "structure": structure,
+                    "structure_quality": unit.structure_quality,
+                    "source_map": [asdict(item) for item in unit.source_map],
+                },
+                "source_maps": [asdict(item) for item in unit.source_map],
+            })
         schema_record = self.db.get_active_schema(project_id)
         if not schema_record:
             raise RuntimeError("Shadow relation v2 缺少 active Schema")
@@ -268,7 +349,6 @@ class ShadowRelationV2Runtime:
             item for item in mentions
             if str(item["mention_key"]) in assignment_by_mention
         ]
-        chunk_by_id = {int(item["id"]): item for item in chunks}
         unknown_chunks = sorted({
             int(item["chunk_id"]) for item in mentions
             if int(item["chunk_id"]) not in chunk_by_id
@@ -332,8 +412,11 @@ class ShadowRelationV2Runtime:
                 "max_char_distance": Config.relation_max_char_distance,
                 "batch_size": Config.relation_classifier_max_candidates,
                 "soft_cues": "schema-configured-nonbinding",
+                "source_context_policy": shadow_context.policy_version,
+                "source_map_policy": shadow_context.source_map_policy,
             },
             "budget": Config.relation_max_candidates_per_chunk,
+            "structure_artifact_hash": shadow_context.artifact_hash,
         }
         classifier = {
             "prompt_version": v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
@@ -420,7 +503,10 @@ class ShadowRelationV2Runtime:
             "project": project,
             "documents": documents,
             "chunks": chunks,
+            "relation_chunks": relation_chunks,
             "chunk_by_id": chunk_by_id,
+            "shadow_context": shadow_context,
+            "source_context_rows": source_context_rows,
             "schema": schema,
             "mentions": mentions,
             "assignments": assignments,
@@ -446,6 +532,134 @@ class ShadowRelationV2Runtime:
             or mention["mention_key"]
         )
 
+    @staticmethod
+    def _direct_proposer_opportunity(
+        *,
+        run_id: str,
+        project_id: int,
+        chunk: dict[str, Any],
+        proposal: v2.RelationProposal,
+        mentions: list[dict[str, Any]],
+        logical_schema: dict[str, Any],
+    ) -> v2.PairOpportunity:
+        """Create a pair-ledger row for a legal direct-proposer-only pair."""
+
+        mentions_by_occurrence = {
+            str(item["occurrence_key"]): item for item in mentions
+        }
+        try:
+            subject = mentions_by_occurrence[proposal.subject_occurrence_key]
+            object_ = mentions_by_occurrence[proposal.object_occurrence_key]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Shadow v2 direct proposer endpoint missing from context"
+            ) from exc
+        left, right = sorted(
+            (subject, object_),
+            key=lambda item: (
+                str(item["occurrence_key"]),
+                int(item["mention_start"]),
+                int(item["mention_end"]),
+            ),
+        )
+        content = str(chunk.get("content") or "")
+        if not content:
+            raise RuntimeError("Shadow v2 direct proposer context is empty")
+        evidence_start = min(span.start for span in proposal.evidence_spans)
+        evidence_end = max(span.end for span in proposal.evidence_spans)
+        context_start = max(
+            0,
+            min(
+                evidence_start,
+                int(left["mention_start"]),
+                int(right["mention_start"]),
+            ),
+        )
+        context_end = min(
+            len(content),
+            max(
+                evidence_end,
+                int(left["mention_end"]),
+                int(right["mention_end"]),
+            ),
+        )
+        if context_end <= context_start:
+            raise RuntimeError(
+                "Shadow v2 direct proposer context span is invalid"
+            )
+        document_revision_id = str(chunk["revision_id"])
+        stable_pair = v2.pair_identity(
+            document_revision_id,
+            str(left["occurrence_key"]),
+            str(right["occurrence_key"]),
+        )
+        spec = v2.normalize_predicate_schema(logical_schema).get(
+            proposal.predicate,
+        )
+        if spec is None:
+            raise RuntimeError(
+                "Shadow v2 direct proposer predicate missing from schema"
+            )
+        source_context_id = str(chunk.get("shadow_context_id") or chunk["id"])
+        return v2.PairOpportunity(
+            opportunity_identity=v2.opportunity_identity(
+                run_id,
+                SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION,
+                stable_pair,
+            ),
+            pair_identity=stable_pair,
+            run_id=run_id,
+            project_id=int(project_id),
+            document_revision_id=document_revision_id,
+            chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
+            candidate_policy_version=SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION,
+            left_occurrence_key=str(left["occurrence_key"]),
+            right_occurrence_key=str(right["occurrence_key"]),
+            left_mention_id=str(left["mention_id"]),
+            right_mention_id=str(right["mention_id"]),
+            left_span=(
+                int(left["mention_start"]),
+                int(left["mention_end"]),
+            ),
+            right_span=(
+                int(right["mention_start"]),
+                int(right["mention_end"]),
+            ),
+            left_canonical_id=str(left.get("canonical_id") or ""),
+            right_canonical_id=str(right.get("canonical_id") or ""),
+            left_assignment_version=str(left.get("assignment_version") or ""),
+            right_assignment_version=str(right.get("assignment_version") or ""),
+            left_type=str(left.get("type") or ""),
+            right_type=str(right.get("type") or ""),
+            context_identity="relctx_direct_" + canonical_digest({
+                "source_context_id": source_context_id,
+                "pair_identity": stable_pair,
+                "context_span": [context_start, context_end],
+            }),
+            context_span=(context_start, context_end),
+            allowed_predicate_metadata=(asdict(spec),),
+            planning_reason="direct_proposer_pair_not_in_planner",
+            cue=v2.DIRECT_PROPOSER,
+            type_status="direct_proposer",
+            status=v2.PENDING_CLASSIFICATION,
+            provenance={
+                "candidate_sources": [v2.DIRECT_PROPOSER],
+                "source_kind": "v2_direct_proposer",
+                "source_record_id": proposal.proposal_id,
+                "source_context_id": source_context_id,
+                "source_context_kind": str(
+                    chunk.get("shadow_context_kind") or ""
+                ),
+                "source_context_quality": str(
+                    chunk.get("shadow_context_quality") or ""
+                ),
+                "document_id": int(chunk["document_id"]),
+                "chunk_id": int(chunk["id"]),
+                "content_hash": str(chunk.get("content_hash") or ""),
+                "direct_proposer_union": True,
+            },
+        )
+
     def _classify(
         self,
         *,
@@ -455,17 +669,27 @@ class ShadowRelationV2Runtime:
         opportunities: list[v2.PairOpportunity],
         content: str,
         schema: dict[str, Any],
+        prompt: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> Any:
         output_budget = int(
             max_output_tokens or Config.relation_classifier_output_reserve
         )
+        request_prompt = (
+            prompt if prompt is not None
+            else v2.classifier_prompt(
+                opportunities, content=content, logical_schema=schema,
+            )
+        )
+        request_schema = (
+            response_schema if response_schema is not None
+            else v2.classifier_response_schema(opportunities)
+        )
         raw = self.models.json_chat(
             model=model,
             system=SHADOW_RELATION_V2_CLASSIFIER_SYSTEM_PROMPT,
-            prompt=v2.classifier_prompt(
-                opportunities, content=content, logical_schema=schema,
-            ),
-            schema=v2.classifier_response_schema(opportunities),
+            prompt=request_prompt,
+            schema=request_schema,
             temperature=0.0,
             context_budget_tokens=context_budget_tokens,
             max_output_tokens=output_budget,
@@ -509,6 +733,8 @@ class ShadowRelationV2Runtime:
         schema: dict[str, Any],
         pass_no: int = 0,
         already_found_keys: list[str] | None = None,
+        prompt: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> Any:
         output_budget = int(
             max_output_tokens
@@ -517,18 +743,32 @@ class ShadowRelationV2Runtime:
                 attempt_no=pass_no + 1,
             )
         )
-        return self.models.json_chat(
-            model=model,
-            system=SHADOW_RELATION_V2_PROPOSER_SYSTEM_PROMPT,
-            prompt=v2.proposer_prompt(
+        request_prompt = (
+            prompt if prompt is not None
+            else v2.proposer_prompt(
                 context_id=context_id,
                 content=content,
                 mentions=mentions,
                 logical_schema=schema,
                 already_found_keys=already_found_keys or [],
                 pass_no=pass_no,
-            ),
-            schema=v2.proposer_response_schema(),
+                max_proposals=Config.relation_proposer_max_proposals,
+            )
+        )
+        request_schema = (
+            response_schema if response_schema is not None
+            else v2.proposer_response_schema(
+                mentions=mentions,
+                logical_schema=schema,
+                content_length=len(content),
+                max_proposals=Config.relation_proposer_max_proposals,
+            )
+        )
+        return self.models.json_chat(
+            model=model,
+            system=SHADOW_RELATION_V2_PROPOSER_SYSTEM_PROMPT,
+            prompt=request_prompt,
+            schema=request_schema,
             temperature=0.0,
             context_budget_tokens=context_budget_tokens,
             max_output_tokens=output_budget,
@@ -759,6 +999,10 @@ class ShadowRelationV2Runtime:
                 ),
             })
             started = True
+            self.db.persist_shadow_relation_v2_source_contexts(
+                run_id,
+                context["source_context_rows"],
+            )
             mentions_by_chunk: dict[int, list[dict[str, Any]]] = {}
             for mention in context["mentions"]:
                 assignment = context["assignment_by_mention"][
@@ -780,21 +1024,25 @@ class ShadowRelationV2Runtime:
                         assignment.get("entity_type") or "GenericEntity"
                     ),
                 })
-            plans_by_chunk: dict[int, v2.PairOpportunityPlan] = {}
+            plans_by_context: dict[str, v2.PairOpportunityPlan] = {}
             all_opportunities: list[v2.PairOpportunity] = []
-            proposal_batches: list[tuple[int, v2.RelationProposalBatch]] = []
+            proposal_batches: list[tuple[str, v2.RelationProposalBatch]] = []
             proposer_calls = 0
             proposer_failures = 0
-            proposer_consecutive_failed_contexts = 0
+            proposer_attempt_counts: Counter[str] = Counter()
+            proposer_failure_keys: Counter[tuple[str, str, str]] = Counter()
             proposer_circuit_breaker_tripped = False
             proposer_skipped_by_circuit = 0
-            total_chunks = len(context["chunks"])
+            proposer_terminal_statuses: Counter[str] = Counter()
+            relation_chunks = list(context["relation_chunks"])
+            total_chunks = len(relation_chunks)
             total_progress = max(1, total_chunks * 4)
             context_budget = int(
                 context["project"].get("model_max_tokens")
                 or self.default_context_tokens
             )
-            for chunk_index, chunk in enumerate(context["chunks"], start=1):
+            for chunk_index, chunk in enumerate(relation_chunks, start=1):
+                context_key = str(chunk.get("shadow_context_id") or chunk["id"])
                 chunk_mentions = mentions_by_chunk.get(int(chunk["id"]), [])
                 plan = v2.plan_pair_opportunities(
                     project_id=project_id,
@@ -818,6 +1066,13 @@ class ShadowRelationV2Runtime:
                             **item.provenance,
                             "document_id": int(chunk["document_id"]),
                             "chunk_id": int(chunk["id"]),
+                            "source_context_id": context_key,
+                            "source_context_kind": str(
+                                chunk.get("shadow_context_kind") or ""
+                            ),
+                            "source_context_quality": str(
+                                chunk.get("shadow_context_quality") or ""
+                            ),
                             "content_hash": str(
                                 chunk.get("content_hash") or ""
                             ),
@@ -826,7 +1081,7 @@ class ShadowRelationV2Runtime:
                     for item in plan.opportunities
                 )
                 plan = replace(plan, opportunities=annotated)
-                plans_by_chunk[int(chunk["id"])] = plan
+                plans_by_context[context_key] = plan
                 all_opportunities.extend(plan.opportunities)
                 if progress:
                     progress(
@@ -838,93 +1093,382 @@ class ShadowRelationV2Runtime:
                     f"Shadow v2 proposer {chunk_index}/{total_chunks} "
                     "跳过：实体不足"
                 )
-                if len(chunk_mentions) >= 2 and proposer_circuit_breaker_tripped:
-                    proposer_skipped_by_circuit += 1
-                    proposer_message = (
-                        f"Shadow v2 proposer {chunk_index}/{total_chunks} "
-                        "熔断跳过（辅助召回已关闭，主链继续）"
+                if len(chunk_mentions) >= 2:
+                    context_kind = str(
+                        chunk.get("shadow_context_kind") or "legacy_chunk"
                     )
-                elif len(chunk_mentions) >= 2:
-                    last_proposer_error: Exception | None = None
-                    for proposer_attempt_no in range(
-                        1, int(Config.relation_shadow_max_attempts) + 1,
-                    ):
-                        proposer_calls += 1
-                        try:
-                            raw_proposal = self._propose(
-                                model=context["model"],
-                                context_budget_tokens=context_budget,
-                                max_output_tokens=self._proposer_output_budget(
+                    blocked = [
+                        key for key, count in proposer_failure_keys.items()
+                        if (
+                            key[0] == str(chunk.get("document_id") or "")
+                            and key[1] == context_kind
+                            and count >= int(
+                                Config.relation_proposer_failure_circuit_breaker
+                            ) > 0
+                        )
+                    ]
+                    if blocked:
+                        proposer_skipped_by_circuit += 1
+                        proposer_circuit_breaker_tripped = True
+                        proposer_terminal_statuses[
+                            "TERMINAL_FAILED_WITH_PLANNER_FALLBACK"
+                        ] += 1
+                        proposer_message = (
+                            f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                            "辅助召回已达异常阈值，本轮后续不再调用（主链继续）"
+                        )
+                    else:
+                        already_found_keys: set[str] = set()
+                        context_success = False
+                        last_proposer_error: Exception | None = None
+                        for pass_no in range(0, 3):
+                            legal_batch: v2.RelationProposalBatch | None = None
+                            for retry_no in range(
+                                1, int(Config.relation_shadow_max_attempts) + 1,
+                            ):
+                                proposer_calls += 1
+                                proposer_attempt_counts[context_key] += 1
+                                audit_attempt_no = int(
+                                    proposer_attempt_counts[context_key]
+                                )
+                                output_budget = self._proposer_output_budget(
                                     context_budget_tokens=context_budget,
-                                    attempt_no=proposer_attempt_no,
-                                ),
-                                context_id=str(
-                                    chunk.get("chunk_key") or chunk["id"]
-                                ),
-                                content=str(chunk.get("content") or ""),
-                                mentions=chunk_mentions,
-                                schema=context["schema"],
-                                pass_no=proposer_attempt_no - 1,
-                            )
-                            proposal_batches.append((
-                                int(chunk["id"]),
-                                v2.parse_proposer_response(
+                                    attempt_no=retry_no,
+                                )
+                                already_found_payload = sorted(
+                                    already_found_keys
+                                )
+                                proposer_protocol_feedback = ""
+                                if last_proposer_error is not None:
+                                    proposer_protocol_feedback = (
+                                        "Previous proposer response violated "
+                                        "the v2 contract and was rejected "
+                                        "fail-closed: "
+                                        f"{type(last_proposer_error).__name__}: "
+                                        f"{str(last_proposer_error)[:800]}. "
+                                        "Return exactly one object with "
+                                        "proposals as an array, "
+                                        "missing_endpoint_mentions as an array, "
+                                        "and coverage as an object. Keep "
+                                        "endpoints copied from occurrences, "
+                                        "predicate copied from predicates, and "
+                                        "evidence_spans covering both endpoints."
+                                    )
+                                proposer_prompt = v2.proposer_prompt(
                                     context_id=str(
                                         chunk.get("chunk_key") or chunk["id"]
                                     ),
                                     content=str(chunk.get("content") or ""),
                                     mentions=chunk_mentions,
                                     logical_schema=context["schema"],
-                                    raw=raw_proposal,
-                                    candidate_source=v2.DIRECT_PROPOSER,
-                                    pass_no=proposer_attempt_no - 1,
-                                    proposer_model_revision=
-                                        context["model_revision"],
-                                ),
-                            ))
-                            last_proposer_error = None
-                            proposer_consecutive_failed_contexts = 0
+                                    already_found_keys=
+                                        already_found_payload,
+                                    pass_no=pass_no,
+                                    protocol_feedback=
+                                        proposer_protocol_feedback,
+                                    max_proposals=
+                                        Config.relation_proposer_max_proposals,
+                                )
+                                proposer_schema = v2.proposer_response_schema(
+                                    mentions=chunk_mentions,
+                                    logical_schema=context["schema"],
+                                    content_length=len(
+                                        str(chunk.get("content") or ""),
+                                    ),
+                                    max_proposals=
+                                        Config.relation_proposer_max_proposals,
+                                )
+                                request_payload = {
+                                    "stage": "proposer",
+                                    "model": context["model"],
+                                    "model_revision": context["model_revision"],
+                                    "system":
+                                        SHADOW_RELATION_V2_PROPOSER_SYSTEM_PROMPT,
+                                    "prompt": proposer_prompt,
+                                    "schema": proposer_schema,
+                                    "temperature": 0.0,
+                                    "context_budget_tokens": context_budget,
+                                    "max_output_tokens": output_budget,
+                                    "safety_margin_tokens":
+                                        Config.relation_classifier_safety_margin,
+                                    "context_identity": context_key,
+                                    "pass_no": pass_no,
+                                    "retry_no": retry_no,
+                                }
+                                request_hash = shadow_model_payload_hash(
+                                    "request", request_payload,
+                                )
+                                raw_response_text = ""
+                                parsed_response: Any = {}
+                                token_usage: dict[str, Any] = {}
+                                try:
+                                    raw_proposal = self._propose(
+                                        model=context["model"],
+                                        context_budget_tokens=context_budget,
+                                        max_output_tokens=output_budget,
+                                        context_id=str(
+                                            chunk.get("chunk_key") or chunk["id"]
+                                        ),
+                                        content=str(chunk.get("content") or ""),
+                                        mentions=chunk_mentions,
+                                        schema=context["schema"],
+                                        pass_no=pass_no,
+                                        already_found_keys=already_found_payload,
+                                        prompt=proposer_prompt,
+                                        response_schema=proposer_schema,
+                                    )
+                                    parsed_response = raw_proposal
+                                    raw_response_text = str(
+                                        getattr(
+                                            self.models,
+                                            "last_raw_response_text",
+                                            "",
+                                        )
+                                        or _safe_json_text(raw_proposal)
+                                    )
+                                    diagnostics = getattr(
+                                        self.models, "last_call_diagnostics", None,
+                                    )
+                                    if diagnostics is not None:
+                                        token_usage = asdict(diagnostics)
+                                    legal_batch = v2.parse_proposer_response(
+                                        context_id=str(
+                                            chunk.get("chunk_key") or chunk["id"]
+                                        ),
+                                        content=str(chunk.get("content") or ""),
+                                        mentions=chunk_mentions,
+                                        logical_schema=context["schema"],
+                                        raw=raw_proposal,
+                                        candidate_source=v2.DIRECT_PROPOSER,
+                                        pass_no=pass_no,
+                                        proposer_model_revision=
+                                            context["model_revision"],
+                                    )
+                                    parsed_response = {
+                                        "raw": raw_proposal,
+                                        "proposals": [
+                                            {
+                                                "proposal_id": item.proposal_id,
+                                                "subject_occurrence_id":
+                                                    item.subject_occurrence_key,
+                                                "predicate": item.predicate,
+                                                "object_occurrence_id":
+                                                    item.object_occurrence_key,
+                                                "evidence_spans": [
+                                                    {
+                                                        "start": span.start,
+                                                        "end": span.end,
+                                                    }
+                                                    for span in item.evidence_spans
+                                                ],
+                                                "qualifiers":
+                                                    list(item.qualifiers),
+                                                "confidence": item.confidence,
+                                            }
+                                            for item in legal_batch.proposals
+                                        ],
+                                        "missing_endpoint_mentions": [
+                                            dict(item)
+                                            for item in (
+                                                legal_batch
+                                                .missing_endpoint_mentions
+                                            )
+                                        ],
+                                        "coverage": dict(legal_batch.coverage),
+                                    }
+                                    self.db.record_shadow_relation_v2_proposal_attempt(
+                                        run_id,
+                                        {
+                                            "context_identity": context_key,
+                                            "attempt_no": audit_attempt_no,
+                                            "status": "ACCEPTED",
+                                            "request_hash": request_hash,
+                                            "response_hash":
+                                                shadow_model_payload_hash(
+                                                    "response",
+                                                    raw_response_text,
+                                                ),
+                                            "proposer_prompt_version":
+                                                v2.SHADOW_RELATION_PROPOSER_PROMPT_VERSION,
+                                            "proposer_schema_version":
+                                                v2.SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
+                                            "proposer_parser_version":
+                                                v2.SHADOW_RELATION_PROPOSER_PARSER_VERSION,
+                                            "proposer_model_revision":
+                                                context["model_revision"],
+                                            "model_name": context["model"],
+                                            "request_payload": request_payload,
+                                            "raw_response_text": raw_response_text,
+                                            "parsed_response": parsed_response,
+                                            "token_usage": token_usage,
+                                            "metadata": {
+                                                "chunk_id": int(chunk["id"]),
+                                                "pass_no": pass_no,
+                                                "retry_no": retry_no,
+                                                "proposal_count":
+                                                    len(legal_batch.proposals),
+                                                "missing_endpoint_mentions":
+                                                    len(
+                                                        legal_batch
+                                                        .missing_endpoint_mentions
+                                                    ),
+                                            },
+                                        },
+                                    )
+                                    last_proposer_error = None
+                                    break
+                                except Exception as exc:
+                                    proposer_failures += 1
+                                    last_proposer_error = exc
+                                    raw_response_text = str(
+                                        getattr(
+                                            self.models,
+                                            "last_raw_response_text",
+                                            "",
+                                        )
+                                        or raw_response_text
+                                    )
+                                    diagnostics = getattr(
+                                        self.models, "last_call_diagnostics", None,
+                                    )
+                                    if diagnostics is not None:
+                                        token_usage = asdict(diagnostics)
+                                    response_hash = (
+                                        shadow_model_payload_hash(
+                                            "response", raw_response_text,
+                                        )
+                                        if raw_response_text else ""
+                                    )
+                                    self.db.record_shadow_relation_v2_proposal_attempt(
+                                        run_id,
+                                        {
+                                            "context_identity": context_key,
+                                            "attempt_no": audit_attempt_no,
+                                            "status": (
+                                                "TERMINAL_FAILED"
+                                                if retry_no == int(
+                                                    Config
+                                                    .relation_shadow_max_attempts
+                                                )
+                                                else "RETRYABLE_FAILED"
+                                            ),
+                                            "request_hash": request_hash,
+                                            "response_hash": response_hash,
+                                            "proposer_prompt_version":
+                                                v2.SHADOW_RELATION_PROPOSER_PROMPT_VERSION,
+                                            "proposer_schema_version":
+                                                v2.SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
+                                            "proposer_parser_version":
+                                                v2.SHADOW_RELATION_PROPOSER_PARSER_VERSION,
+                                            "proposer_model_revision":
+                                                context["model_revision"],
+                                            "model_name": context["model"],
+                                            "request_payload": request_payload,
+                                            "raw_response_text": raw_response_text,
+                                            "parsed_response": parsed_response,
+                                            "token_usage": token_usage,
+                                            "error_type": type(exc).__name__,
+                                            "error_message": str(exc)[:2000],
+                                            "metadata": {
+                                                "chunk_id": int(chunk["id"]),
+                                                "pass_no": pass_no,
+                                                "retry_no": retry_no,
+                                            },
+                                        },
+                                    )
+                                    continue
+                            if legal_batch is None:
+                                error_class = (
+                                    type(last_proposer_error).__name__
+                                    if last_proposer_error else "unknown"
+                                )
+                                proposer_failure_keys[(
+                                    str(chunk.get("document_id") or ""),
+                                    context_kind,
+                                    error_class,
+                                )] += 1
+                                proposer_terminal_statuses[
+                                    "TERMINAL_FAILED_WITH_PLANNER_FALLBACK"
+                                ] += 1
+                                proposer_message = (
+                                    f"Shadow v2 proposer "
+                                    f"{chunk_index}/{total_chunks} "
+                                    f"辅助召回未采用：{error_class}（已审计，主链继续）"
+                                )
+                                break
+                            proposal_batches.append((context_key, legal_batch))
+                            context_success = True
+                            new_found_keys = {
+                                _proposal_found_key(item)
+                                for item in legal_batch.proposals
+                                if _proposal_found_key(item)
+                                not in already_found_keys
+                            }
+                            already_found_keys.update(new_found_keys)
+                            if pass_no == 0:
+                                continue
+                            if not new_found_keys:
+                                break
+                        if context_success:
+                            proposer_terminal_statuses[
+                                "SUCCESS_WITH_PROPOSALS"
+                                if already_found_keys else "SUCCESS_EMPTY"
+                            ] += 1
                             proposer_message = (
                                 f"Shadow v2 proposer {chunk_index}/{total_chunks} "
                                 "完成"
                             )
-                            break
-                        except Exception as exc:
-                            proposer_failures += 1
-                            last_proposer_error = exc
-                            continue
-                    if last_proposer_error is not None:
-                        proposer_consecutive_failed_contexts += 1
-                        proposer_message = (
-                            f"Shadow v2 proposer {chunk_index}/{total_chunks} "
-                            f"失败跳过：{type(last_proposer_error).__name__}"
-                        )
-                        circuit_threshold = int(
-                            Config.relation_proposer_failure_circuit_breaker
-                        )
-                        if (
-                            circuit_threshold > 0
-                            and proposer_consecutive_failed_contexts
-                            >= circuit_threshold
-                        ):
-                            proposer_circuit_breaker_tripped = True
-                            proposer_message += "；已熔断后续 chunk"
                 if progress:
                     progress(
                         total_chunks + chunk_index,
                         total_progress,
                         proposer_message,
                     )
-            self.db.persist_shadow_relation_v2_opportunities(
-                run_id, all_opportunities,
-            )
             opportunity_by_pair = {
                 str(item.pair_identity): item for item in all_opportunities
             }
-            proposer_hypotheses: list[v2.RelationHypothesis] = []
+            chunks_by_context = {
+                str(chunk.get("shadow_context_id") or chunk["id"]): chunk
+                for chunk in relation_chunks
+            }
             missing_endpoint_mentions = 0
-            for chunk_id, batch in proposal_batches:
-                chunk = context["chunk_by_id"][int(chunk_id)]
+
+            def replace_opportunity(updated: v2.PairOpportunity) -> None:
+                for index, item in enumerate(all_opportunities):
+                    if str(item.pair_identity) == str(updated.pair_identity):
+                        all_opportunities[index] = updated
+                        break
+                for plan_context, plan in list(plans_by_context.items()):
+                    replaced = tuple(
+                        updated
+                        if str(item.pair_identity) == str(updated.pair_identity)
+                        else item
+                        for item in plan.opportunities
+                    )
+                    if replaced != plan.opportunities:
+                        plans_by_context[plan_context] = replace(
+                            plan, opportunities=replaced,
+                        )
+                opportunity_by_pair[str(updated.pair_identity)] = updated
+
+            def add_direct_opportunity(
+                context_key: str,
+                opportunity: v2.PairOpportunity,
+            ) -> None:
+                all_opportunities.append(opportunity)
+                plan = plans_by_context[context_key]
+                plans_by_context[context_key] = replace(
+                    plan,
+                    opportunities=(*plan.opportunities, opportunity),
+                    theoretical_pairs=max(
+                        int(plan.theoretical_pairs),
+                        len(plan.opportunities) + 1,
+                    ),
+                )
+                opportunity_by_pair[str(opportunity.pair_identity)] = opportunity
+
+            for context_key, batch in proposal_batches:
+                chunk = chunks_by_context[context_key]
                 missing_endpoint_mentions += len(batch.missing_endpoint_mentions)
                 for proposal in batch.proposals:
                     pair_id = v2.pair_identity(
@@ -934,9 +1478,40 @@ class ShadowRelationV2Runtime:
                     )
                     opportunity = opportunity_by_pair.get(pair_id)
                     if not opportunity:
-                        raise RuntimeError(
-                            "Shadow v2 proposer pair 缺少 pair ledger"
+                        opportunity = self._direct_proposer_opportunity(
+                            run_id=run_id,
+                            project_id=project_id,
+                            chunk=chunk,
+                            proposal=proposal,
+                            mentions=mentions_by_chunk.get(
+                                int(chunk["id"]), [],
+                            ),
+                            logical_schema=context["schema"],
                         )
+                        add_direct_opportunity(context_key, opportunity)
+                    else:
+                        updated = _with_direct_proposer_source(opportunity)
+                        if updated != opportunity:
+                            opportunity = updated
+                            replace_opportunity(opportunity)
+            self.db.persist_shadow_relation_v2_opportunities(
+                run_id, all_opportunities,
+            )
+            proposer_hypotheses: list[v2.RelationHypothesis] = []
+            proposer_seen_keys: set[str] = set()
+            for context_key, batch in proposal_batches:
+                chunk = chunks_by_context[context_key]
+                for proposal in batch.proposals:
+                    found_key = _proposal_found_key(proposal)
+                    if found_key in proposer_seen_keys:
+                        continue
+                    proposer_seen_keys.add(found_key)
+                    pair_id = v2.pair_identity(
+                        str(chunk["revision_id"]),
+                        proposal.subject_occurrence_key,
+                        proposal.object_occurrence_key,
+                    )
+                    opportunity = opportunity_by_pair[pair_id]
                     proposer_hypotheses.append(v2.proposal_to_hypothesis(
                         proposal,
                         opportunity,
@@ -958,95 +1533,31 @@ class ShadowRelationV2Runtime:
                 last_error: Exception | None = None
                 max_attempts = int(Config.relation_shadow_max_attempts)
 
-                def record_terminal_unsupported(
-                    terminal_decision: v2.PairClassificationDecision,
-                    error: Exception | None,
-                ) -> list[v2.PairClassificationDecision]:
-                    pair = batch[0]
-                    pair_id = str(pair.pair_identity)
-                    classifier_attempt_counts[pair_id] += 1
-                    audit_attempt_no = int(classifier_attempt_counts[pair_id])
-                    parsed_response = {
-                        "items": [{
-                            "pair_id": pair_id,
-                            "decision": terminal_decision.decision,
-                            "hypotheses": [],
-                            "reason_code": terminal_decision.reason_code,
-                            "evidence_spans": [
-                                {"start": span.start, "end": span.end}
-                                for span in terminal_decision.evidence_spans
-                            ],
-                            "terminal_from_error": str(error or ""),
-                        }],
-                    }
-                    raw_response_text = _safe_json_text(parsed_response)
-                    request_payload = {
-                        "stage": "classifier_terminal_unsupported",
-                        "model": context["model"],
-                        "model_revision": context["model_revision"],
-                        "classifier_prompt_version":
-                            v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
-                        "classifier_schema_version":
-                            v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-                        "classifier_parser_version":
-                            v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
-                        "pair_ids": [pair_id],
-                        "previous_attempts": audit_attempt_no - 1,
-                        "terminal_from_error_type":
-                            type(error).__name__ if error else "",
-                        "terminal_from_error_message": str(error or ""),
-                    }
-                    self.db.record_shadow_relation_v2_classification_attempt(
-                        run_id,
-                        pair.pair_identity,
-                        {
-                            "attempt_no": audit_attempt_no,
-                            "status": CLASSIFIER_ACCEPTED,
-                            "request_hash": shadow_model_payload_hash(
-                                "request", request_payload,
-                            ),
-                            "response_hash": shadow_model_payload_hash(
-                                "response", raw_response_text,
-                            ),
-                            "classifier_prompt_version":
-                                v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
-                            "classifier_schema_version":
-                                v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-                            "classifier_parser_version":
-                                v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
-                            "classifier_model_revision":
-                                context["model_revision"],
-                            "model_name": context["model"],
-                            "request_payload": request_payload,
-                            "raw_response_text": raw_response_text,
-                            "parsed_response": parsed_response,
-                            "token_usage": {},
-                            "error_type": "",
-                            "error_message": "",
-                            "independent_call": False,
-                            "metadata": {
-                                "chunk_id": int(chunk["id"]),
-                                "batch_offset": batch_offset,
-                                "batch_size": len(batch),
-                                "terminal_unsupported_from_failed_attempts": True,
-                                "previous_error_type":
-                                    type(error).__name__ if error else "",
-                                "previous_error_message": str(error or ""),
-                            },
-                        },
-                    )
-                    return [terminal_decision]
-
                 for call_attempt_no in range(1, max_attempts + 1):
                     classifier_calls += 1
                     output_budget = self._classifier_output_budget(
                         context_budget_tokens=context_budget,
                         attempt_no=call_attempt_no,
                     )
+                    protocol_feedback = ""
+                    if last_error is not None:
+                        protocol_feedback = (
+                            "Previous classifier response violated the v2 "
+                            "contract and was rejected fail-closed: "
+                            f"{type(last_error).__name__}: "
+                            f"{str(last_error)[:800]}. "
+                            "Return exactly one decision for each pair. For "
+                            "every hypothesis, copy predicate only from that "
+                            "pair's allowed_predicates. If no allowed predicate "
+                            "fits the text, return NO_RELATION, or "
+                            "OTHER_UNSUPPORTED when the text has an explicit "
+                            "relation that this Schema cannot express."
+                        )
                     prompt = v2.classifier_prompt(
                         batch,
                         content=content,
                         logical_schema=context["schema"],
+                        protocol_feedback=protocol_feedback,
                     )
                     response_contract = v2.classifier_response_schema(batch)
                     request_payload = {
@@ -1086,6 +1597,8 @@ class ShadowRelationV2Runtime:
                             opportunities=batch,
                             content=content,
                             schema=context["schema"],
+                            prompt=prompt,
+                            response_schema=response_contract,
                         )
                         parsed_response = raw
                         raw_response_text = str(
@@ -1150,17 +1663,6 @@ class ShadowRelationV2Runtime:
                             getattr(self.models, "last_raw_response_text", "")
                             or ""
                         )
-                        if len(batch) == 1:
-                            terminal_decision = (
-                                _terminal_unsupported_decision_for_single_pair(
-                                    batch[0], exc, raw_response_text,
-                                )
-                            )
-                            if terminal_decision is not None:
-                                return record_terminal_unsupported(
-                                    terminal_decision,
-                                    exc,
-                                )
                         classifier_failures += 1
                         diagnostics = getattr(
                             self.models, "last_call_diagnostics", None,
@@ -1227,20 +1729,15 @@ class ShadowRelationV2Runtime:
                             batch_offset=batch_offset + midpoint,
                         ),
                     ]
-                terminal_decision = _terminal_unsupported_decision_for_single_pair(
-                    batch[0], last_error, raw_response_text,
-                )
-                if terminal_decision is not None:
-                    return record_terminal_unsupported(
-                        terminal_decision,
-                        last_error,
+                return [
+                    _terminal_classifier_fail_closed_decision(
+                        batch[0], last_error,
                     )
-                raise RuntimeError(
-                    "Shadow v2 classifier 未收敛且禁止回退旧流程"
-                ) from last_error
+                ]
 
-            for chunk_index, chunk in enumerate(context["chunks"], start=1):
-                admitted = list(plans_by_chunk[int(chunk["id"])].admitted)
+            for chunk_index, chunk in enumerate(relation_chunks, start=1):
+                context_key = str(chunk.get("shadow_context_id") or chunk["id"])
+                admitted = list(plans_by_context[context_key].admitted)
                 for offset in range(
                     0, len(admitted),
                     Config.relation_classifier_max_candidates,
@@ -1399,6 +1896,8 @@ class ShadowRelationV2Runtime:
                     "proposer_circuit_breaker_tripped":
                         proposer_circuit_breaker_tripped,
                     "proposer_skipped_by_circuit": proposer_skipped_by_circuit,
+                    "proposer_terminal_statuses":
+                        dict(proposer_terminal_statuses),
                     "proposals_total": len(proposer_hypotheses),
                     "proposer_hypotheses_persisted":
                         len(proposer_hypotheses_to_persist),
@@ -1506,6 +2005,7 @@ class ShadowRelationV2Runtime:
                 "proposer_circuit_breaker_tripped":
                     proposer_circuit_breaker_tripped,
                 "proposer_skipped_by_circuit": proposer_skipped_by_circuit,
+                "proposer_terminal_statuses": dict(proposer_terminal_statuses),
                 "proposals_total": len(proposer_hypotheses),
                 "proposer_hypotheses_persisted":
                     len(proposer_hypotheses_to_persist),

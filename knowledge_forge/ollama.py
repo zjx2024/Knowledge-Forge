@@ -205,10 +205,11 @@ class OllamaClient:
         max_output_tokens: int | None = None,
         safety_margin_tokens: int | None = None,
         images: Iterable[bytes] | None = None,
-    ) -> dict[str, Any]:
+        ) -> dict[str, Any]:
         increment("ollama_logical_calls")
         self.last_raw_response_text = ""
         self.last_parsed_json_response = None
+        self.last_call_diagnostics = None
         context_budget = int(
             context_budget_tokens or Config.ollama_default_context_budget
         )

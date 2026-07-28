@@ -531,12 +531,57 @@ def test_prompt_and_json_schema_version_the_generic_contract() -> None:
     payload = json.loads(prompt)
     assert payload["pairs"][0]["left_occurrence_id"] == "LEFT"
     assert payload["pairs"][0]["right_occurrence_id"] == "RIGHT"
+    assert "predicates" not in payload
+    assert payload["protocol_feedback"] == ""
+    pair_payload = payload["pairs"][0]
+    allowed_predicates = {
+        metadata["name"] for metadata in pair.allowed_predicate_metadata
+    }
+    assert set(pair_payload["allowed_predicates"]) == allowed_predicates
+    assert {
+        metadata["name"] for metadata in pair_payload["allowed_predicate_metadata"]
+    } == allowed_predicates
     endpoint_schema = (
         schema["properties"]["hypotheses"]["items"]["properties"]
     )
     assert endpoint_schema["subject_occurrence_id"]["enum"] == ["LEFT", "RIGHT"]
     assert endpoint_schema["object_occurrence_id"]["enum"] == ["LEFT", "RIGHT"]
+    assert set(endpoint_schema["predicate"]["enum"]) == allowed_predicates
     assert "direction" not in endpoint_schema
+
+
+def test_classifier_prompt_omits_pair_ineligible_global_predicates() -> None:
+    schema = logical_schema(
+        predicate_policy(
+            "alpha_rel",
+            domain=["Organization"],
+            range_=["Product"],
+            semantic_definition="A generic allowed relation.",
+        ),
+        predicate_policy(
+            "beta_rel",
+            domain=["Location"],
+            range_=["Location"],
+            semantic_definition="A generic relation ineligible for this pair.",
+        ),
+        version="test-schema-pair-local-v1",
+    )
+    pair = _opportunity(schema=schema)
+
+    prompt = classifier_prompt([pair], content=CONTENT, logical_schema=schema)
+    response_schema = classifier_response_schema([pair])
+    payload = json.loads(prompt)
+    pair_payload = payload["pairs"][0]
+    predicate_schema = (
+        response_schema["properties"]["hypotheses"]["items"]["properties"]
+        ["predicate"]
+    )
+
+    assert "alpha_rel" in pair_payload["allowed_predicates"]
+    assert "beta_rel" not in pair_payload["allowed_predicates"]
+    assert "beta_rel" not in prompt
+    assert "beta_rel" not in predicate_schema["enum"]
+    assert "predicates" not in payload
 
 
 def test_multi_pair_schema_uses_decisions_array_wrapper() -> None:

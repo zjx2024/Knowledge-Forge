@@ -71,7 +71,47 @@ def test_proposer_prompt_uses_occurrence_universe_and_predicate_metadata():
 
     assert prompt["occurrences"][0]["occurrence_id"] == "occ-acme"
     assert prompt["predicates"]["alpha_rel"]["semantic_definition"]
+    assert prompt["protocol_feedback"] == ""
+    assert prompt["required_evidence_span"] == {"start": 0, "end": len(CONTENT)}
     assert "Do not invent endpoints" in prompt["instruction"]
+    assert "coverage as an object" in prompt["instruction"]
+
+
+def test_proposer_prompt_carries_retry_protocol_feedback():
+    prompt = json.loads(v2.proposer_prompt(
+        context_id="ctx-1",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        protocol_feedback="coverage must be an object",
+    ))
+
+    assert prompt["protocol_feedback"] == "coverage must be an object"
+
+
+def test_proposer_response_schema_constrains_runtime_universe():
+    schema = v2.proposer_response_schema(
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        content_length=len(CONTENT),
+        max_proposals=7,
+    )
+    proposal_schema = schema["properties"]["proposals"]
+    properties = proposal_schema["items"]["properties"]
+
+    assert proposal_schema["maxItems"] == 7
+    assert properties["subject_occurrence_id"]["enum"] == [
+        "occ-acme",
+        "occ-alloy",
+    ]
+    assert properties["object_occurrence_id"]["enum"] == [
+        "occ-acme",
+        "occ-alloy",
+    ]
+    assert properties["predicate"]["enum"] == ["alpha_rel"]
+    span_properties = properties["evidence_spans"]["items"]["properties"]
+    assert span_properties["start"]["maximum"] == len(CONTENT) - 1
+    assert span_properties["end"]["maximum"] == len(CONTENT)
 
 
 def test_proposer_response_becomes_candidate_hypothesis_for_same_verifier_path():
@@ -111,25 +151,113 @@ def test_proposer_response_becomes_candidate_hypothesis_for_same_verifier_path()
 
 
 @pytest.mark.parametrize(
-    "overrides, message",
+    "overrides, reason",
     [
-        ({"subject_occurrence_id": "invented"}, "endpoint"),
-        ({"predicate": "invented_rel"}, "predicate"),
-        ({"evidence_spans": [{"start": 5, "end": 9}]}, "evidence"),
-        ({"confidence": 2.0}, "confidence"),
+        ({"subject_occurrence_id": "invented"}, "endpoint_not_in_occurrence_universe"),
+        ({"predicate": "invented_rel"}, "predicate_not_in_schema"),
     ],
 )
-def test_proposer_fail_closed_on_invented_endpoint_predicate_evidence_or_confidence(
-    overrides, message,
+def test_proposer_drops_unsafe_candidate_without_failing_context(
+    overrides, reason,
 ):
-    with pytest.raises(v2.ShadowClassificationError, match=message):
-        v2.parse_proposer_response(
-            context_id="ctx-1",
-            content=CONTENT,
-            mentions=MENTIONS,
-            logical_schema=_schema(),
-            raw=_response(**overrides),
-        )
+    batch = v2.parse_proposer_response(
+        context_id="ctx-1",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        raw=_response(**overrides),
+    )
+
+    assert batch.proposals == ()
+    assert batch.coverage["complete"] is False
+    assert batch.coverage["_parser_rejected_proposals"] == [{
+        "index": 0,
+        "reason": reason,
+    }]
+
+
+def test_proposer_non_decision_fields_are_safely_repaired():
+    batch = v2.parse_proposer_response(
+        context_id="ctx-1",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        raw=_response(qualifiers="not-array", confidence=2.0),
+    )
+
+    proposal = batch.proposals[0]
+    assert proposal.qualifiers == ()
+    assert proposal.confidence == 1.0
+    assert "proposal_0_qualifiers_defaulted" in batch.coverage["_parser_repairs"]
+    assert "proposal_0_confidence_clamped" in batch.coverage["_parser_repairs"]
+
+
+def test_proposer_top_level_proposals_shape_defaults_to_no_proposals():
+    raw = _response()
+    raw["proposals"] = "not-array"
+    batch = v2.parse_proposer_response(
+        context_id="ctx-1",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        raw=raw,
+    )
+
+    assert batch.proposals == ()
+    assert "proposals_type_defaulted" in batch.coverage["_parser_repairs"]
+
+
+def test_proposer_audit_only_fields_are_safely_defaulted():
+    raw = _response()
+    raw["missing_endpoint_mentions"] = None
+    raw["coverage"] = []
+
+    batch = v2.parse_proposer_response(
+        context_id="ctx-1",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        raw=raw,
+    )
+
+    assert len(batch.proposals) == 1
+    assert batch.missing_endpoint_mentions == ()
+    assert batch.coverage["complete"] is False
+    assert batch.coverage["uncovered_cues"] == []
+    assert "missing_endpoint_mentions_defaulted" in (
+        batch.coverage["_parser_repairs"]
+    )
+    assert "coverage_type_defaulted" in batch.coverage["_parser_repairs"]
+
+
+@pytest.mark.parametrize(
+    "evidence_spans",
+    [
+        {"start": 0, "end": len(CONTENT)},
+        [{"start": "bad", "end": len(CONTENT)}],
+        [{"start": 5, "end": 9}],
+        [],
+    ],
+)
+def test_proposer_evidence_shape_errors_fall_back_to_full_context(
+    evidence_spans,
+):
+    batch = v2.parse_proposer_response(
+        context_id="ctx-1",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        raw=_response(evidence_spans=evidence_spans),
+    )
+
+    proposal = batch.proposals[0]
+    assert [(span.start, span.end) for span in proposal.evidence_spans] == [
+        (0, len(CONTENT)),
+    ]
+    assert any(
+        item.startswith("proposal_0_evidence")
+        for item in batch.coverage["_parser_repairs"]
+    )
 
 
 def test_missing_endpoint_mentions_are_audit_only_not_hypotheses():

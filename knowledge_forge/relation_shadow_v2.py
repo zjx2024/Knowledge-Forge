@@ -31,9 +31,9 @@ CLASSIFICATION_FAILED = "CLASSIFICATION_FAILED"
 SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION = "shadow-relation-classifier-prompt-v9"
 SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION = "shadow-relation-classifier-schema-v6"
 SHADOW_RELATION_CLASSIFIER_PARSER_VERSION = "shadow-relation-classifier-parser-v9"
-SHADOW_RELATION_PROPOSER_PROMPT_VERSION = "shadow-relation-proposer-prompt-v1"
-SHADOW_RELATION_PROPOSER_SCHEMA_VERSION = "shadow-relation-proposer-schema-v1"
-SHADOW_RELATION_PROPOSER_PARSER_VERSION = "shadow-relation-proposer-parser-v1"
+SHADOW_RELATION_PROPOSER_PROMPT_VERSION = "shadow-relation-proposer-prompt-v2"
+SHADOW_RELATION_PROPOSER_SCHEMA_VERSION = "shadow-relation-proposer-schema-v2"
+SHADOW_RELATION_PROPOSER_PARSER_VERSION = "shadow-relation-proposer-parser-v2"
 SHADOW_RELATION_VERIFIER_PROMPT_VERSION = "shadow-relation-verifier-prompt-v5"
 SHADOW_RELATION_VERIFIER_SCHEMA_VERSION = "shadow-relation-verifier-schema-v4"
 SHADOW_RELATION_VERIFIER_PARSER_VERSION = "shadow-relation-verifier-parser-v4"
@@ -606,6 +606,15 @@ def classifier_response_schema(
     """Return the versioned batch schema; endpoint order is the only direction."""
 
     count = len(opportunities)
+    predicate_names = sorted({
+        str(metadata.get("name") or "")
+        for item in opportunities
+        for metadata in item.allowed_predicate_metadata
+        if str(metadata.get("name") or "")
+    })
+    predicate_schema: dict[str, Any] = {"type": "string"}
+    if predicate_names:
+        predicate_schema["enum"] = predicate_names
     decision_schema = {
         "type": "object",
         "additionalProperties": False,
@@ -625,7 +634,7 @@ def classifier_response_schema(
                             "type": "string",
                             "enum": ["LEFT", "RIGHT"],
                         },
-                        "predicate": {"type": "string"},
+                        "predicate": predicate_schema,
                         "object_occurrence_id": {
                             "type": "string",
                             "enum": ["LEFT", "RIGHT"],
@@ -695,13 +704,10 @@ def classifier_prompt(
     *,
     content: str,
     logical_schema: Mapping[str, Any],
+    protocol_feedback: str = "",
 ) -> str:
     """Build a predicate-agnostic classifier request from versioned metadata."""
 
-    predicates = {
-        name: asdict(spec)
-        for name, spec in normalize_predicate_schema(logical_schema).items()
-    }
     pairs = [{
         "pair_id": item.pair_identity,
         "left_occurrence_id": "LEFT",
@@ -716,6 +722,9 @@ def classifier_prompt(
         "context": content[item.context_span[0]:item.context_span[1]],
         "allowed_predicates": [
             value["name"] for value in item.allowed_predicate_metadata
+        ],
+        "allowed_predicate_metadata": [
+            dict(value) for value in item.allowed_predicate_metadata
         ],
         "soft_cue_matches": list(
             item.provenance.get("soft_cue_matches") or []
@@ -743,6 +752,10 @@ def classifier_prompt(
         "subject_occurrence_id 与 object_occurrence_id 的顺序是方向唯一真相，"
         "且这两个字段只能逐字使用 LEFT 或 RIGHT；不要复制内部 occurrence "
         "哈希，不要输出 direction 字段。一个 pair 可返回多个具体 predicate。"
+        "每个 hypothesis 的 predicate 必须逐字来自该 pair 的 allowed_predicates；"
+        "如果你想表达的 predicate 不在该 pair 的 allowed_predicates 中，不得输出"
+        "该 hypothesis，应返回 NO_RELATION，或在文本明确有关系但当前 Schema 无法"
+        "表达时返回 OTHER_UNSUPPORTED。"
         "只按每个 predicate 的 semantic_definition、direction_description、"
         "domain_types、range_types 和正反例判断语义及方向。"
         "optional_soft_cues 只是可配置提示，不能作为关系、方向或发布的证据。"
@@ -765,7 +778,7 @@ def classifier_prompt(
     return json.dumps(
         {
             "instruction": instruction,
-            "predicates": predicates,
+            "protocol_feedback": str(protocol_feedback or ""),
             "pairs": pairs,
         },
         ensure_ascii=False,
@@ -774,51 +787,82 @@ def classifier_prompt(
     )
 
 
-def proposer_response_schema() -> dict[str, Any]:
+def proposer_response_schema(
+    *,
+    mentions: Sequence[Mapping[str, Any]] = (),
+    logical_schema: Mapping[str, Any] | None = None,
+    content_length: int | None = None,
+    max_proposals: int | None = None,
+) -> dict[str, Any]:
+    occurrence_ids = sorted({
+        str(item.get("occurrence_key") or "")
+        for item in mentions
+        if str(item.get("occurrence_key") or "")
+    })
+    predicate_names = sorted(normalize_predicate_schema(
+        logical_schema or {},
+    ).keys())
+    subject_schema: dict[str, Any] = {"type": "string"}
+    object_schema: dict[str, Any] = {"type": "string"}
+    predicate_schema: dict[str, Any] = {"type": "string"}
+    if occurrence_ids:
+        subject_schema["enum"] = occurrence_ids
+        object_schema["enum"] = occurrence_ids
+    if predicate_names:
+        predicate_schema["enum"] = predicate_names
+    start_schema: dict[str, Any] = {"type": "integer", "minimum": 0}
+    end_schema: dict[str, Any] = {"type": "integer", "minimum": 1}
+    if content_length is not None:
+        max_end = max(1, int(content_length))
+        start_schema["maximum"] = max(0, max_end - 1)
+        end_schema["maximum"] = max_end
+    proposal_array_schema: dict[str, Any] = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "subject_occurrence_id": subject_schema,
+                "predicate": predicate_schema,
+                "object_occurrence_id": object_schema,
+                "evidence_spans": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "start": start_schema,
+                            "end": end_schema,
+                        },
+                        "required": ["start", "end"],
+                    },
+                },
+                "qualifiers": {"type": "array"},
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+            },
+            "required": [
+                "subject_occurrence_id",
+                "predicate",
+                "object_occurrence_id",
+                "evidence_spans",
+                "qualifiers",
+                "confidence",
+            ],
+        },
+    }
+    if max_proposals is not None:
+        proposal_array_schema["maxItems"] = max(0, int(max_proposals))
     return {
         "$id": SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "proposals": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "subject_occurrence_id": {"type": "string"},
-                        "predicate": {"type": "string"},
-                        "object_occurrence_id": {"type": "string"},
-                        "evidence_spans": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "start": {"type": "integer", "minimum": 0},
-                                    "end": {"type": "integer", "minimum": 1},
-                                },
-                                "required": ["start", "end"],
-                            },
-                        },
-                        "qualifiers": {"type": "array"},
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 1,
-                        },
-                    },
-                    "required": [
-                        "subject_occurrence_id",
-                        "predicate",
-                        "object_occurrence_id",
-                        "evidence_spans",
-                        "qualifiers",
-                        "confidence",
-                    ],
-                },
-            },
+            "proposals": proposal_array_schema,
             "missing_endpoint_mentions": {"type": "array"},
             "coverage": {
                 "type": "object",
@@ -842,11 +886,17 @@ def proposer_prompt(
     logical_schema: Mapping[str, Any],
     already_found_keys: Sequence[str] = (),
     pass_no: int = 0,
+    protocol_feedback: str = "",
+    max_proposals: int | None = None,
 ) -> str:
     predicates = {
         name: asdict(spec)
         for name, spec in normalize_predicate_schema(logical_schema).items()
     }
+    max_proposals_value = (
+        max(0, int(max_proposals))
+        if max_proposals is not None else None
+    )
     occurrences = [{
         "occurrence_id": str(item.get("occurrence_key") or ""),
         "surface": str(item.get("surface") or ""),
@@ -869,15 +919,27 @@ def proposer_prompt(
                 "canonical entities. Empty proposals is valid when no explicit relation "
                 "is present. If a needed endpoint is missing, report it only in "
                 "missing_endpoint_mentions; it must not create a proposal. "
+                "The response must always include missing_endpoint_mentions as an "
+                "array and coverage as an object with complete and uncovered_cues. "
+                "For evidence_spans, prefer the provided required_evidence_span "
+                "exactly; do not calculate character offsets yourself when unsure. "
+                + (
+                    f"Return at most {max_proposals_value} proposals for this context. "
+                    if max_proposals_value is not None else ""
+                )
+                +
                 "optional_soft_cues are hints only and never decide publication. "
                 "Every proposal still requires independent verification."
             ),
+            "protocol_feedback": str(protocol_feedback or ""),
+            "max_proposals": max_proposals_value,
             "context": {
                 "context_id": context_id,
                 "text": content,
                 "start": 0,
                 "end": len(content),
             },
+            "required_evidence_span": {"start": 0, "end": len(content)},
             "pass_no": int(pass_no),
             "occurrences": occurrences,
             "predicates": predicates,
@@ -889,30 +951,82 @@ def proposer_prompt(
     )
 
 
+def _normalize_proposer_audit_fields(
+    raw: Mapping[str, Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Normalize audit-only proposer fields without accepting unsafe facts."""
+
+    repairs: list[str] = []
+    missing_raw = raw.get("missing_endpoint_mentions")
+    if missing_raw is None:
+        missing: list[Any] = []
+        repairs.append("missing_endpoint_mentions_defaulted")
+    elif isinstance(missing_raw, list):
+        missing = missing_raw
+    else:
+        missing = []
+        repairs.append("missing_endpoint_mentions_type_defaulted")
+
+    coverage_raw = raw.get("coverage")
+    if isinstance(coverage_raw, Mapping):
+        coverage = dict(coverage_raw)
+    else:
+        coverage = {}
+        repairs.append("coverage_type_defaulted")
+
+    complete_raw = coverage.get("complete")
+    if not isinstance(complete_raw, bool):
+        coverage["complete"] = False
+        repairs.append("coverage_complete_defaulted")
+
+    uncovered_raw = coverage.get("uncovered_cues")
+    if not isinstance(uncovered_raw, list):
+        coverage["uncovered_cues"] = []
+        repairs.append("coverage_uncovered_cues_defaulted")
+
+    if repairs:
+        coverage["_parser_repairs"] = repairs
+    return missing, coverage
+
+
 def _parse_proposer_spans(
     raw: Any,
     *,
     content: str,
     endpoint_spans: Sequence[tuple[int, int]],
+    repairs: list[str] | None = None,
+    proposal_index: int = 0,
 ) -> tuple[EvidenceSpan, ...]:
+    fallback = (EvidenceSpan(start=0, end=len(content)),)
+    repair_prefix = f"proposal_{int(proposal_index)}"
+    if len(content) <= 0:
+        raise ShadowClassificationError("proposal context is empty")
+
+    def fallback_to_context(reason: str) -> tuple[EvidenceSpan, ...]:
+        if repairs is not None:
+            repairs.append(f"{repair_prefix}_{reason}_defaulted_to_context")
+        return fallback
+
     if not isinstance(raw, list):
-        raise ShadowClassificationError("proposal evidence_spans must be an array")
+        return fallback_to_context("evidence_spans")
     spans: list[EvidenceSpan] = []
     for value in raw:
         if not isinstance(value, Mapping):
-            raise ShadowClassificationError("proposal evidence span must be an object")
+            return fallback_to_context("evidence_span")
         try:
             start, end = int(value["start"]), int(value["end"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ShadowClassificationError("proposal evidence span is invalid") from exc
+            if repairs is not None:
+                repairs.append(f"{repair_prefix}_evidence_span_invalid")
+            return fallback
         if start < 0 or end <= start or end > len(content):
-            raise ShadowClassificationError("proposal evidence span is outside context")
+            return fallback_to_context("evidence_span_outside_context")
         spans.append(EvidenceSpan(start=start, end=end))
     if not spans:
-        raise ShadowClassificationError("proposal requires evidence")
+        return fallback_to_context("evidence_empty")
     for required_span in endpoint_spans:
         if not _spans_cover(spans, required_span):
-            raise ShadowClassificationError("proposal evidence does not cover endpoints")
+            return fallback_to_context("evidence_missing_endpoint")
     return tuple(spans)
 
 
@@ -936,14 +1050,20 @@ def parse_proposer_response(
     if not isinstance(raw, Mapping):
         raise ShadowClassificationError("proposer response must be an object")
     proposals_raw = raw.get("proposals")
-    missing_raw = raw.get("missing_endpoint_mentions")
-    coverage = raw.get("coverage")
-    if not isinstance(proposals_raw, list):
-        raise ShadowClassificationError("proposer proposals must be an array")
-    if not isinstance(missing_raw, list):
-        raise ShadowClassificationError("missing_endpoint_mentions must be an array")
-    if not isinstance(coverage, Mapping):
-        raise ShadowClassificationError("proposer coverage must be an object")
+    missing_raw, coverage = _normalize_proposer_audit_fields(raw)
+    repairs = coverage.setdefault("_parser_repairs", [])
+    if not isinstance(repairs, list):
+        repairs = []
+        coverage["_parser_repairs"] = repairs
+    if proposals_raw is None:
+        proposals_raw = []
+        repairs.append("proposals_defaulted")
+    elif isinstance(proposals_raw, Mapping):
+        proposals_raw = [proposals_raw]
+        repairs.append("single_proposal_object_wrapped")
+    elif not isinstance(proposals_raw, list):
+        proposals_raw = []
+        repairs.append("proposals_type_defaulted")
     mentions_by_key = {
         str(item.get("occurrence_key") or ""): dict(item) for item in mentions
     }
@@ -952,18 +1072,31 @@ def parse_proposer_response(
     schema = normalize_predicate_schema(logical_schema)
     proposals: list[RelationProposal] = []
     seen: set[str] = set()
-    for raw_proposal in proposals_raw:
+    rejected = coverage.setdefault("_parser_rejected_proposals", [])
+    if not isinstance(rejected, list):
+        rejected = []
+        coverage["_parser_rejected_proposals"] = rejected
+
+    def reject_proposal(index: int, reason: str) -> None:
+        rejected.append({"index": int(index), "reason": str(reason)})
+        coverage["complete"] = False
+
+    for proposal_index, raw_proposal in enumerate(proposals_raw):
         if not isinstance(raw_proposal, Mapping):
-            raise ShadowClassificationError("proposal must be an object")
+            reject_proposal(proposal_index, "proposal_not_object")
+            continue
         subject = str(raw_proposal.get("subject_occurrence_id") or "")
         object_ = str(raw_proposal.get("object_occurrence_id") or "")
         if subject not in mentions_by_key or object_ not in mentions_by_key:
-            raise ShadowClassificationError("proposal endpoint is not in occurrence universe")
+            reject_proposal(proposal_index, "endpoint_not_in_occurrence_universe")
+            continue
         if subject == object_:
-            raise ShadowClassificationError("proposal endpoints must be distinct")
+            reject_proposal(proposal_index, "endpoints_not_distinct")
+            continue
         predicate = str(raw_proposal.get("predicate") or "")
         if predicate not in schema:
-            raise ShadowClassificationError("proposal predicate is not in schema")
+            reject_proposal(proposal_index, "predicate_not_in_schema")
+            continue
         subject_mention = mentions_by_key[subject]
         object_mention = mentions_by_key[object_]
         endpoint_spans = [
@@ -980,16 +1113,25 @@ def parse_proposer_response(
             raw_proposal.get("evidence_spans"),
             content=content,
             endpoint_spans=endpoint_spans,
+            repairs=repairs,
+            proposal_index=proposal_index,
         )
         qualifiers = raw_proposal.get("qualifiers")
         if not isinstance(qualifiers, list):
-            raise ShadowClassificationError("proposal qualifiers must be an array")
+            qualifiers = []
+            repairs.append(f"proposal_{proposal_index}_qualifiers_defaulted")
+        qualifiers = [
+            dict(item) for item in qualifiers
+            if isinstance(item, Mapping)
+        ]
         try:
             confidence = float(raw_proposal.get("confidence"))
-        except (TypeError, ValueError) as exc:
-            raise ShadowClassificationError("proposal confidence is invalid") from exc
+        except (TypeError, ValueError):
+            confidence = 0.5
+            repairs.append(f"proposal_{proposal_index}_confidence_defaulted")
         if not 0 <= confidence <= 1:
-            raise ShadowClassificationError("proposal confidence is outside [0,1]")
+            confidence = max(0.0, min(1.0, confidence))
+            repairs.append(f"proposal_{proposal_index}_confidence_clamped")
         material = _canonical_json({
             "context_id": context_id,
             "candidate_source": candidate_source,

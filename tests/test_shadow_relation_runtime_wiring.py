@@ -8,6 +8,7 @@ import pytest
 
 from knowledge_forge.config import Config
 from knowledge_forge.ollama import OllamaProtocolError
+from knowledge_forge import relation_shadow_v2 as v2
 from knowledge_forge.relation_shadow_runtime import ShadowRelationV2Runtime
 from knowledge_forge.relation_shadow_v2 import (
     HYPOTHESES,
@@ -182,6 +183,8 @@ class _RuntimeDatabase:
         self.materialization_decisions = []
         self.finished = []
         self.endpoints = []
+        self.source_contexts = []
+        self.proposal_attempts = []
         cases = [
             ("NO_CASE", "Organization", "Product", "no-left", "no-right"),
             ("OTHER_CASE", "Organization", "Product", "other-left", "other-right"),
@@ -320,6 +323,14 @@ class _RuntimeDatabase:
         self.runs.append(values)
         return values
 
+    def persist_shadow_relation_v2_source_contexts(self, run_id, values):
+        self.source_contexts.extend((run_id, item) for item in values)
+        return values
+
+    def record_shadow_relation_v2_proposal_attempt(self, run_id, values):
+        self.proposal_attempts.append((run_id, values))
+        return values
+
     def persist_shadow_relation_v2_opportunities(self, _run_id, values):
         self.opportunities = list(values)
         return []
@@ -448,6 +459,29 @@ def test_runtime_executes_every_v2_stage_and_never_treats_classified_as_verified
                for item in database.normalization.evidence)
 
 
+def test_runtime_persists_and_uses_shadow_context_units():
+    database = _RuntimeDatabase()
+
+    ShadowRelationV2Runtime(database, _ScriptedGateway()).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert len(database.source_contexts) == len(database.chunks)
+    assert all(
+        item["payload"]["structure_quality"] == "legacy_chunk_local"
+        for _, item in database.source_contexts
+    )
+    assert all(
+        str(item.chunk_key).startswith("shadowctx_")
+        for item in database.opportunities
+    )
+    assert all(
+        item.provenance["source_context_quality"] == "legacy_chunk_local"
+        for item in database.opportunities
+    )
+
+
 def test_runtime_predicate_rename_with_same_metadata_keeps_stage_behavior():
     outputs = []
     for name in ("acts_on", "renamed_action"):
@@ -488,16 +522,27 @@ def test_runtime_stale_fingerprint_fails_closed_without_materialization():
 def test_runtime_classifier_failure_does_not_fallback_or_materialize():
     database = _RuntimeDatabase()
 
-    with pytest.raises(RuntimeError, match="禁止回退旧流程"):
-        ShadowRelationV2Runtime(
-            database, _ScriptedGateway(fail_classifier=True),
-        ).run_namespace(
-            namespace_id="namespace-runtime",
-            project_id=1,
-        )
+    result = ShadowRelationV2Runtime(
+        database, _ScriptedGateway(fail_classifier=True),
+    ).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
 
     assert database.endpoints == []
-    assert database.finished[-1][1]["status"] == "failed"
+    assert result["metrics"]["classification_decisions"] == {
+        OTHER_UNSUPPORTED: len(database.decisions),
+    }
+    assert len(database.decisions) > 0
+    assert all(
+        decision.decision == OTHER_UNSUPPORTED
+        and decision.hypotheses == ()
+        for decision in database.decisions
+    )
+    assert result["metrics"]["classified_hypotheses"] == 0
+    assert result["metrics"]["verification_attempts"] == 0
+    assert result["metrics"]["facts_after_normalization"] == 0
+    assert database.finished[-1][1]["status"] == "ready"
 
 
 def test_runtime_excludes_quarantined_canonicals_from_pair_planner():
@@ -575,13 +620,413 @@ def test_runtime_direct_proposer_enters_verifier_even_when_classifier_says_no_re
     )
 
     assert result["metrics"]["classification_decisions"] == {NO_RELATION: 1}
-    assert result["metrics"]["proposer_model_calls"] == 1
+    assert result["metrics"]["proposer_model_calls"] == 2
     assert result["metrics"]["proposals_total"] == 1
     assert result["metrics"]["proposer_hypotheses_persisted"] == 1
     assert result["metrics"]["verifier_supported"] == 1
     assert len(database.proposed_hypotheses) == 1
     assert database.proposed_candidate_source == "DIRECT_PROPOSER"
     assert len(database.endpoints) == 1
+
+
+def test_runtime_direct_proposer_creates_missing_pair_ledger(monkeypatch):
+    monkeypatch.setattr(
+        v2,
+        "plan_pair_opportunities",
+        lambda **_kwargs: v2.PairOpportunityPlan(
+            opportunities=(),
+            theoretical_pairs=1,
+            duplicate_occurrences_collapsed=0,
+        ),
+    )
+
+    class DirectOnlyGateway(_ScriptedGateway):
+        def json_chat(self, **kwargs):
+            system = str(kwargs["system"])
+            payload = json.loads(kwargs["prompt"])
+            if "proposer" in system:
+                left, right = payload["occurrences"]
+                return {
+                    "proposals": [{
+                        "subject_occurrence_id": left["occurrence_id"],
+                        "predicate": self.action_name,
+                        "object_occurrence_id": right["occurrence_id"],
+                        "evidence_spans": [{
+                            "start": 0,
+                            "end": len(payload["context"]["text"]),
+                        }],
+                        "qualifiers": [],
+                        "confidence": 0.77,
+                    }],
+                    "missing_endpoint_mentions": [],
+                    "coverage": {"complete": True, "uncovered_cues": []},
+                }
+            if "classifier" in system:
+                self.classifier_calls += 1
+                return {"items": [{
+                    "pair_id": pair["pair_id"],
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "CLASSIFIER_NO_RELATION",
+                    "evidence_spans": [{
+                        "start": pair["context_span"][0],
+                        "end": pair["context_span"][1],
+                    }],
+                } for pair in payload["pairs"]]}
+            return super().json_chat(**kwargs)
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = DirectOnlyGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert len(database.opportunities) == 1
+    opportunity = database.opportunities[0]
+    assert opportunity.planning_reason == "direct_proposer_pair_not_in_planner"
+    assert opportunity.status == "PENDING_CLASSIFICATION"
+    assert opportunity.provenance["candidate_sources"] == ["DIRECT_PROPOSER"]
+    assert result["metrics"]["pair_opportunities_classified"] == 1
+    assert gateway.classifier_calls == 1
+    assert result["metrics"]["proposer_hypotheses_persisted"] == 1
+    assert result["metrics"]["verifier_supported"] == 1
+    assert len(database.endpoints) == 1
+
+
+def test_runtime_proposer_retry_then_relation_only_gleaning(monkeypatch):
+    monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
+
+    class RetryThenGleanGateway(_ScriptedGateway):
+        def __init__(self):
+            super().__init__()
+            self.proposer_payloads = []
+
+        def json_chat(self, **kwargs):
+            system = str(kwargs["system"])
+            payload = json.loads(kwargs["prompt"])
+            if "proposer" in system:
+                self.proposer_payloads.append(payload)
+                if len(self.proposer_payloads) == 1:
+                    raise OllamaProtocolError(
+                        "Ollama response was truncated by output length",
+                    )
+                if payload["pass_no"] == 1:
+                    left, right = payload["occurrences"]
+                    return {
+                        "proposals": [{
+                            "subject_occurrence_id": left["occurrence_id"],
+                            "predicate": self.action_name,
+                            "object_occurrence_id": right["occurrence_id"],
+                            "evidence_spans": [{
+                                "start": 0,
+                                "end": len(payload["context"]["text"]),
+                            }],
+                            "qualifiers": [],
+                            "confidence": 0.77,
+                        }],
+                        "missing_endpoint_mentions": [],
+                        "coverage": {"complete": False, "uncovered_cues": []},
+                    }
+                return {
+                    "proposals": [],
+                    "missing_endpoint_mentions": [],
+                    "coverage": {"complete": True, "uncovered_cues": []},
+                }
+            if "classifier" in system:
+                self.classifier_calls += 1
+                return {"items": [{
+                    "pair_id": pair["pair_id"],
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "CLASSIFIER_NO_RELATION",
+                    "evidence_spans": [{
+                        "start": pair["context_span"][0],
+                        "end": pair["context_span"][1],
+                    }],
+                } for pair in payload["pairs"]]}
+            return super().json_chat(**kwargs)
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = RetryThenGleanGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert [item["pass_no"] for item in gateway.proposer_payloads] == [
+        0, 0, 1, 2,
+    ]
+    assert gateway.proposer_payloads[2]["already_found_keys"] == []
+    assert gateway.proposer_payloads[3]["already_found_keys"]
+    assert result["metrics"]["proposer_model_calls"] == 4
+    assert result["metrics"]["proposer_failures"] == 1
+    assert result["metrics"]["proposals_total"] == 1
+    assert result["metrics"]["proposer_terminal_statuses"] == {
+        "SUCCESS_WITH_PROPOSALS": 1,
+    }
+    assert [
+        item["status"] for _, item in database.proposal_attempts
+    ] == [
+        "RETRYABLE_FAILED", "ACCEPTED", "ACCEPTED", "ACCEPTED",
+    ]
+    assert [
+        (item["metadata"]["pass_no"], item["metadata"]["retry_no"])
+        for _, item in database.proposal_attempts
+    ] == [(0, 1), (0, 2), (1, 1), (2, 1)]
+    assert all(item["request_hash"] for _, item in database.proposal_attempts)
+    assert len(database.proposed_hypotheses) == 1
+    assert len(database.endpoints) == 1
+
+
+def test_runtime_proposer_retry_sends_protocol_feedback_after_hard_failure(
+    monkeypatch,
+):
+    monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
+
+    class InvalidThenCorrectedProposerGateway(_ScriptedGateway):
+        def __init__(self):
+            super().__init__()
+            self.proposer_payloads = []
+
+        def json_chat(self, **kwargs):
+            system = str(kwargs["system"])
+            payload = json.loads(kwargs["prompt"])
+            if "proposer" in system:
+                self.proposer_payloads.append(payload)
+                if len(self.proposer_payloads) == 1:
+                    occurrence = payload["occurrences"][0]
+                    return {
+                        "proposals": [{
+                            "subject_occurrence_id": "invented-occurrence",
+                            "predicate": self.action_name,
+                            "object_occurrence_id": occurrence["occurrence_id"],
+                            "evidence_spans": [{
+                                "start": 0,
+                                "end": len(payload["context"]["text"]),
+                            }],
+                            "qualifiers": [],
+                            "confidence": 0.77,
+                        }],
+                        "missing_endpoint_mentions": [],
+                        "coverage": {"complete": True, "uncovered_cues": []},
+                    }
+                left, right = payload["occurrences"]
+                return {
+                    "proposals": [{
+                        "subject_occurrence_id": left["occurrence_id"],
+                        "predicate": self.action_name,
+                        "object_occurrence_id": right["occurrence_id"],
+                        "evidence_spans": [{
+                            "start": 0,
+                            "end": len(payload["context"]["text"]),
+                        }],
+                        "qualifiers": [],
+                        "confidence": 0.77,
+                    }],
+                    "missing_endpoint_mentions": [],
+                    "coverage": {"complete": True, "uncovered_cues": []},
+                }
+            if "classifier" in system:
+                self.classifier_calls += 1
+                return {"items": [{
+                    "pair_id": pair["pair_id"],
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "CLASSIFIER_NO_RELATION",
+                    "evidence_spans": [{
+                        "start": pair["context_span"][0],
+                        "end": pair["context_span"][1],
+                    }],
+                } for pair in payload["pairs"]]}
+            return super().json_chat(**kwargs)
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = InvalidThenCorrectedProposerGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert len(gateway.proposer_payloads) >= 1
+    assert gateway.proposer_payloads[0]["protocol_feedback"] == ""
+    assert [
+        values["status"] for _, values in database.proposal_attempts
+    ][0] == "ACCEPTED"
+    first_schema = database.proposal_attempts[0][1]["request_payload"]["schema"]
+    first_properties = (
+        first_schema["properties"]["proposals"]["items"]["properties"]
+    )
+    assert first_properties["subject_occurrence_id"]["enum"] == [
+        "no-left",
+        "no-right",
+    ]
+    assert first_properties["predicate"]["enum"]
+    assert (
+        first_schema["properties"]["proposals"]["maxItems"]
+        == Config.relation_proposer_max_proposals
+    )
+    rejected = (
+        database.proposal_attempts[0][1]["parsed_response"]["coverage"]
+        ["_parser_rejected_proposals"]
+    )
+    assert rejected == [{
+        "index": 0,
+        "reason": "endpoint_not_in_occurrence_universe",
+    }]
+    assert result["metrics"]["proposer_failures"] == 0
+    assert result["metrics"]["proposals_total"] == 1
+    assert result["metrics"]["proposer_hypotheses_persisted"] == 1
+    assert result["metrics"]["verifier_supported"] == 1
+    assert len(database.endpoints) == 1
+
+
+def test_runtime_proposer_malformed_candidates_are_isolated_not_fatal(
+    monkeypatch,
+):
+    monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
+    monkeypatch.setattr(Config, "relation_proposer_failure_circuit_breaker", 1)
+
+    class MalformedCandidatesGateway(_ScriptedGateway):
+        def __init__(self):
+            super().__init__()
+            self.proposer_payloads = []
+
+        def json_chat(self, **kwargs):
+            system = str(kwargs["system"])
+            payload = json.loads(kwargs["prompt"])
+            if "proposer" in system:
+                self.proposer_payloads.append(payload)
+                left, right = payload["occurrences"]
+                return {
+                    "proposals": [
+                        {
+                            "subject_occurrence_id": "invented-occurrence",
+                            "predicate": self.action_name,
+                            "object_occurrence_id": right["occurrence_id"],
+                            "evidence_spans": "bad-spans",
+                            "qualifiers": "bad-qualifiers",
+                            "confidence": 3.0,
+                        },
+                        {
+                            "subject_occurrence_id": left["occurrence_id"],
+                            "predicate": self.action_name,
+                            "object_occurrence_id": right["occurrence_id"],
+                            "evidence_spans": "bad-spans",
+                            "qualifiers": "bad-qualifiers",
+                            "confidence": 3.0,
+                        },
+                    ],
+                    "missing_endpoint_mentions": "bad-audit-field",
+                    "coverage": "bad-coverage",
+                }
+            if "classifier" in system:
+                self.classifier_calls += 1
+                return {"items": [{
+                    "pair_id": pair["pair_id"],
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "CLASSIFIER_NO_RELATION",
+                    "evidence_spans": [{
+                        "start": pair["context_span"][0],
+                        "end": pair["context_span"][1],
+                    }],
+                } for pair in payload["pairs"]]}
+            return super().json_chat(**kwargs)
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = MalformedCandidatesGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert result["metrics"]["proposer_failures"] == 0
+    assert result["metrics"]["proposer_circuit_breaker_tripped"] is False
+    assert result["metrics"]["proposer_skipped_by_circuit"] == 0
+    assert result["metrics"]["proposals_total"] == 1
+    assert len(database.proposed_hypotheses) == 1
+    accepted_attempt = database.proposal_attempts[0][1]
+    assert accepted_attempt["status"] == "ACCEPTED"
+    proposal = accepted_attempt["parsed_response"]["proposals"][0]
+    assert proposal["evidence_spans"] == [{
+        "start": 0,
+        "end": len(database.chunks[0]["content"]),
+    }]
+    assert proposal["qualifiers"] == []
+    assert proposal["confidence"] == 1.0
+    coverage = accepted_attempt["parsed_response"]["coverage"]
+    assert coverage["_parser_rejected_proposals"] == [{
+        "index": 0,
+        "reason": "endpoint_not_in_occurrence_universe",
+    }]
+    assert "coverage_type_defaulted" in coverage["_parser_repairs"]
+    assert "missing_endpoint_mentions_type_defaulted" in (
+        coverage["_parser_repairs"]
+    )
+    assert "proposal_1_evidence_spans_defaulted_to_context" in (
+        coverage["_parser_repairs"]
+    )
+    assert "proposal_1_qualifiers_defaulted" in coverage["_parser_repairs"]
+    assert "proposal_1_confidence_clamped" in coverage["_parser_repairs"]
+
+
+def test_runtime_proposer_bad_top_level_proposals_shape_is_empty_success(
+    monkeypatch,
+):
+    monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
+    monkeypatch.setattr(Config, "relation_proposer_failure_circuit_breaker", 1)
+
+    class BadTopLevelProposalsGateway(_ScriptedGateway):
+        def json_chat(self, **kwargs):
+            system = str(kwargs["system"])
+            payload = json.loads(kwargs["prompt"])
+            if "proposer" in system:
+                return {
+                    "proposals": "not-array",
+                    "missing_endpoint_mentions": [],
+                    "coverage": {"complete": True, "uncovered_cues": []},
+                }
+            if "classifier" in system:
+                self.classifier_calls += 1
+                return {"items": [{
+                    "pair_id": pair["pair_id"],
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "CLASSIFIER_NO_RELATION",
+                    "evidence_spans": [{
+                        "start": pair["context_span"][0],
+                        "end": pair["context_span"][1],
+                    }],
+                } for pair in payload["pairs"]]}
+            return super().json_chat(**kwargs)
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = BadTopLevelProposalsGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert result["metrics"]["proposer_failures"] == 0
+    assert result["metrics"]["proposals_total"] == 0
+    assert result["metrics"]["proposer_circuit_breaker_tripped"] is False
+    assert database.proposal_attempts[0][1]["status"] == "ACCEPTED"
+    assert database.proposal_attempts[0][1]["metadata"]["proposal_count"] == 0
+    assert "proposals_type_defaulted" in (
+        database.proposal_attempts[0][1]["parsed_response"]["coverage"]
+        ["_parser_repairs"]
+    )
 
 
 def test_runtime_proposer_truncation_does_not_abort_v2_main_chain(monkeypatch):
@@ -690,7 +1135,84 @@ def test_runtime_no_relation_without_evidence_span_is_a_negative_decision():
     assert len(database.endpoints) == 0
 
 
-def test_runtime_invalid_single_pair_hypothesis_becomes_unsupported_not_failure(
+def test_runtime_classifier_retry_sends_protocol_feedback_and_recovers(
+    monkeypatch,
+):
+    monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
+
+    class InvalidThenCorrectedGateway(_ScriptedGateway):
+        def __init__(self):
+            super().__init__()
+            self.classifier_payloads = []
+
+        def json_chat(self, **kwargs):
+            if "classifier" in str(kwargs["system"]):
+                self.classifier_calls += 1
+                payload = json.loads(kwargs["prompt"])
+                self.classifier_payloads.append(payload)
+                pair = payload["pairs"][0]
+                if self.classifier_calls == 1:
+                    return {"items": [{
+                        "pair_id": pair["pair_id"],
+                        "decision": HYPOTHESES,
+                        "hypotheses": [{
+                            "subject_occurrence_id": "LEFT",
+                            "predicate": "schema_outside_relation",
+                            "object_occurrence_id": "RIGHT",
+                            "evidence_spans": [{
+                                "start": pair["context_span"][0],
+                                "end": pair["context_span"][1],
+                            }],
+                            "classifier_confidence": 0.95,
+                        }],
+                    }]}
+                return {"items": [{
+                    "pair_id": pair["pair_id"],
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "CORRECTED_AFTER_PROTOCOL_FEEDBACK",
+                    "evidence_spans": [{
+                        "start": pair["context_span"][0],
+                        "end": pair["context_span"][1],
+                    }],
+                }]}
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = InvalidThenCorrectedGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert gateway.classifier_calls == 2
+    assert len(gateway.classifier_payloads) == 2
+    assert gateway.classifier_payloads[0]["protocol_feedback"] == ""
+    assert "predicates" not in gateway.classifier_payloads[0]
+    assert "predicates" not in gateway.classifier_payloads[1]
+    assert "schema_outside_relation" not in (
+        gateway.classifier_payloads[1]["pairs"][0]["allowed_predicates"]
+    )
+    assert "Previous classifier response violated the v2 contract" in (
+        gateway.classifier_payloads[1]["protocol_feedback"]
+    )
+    assert "predicate only from that pair's allowed_predicates" in (
+        gateway.classifier_payloads[1]["protocol_feedback"]
+    )
+    assert result["metrics"]["classifier_failures"] == 1
+    assert result["metrics"]["classification_decisions"] == {NO_RELATION: 1}
+    assert result["metrics"]["classified_hypotheses"] == 0
+    assert result["metrics"]["verification_attempts"] == 0
+    assert result["metrics"]["facts_after_normalization"] == 0
+    assert database.finished[-1][1]["status"] == "ready"
+    assert len(database.endpoints) == 0
+    assert [
+        values["status"] for _, _, values in database.classification_attempts
+    ] == ["RETRYABLE_PROTOCOL", "ACCEPTED"]
+
+
+def test_runtime_invalid_single_pair_hypothesis_fails_closed(
     monkeypatch,
 ):
     monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
@@ -725,26 +1247,39 @@ def test_runtime_invalid_single_pair_hypothesis_becomes_unsupported_not_failure(
         project_id=1,
     )
 
-    assert gateway.classifier_calls == 1
-    assert result["metrics"]["classifier_failures"] == 0
+    assert gateway.classifier_calls == 2
     assert result["metrics"]["classification_decisions"] == {
         OTHER_UNSUPPORTED: 1,
     }
+    assert result["metrics"]["classified_hypotheses"] == 0
     assert result["metrics"]["verification_attempts"] == 0
     assert result["metrics"]["facts_after_normalization"] == 0
+    assert len(database.decisions) == 1
+    decision = database.decisions[0]
+    assert decision.pair_identity == database.opportunities[0].pair_identity
+    assert decision.decision == OTHER_UNSUPPORTED
+    assert decision.hypotheses == ()
+    assert decision.evidence_spans[0].start == (
+        database.opportunities[0].context_span[0]
+    )
+    assert decision.evidence_spans[0].end == (
+        database.opportunities[0].context_span[1]
+    )
+    assert decision.reason_code == "CLASSIFIER_TERMINAL_PROTOCOL_FAILURE"
     assert database.finished[-1][1]["status"] == "ready"
     assert len(database.endpoints) == 0
-    accepted = [
-        values for _, _, values in database.classification_attempts
-        if values["status"] == "ACCEPTED"
+    statuses = [
+        values["status"] for _, _, values in database.classification_attempts
     ]
-    assert len(accepted) == 1
-    assert accepted[0]["independent_call"] is False
-    assert accepted[0]["metadata"]["terminal_unsupported_from_failed_attempts"] is True
-    assert accepted[0]["metadata"]["previous_error_type"] == "ShadowClassificationError"
+    assert statuses == ["RETRYABLE_PROTOCOL", "TERMINAL_FAILED"]
+    assert all(status != "ACCEPTED" for status in statuses)
+    assert all(
+        values["error_type"] == "ShadowClassificationError"
+        for _, _, values in database.classification_attempts
+    )
 
 
-def test_runtime_recovers_single_pair_negative_raw_when_parser_reports_missing(
+def test_runtime_does_not_recover_single_pair_negative_raw_parser_failure(
     monkeypatch,
 ):
     monkeypatch.setattr(Config, "relation_shadow_max_attempts", 1)
@@ -775,16 +1310,76 @@ def test_runtime_recovers_single_pair_negative_raw_when_parser_reports_missing(
     )
 
     assert gateway.classifier_calls == 1
-    assert result["metrics"]["classification_decisions"] == {NO_RELATION: 1}
+    assert result["metrics"]["classification_decisions"] == {
+        OTHER_UNSUPPORTED: 1,
+    }
     assert result["metrics"]["classified_hypotheses"] == 0
+    assert result["metrics"]["verification_attempts"] == 0
+    assert result["metrics"]["facts_after_normalization"] == 0
+    assert len(database.decisions) == 1
+    decision = database.decisions[0]
+    assert decision.pair_identity == database.opportunities[0].pair_identity
+    assert decision.decision == OTHER_UNSUPPORTED
+    assert decision.hypotheses == ()
+    assert decision.evidence_spans[0].start == (
+        database.opportunities[0].context_span[0]
+    )
+    assert decision.evidence_spans[0].end == (
+        database.opportunities[0].context_span[1]
+    )
+    assert decision.reason_code == "CLASSIFIER_TERMINAL_PROTOCOL_FAILURE"
+    assert database.finished[-1][1]["status"] == "ready"
+    statuses = [
+        values["status"] for _, _, values in database.classification_attempts
+    ]
+    assert statuses == ["TERMINAL_FAILED"]
+    assert all(status != "ACCEPTED" for status in statuses)
+
+
+def test_runtime_single_pair_classifier_pair_id_drift_fails_closed(
+    monkeypatch,
+):
+    monkeypatch.setattr(Config, "relation_shadow_max_attempts", 1)
+
+    class DriftedPairGateway(_ScriptedGateway):
+        def json_chat(self, **kwargs):
+            if "classifier" in str(kwargs["system"]):
+                self.classifier_calls += 1
+                return {"items": [{
+                    "pair_id": "relpair_drifted_from_another_prompt",
+                    "decision": NO_RELATION,
+                    "hypotheses": [],
+                    "reason_code": "NO_SEMANTIC_RELATION",
+                }]}
+            return super().json_chat(**kwargs)
+
+    database = _RuntimeDatabase()
+    _keep_runtime_chunks(database, {1})
+    gateway = DriftedPairGateway()
+
+    result = ShadowRelationV2Runtime(database, gateway).run_namespace(
+        namespace_id="namespace-runtime",
+        project_id=1,
+    )
+
+    assert gateway.classifier_calls == 1
+    assert result["metrics"]["classification_decisions"] == {
+        OTHER_UNSUPPORTED: 1,
+    }
+    assert result["metrics"]["classified_hypotheses"] == 0
+    assert result["metrics"]["verification_attempts"] == 0
     assert result["metrics"]["facts_after_normalization"] == 0
     assert database.finished[-1][1]["status"] == "ready"
-    accepted = [
-        values for _, _, values in database.classification_attempts
-        if values["status"] == "ACCEPTED"
-    ]
-    assert len(accepted) == 1
-    assert accepted[0]["independent_call"] is False
+    assert database.decisions[0].reason_code == (
+        "CLASSIFIER_TERMINAL_PROTOCOL_FAILURE"
+    )
+    assert database.classification_attempts[0][2]["status"] == (
+        "TERMINAL_FAILED"
+    )
+    assert database.classification_attempts[0][2]["error_type"] == (
+        "ShadowClassificationError"
+    )
+    assert len(database.endpoints) == 0
 
 
 def test_runtime_classifier_truncation_retry_expands_output_budget(monkeypatch):

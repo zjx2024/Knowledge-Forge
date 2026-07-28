@@ -41,14 +41,18 @@ def test_singleton_empty_classifier_response_retries_then_fails_closed(
                 return {"items": []}
             return super().json_chat(**kwargs)
 
-    with pytest.raises(RuntimeError, match="禁止回退旧流程"):
-        ShadowRelationV2Runtime(
-            database, EmptyClassifierGateway(),
-        ).run_namespace(namespace_id="namespace-runtime", project_id=1)
+    result = ShadowRelationV2Runtime(
+        database, EmptyClassifierGateway(),
+    ).run_namespace(namespace_id="namespace-runtime", project_id=1)
 
-    assert database.decisions == []
+    assert len(database.decisions) == 1
+    assert database.decisions[0].decision == "OTHER_UNSUPPORTED"
+    assert database.decisions[0].hypotheses == ()
+    assert result["metrics"]["classified_hypotheses"] == 0
+    assert result["metrics"]["verification_attempts"] == 0
+    assert result["metrics"]["facts_after_normalization"] == 0
     assert database.endpoints == []
-    assert database.finished[-1][1]["status"] == "failed"
+    assert database.finished[-1][1]["status"] == "ready"
     assert [values["status"] for _, _, values in database.classification_attempts] == [
         "RETRYABLE_EMPTY",
         "TERMINAL_FAILED",

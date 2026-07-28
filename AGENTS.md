@@ -33,6 +33,15 @@ must not require a running RAGFlow service or call its API.
    supported by another document.
 8. Long-running work uses the PostgreSQL `jobs` table; do not rely on process
    memory for user-visible status.
+9. Fixes to extraction, normalization, graph construction and UI state must be
+   generic system fixes. Production control flow must not branch on the current
+   task, a specific uploaded document, a concrete domain term, or a hard-coded
+   predicate name. Such examples may appear only in tests, Gold fixtures or
+   documentation.
+10. Before reporting implementation work as complete, run and report relevant
+    self-checks. Prefer targeted regression tests plus the standard compile/test
+    commands below; do not rely on the user to discover first-order failures
+    through the UI.
 
 ## Module boundaries
 

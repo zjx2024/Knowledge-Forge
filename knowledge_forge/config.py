@@ -204,6 +204,9 @@ class Config:
     relation_proposer_failure_circuit_breaker = max(
         0, min(100, int(os.getenv("RELATION_PROPOSER_FAILURE_CIRCUIT_BREAKER", "2"))),
     )
+    relation_proposer_max_proposals = max(
+        0, min(128, int(os.getenv("RELATION_PROPOSER_MAX_PROPOSALS", "8"))),
+    )
     relation_shadow_lease_seconds = max(
         10, int(os.getenv("RELATION_SHADOW_LEASE_SECONDS", "300")),
     )

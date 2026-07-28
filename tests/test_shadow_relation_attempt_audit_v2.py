@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from knowledge_forge.config import Config
 from knowledge_forge.relation_shadow_runtime import (
     ShadowRelationV2Runtime,
@@ -60,10 +58,9 @@ def test_classifier_failure_audit_records_error_without_response_hash(
     database = _RuntimeDatabase()
     _keep_chunks(database, {11})
 
-    with pytest.raises(RuntimeError, match="禁止回退旧流程"):
-        ShadowRelationV2Runtime(
-            database, _ScriptedGateway(fail_classifier=True),
-        ).run_namespace(namespace_id="namespace-runtime", project_id=1)
+    result = ShadowRelationV2Runtime(
+        database, _ScriptedGateway(fail_classifier=True),
+    ).run_namespace(namespace_id="namespace-runtime", project_id=1)
 
     attempt = database.classification_attempts[-1][2]
     assert attempt["status"] == "TERMINAL_FAILED"
@@ -75,3 +72,8 @@ def test_classifier_failure_audit_records_error_without_response_hash(
     assert attempt["response_hash"] == ""
     assert attempt["error_type"] == "RuntimeError"
     assert "scripted classifier failure" in attempt["error_message"]
+    assert result["metrics"]["classified_hypotheses"] == 0
+    assert result["metrics"]["verification_attempts"] == 0
+    assert result["metrics"]["facts_after_normalization"] == 0
+    assert database.finished[-1][1]["status"] == "ready"
+    assert database.endpoints == []

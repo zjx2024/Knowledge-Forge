@@ -4296,6 +4296,137 @@ class Database:
                 ).fetchone()
             return row
 
+    def persist_shadow_relation_v2_source_contexts(
+        self,
+        run_id: str,
+        contexts: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist Shadow v2 SourceUnit/ProposalWindow context audit rows.
+
+        This is an Enhanced/Shadow-only ledger.  It records the rendered
+        relation context and source-map rows used by the v2 runtime; it never
+        mutates product chunks, stable entities or formal graph state.
+        """
+
+        values = list(contexts)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            run = conn.execute(
+                "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise LookupError("Shadow relation v2 run does not exist")
+            persisted: list[dict[str, Any]] = []
+            for item in values:
+                context_identity = str(item.get("context_identity") or "")
+                if not context_identity:
+                    raise ValueError("Shadow source context requires identity")
+                project_id = int(item.get("project_id") or run["project_id"])
+                if project_id != int(run["project_id"]):
+                    raise ValueError("Shadow source context project mismatch")
+                context_id = self._shadow_relation_v2_db_id(
+                    "srcctx_", run_id, context_identity,
+                )
+                payload = dict(item.get("payload") or {})
+                source_maps = list(item.get("source_maps") or [])
+                conn.execute(
+                    """INSERT INTO shadow_source_contexts(
+                       id,run_id,project_id,document_id,document_revision_id,
+                       chunk_id,chunk_key,context_kind,context_identity,
+                       context_start,context_end,content_hash,
+                       structure_artifact_hash,parser_version,payload)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT(run_id,context_identity) DO UPDATE SET
+                         payload=EXCLUDED.payload,
+                         context_kind=EXCLUDED.context_kind,
+                         context_start=EXCLUDED.context_start,
+                         context_end=EXCLUDED.context_end,
+                         content_hash=EXCLUDED.content_hash,
+                         structure_artifact_hash=EXCLUDED.structure_artifact_hash,
+                         parser_version=EXCLUDED.parser_version
+                       RETURNING *""",
+                    (
+                        context_id,
+                        run_id,
+                        project_id,
+                        item.get("document_id") or None,
+                        str(item.get("document_revision_id") or ""),
+                        item.get("chunk_id") or None,
+                        str(item.get("chunk_key") or context_identity),
+                        str(item.get("context_kind") or "legacy_chunk"),
+                        context_identity,
+                        int(item.get("context_start") or 0),
+                        int(item.get("context_end") or 0),
+                        str(item.get("content_hash") or ""),
+                        str(item.get("structure_artifact_hash") or ""),
+                        str(item.get("parser_version") or ""),
+                        self._canonical_json(payload),
+                    ),
+                )
+                for source_map in source_maps:
+                    source_kind = str(
+                        source_map.get("anchor_kind")
+                        or source_map.get("source_kind")
+                        or "legacy_chunk_local"
+                    )
+                    source_record_id = str(
+                        source_map.get("block_key")
+                        or source_map.get("source_record_id")
+                        or context_identity
+                    )
+                    source_start = int(
+                        source_map.get("block_local_start")
+                        if source_map.get("block_local_start") is not None
+                        else source_map.get("source_start") or 0
+                    )
+                    source_end = int(
+                        source_map.get("block_local_end")
+                        if source_map.get("block_local_end") is not None
+                        else source_map.get("source_end") or 0
+                    )
+                    payload_json = self._canonical_json(source_map)
+                    payload_hash = hashlib.sha256(
+                        payload_json.encode("utf-8")
+                    ).hexdigest()
+                    source_map_id = self._shadow_relation_v2_db_id(
+                        "srcmap_",
+                        run_id,
+                        context_identity,
+                        source_kind,
+                        source_record_id,
+                        source_start,
+                        source_end,
+                    )
+                    conn.execute(
+                        """INSERT INTO shadow_context_source_maps(
+                           id,context_id,source_kind,source_record_id,
+                           source_start,source_end,payload_hash,payload)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                           ON CONFLICT(
+                             context_id,source_kind,source_record_id,
+                             source_start,source_end
+                           ) DO UPDATE SET
+                             payload_hash=EXCLUDED.payload_hash,
+                             payload=EXCLUDED.payload""",
+                        (
+                            source_map_id,
+                            context_id,
+                            source_kind,
+                            source_record_id,
+                            source_start,
+                            source_end,
+                            payload_hash,
+                            payload_json,
+                        ),
+                    )
+                persisted.append({
+                    "id": context_id,
+                    "context_identity": context_identity,
+                    "source_maps": len(source_maps),
+                })
+            return persisted
+
     def _reset_shadow_relation_v2_run_attempt(self, conn: Any, run_id: str) -> None:
         """Discard one failed/incomplete Shadow v2 attempt before same-input retry.
 
@@ -4412,6 +4543,16 @@ class Database:
                     raise ValueError("pair opportunity belongs to another run")
                 if int(item.project_id) != int(run["project_id"]):
                     raise ValueError("pair opportunity belongs to another project")
+                provenance = (
+                    item.provenance if isinstance(item.provenance, dict) else {}
+                )
+                source_kind = str(
+                    provenance.get("source_kind") or "v2_pair_planner"
+                )
+                source_record_id = str(
+                    provenance.get("source_record_id")
+                    or item.context_identity
+                )
                 conn.execute(
                     """INSERT INTO shadow_relation_pair_opportunities(
                        id,run_id,project_id,document_revision_id,document_id,chunk_id,
@@ -4457,8 +4598,8 @@ class Database:
                         item.type_status,
                         item.status,
                         self._canonical_json(item.provenance),
-                        "v2_pair_planner",
-                        item.context_identity,
+                        source_kind,
+                        source_record_id,
                     ),
                 )
                 persisted = conn.execute(
@@ -4494,6 +4635,85 @@ class Database:
                 )
                 if actual != expected:
                     raise ValueError("pair opportunity immutable input mismatch")
+                source_context_identity = str(
+                    provenance.get("source_context_id") or ""
+                )
+                if source_context_identity:
+                    source_context = conn.execute(
+                        """SELECT id FROM shadow_source_contexts
+                           WHERE run_id=%s AND context_identity=%s""",
+                        (run_id, source_context_identity),
+                    ).fetchone()
+                    if source_context:
+                        conn.execute(
+                            """INSERT INTO shadow_relation_pair_contexts(
+                               pair_opportunity_id,context_id,context_role,payload)
+                               VALUES(%s,%s,%s,%s::jsonb)
+                               ON CONFLICT(pair_opportunity_id,context_id,context_role)
+                               DO NOTHING""",
+                            (
+                                item.opportunity_identity,
+                                source_context["id"],
+                                "classification_context",
+                                self._canonical_json({
+                                    "context_identity": item.context_identity,
+                                    "context_span": [
+                                        int(item.context_span[0]),
+                                        int(item.context_span[1]),
+                                    ],
+                                    "candidate_sources": list(
+                                        provenance.get("candidate_sources") or []
+                                    ),
+                                    "planning_reason": item.planning_reason,
+                                }),
+                            ),
+                        )
+                candidate_sources = [
+                    str(value)
+                    for value in provenance.get("candidate_sources", [])
+                    if str(value)
+                ]
+                if not candidate_sources:
+                    candidate_sources = ["PAIR_PLANNER"]
+                for rank, candidate_source in enumerate(
+                    sorted(set(candidate_sources)),
+                    start=1,
+                ):
+                    candidate_source_id = self._shadow_relation_v2_db_id(
+                        "relcandsrc_",
+                        run_id,
+                        item.opportunity_identity,
+                        candidate_source,
+                        source_kind,
+                        source_record_id,
+                    )
+                    conn.execute(
+                        """INSERT INTO shadow_relation_candidate_sources(
+                           id,run_id,pair_opportunity_id,candidate_source,
+                           source_kind,source_record_id,candidate_rank,admitted,
+                           terminal_status,metadata)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                           ON CONFLICT(
+                               pair_opportunity_id,candidate_source,
+                               source_kind,source_record_id)
+                           DO NOTHING""",
+                        (
+                            candidate_source_id,
+                            run_id,
+                            item.opportunity_identity,
+                            candidate_source,
+                            source_kind,
+                            source_record_id,
+                            rank,
+                            bool(item.status == "PENDING_CLASSIFICATION"),
+                            str(item.status),
+                            self._canonical_json({
+                                "planning_reason": item.planning_reason,
+                                "cue": item.cue,
+                                "type_status": item.type_status,
+                            }),
+                        ),
+                    )
             if run["status"] == "planning":
                 conn.execute(
                     """UPDATE shadow_relation_v2_runs SET status='classifying'
@@ -4505,6 +4725,108 @@ class Database:
                    WHERE run_id=%s ORDER BY pair_identity""",
                 (run_id,),
             ).fetchall()
+
+    def record_shadow_relation_v2_proposal_attempt(
+        self,
+        run_id: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one direct proposer attempt and its model-call envelope."""
+
+        context_identity = str(values.get("context_identity") or "")
+        attempt_no = int(values.get("attempt_no") or 0)
+        status = str(values.get("status") or "")
+        if not context_identity or attempt_no <= 0 or not status:
+            raise ValueError("proposal attempt requires context, attempt and status")
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            context = conn.execute(
+                """SELECT * FROM shadow_source_contexts
+                   WHERE run_id=%s AND context_identity=%s""",
+                (run_id, context_identity),
+            ).fetchone()
+            if not context:
+                raise LookupError("proposal attempt context does not exist")
+            model_call_id = str(
+                values.get("model_call_id")
+                or self._shadow_relation_v2_db_id(
+                    "modelcall_", run_id, "proposer", context["id"], attempt_no,
+                )
+            )
+            idempotency_key = f"proposer:{context['id']}:{attempt_no}"
+            conn.execute(
+                """INSERT INTO shadow_model_calls(
+                   id,run_id,component,model_name,model_digest,
+                   prompt_version,schema_version,parser_version,
+                   idempotency_key,attempt_no,status,request_hash,response_hash,
+                   request_payload,raw_response_text,parsed_response,
+                   token_usage,error_type,error_message,independent_call)
+                   VALUES(%s,%s,'proposer',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                          %s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,TRUE)
+                   ON CONFLICT(run_id,component,idempotency_key,attempt_no)
+                   DO NOTHING""",
+                (
+                    model_call_id,
+                    run_id,
+                    str(values.get("model_name") or ""),
+                    str(values.get("proposer_model_revision") or ""),
+                    str(values.get("proposer_prompt_version") or ""),
+                    str(values.get("proposer_schema_version") or ""),
+                    str(values.get("proposer_parser_version") or ""),
+                    idempotency_key,
+                    attempt_no,
+                    status,
+                    str(values.get("request_hash") or ""),
+                    str(values.get("response_hash") or ""),
+                    self._canonical_json(values.get("request_payload") or {}),
+                    str(values.get("raw_response_text") or ""),
+                    self._canonical_json(values.get("parsed_response") or {}),
+                    self._canonical_json(values.get("token_usage") or {}),
+                    str(values.get("error_type") or ""),
+                    str(values.get("error_message") or ""),
+                ),
+            )
+            attempt_id = self._shadow_relation_v2_db_id(
+                "relpropattdb_",
+                run_id,
+                context["id"],
+                attempt_no,
+                str(values.get("proposer_prompt_version") or ""),
+            )
+            conn.execute(
+                """INSERT INTO shadow_relation_proposal_attempts(
+                   id,run_id,context_id,model_call_id,attempt_no,status,
+                   proposer_prompt_version,proposer_schema_version,
+                   proposer_parser_version,proposer_model_revision,
+                   request_hash,response_hash,token_usage,error_type,
+                   error_message,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,
+                          %s::jsonb)
+                   ON CONFLICT(run_id,context_id,attempt_no,proposer_prompt_version)
+                   DO NOTHING""",
+                (
+                    attempt_id,
+                    run_id,
+                    context["id"],
+                    model_call_id,
+                    attempt_no,
+                    status,
+                    str(values.get("proposer_prompt_version") or ""),
+                    str(values.get("proposer_schema_version") or ""),
+                    str(values.get("proposer_parser_version") or ""),
+                    str(values.get("proposer_model_revision") or ""),
+                    str(values.get("request_hash") or ""),
+                    str(values.get("response_hash") or ""),
+                    self._canonical_json(values.get("token_usage") or {}),
+                    str(values.get("error_type") or ""),
+                    str(values.get("error_message") or ""),
+                    self._canonical_json(values.get("metadata") or {}),
+                ),
+            )
+            return conn.execute(
+                "SELECT * FROM shadow_relation_proposal_attempts WHERE id=%s",
+                (attempt_id,),
+            ).fetchone()
 
     def record_shadow_relation_v2_classification_attempt(
         self,
@@ -4546,15 +4868,56 @@ class Database:
             attempt_id = self._shadow_relation_v2_db_id(
                 "relclassdb_", pair["id"], attempt_no,
             )
+            model_call_id = str(
+                values.get("model_call_id")
+                or self._shadow_relation_v2_db_id(
+                    "modelcall_", run_id, "classifier", pair["id"], attempt_no,
+                )
+            )
+            idempotency_key = f"classifier:{pair['id']}:{attempt_no}"
+            conn.execute(
+                """INSERT INTO shadow_model_calls(
+                   id,run_id,component,model_name,model_digest,
+                   prompt_version,schema_version,parser_version,
+                   idempotency_key,attempt_no,status,request_hash,response_hash,
+                   request_payload,raw_response_text,parsed_response,
+                   token_usage,error_type,error_message,independent_call)
+                   VALUES(%s,%s,'classifier',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                          %s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
+                   ON CONFLICT(run_id,component,idempotency_key,attempt_no)
+                   DO NOTHING""",
+                (
+                    model_call_id,
+                    run_id,
+                    str(values.get("model_name") or ""),
+                    str(values.get("classifier_model_revision") or ""),
+                    str(values.get("classifier_prompt_version") or ""),
+                    str(values.get("classifier_schema_version") or ""),
+                    str(values.get("classifier_parser_version") or ""),
+                    idempotency_key,
+                    attempt_no,
+                    status,
+                    str(values.get("request_hash") or ""),
+                    str(values.get("response_hash") or ""),
+                    self._canonical_json(values.get("request_payload") or {}),
+                    str(values.get("raw_response_text") or ""),
+                    self._canonical_json(values.get("parsed_response") or {}),
+                    self._canonical_json(values.get("token_usage") or {}),
+                    str(values.get("error_type") or ""),
+                    str(values.get("error_message") or ""),
+                    bool(values.get("independent_call", True)),
+                ),
+            )
             conn.execute(
                 """INSERT INTO shadow_relation_classification_attempts(
                    id,pair_opportunity_id,attempt_no,status,request_hash,response_hash,
                    classifier_prompt_version,classifier_schema_version,
                    classifier_parser_version,classifier_model_revision,error_message,
                    metadata,model_name,request_payload,raw_response_text,
-                   parsed_response,token_usage,error_type,independent_call)
+                   parsed_response,token_usage,error_type,independent_call,
+                   model_call_id)
                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
-                          %s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s)
+                          %s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     attempt_id,
@@ -4576,6 +4939,7 @@ class Database:
                     self._canonical_json(values.get("token_usage") or {}),
                     str(values.get("error_type") or ""),
                     bool(values.get("independent_call", True)),
+                    model_call_id,
                 ),
             )
             row = conn.execute(
@@ -4598,6 +4962,7 @@ class Database:
                 row.get("token_usage") or {},
                 str(row.get("error_type") or ""),
                 bool(row.get("independent_call", True)),
+                str(row.get("model_call_id") or ""),
             )
             expected = (
                 attempt_no,
@@ -4615,6 +4980,7 @@ class Database:
                 values.get("token_usage") or {},
                 str(values.get("error_type") or ""),
                 bool(values.get("independent_call", True)),
+                model_call_id,
             )
             if immutable != expected:
                 raise ValueError("classification attempt immutable payload mismatch")
@@ -4974,14 +5340,55 @@ class Database:
                 payload_hash = hashlib.sha256(
                     self._canonical_json(canonical_attempt).encode("utf-8")
                 ).hexdigest()
+                model_call_id = self._shadow_relation_v2_db_id(
+                    "modelcall_",
+                    run_id,
+                    "verifier",
+                    hypothesis["id"],
+                    int(attempt.attempt_no),
+                )
+                idempotency_key = f"verifier:{hypothesis['id']}:{int(attempt.attempt_no)}"
+                conn.execute(
+                    """INSERT INTO shadow_model_calls(
+                       id,run_id,component,model_name,model_digest,
+                       prompt_version,schema_version,parser_version,
+                       idempotency_key,attempt_no,status,request_hash,response_hash,
+                       request_payload,raw_response_text,parsed_response,
+                       token_usage,error_type,error_message,independent_call)
+                       VALUES(%s,%s,'verifier',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                              %s::jsonb,%s,%s::jsonb,'{}'::jsonb,%s,%s,%s)
+                       ON CONFLICT(run_id,component,idempotency_key,attempt_no)
+                       DO NOTHING""",
+                    (
+                        model_call_id,
+                        run_id,
+                        str(attempt.verifier_model_revision or ""),
+                        str(attempt.verifier_model_revision or ""),
+                        attempt.verifier_prompt_version,
+                        attempt.verifier_schema_version,
+                        attempt.verifier_parser_version,
+                        idempotency_key,
+                        int(attempt.attempt_no),
+                        attempt.verdict,
+                        payload_hash,
+                        payload_hash,
+                        self._canonical_json(canonical_attempt),
+                        self._canonical_json(canonical_attempt),
+                        self._canonical_json(canonical_attempt),
+                        "ShadowClassificationError"
+                        if attempt.verdict == "RETRYABLE_FAILED" else "",
+                        str(attempt.error_message or ""),
+                        bool(attempt.independent_call),
+                    ),
+                )
                 conn.execute(
                     """INSERT INTO shadow_relation_verification_attempts(
                        id,hypothesis_id,attempt_no,verdict,reason_code,
                        supported_evidence_spans,independent_call,
                        verifier_prompt_version,verifier_schema_version,
                        verifier_parser_version,verifier_model_revision,
-                       request_hash,response_hash,error_message)
-                       VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s)
+                       request_hash,response_hash,error_message,model_call_id)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT(id) DO NOTHING""",
                     (
                         database_id,
@@ -5000,6 +5407,7 @@ class Database:
                         payload_hash,
                         payload_hash,
                         attempt.error_message,
+                        model_call_id,
                     ),
                 )
                 row = conn.execute(
