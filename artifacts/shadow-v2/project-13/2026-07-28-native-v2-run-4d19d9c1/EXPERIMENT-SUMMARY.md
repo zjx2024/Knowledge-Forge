@@ -89,6 +89,16 @@ enhanced_shadow 公共入口
 
 这说明“27 条关系”不是候选关系数，而是经过 classifier、确定性校验、独立 verifier 和方向归一之后，最终允许进入隔离 Shadow 图的 supported facts。
 
+## Proposer 熔断说明
+
+`proposer` 是 v2 主链之外的辅助召回组件，用来尝试从较大的 chunk 上下文中补充候选关系。它不是最终关系抽取的唯一入口，也不能绕过 classifier、verifier 或 normalized fact 持久化。
+
+本轮出现 `proposer failures = 6` 和 `proposer skipped by circuit breaker = 13`，含义是：proposer 连续多次返回被截断或不符合结构契约的响应后，运行时触发熔断，后续 chunk 不再继续调用 proposer，避免把不稳定输出带入审计链。熔断后主链仍继续执行：pair ledger、classifier、deterministic validation、independent verifier 和 normalization 都正常完成。
+
+因此，本轮最终 27 条关系不是 proposer 直接生成的结果，而是主链中 verifier 判定 `SUPPORTED` 的可物化事实。这个熔断更像是“辅助召回关闭”，不是“关系抽取停止”。它可能影响召回上限，但不会降低已发布 fact 的审计约束。
+
+后续如果要提高召回，应优先审阅被熔断前后的 missed cases，再考虑调整 proposer 输出预算、chunk 拆分、候选预算或 prompt 结构；不建议直接放宽 verifier 发布规则。
+
 ## 当前 27 条关系的谓词分布
 
 | predicate | facts |
