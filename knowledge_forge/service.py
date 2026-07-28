@@ -57,6 +57,7 @@ from .relation_shadow_runtime import (
     ShadowRelationV2Runtime,
 )
 from .schema_evolution import SchemaEvolutionService
+from .shadow_context import build_shadow_context_manifest
 from .span_entities import SpanFirstEntityExtractor
 from .vector_store import VectorStore
 
@@ -828,7 +829,29 @@ class KnowledgeForgeService:
         chunks.sort(key=lambda item: (
             int(item["document_id"]), int(item.get("chunk_index") or 0), int(item["id"]),
         ))
-        policy_set = dict(P2_ENTITY_SHADOW_POLICY_SET)
+        chunks_by_document: dict[int, list[dict[str, Any]]] = {}
+        for chunk in chunks:
+            chunks_by_document.setdefault(int(chunk["document_id"]), []).append(chunk)
+
+        def load_processing_payload(document: dict[str, Any]) -> dict[str, Any] | None:
+            try:
+                _, payload, _ = self._document_process_payload(int(document["id"]))
+                return payload
+            except (LookupError, RuntimeError):
+                return None
+
+        shadow_context = build_shadow_context_manifest(
+            namespace_id=f"shadow-context:{project_id}:{snapshot_id or 'live'}",
+            documents=documents,
+            chunks_by_document=chunks_by_document,
+            payload_loader=load_processing_payload,
+        )
+        policy_set = {
+            **P2_ENTITY_SHADOW_POLICY_SET,
+            "shadow_context_policy_version": shadow_context.policy_version,
+            "shadow_context_source_map_policy": shadow_context.source_map_policy,
+            "structure_artifact_hash": shadow_context.artifact_hash,
+        }
         llm_model = str(project.get("llm_model") or Config.default_llm_model)
         embedding_model = str(project.get("embedding_model") or Config.default_embedding_model)
         frozen_inputs = [{
@@ -856,6 +879,7 @@ class KnowledgeForgeService:
             "vector_cap": min(Config.entity_vector_max_k, Config.entity_vector_top_k),
             "reranker_cap": Config.entity_reranker_max_k,
             "code_version": code_version,
+            "shadow_context": shadow_context.fingerprint_payload(),
         }
         config_hash = hashlib.sha256(
             json.dumps(config_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -865,6 +889,7 @@ class KnowledgeForgeService:
             "snapshot_id": snapshot_id or "live",
             "documents": frozen_inputs,
             "chunks": frozen_chunks,
+            "shadow_context": shadow_context.fingerprint_payload(),
             "config_hash": config_hash,
         }
         input_fingerprint = hashlib.sha256(
@@ -1008,7 +1033,8 @@ class KnowledgeForgeService:
                         "input_fingerprint": work["input_fingerprint"],
                         "model_name": llm_model,
                         "config_hash": config_hash,
-                            "code_version": code_version,
+                        "code_version": code_version,
+                        "physical_occurrence_key": item.occurrence_key,
                     },
                 } for item in normalized.mentions]
                 assertion_rows = [asdict(item) for item in normalized.type_assertions]
@@ -1029,7 +1055,7 @@ class KnowledgeForgeService:
                 alias_by_mention: dict[str, list[dict[str, Any]]] = {}
                 for alias in normalized.aliases:
                     alias_by_mention.setdefault(alias.mention_id, []).append({
-                        **asdict(alias), "kind": "verified_alias",
+                        **asdict(alias),
                     })
                 type_by_mention = {item.mention_id: item for item in normalized.type_assertions}
                 raw_id_by_span = {
@@ -1047,6 +1073,7 @@ class KnowledgeForgeService:
                     type_assertion = type_by_mention[item.mention_id]
                     mention = {
                         "mention_id": item.mention_id,
+                        "occurrence_key": item.occurrence_key,
                         "surface": item.surface,
                         "normalized_surface": item.normalized_surface,
                         "entity_type": type_assertion.entity_type,
@@ -1121,6 +1148,8 @@ class KnowledgeForgeService:
                         "metadata": {
                             "type_assertion": asdict(type_assertion),
                             "identity_type_decoupled": True,
+                            "resolution_decision": str(result.get("decision") or ""),
+                            "quarantined": bool(result.get("quarantined")),
                         },
                     }
                     self.db.upsert_entity_shadow_canonical(
@@ -1177,6 +1206,7 @@ class KnowledgeForgeService:
         artifact_payload = {
             "namespace_id": namespace_id,
             "input_fingerprint": input_fingerprint,
+            "structure_artifact_hash": shadow_context.artifact_hash,
             "canonicals": [str(item["canonical_key"]) for item in persisted["canonicals"]],
             "assignments": [{
                 "mention_key": str(item["mention_key"]),
@@ -1201,6 +1231,8 @@ class KnowledgeForgeService:
             "relation_v2_run_id": relation_v2["run_id"],
             "relation_v2_fingerprint": relation_v2["input_fingerprint"],
             "relation_v2": relation_v2["metrics"],
+            "shadow_context": shadow_context.summary,
+            "structure_artifact_hash": shadow_context.artifact_hash,
         }
         self.db.finalize_entity_shadow_namespace(
             namespace_id, metrics=metrics, artifact_hash=artifact_hash,

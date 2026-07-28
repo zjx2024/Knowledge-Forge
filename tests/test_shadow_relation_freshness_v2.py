@@ -59,6 +59,14 @@ def _components():
             "model": "qwen3.6:latest",
             "model_revision": "classifier-model-r1",
         },
+        "proposer": {
+            "prompt_version": "proposer-prompt-v1",
+            "schema_version": "proposer-schema-v1",
+            "parser_version": "proposer-parser-v1",
+            "model": "qwen3.6:latest",
+            "model_revision": "proposer-model-r1",
+            "max_gleaning_rounds": 2,
+        },
         "verifier": {
             "prompt_version": "verifier-prompt-v2",
             "schema_version": "verifier-schema-v2",
@@ -104,6 +112,8 @@ def _fingerprint(components=None):
         (("documents", 0, "chunks", 0, "content_hash"), "9" * 64),
         (("entity_assignment", "version"), "assignment-v2"),
         (("schema", "predicate_metadata_hash"), "8" * 64),
+        (("proposer", "prompt_version"), "proposer-prompt-v2"),
+        (("proposer", "max_gleaning_rounds"), 1),
         (("classifier", "prompt_version"), "classifier-prompt-v3"),
         (("classifier", "model_revision"), "classifier-model-r2"),
         (("verifier", "prompt_version"), "verifier-prompt-v3"),

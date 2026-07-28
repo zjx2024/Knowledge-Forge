@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import uuid
 
 import pytest
@@ -180,13 +181,20 @@ def test_shadow_relation_v2_persistence_is_idempotent_and_product_isolated() -> 
         pair.pair_identity,
         {
             "attempt_no": 1,
-            "status": "accepted",
+            "status": "ACCEPTED",
             "request_hash": "request-hash",
             "response_hash": "response-hash",
             "classifier_prompt_version": hypothesis.classifier_prompt_version,
             "classifier_schema_version": hypothesis.classifier_schema_version,
             "classifier_parser_version": hypothesis.classifier_parser_version,
             "classifier_model_revision": hypothesis.classifier_model_revision,
+            "model_name": "test-model",
+            "request_payload": {"stage": "classifier"},
+            "raw_response_text": "{\"decisions\": []}",
+            "parsed_response": {"decisions": []},
+            "token_usage": {},
+            "error_type": "",
+            "independent_call": True,
         },
     )
     database.persist_shadow_relation_v2_classifications(run_id, decisions)
@@ -263,6 +271,7 @@ def test_shadow_relation_v2_database_api_is_explicitly_isolated() -> None:
         "persist_shadow_relation_v2_opportunities",
         "record_shadow_relation_v2_classification_attempt",
         "persist_shadow_relation_v2_classifications",
+        "persist_shadow_relation_v2_proposed_hypotheses",
         "persist_shadow_relation_v2_validations",
         "persist_shadow_relation_v2_verification_attempts",
         "persist_shadow_relation_v2_normalization",
@@ -270,3 +279,186 @@ def test_shadow_relation_v2_database_api_is_explicitly_isolated() -> None:
     }
 
     assert source_names <= set(dir(Database))
+
+
+def test_shadow_relation_v2_persistence_writes_v2_audit_source_labels() -> None:
+    """v2 rows must not depend on compatibility defaults that look like P1."""
+
+    persistence_source = "\n".join(
+        inspect.getsource(method)
+        for method in (
+            Database.persist_shadow_relation_v2_opportunities,
+            Database.persist_shadow_relation_v2_classifications,
+            Database.persist_shadow_relation_v2_proposed_hypotheses,
+            Database.persist_shadow_relation_v2_normalization,
+        )
+    )
+
+    assert '"v2_pair_planner"' in persistence_source
+    assert '"v2_classifier"' in persistence_source
+    assert '"v2_verifier"' in persistence_source
+    assert "legacy_pair" not in persistence_source
+    assert "legacy_classifier" not in persistence_source
+    assert "legacy_evidence" not in persistence_source
+
+
+@pytest.mark.integration
+def test_shadow_relation_v2_failed_run_is_reset_for_same_input_retry() -> None:
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
+    database = _database(dsn)
+    database.bootstrap()
+    suffix = uuid.uuid4().hex[:12]
+    with database.connection() as conn:
+        project_id = int(conn.execute(
+            "INSERT INTO projects(project_key,name) VALUES(%s,%s) RETURNING id",
+            (f"shadow-v2-retry-{suffix}", f"Shadow v2 retry {suffix}"),
+        ).fetchone()["id"])
+
+    content = "Alpha uses Beta."
+    run_id = f"shadow-v2-retry-run-{suffix}"
+    fingerprint = f"shadow-v2-retry-fingerprint-{suffix}"
+    plan = plan_pair_opportunities(
+        project_id=project_id,
+        document_revision_id=f"revision-{suffix}",
+        chunk_key=f"chunk-{suffix}",
+        content=content,
+        mentions=[
+            {
+                "occurrence_key": "occ-alpha",
+                "mention_id": "mention-alpha",
+                "surface": "Alpha",
+                "mention_start": 0,
+                "mention_end": 5,
+                "canonical_id": "entity-alpha",
+                "assignment_version": "assignment-v1",
+                "type": "Organization",
+            },
+            {
+                "occurrence_key": "occ-beta",
+                "mention_id": "mention-beta",
+                "surface": "Beta",
+                "mention_start": 11,
+                "mention_end": 15,
+                "canonical_id": "entity-beta",
+                "assignment_version": "assignment-v1",
+                "type": "Product",
+            },
+        ],
+        logical_schema=_schema(),
+        run_id=run_id,
+        candidate_policy_version="candidate-v2",
+    )
+    pair = plan.admitted[0]
+    decisions = parse_classifier_response(
+        plan.admitted,
+        [{
+            "pair_id": pair.pair_identity,
+            "decision": HYPOTHESES,
+            "hypotheses": [{
+                "subject_occurrence_id": "occ-alpha",
+                "predicate": "uses",
+                "object_occurrence_id": "occ-beta",
+                "evidence_spans": [{"start": 0, "end": len(content)}],
+                "classifier_confidence": 0.9,
+            }],
+        }],
+        content=content,
+        logical_schema=_schema(),
+        classifier_model_revision="classifier-r1",
+    )
+    hypothesis = decisions[0].hypotheses[0]
+
+    database.start_shadow_relation_v2_run({
+        "id": run_id,
+        "project_id": project_id,
+        "input_fingerprint": fingerprint,
+        "fingerprint_components": {"test": suffix},
+        "source_generation": 1,
+    })
+    database.persist_shadow_relation_v2_opportunities(run_id, plan.opportunities)
+    database.record_shadow_relation_v2_classification_attempt(
+        run_id,
+        pair.pair_identity,
+        {
+            "attempt_no": 1,
+            "status": "ACCEPTED",
+            "request_hash": "request-hash",
+            "response_hash": "response-hash",
+            "classifier_prompt_version": hypothesis.classifier_prompt_version,
+            "classifier_schema_version": hypothesis.classifier_schema_version,
+            "classifier_parser_version": hypothesis.classifier_parser_version,
+            "classifier_model_revision": hypothesis.classifier_model_revision,
+            "model_name": "test-model",
+            "request_payload": {"stage": "classifier"},
+            "raw_response_text": "{\"decisions\": []}",
+            "parsed_response": {"decisions": []},
+            "token_usage": {},
+            "error_type": "",
+            "independent_call": True,
+        },
+    )
+    database.persist_shadow_relation_v2_classifications(run_id, decisions)
+    database.finish_shadow_relation_v2_run(
+        run_id,
+        status="failed",
+        metrics={"runtime_failure": "SyntheticFailure"},
+        input_fingerprint=fingerprint,
+        error_message="synthetic failure",
+    )
+
+    with database.connection() as conn:
+        assert conn.execute(
+            """SELECT COUNT(*) AS count FROM shadow_relation_pair_opportunities
+               WHERE run_id=%s""",
+            (run_id,),
+        ).fetchone()["count"] == 1
+        assert conn.execute(
+            """SELECT COUNT(*) AS count
+               FROM shadow_relation_classification_attempts attempt
+               JOIN shadow_relation_pair_opportunities pair
+                 ON pair.id=attempt.pair_opportunity_id
+               WHERE pair.run_id=%s""",
+            (run_id,),
+        ).fetchone()["count"] == 1
+        assert conn.execute(
+            """SELECT COUNT(*) AS count
+               FROM shadow_relation_hypotheses hypothesis
+               JOIN shadow_relation_pair_opportunities pair
+                 ON pair.id=hypothesis.pair_opportunity_id
+               WHERE pair.run_id=%s""",
+            (run_id,),
+        ).fetchone()["count"] == 1
+
+    restarted = database.start_shadow_relation_v2_run({
+        "id": run_id,
+        "project_id": project_id,
+        "input_fingerprint": fingerprint,
+        "fingerprint_components": {"test": suffix},
+        "source_generation": 1,
+    })
+    assert restarted["status"] == "planning"
+    assert restarted["completed_at"] is None
+    assert restarted["error_message"] == ""
+
+    with database.connection() as conn:
+        for table in (
+            "shadow_relation_pair_opportunities",
+            "shadow_relation_classification_attempts",
+            "shadow_relation_hypotheses",
+        ):
+            if table == "shadow_relation_pair_opportunities":
+                count = conn.execute(
+                    f"SELECT COUNT(*) AS count FROM {table} WHERE run_id=%s",
+                    (run_id,),
+                ).fetchone()["count"]
+            else:
+                count = conn.execute(
+                    f"""SELECT COUNT(*) AS count FROM {table} item
+                        JOIN shadow_relation_pair_opportunities pair
+                          ON pair.id=item.pair_opportunity_id
+                        WHERE pair.run_id=%s""",
+                    (run_id,),
+                ).fetchone()["count"]
+            assert count == 0

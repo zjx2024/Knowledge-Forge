@@ -81,6 +81,20 @@ def _strategy_statistics(
         return {"documents": 0, "chunks": 0, "entities": 0, "relations": 0}
     if strategy_key == STABLE_STRATEGY:
         return SERVICE.db.statistics(project_id)
+    current = SERVICE.db.statistics(project_id)
+    graph_status = str((graph_state or {}).get("status") or "")
+    graph_current = (
+        graph_status == "ready"
+        and int((graph_state or {}).get("generation") or 0)
+        == int((graph_state or {}).get("ready_generation") or 0)
+    )
+    if not graph_current:
+        return {
+            "documents": int(current.get("documents") or 0),
+            "chunks": int(current.get("chunks") or 0),
+            "entities": 0,
+            "relations": 0,
+        }
     stats = (graph_state or {}).get("stats") or {}
     return {
         "documents": int(stats.get("documents") or 0),
@@ -122,6 +136,13 @@ def _document_rows(documents: list[dict], strategy_key: str) -> str:
     return "".join(rows) or '<tr><td colspan="5" class="empty">该项目尚未上传文档。</td></tr>'
 
 
+def _documents_ready_for_knowledge_build(documents: list[dict]) -> bool:
+    return bool(documents) and all(
+        bool(item.get("active_revision_id")) and str(item.get("status") or "") == "indexed"
+        for item in documents
+    )
+
+
 def _construction_controls(
     *,
     project_id: int,
@@ -130,14 +151,22 @@ def _construction_controls(
     latest_job_id: str,
     latest_batch_id: str,
     active_job_id: str,
+    build_ready: bool = True,
 ) -> str:
     disabled = " disabled" if active_job_id else ""
+    build_disabled = " disabled" if active_job_id or not build_ready else ""
+    build_title = (
+        "基于已完成预处理的文档抽取实体关系并构建知识图谱"
+        if build_ready
+        else "请先预处理文档，完成结构块、Chunk、向量和 Schema 后再构建知识"
+    )
     return f"""<div class="construction-controls">
       <form method="get"><input type="hidden" name="project" value="{_esc(project_id)}">
         <label><span>构建方案</span><select name="strategy" onchange="this.form.submit()">{strategy_select}</select></label></form>
       <button class="button secondary" id="prepare-project-documents" data-prepare-project="{_esc(project_id)}" type="button"
         title="生成结构块、Chunk 分片、向量索引和 Schema，不抽取实体关系，也不更新知识图谱"{disabled}>预处理文档</button>
-      <button class="button secondary" id="build-project-knowledge" data-build-project="{_esc(project_id)}" type="button"{disabled}>构建知识</button>
+      <button class="button secondary" id="build-project-knowledge" data-build-project="{_esc(project_id)}" type="button"
+        title="{_esc(build_title)}"{build_disabled}>构建知识</button>
       <button class="button secondary" id="view-ingestion-log" data-view-job-log data-job="{_esc(latest_job_id)}"
         data-batch="{_esc(latest_batch_id)}"{' disabled' if not latest_job_id else ''}>查看知识构建日志</button>
     </div>"""
@@ -215,6 +244,7 @@ def render_page(
             latest_job_id=latest_job_id,
             latest_batch_id=latest_batch_id,
             active_job_id=active_job_id,
+            build_ready=_documents_ready_for_knowledge_build(documents),
         )
         current_block = f"""
         <div class="workspace-section graph-summary"><div class="stats"><div><b data-stat="documents">{statistics['documents']}</b><span>文档</span></div><div><b data-stat="chunks">{statistics['chunks']}</b><span>知识块</span></div>

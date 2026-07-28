@@ -46,6 +46,12 @@ class _ScriptedV2Gateway:
 
     def json_chat(self, **kwargs):
         payload = json.loads(kwargs["prompt"])
+        if "proposer" in str(kwargs["system"]):
+            return {
+                "proposals": [],
+                "missing_endpoint_mentions": [],
+                "coverage": {"complete": True, "uncovered_cues": []},
+            }
         if "classifier" in str(kwargs["system"]):
             self.classifier_calls += 1
             if self.fail_classifier:

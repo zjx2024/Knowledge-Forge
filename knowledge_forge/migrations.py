@@ -1774,6 +1774,332 @@ $$;
 """
 
 
+SHADOW_RELATION_V2_MODEL_AUDIT_SQL = r"""
+ALTER TABLE shadow_relation_classification_attempts
+    ADD COLUMN IF NOT EXISTS model_name TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS raw_response_text TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS parsed_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS token_usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS error_type TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS independent_call BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE shadow_relation_classification_attempts
+    DROP CONSTRAINT IF EXISTS shadow_relation_classification_attempts_status_check;
+
+ALTER TABLE shadow_relation_classification_attempts
+    ADD CONSTRAINT shadow_relation_classification_attempts_status_check
+    CHECK(status IN (
+        'ACCEPTED',
+        'RETRYABLE_EMPTY',
+        'RETRYABLE_PROTOCOL',
+        'RETRYABLE_TRUNCATED',
+        'RETRYABLE_TIMEOUT',
+        'RETRYABLE_MODEL_ERROR',
+        'TERMINAL_FAILED',
+        'SUPERSEDED',
+        'accepted',
+        'retryable_failed',
+        'permanent_failed',
+        'superseded'
+    ));
+
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_classification_attempts_status_v2
+    ON shadow_relation_classification_attempts(status,attempt_no);
+"""
+
+
+SHADOW_RELATION_V2_ARTIFACT_AUDIT_SQL = r"""
+ALTER TABLE shadow_relation_v2_runs
+    ADD COLUMN IF NOT EXISTS pipeline_generation BIGINT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS audit_quality TEXT NOT NULL DEFAULT 'legacy_audit_incomplete';
+
+ALTER TABLE shadow_relation_pair_opportunities
+    ADD COLUMN IF NOT EXISTS pipeline_generation BIGINT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS context_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'v2_pair_planner',
+    ADD COLUMN IF NOT EXISTS source_record_id TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE shadow_relation_classification_attempts
+    ADD COLUMN IF NOT EXISTS model_call_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS audit_quality TEXT NOT NULL DEFAULT 'legacy_audit_incomplete',
+    ADD COLUMN IF NOT EXISTS terminal_status TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE shadow_relation_hypotheses
+    ADD COLUMN IF NOT EXISTS qualifiers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'v2_classifier',
+    ADD COLUMN IF NOT EXISTS source_record_id TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE shadow_relation_verification_attempts
+    ADD COLUMN IF NOT EXISTS model_call_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS audit_quality TEXT NOT NULL DEFAULT 'legacy_audit_incomplete',
+    ADD COLUMN IF NOT EXISTS terminal_status TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE shadow_relation_normalized_facts
+    ADD COLUMN IF NOT EXISTS qualifiers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS audit_quality TEXT NOT NULL DEFAULT 'legacy_audit_incomplete';
+
+ALTER TABLE shadow_relation_fact_evidence
+    ADD COLUMN IF NOT EXISTS context_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'v2_verifier',
+    ADD COLUMN IF NOT EXISTS source_record_id TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS qualifiers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS audit_quality TEXT NOT NULL DEFAULT 'legacy_audit_incomplete';
+
+CREATE TABLE IF NOT EXISTS shadow_source_contexts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id) ON DELETE CASCADE,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT,
+    document_revision_id TEXT,
+    chunk_id BIGINT,
+    chunk_key TEXT NOT NULL DEFAULT '',
+    context_kind TEXT NOT NULL,
+    context_identity TEXT NOT NULL,
+    context_start INTEGER NOT NULL DEFAULT 0 CHECK(context_start>=0),
+    context_end INTEGER NOT NULL DEFAULT 0 CHECK(context_end>=context_start),
+    content_hash TEXT NOT NULL,
+    structure_artifact_hash TEXT NOT NULL DEFAULT '',
+    parser_version TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,context_identity),
+    FOREIGN KEY(document_revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,document_revision_id)
+        REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_source_contexts_run
+    ON shadow_source_contexts(run_id,document_revision_id,chunk_id,context_identity);
+
+CREATE TABLE IF NOT EXISTS shadow_context_source_maps (
+    id TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL REFERENCES shadow_source_contexts(id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    source_start INTEGER NOT NULL DEFAULT 0 CHECK(source_start>=0),
+    source_end INTEGER NOT NULL DEFAULT 0 CHECK(source_end>=source_start),
+    payload_hash TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(context_id,source_kind,source_record_id,source_start,source_end)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_context_source_maps_context
+    ON shadow_context_source_maps(context_id,source_kind,source_record_id);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_occurrences (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id) ON DELETE CASCADE,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT,
+    document_revision_id TEXT,
+    chunk_id BIGINT,
+    occurrence_key TEXT NOT NULL,
+    physical_occurrence_key TEXT NOT NULL DEFAULT '',
+    surface TEXT NOT NULL,
+    normalized_surface TEXT NOT NULL,
+    evidence_start INTEGER NOT NULL DEFAULT 0 CHECK(evidence_start>=0),
+    evidence_end INTEGER NOT NULL DEFAULT 0 CHECK(evidence_end>=evidence_start),
+    source_context_id TEXT REFERENCES shadow_source_contexts(id),
+    provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(namespace_id,occurrence_key),
+    FOREIGN KEY(document_revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id),
+    FOREIGN KEY(chunk_id,document_revision_id)
+        REFERENCES chunks(id,revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_occurrences_namespace
+    ON entity_shadow_occurrences(namespace_id,document_revision_id,chunk_id,occurrence_key);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_mention_occurrence_map (
+    namespace_id TEXT NOT NULL,
+    mention_key TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL REFERENCES entity_shadow_occurrences(id) ON DELETE CASCADE,
+    mapping_policy_version TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(namespace_id,mention_key),
+    FOREIGN KEY(namespace_id,mention_key)
+        REFERENCES entity_shadow_mentions(namespace_id,mention_key)
+);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_occurrence_assignments (
+    occurrence_id TEXT NOT NULL REFERENCES entity_shadow_occurrences(id) ON DELETE CASCADE,
+    namespace_id TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    assignment_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    decision_reason TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(occurrence_id,assignment_version),
+    FOREIGN KEY(namespace_id,canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_shadow_occurrence_assignments_canonical
+    ON entity_shadow_occurrence_assignments(namespace_id,canonical_key,status);
+
+CREATE TABLE IF NOT EXISTS entity_shadow_canonical_redirects (
+    id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id) ON DELETE CASCADE,
+    source_canonical_key TEXT NOT NULL,
+    target_canonical_key TEXT NOT NULL,
+    redirect_policy_version TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(namespace_id,source_canonical_key),
+    CHECK(source_canonical_key<>target_canonical_key),
+    FOREIGN KEY(namespace_id,source_canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key),
+    FOREIGN KEY(namespace_id,target_canonical_key)
+        REFERENCES entity_shadow_canonicals(namespace_id,canonical_key)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_model_calls (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id) ON DELETE CASCADE,
+    component TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    model_digest TEXT NOT NULL DEFAULT '',
+    prompt_version TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK(attempt_no>0),
+    status TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_hash TEXT NOT NULL DEFAULT '',
+    request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    raw_response_text TEXT NOT NULL DEFAULT '',
+    parsed_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+    token_usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    latency_ms BIGINT NOT NULL DEFAULT 0 CHECK(latency_ms>=0),
+    error_type TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    independent_call BOOLEAN NOT NULL DEFAULT TRUE,
+    audit_quality TEXT NOT NULL DEFAULT 'complete',
+    terminal_status TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(run_id,component,idempotency_key,attempt_no)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_model_calls_run_component
+    ON shadow_model_calls(run_id,component,status,attempt_no);
+
+CREATE TABLE IF NOT EXISTS shadow_model_call_members (
+    id TEXT PRIMARY KEY,
+    model_call_id TEXT NOT NULL REFERENCES shadow_model_calls(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    pair_opportunity_id TEXT REFERENCES shadow_relation_pair_opportunities(id),
+    hypothesis_id TEXT REFERENCES shadow_relation_hypotheses(id),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(model_call_id,source_kind,source_record_id)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_pair_contexts (
+    pair_opportunity_id TEXT NOT NULL REFERENCES shadow_relation_pair_opportunities(id)
+        ON DELETE CASCADE,
+    context_id TEXT NOT NULL REFERENCES shadow_source_contexts(id) ON DELETE CASCADE,
+    context_role TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(pair_opportunity_id,context_id,context_role)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_pair_contexts_context
+    ON shadow_relation_pair_contexts(context_id,context_role);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_candidate_sources (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id) ON DELETE CASCADE,
+    pair_opportunity_id TEXT NOT NULL REFERENCES shadow_relation_pair_opportunities(id)
+        ON DELETE CASCADE,
+    candidate_source TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    candidate_rank INTEGER NOT NULL DEFAULT 0 CHECK(candidate_rank>=0),
+    admitted BOOLEAN NOT NULL DEFAULT FALSE,
+    terminal_status TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(pair_opportunity_id,candidate_source,source_kind,source_record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_candidate_sources_pair
+    ON shadow_relation_candidate_sources(pair_opportunity_id,candidate_source,admitted);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_proposal_attempts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id) ON DELETE CASCADE,
+    context_id TEXT REFERENCES shadow_source_contexts(id),
+    model_call_id TEXT REFERENCES shadow_model_calls(id),
+    attempt_no INTEGER NOT NULL CHECK(attempt_no>0),
+    status TEXT NOT NULL,
+    proposer_prompt_version TEXT NOT NULL,
+    proposer_schema_version TEXT NOT NULL,
+    proposer_parser_version TEXT NOT NULL,
+    proposer_model_revision TEXT NOT NULL DEFAULT '',
+    request_hash TEXT NOT NULL,
+    response_hash TEXT NOT NULL DEFAULT '',
+    token_usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_type TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(run_id,context_id,attempt_no,proposer_prompt_version)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_proposal_attempts_run
+    ON shadow_relation_proposal_attempts(run_id,status,attempt_no);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_proposals (
+    id TEXT PRIMARY KEY,
+    proposal_attempt_id TEXT NOT NULL REFERENCES shadow_relation_proposal_attempts(id)
+        ON DELETE CASCADE,
+    pair_opportunity_id TEXT REFERENCES shadow_relation_pair_opportunities(id),
+    hypothesis_id TEXT REFERENCES shadow_relation_hypotheses(id),
+    proposal_key TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    subject_occurrence_key TEXT NOT NULL,
+    object_occurrence_key TEXT NOT NULL,
+    evidence_spans JSONB NOT NULL DEFAULT '[]'::jsonb,
+    qualifiers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    reason_code TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(proposal_attempt_id,proposal_key)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_proposals_attempt
+    ON shadow_relation_proposals(proposal_attempt_id,status,predicate);
+
+CREATE TABLE IF NOT EXISTS shadow_relation_evidence_refs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES shadow_relation_v2_runs(id) ON DELETE CASCADE,
+    fact_evidence_id TEXT NOT NULL REFERENCES shadow_relation_fact_evidence(id)
+        ON DELETE CASCADE,
+    verification_attempt_id TEXT REFERENCES shadow_relation_verification_attempts(id),
+    context_id TEXT REFERENCES shadow_source_contexts(id),
+    source_kind TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    evidence_start INTEGER NOT NULL DEFAULT 0 CHECK(evidence_start>=0),
+    evidence_end INTEGER NOT NULL DEFAULT 0 CHECK(evidence_end>=evidence_start),
+    evidence_hash TEXT NOT NULL,
+    qualifiers JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,fact_evidence_id,context_id,evidence_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_relation_evidence_refs_run
+    ON shadow_relation_evidence_refs(run_id,fact_evidence_id,context_id);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -1874,6 +2200,16 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0019_shadow_relation_v2_execution",
         description="Persist classifier attempts, rule validation, and retry-safe run evidence",
         sql=SHADOW_RELATION_V2_EXECUTION_SQL,
+    ),
+    Migration(
+        version="0020_shadow_relation_v2_model_audit",
+        description="Audit Shadow v2 classifier request and response payloads with fail-closed statuses",
+        sql=SHADOW_RELATION_V2_MODEL_AUDIT_SQL,
+    ),
+    Migration(
+        version="0021_shadow_relation_v2_artifact_audit",
+        description="Persist enhanced Shadow v2 source contexts, model calls, proposals, and export audit refs",
+        sql=SHADOW_RELATION_V2_ARTIFACT_AUDIT_SQL,
     ),
 )
 

@@ -85,6 +85,8 @@ class OllamaClient:
         self.timeout = timeout or Config.ollama_timeout
         self.token_estimator = token_estimator or ConservativeTokenEstimator()
         self.last_call_diagnostics: OllamaCallDiagnostics | None = None
+        self.last_raw_response_text = ""
+        self.last_parsed_json_response: dict[str, Any] | list[Any] | None = None
         self._context_cache: dict[str, tuple[float, EffectiveModelContext]] = {}
 
     def models(self) -> list[dict[str, Any]]:
@@ -205,6 +207,8 @@ class OllamaClient:
         images: Iterable[bytes] | None = None,
     ) -> dict[str, Any]:
         increment("ollama_logical_calls")
+        self.last_raw_response_text = ""
+        self.last_parsed_json_response = None
         context_budget = int(
             context_budget_tokens or Config.ollama_default_context_budget
         )
@@ -271,8 +275,11 @@ class OllamaClient:
                 asdict(self.last_call_diagnostics), ensure_ascii=True, sort_keys=True,
             ))
             content = str((payload.get("message") or {}).get("content") or "").strip()
+            self.last_raw_response_text = content
             try:
-                return self._parse_json(content)
+                parsed = self._parse_json(content)
+                self.last_parsed_json_response = parsed
+                return parsed
             except (RuntimeError, json.JSONDecodeError) as exc:
                 parse_error = exc
                 if attempt:

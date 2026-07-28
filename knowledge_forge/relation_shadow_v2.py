@@ -18,13 +18,22 @@ REJECTED_SELF_LOOP = "REJECTED_SELF_LOOP"
 TYPE_UNRESOLVED = "TYPE_UNRESOLVED"
 TYPE_INCOMPATIBLE = "TYPE_INCOMPATIBLE"
 FILTERED_DISTANCE = "FILTERED_DISTANCE"
+FILTERED_STRUCTURE_PEER = "FILTERED_STRUCTURE_PEER"
 NO_RELATION = "NO_RELATION"
 OTHER_UNSUPPORTED = "OTHER_UNSUPPORTED"
 HYPOTHESES = "HYPOTHESES"
+EXPLICIT_NO_RELATION = "EXPLICIT_NO_RELATION"
+SCHEMA_GAP = "SCHEMA_GAP"
+HYPOTHESES_EMITTED = "HYPOTHESES_EMITTED"
+CLASSIFICATION_PENDING = "CLASSIFICATION_PENDING"
+CLASSIFICATION_FAILED = "CLASSIFICATION_FAILED"
 
 SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION = "shadow-relation-classifier-prompt-v9"
 SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION = "shadow-relation-classifier-schema-v6"
 SHADOW_RELATION_CLASSIFIER_PARSER_VERSION = "shadow-relation-classifier-parser-v9"
+SHADOW_RELATION_PROPOSER_PROMPT_VERSION = "shadow-relation-proposer-prompt-v1"
+SHADOW_RELATION_PROPOSER_SCHEMA_VERSION = "shadow-relation-proposer-schema-v1"
+SHADOW_RELATION_PROPOSER_PARSER_VERSION = "shadow-relation-proposer-parser-v1"
 SHADOW_RELATION_VERIFIER_PROMPT_VERSION = "shadow-relation-verifier-prompt-v5"
 SHADOW_RELATION_VERIFIER_SCHEMA_VERSION = "shadow-relation-verifier-schema-v4"
 SHADOW_RELATION_VERIFIER_PARSER_VERSION = "shadow-relation-verifier-parser-v4"
@@ -43,6 +52,11 @@ PUBLISH_DISABLED = "disabled"
 CANONICAL_FORWARD = "forward"
 CANONICAL_INVERSE = "inverse"
 CANONICAL_SYMMETRIC = "symmetric"
+DIRECT_PROPOSER = "DIRECT_PROPOSER"
+RELATION_GLEANING = "RELATION_GLEANING"
+PAIR_PLANNER = "PAIR_PLANNER"
+TABLE_STRUCTURE = "TABLE_STRUCTURE"
+ENDPOINT_COMPLETION = "ENDPOINT_COMPLETION"
 
 
 def _digest(parts: Sequence[object]) -> str:
@@ -127,14 +141,27 @@ class PredicateSpec:
     domain_types: tuple[str, ...]
     range_types: tuple[str, ...]
     direction_description: str
+    subject_role_description: str
+    object_role_description: str
     symmetric: bool
     inverse_predicate: str
     canonical_orientation: str
     publish_mode: str
     reflexive: bool
+    reciprocal_allowed: bool
+    allowed_context_kinds: tuple[str, ...]
+    required_evidence_roles: tuple[str, ...]
     positive_examples: tuple[str, ...]
     negative_examples: tuple[str, ...]
+    positive_cues: tuple[str, ...]
+    negative_cues: tuple[str, ...]
+    anti_patterns: tuple[str, ...]
     optional_soft_cues: tuple[str, ...]
+    qualifier_schema: dict[str, Any]
+    identity_qualifier_keys: tuple[str, ...]
+    conflicts_with: tuple[str, ...]
+    negation_policy: str
+    modality_policy: str
     schema_version: str
 
     @property
@@ -177,6 +204,45 @@ class PairClassificationDecision:
     hypotheses: tuple[RelationHypothesis, ...]
     evidence_spans: tuple[EvidenceSpan, ...]
     reason_code: str
+
+    @property
+    def decision_status(self) -> str:
+        return pair_decision_status(self.decision)
+
+
+def pair_decision_status(decision: str) -> str:
+    """Return the explicit pair-ledger terminal status for a classifier decision."""
+
+    if decision == NO_RELATION:
+        return EXPLICIT_NO_RELATION
+    if decision == OTHER_UNSUPPORTED:
+        return SCHEMA_GAP
+    if decision == HYPOTHESES:
+        return HYPOTHESES_EMITTED
+    return CLASSIFICATION_FAILED
+
+
+@dataclass(frozen=True)
+class RelationProposal:
+    proposal_id: str
+    context_id: str
+    candidate_source: str
+    pass_no: int
+    subject_occurrence_key: str
+    predicate: str
+    object_occurrence_key: str
+    evidence_spans: tuple[EvidenceSpan, ...]
+    qualifiers: tuple[dict[str, Any], ...]
+    confidence: float
+    proposer_policy_version: str
+    proposer_model_revision: str
+
+
+@dataclass(frozen=True)
+class RelationProposalBatch:
+    proposals: tuple[RelationProposal, ...]
+    missing_endpoint_mentions: tuple[dict[str, Any], ...]
+    coverage: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -396,6 +462,9 @@ def normalize_predicate_schema(
             )
         for field_name in (
             "positive_examples", "negative_examples", "optional_soft_cues",
+            "positive_cues", "negative_cues", "anti_patterns",
+            "allowed_context_kinds", "required_evidence_roles",
+            "identity_qualifier_keys", "conflicts_with",
         ):
             value = raw.get(field_name, [])
             if (
@@ -442,25 +511,67 @@ def normalize_predicate_schema(
             raise ValueError(
                 f"predicate {name} symmetric predicate cannot declare inverse"
             )
+        qualifier_schema = raw.get("qualifier_schema") or {}
+        if not isinstance(qualifier_schema, Mapping):
+            raise ValueError(f"predicate {name} qualifier_schema must be an object")
+        if not isinstance(raw.get("reciprocal_allowed", False), bool):
+            raise ValueError(f"predicate {name} reciprocal_allowed must be boolean")
         result[name] = PredicateSpec(
             name=name,
             semantic_definition=semantic_definition,
             domain_types=tuple(str(item) for item in domain_types),
             range_types=tuple(str(item) for item in range_types),
             direction_description=direction_description,
+            subject_role_description=str(
+                raw.get("subject_role_description")
+                or "The subject endpoint role follows direction_description."
+            ),
+            object_role_description=str(
+                raw.get("object_role_description")
+                or "The object endpoint role follows direction_description."
+            ),
             symmetric=symmetric,
             inverse_predicate=inverse_predicate,
             canonical_orientation=canonical_orientation,
             publish_mode=publish_mode,
             reflexive=bool(raw["reflexive"]),
+            reciprocal_allowed=bool(raw.get("reciprocal_allowed", False)),
+            allowed_context_kinds=tuple(
+                str(value) for value in raw.get("allowed_context_kinds") or []
+            ),
+            required_evidence_roles=tuple(
+                str(value) for value in raw.get("required_evidence_roles") or []
+            ),
             positive_examples=tuple(
                 str(value) for value in raw["positive_examples"]
             ),
             negative_examples=tuple(
                 str(value) for value in raw["negative_examples"]
             ),
+            positive_cues=tuple(
+                str(value) for value in raw.get("positive_cues") or []
+            ),
+            negative_cues=tuple(
+                str(value) for value in raw.get("negative_cues") or []
+            ),
+            anti_patterns=tuple(
+                str(value) for value in raw.get("anti_patterns") or []
+            ),
             optional_soft_cues=tuple(
                 str(value) for value in raw.get("optional_soft_cues") or []
+            ),
+            qualifier_schema=dict(qualifier_schema),
+            identity_qualifier_keys=tuple(
+                str(value) for value in raw.get("identity_qualifier_keys") or []
+            ),
+            conflicts_with=tuple(
+                str(value) for value in raw.get("conflicts_with") or []
+            ),
+            negation_policy=str(
+                raw.get("negation_policy") or "reject_negated"
+            ),
+            modality_policy=str(
+                raw.get("modality_policy") or "require_asserted"
             ),
             schema_version=schema_version,
         )
@@ -663,6 +774,304 @@ def classifier_prompt(
     )
 
 
+def proposer_response_schema() -> dict[str, Any]:
+    return {
+        "$id": SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "proposals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "subject_occurrence_id": {"type": "string"},
+                        "predicate": {"type": "string"},
+                        "object_occurrence_id": {"type": "string"},
+                        "evidence_spans": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "start": {"type": "integer", "minimum": 0},
+                                    "end": {"type": "integer", "minimum": 1},
+                                },
+                                "required": ["start", "end"],
+                            },
+                        },
+                        "qualifiers": {"type": "array"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                    },
+                    "required": [
+                        "subject_occurrence_id",
+                        "predicate",
+                        "object_occurrence_id",
+                        "evidence_spans",
+                        "qualifiers",
+                        "confidence",
+                    ],
+                },
+            },
+            "missing_endpoint_mentions": {"type": "array"},
+            "coverage": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "complete": {"type": "boolean"},
+                    "uncovered_cues": {"type": "array"},
+                },
+                "required": ["complete", "uncovered_cues"],
+            },
+        },
+        "required": ["proposals", "missing_endpoint_mentions", "coverage"],
+    }
+
+
+def proposer_prompt(
+    *,
+    context_id: str,
+    content: str,
+    mentions: Sequence[Mapping[str, Any]],
+    logical_schema: Mapping[str, Any],
+    already_found_keys: Sequence[str] = (),
+    pass_no: int = 0,
+) -> str:
+    predicates = {
+        name: asdict(spec)
+        for name, spec in normalize_predicate_schema(logical_schema).items()
+    }
+    occurrences = [{
+        "occurrence_id": str(item.get("occurrence_key") or ""),
+        "surface": str(item.get("surface") or ""),
+        "type": str(item.get("type") or ""),
+        "span": [
+            int(item.get("mention_start") or 0),
+            int(item.get("mention_end") or 0),
+        ],
+        "canonical_id": str(item.get("canonical_id") or ""),
+    } for item in mentions]
+    return json.dumps(
+        {
+            "instruction": (
+                f"contract={SHADOW_RELATION_PROPOSER_PROMPT_VERSION}; "
+                f"schema={SHADOW_RELATION_PROPOSER_SCHEMA_VERSION}. "
+                "Directly propose only explicit relations supported by this frozen "
+                "ContextUnit. subject_occurrence_id and object_occurrence_id must be "
+                "copied from occurrences; predicate must be copied from predicates. "
+                "Do not invent endpoints, predicates, evidence spans, qualifiers, or "
+                "canonical entities. Empty proposals is valid when no explicit relation "
+                "is present. If a needed endpoint is missing, report it only in "
+                "missing_endpoint_mentions; it must not create a proposal. "
+                "optional_soft_cues are hints only and never decide publication. "
+                "Every proposal still requires independent verification."
+            ),
+            "context": {
+                "context_id": context_id,
+                "text": content,
+                "start": 0,
+                "end": len(content),
+            },
+            "pass_no": int(pass_no),
+            "occurrences": occurrences,
+            "predicates": predicates,
+            "already_found_keys": list(already_found_keys),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parse_proposer_spans(
+    raw: Any,
+    *,
+    content: str,
+    endpoint_spans: Sequence[tuple[int, int]],
+) -> tuple[EvidenceSpan, ...]:
+    if not isinstance(raw, list):
+        raise ShadowClassificationError("proposal evidence_spans must be an array")
+    spans: list[EvidenceSpan] = []
+    for value in raw:
+        if not isinstance(value, Mapping):
+            raise ShadowClassificationError("proposal evidence span must be an object")
+        try:
+            start, end = int(value["start"]), int(value["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ShadowClassificationError("proposal evidence span is invalid") from exc
+        if start < 0 or end <= start or end > len(content):
+            raise ShadowClassificationError("proposal evidence span is outside context")
+        spans.append(EvidenceSpan(start=start, end=end))
+    if not spans:
+        raise ShadowClassificationError("proposal requires evidence")
+    for required_span in endpoint_spans:
+        if not _spans_cover(spans, required_span):
+            raise ShadowClassificationError("proposal evidence does not cover endpoints")
+    return tuple(spans)
+
+
+def parse_proposer_response(
+    *,
+    context_id: str,
+    content: str,
+    mentions: Sequence[Mapping[str, Any]],
+    logical_schema: Mapping[str, Any],
+    raw: Any,
+    candidate_source: str = DIRECT_PROPOSER,
+    pass_no: int = 0,
+    proposer_policy_version: str = SHADOW_RELATION_PROPOSER_PROMPT_VERSION,
+    proposer_model_revision: str = "unspecified",
+) -> RelationProposalBatch:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ShadowClassificationError("proposer returned invalid JSON") from exc
+    if not isinstance(raw, Mapping):
+        raise ShadowClassificationError("proposer response must be an object")
+    proposals_raw = raw.get("proposals")
+    missing_raw = raw.get("missing_endpoint_mentions")
+    coverage = raw.get("coverage")
+    if not isinstance(proposals_raw, list):
+        raise ShadowClassificationError("proposer proposals must be an array")
+    if not isinstance(missing_raw, list):
+        raise ShadowClassificationError("missing_endpoint_mentions must be an array")
+    if not isinstance(coverage, Mapping):
+        raise ShadowClassificationError("proposer coverage must be an object")
+    mentions_by_key = {
+        str(item.get("occurrence_key") or ""): dict(item) for item in mentions
+    }
+    if any(not key for key in mentions_by_key):
+        raise ShadowClassificationError("proposer input occurrence id is empty")
+    schema = normalize_predicate_schema(logical_schema)
+    proposals: list[RelationProposal] = []
+    seen: set[str] = set()
+    for raw_proposal in proposals_raw:
+        if not isinstance(raw_proposal, Mapping):
+            raise ShadowClassificationError("proposal must be an object")
+        subject = str(raw_proposal.get("subject_occurrence_id") or "")
+        object_ = str(raw_proposal.get("object_occurrence_id") or "")
+        if subject not in mentions_by_key or object_ not in mentions_by_key:
+            raise ShadowClassificationError("proposal endpoint is not in occurrence universe")
+        if subject == object_:
+            raise ShadowClassificationError("proposal endpoints must be distinct")
+        predicate = str(raw_proposal.get("predicate") or "")
+        if predicate not in schema:
+            raise ShadowClassificationError("proposal predicate is not in schema")
+        subject_mention = mentions_by_key[subject]
+        object_mention = mentions_by_key[object_]
+        endpoint_spans = [
+            (
+                int(subject_mention.get("mention_start") or 0),
+                int(subject_mention.get("mention_end") or 0),
+            ),
+            (
+                int(object_mention.get("mention_start") or 0),
+                int(object_mention.get("mention_end") or 0),
+            ),
+        ]
+        spans = _parse_proposer_spans(
+            raw_proposal.get("evidence_spans"),
+            content=content,
+            endpoint_spans=endpoint_spans,
+        )
+        qualifiers = raw_proposal.get("qualifiers")
+        if not isinstance(qualifiers, list):
+            raise ShadowClassificationError("proposal qualifiers must be an array")
+        try:
+            confidence = float(raw_proposal.get("confidence"))
+        except (TypeError, ValueError) as exc:
+            raise ShadowClassificationError("proposal confidence is invalid") from exc
+        if not 0 <= confidence <= 1:
+            raise ShadowClassificationError("proposal confidence is outside [0,1]")
+        material = _canonical_json({
+            "context_id": context_id,
+            "candidate_source": candidate_source,
+            "pass_no": int(pass_no),
+            "subject": subject,
+            "predicate": predicate,
+            "object": object_,
+            "spans": [[span.start, span.end] for span in spans],
+            "qualifiers": qualifiers,
+        })
+        proposal_id = "relproposal_" + hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()
+        if proposal_id in seen:
+            continue
+        seen.add(proposal_id)
+        proposals.append(RelationProposal(
+            proposal_id=proposal_id,
+            context_id=context_id,
+            candidate_source=str(candidate_source),
+            pass_no=int(pass_no),
+            subject_occurrence_key=subject,
+            predicate=predicate,
+            object_occurrence_key=object_,
+            evidence_spans=spans,
+            qualifiers=tuple(dict(item) for item in qualifiers),
+            confidence=confidence,
+            proposer_policy_version=str(proposer_policy_version),
+            proposer_model_revision=str(proposer_model_revision),
+        ))
+    return RelationProposalBatch(
+        proposals=tuple(proposals),
+        missing_endpoint_mentions=tuple(dict(item) for item in missing_raw if isinstance(item, Mapping)),
+        coverage=dict(coverage),
+    )
+
+
+def proposal_to_hypothesis(
+    proposal: RelationProposal,
+    opportunity: PairOpportunity,
+    logical_schema: Mapping[str, Any],
+) -> RelationHypothesis:
+    if {
+        proposal.subject_occurrence_key,
+        proposal.object_occurrence_key,
+    } != {
+        opportunity.left_occurrence_key,
+        opportunity.right_occurrence_key,
+    }:
+        raise ShadowClassificationError("proposal pair does not match opportunity")
+    spec = normalize_predicate_schema(logical_schema).get(proposal.predicate)
+    if spec is None:
+        raise ShadowClassificationError("proposal predicate is no longer in schema")
+    spans_material = json.dumps(
+        [[span.start, span.end] for span in proposal.evidence_spans],
+        separators=(",", ":"),
+    )
+    hypothesis_key = "relhyp_" + _digest((
+        opportunity.pair_identity,
+        proposal.subject_occurrence_key,
+        proposal.predicate,
+        proposal.object_occurrence_key,
+        spans_material,
+    ))
+    return RelationHypothesis(
+        hypothesis_id=hypothesis_key,
+        pair_identity=opportunity.pair_identity,
+        subject_occurrence_key=proposal.subject_occurrence_key,
+        predicate=proposal.predicate,
+        object_occurrence_key=proposal.object_occurrence_key,
+        evidence_spans=proposal.evidence_spans,
+        classifier_confidence=proposal.confidence,
+        classifier_policy_version=proposal.proposer_policy_version,
+        classifier_model_revision=proposal.proposer_model_revision,
+        classifier_prompt_version=SHADOW_RELATION_PROPOSER_PROMPT_VERSION,
+        classifier_schema_version=SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
+        classifier_parser_version=SHADOW_RELATION_PROPOSER_PARSER_VERSION,
+        predicate_metadata=asdict(spec),
+        status="PROPOSED",
+    )
+
+
 def _parse_spans(
     raw: Any,
     *,
@@ -729,6 +1138,20 @@ def parse_classifier_response(
     if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
         raise ShadowClassificationError("classifier decisions must be an array")
     expected = {item.pair_identity: item for item in opportunities}
+    if len(expected) == 1 and len(raw) == 1:
+        only_pair_id = next(iter(expected))
+        only_value = raw[0]
+        returned_pair_id = str(only_value.get("pair_id") or "")
+        returned_decision = str(only_value.get("decision") or "")
+        returned_hypotheses = only_value.get("hypotheses") or []
+        if (
+            returned_pair_id
+            and returned_pair_id not in expected
+            and _looks_like_abbreviated_pair_id(returned_pair_id, only_pair_id)
+            and returned_decision in {NO_RELATION, OTHER_UNSUPPORTED}
+            and returned_hypotheses == []
+        ):
+            raw = [{**dict(only_value), "pair_id": only_pair_id}]
     ids = [str(item.get("pair_id") or "") for item in raw]
     duplicates = sorted(
         pair_id for pair_id, count in {
@@ -758,12 +1181,26 @@ def parse_classifier_response(
             raise ShadowClassificationError("negative/schema-gap decision cannot contain hypotheses")
         if decision == HYPOTHESES and not raw_hypotheses:
             raise ShadowClassificationError("HYPOTHESES decision requires hypotheses")
+        raw_decision_spans = value.get("evidence_spans")
+        if decision in {NO_RELATION, OTHER_UNSUPPORTED} and not raw_decision_spans:
+            raw_decision_spans = [{
+                "start": pair.context_span[0],
+                "end": pair.context_span[1],
+            }]
         decision_spans = _parse_spans(
-            value.get("evidence_spans") or [],
+            raw_decision_spans or [],
             opportunity=pair,
             content=content,
         )
         reason_code = str(value.get("reason_code") or "")
+        if decision == NO_RELATION and not reason_code.strip():
+            reason_code = "NO_RELATION_UNSPECIFIED"
+        if decision == OTHER_UNSUPPORTED:
+            reason_code = "SCHEMA_GAP"
+        if decision == NO_RELATION and not decision_spans:
+            raise ShadowClassificationError(
+                "NO_RELATION requires evidence spans covering the pair context"
+            )
         if decision == OTHER_UNSUPPORTED and (
             not decision_spans or reason_code != "SCHEMA_GAP"
         ):
@@ -775,6 +1212,32 @@ def parse_classifier_response(
             str(item.get("name") or ""): item
             for item in pair.allowed_predicate_metadata
         }
+        if decision == HYPOTHESES:
+            unsupported_schema_predicate = False
+            for hypothesis in raw_hypotheses:
+                if not isinstance(hypothesis, Mapping):
+                    raise ShadowClassificationError("hypothesis must be an object")
+                predicate = str(hypothesis.get("predicate") or "")
+                if predicate not in schema or predicate not in pair_metadata:
+                    unsupported_schema_predicate = True
+                    break
+            if unsupported_schema_predicate:
+                unsupported_spans = decision_spans or _parse_spans(
+                    [{
+                        "start": pair.context_span[0],
+                        "end": pair.context_span[1],
+                    }],
+                    opportunity=pair,
+                    content=content,
+                )
+                decisions.append(PairClassificationDecision(
+                    pair_identity=pair.pair_identity,
+                    decision=OTHER_UNSUPPORTED,
+                    hypotheses=(),
+                    evidence_spans=unsupported_spans,
+                    reason_code="SCHEMA_GAP",
+                ))
+                continue
         for hypothesis in raw_hypotheses:
             if not isinstance(hypothesis, Mapping):
                 raise ShadowClassificationError("hypothesis must be an object")
@@ -851,6 +1314,20 @@ def parse_classifier_response(
             reason_code=reason_code,
         ))
     return tuple(decisions)
+
+
+def _looks_like_abbreviated_pair_id(returned_pair_id: str, expected_pair_id: str) -> bool:
+    returned = str(returned_pair_id)
+    expected = str(expected_pair_id)
+    if not returned.startswith("relpair_") or not expected.startswith("relpair_"):
+        return False
+    if len(returned) >= len(expected):
+        return False
+    prefix_len = min(32, len(returned))
+    suffix_len = min(6, len(returned))
+    return expected.startswith(returned[:prefix_len]) and expected.endswith(
+        returned[-suffix_len:],
+    )
 
 
 def _occurrence_details(
@@ -1132,16 +1609,6 @@ def _parse_verifier_response(
         ):
             raise ShadowClassificationError(
                 "verifier evidence does not cover exact occurrences"
-            )
-        if any(
-            not any(
-                source.start <= span.start and source.end >= span.end
-                for source in hypothesis.evidence_spans
-            )
-            for span in spans
-        ):
-            raise ShadowClassificationError(
-                "verifier evidence escaped classifier evidence"
             )
     return _attempt(
         hypothesis,
@@ -1551,6 +2018,7 @@ def build_relation_materialization_fingerprint(
     entity_assignment: Mapping[str, Any],
     schema: Mapping[str, Any],
     candidate: Mapping[str, Any],
+    proposer: Mapping[str, Any],
     classifier: Mapping[str, Any],
     verifier: Mapping[str, Any],
     thresholds: Mapping[str, Any],
@@ -1567,6 +2035,7 @@ def build_relation_materialization_fingerprint(
         "entity_assignment": entity_assignment,
         "schema": schema,
         "candidate": candidate,
+        "proposer": proposer,
         "classifier": classifier,
         "verifier": verifier,
         "thresholds": thresholds,
@@ -1585,6 +2054,10 @@ def build_relation_materialization_fingerprint(
         "classifier": (
             "prompt_version", "schema_version", "parser_version",
             "model", "model_revision",
+        ),
+        "proposer": (
+            "prompt_version", "schema_version", "parser_version",
+            "model", "model_revision", "max_gleaning_rounds",
         ),
         "verifier": (
             "prompt_version", "schema_version", "parser_version",
@@ -1812,8 +2285,20 @@ def _validated_occurrences(
             "type": str(raw.get("type") or ""),
         }
         existing = by_key.get(key)
-        if existing is not None and existing != normalized:
-            raise ValueError(f"occurrence key collision: {key}")
+        if existing is not None:
+            comparable_existing = {
+                name: value for name, value in existing.items()
+                if name != "mention_id"
+            }
+            comparable_normalized = {
+                name: value for name, value in normalized.items()
+                if name != "mention_id"
+            }
+            if comparable_existing != comparable_normalized:
+                raise ValueError(f"occurrence key collision: {key}")
+            if str(normalized["mention_id"]) < str(existing["mention_id"]):
+                by_key[key] = normalized
+            continue
         by_key[key] = normalized
     ordered = sorted(
         by_key.values(),
@@ -1891,6 +2376,29 @@ def plan_pair_opportunities(
             str(right.get("type") or ""),
             logical_schema,
         )
+        left_table = str(left.get("table_id") or "")
+        right_table = str(right.get("table_id") or "")
+        left_row = str(left.get("row_id") or "")
+        right_row = str(right.get("row_id") or "")
+        left_cell = str(left.get("cell_id") or "")
+        right_cell = str(right.get("cell_id") or "")
+        same_table = bool(left_table and left_table == right_table)
+        same_table_row = bool(same_table and left_row and left_row == right_row)
+        same_cell = bool(same_table_row and left_cell and left_cell == right_cell)
+        different_table_peer_rows = bool(
+            same_table and left_row and right_row and left_row != right_row
+        )
+        same_sentence = sentence_distance == 0
+        same_paragraph_with_schema_cue = False
+        structural_admission_reason = ""
+        if same_cell:
+            structural_admission_reason = "same_cell"
+        elif same_table_row:
+            structural_admission_reason = "same_table_row"
+        elif same_sentence:
+            structural_admission_reason = "same_sentence"
+        elif same_paragraph_with_schema_cue:
+            structural_admission_reason = "same_paragraph_with_schema_cue"
         normalized_context = context_text.casefold()
         soft_cue_matches = sorted(
             (
@@ -1906,19 +2414,55 @@ def plan_pair_opportunities(
             key=lambda item: (item["predicate"], item["cue"]),
         )
         cue = str(soft_cue_matches[0]["cue"]) if soft_cue_matches else ""
+        if (
+            not structural_admission_reason
+            and sentence_distance <= sentence_window
+            and cue
+        ):
+            same_paragraph_with_schema_cue = True
+            structural_admission_reason = "same_paragraph_with_schema_cue"
         status = PENDING_CLASSIFICATION
-        reason = "local_pair_within_structural_window"
+        reason = structural_admission_reason or "local_pair_within_structural_window"
         if (
             str(left.get("canonical_id") or "")
             and str(left.get("canonical_id")) == str(right.get("canonical_id") or "")
         ):
             status, reason = REJECTED_SELF_LOOP, "same_canonical_assignment"
-        elif sentence_distance > sentence_window or centre_distance > max_char_distance:
-            status, reason = FILTERED_DISTANCE, "outside_local_context_window"
+        elif different_table_peer_rows:
+            status, reason = FILTERED_STRUCTURE_PEER, "different_table_peer_rows"
         elif type_status == "incompatible":
             status, reason = TYPE_INCOMPATIBLE, "known_schema_type_incompatibility"
         elif type_status == "unresolved":
             status, reason = TYPE_UNRESOLVED, "unknown_endpoint_type"
+        elif (
+            not structural_admission_reason
+            and (
+                sentence_distance > sentence_window
+                or centre_distance > max_char_distance
+            )
+        ):
+            status, reason = FILTERED_DISTANCE, "outside_local_context_window"
+        structure_rank = {
+            "same_cell": 0,
+            "same_table_row": 1,
+            "same_sentence": 2,
+            "same_paragraph_with_schema_cue": 3,
+        }.get(structural_admission_reason, 9)
+        type_rank = {
+            "compatible": 0,
+            "unresolved": 1,
+            "incompatible": 2,
+        }.get(type_status, 3)
+        priority = (
+            3,
+            structure_rank,
+            type_rank,
+            0 if cue else 1,
+            sentence_distance,
+            centre_distance,
+            str(left["occurrence_key"]),
+            str(right["occurrence_key"]),
+        )
         planned.append(PairOpportunity(
             opportunity_identity=opportunity_identity(
                 run_id, candidate_policy_version, stable_pair,
@@ -1953,10 +2497,12 @@ def plan_pair_opportunities(
             provenance={
                 "sentence_distance": sentence_distance,
                 "character_distance": centre_distance,
+                "structure_admission": structural_admission_reason,
+                "priority": list(priority),
                 "soft_cue_matches": soft_cue_matches,
             },
         ))
-    planned.sort(key=lambda item: item.pair_identity)
+    planned.sort(key=lambda item: tuple(item.provenance.get("priority") or ()))
     if max_pair_opportunities is not None:
         budget = max(0, int(max_pair_opportunities))
         admitted = 0

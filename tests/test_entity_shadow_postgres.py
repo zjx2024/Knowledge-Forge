@@ -26,6 +26,12 @@ class _FakeOllama:
         return [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in texts]
 
     def json_chat(self, **kwargs):
+        if "proposer" in str(kwargs.get("system") or ""):
+            return {
+                "proposals": [],
+                "missing_endpoint_mentions": [],
+                "coverage": {"complete": True, "uncovered_cues": []},
+            }
         if "classifier" in str(kwargs.get("system") or ""):
             payload = json.loads(kwargs["prompt"])
             return {"items": [{
@@ -33,6 +39,10 @@ class _FakeOllama:
                 "decision": "NO_RELATION",
                 "hypotheses": [],
                 "reason_code": "FIXTURE_NO_RELATION",
+                "evidence_spans": [{
+                    "start": pair["context_span"][0],
+                    "end": pair["context_span"][1],
+                }],
             } for pair in payload["pairs"]]}
         if "verifier" in str(kwargs.get("system") or ""):
             raise AssertionError("NO_RELATION fixture must not call verifier")

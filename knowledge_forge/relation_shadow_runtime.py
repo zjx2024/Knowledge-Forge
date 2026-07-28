@@ -3,14 +3,148 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from . import relation_shadow_v2 as v2
 from .config import Config
-from .quality import canonical_digest
+from .quality import canonical_digest, canonical_json
+from .shadow_schema_overlay import (
+    SHADOW_RELATION_SCHEMA_OVERLAY_VERSION,
+    apply_shadow_relation_schema_overlay,
+)
+
+
+CLASSIFIER_ACCEPTED = "ACCEPTED"
+CLASSIFIER_RETRYABLE_EMPTY = "RETRYABLE_EMPTY"
+CLASSIFIER_RETRYABLE_PROTOCOL = "RETRYABLE_PROTOCOL"
+CLASSIFIER_RETRYABLE_TRUNCATED = "RETRYABLE_TRUNCATED"
+CLASSIFIER_RETRYABLE_TIMEOUT = "RETRYABLE_TIMEOUT"
+CLASSIFIER_RETRYABLE_MODEL_ERROR = "RETRYABLE_MODEL_ERROR"
+CLASSIFIER_TERMINAL_FAILED = "TERMINAL_FAILED"
+CLASSIFIER_SUPERSEDED = "SUPERSEDED"
+CLASSIFIER_ATTEMPT_STATUSES = {
+    CLASSIFIER_ACCEPTED,
+    CLASSIFIER_RETRYABLE_EMPTY,
+    CLASSIFIER_RETRYABLE_PROTOCOL,
+    CLASSIFIER_RETRYABLE_TRUNCATED,
+    CLASSIFIER_RETRYABLE_TIMEOUT,
+    CLASSIFIER_RETRYABLE_MODEL_ERROR,
+    CLASSIFIER_TERMINAL_FAILED,
+    CLASSIFIER_SUPERSEDED,
+}
+
+
+def shadow_model_payload_hash(kind: str, payload: Any) -> str:
+    """Hash audited model payload bytes with a request/response domain separator."""
+
+    normalized_kind = str(kind)
+    if normalized_kind not in {"request", "response"}:
+        raise ValueError("shadow model payload hash kind must be request or response")
+    if isinstance(payload, bytes):
+        material = payload
+    elif isinstance(payload, str):
+        material = payload.encode("utf-8")
+    else:
+        material = canonical_json(payload).encode("utf-8")
+    return hashlib.sha256(
+        normalized_kind.encode("utf-8") + b"\0" + material
+    ).hexdigest()
+
+
+def _safe_json_text(value: Any) -> str:
+    try:
+        return canonical_json(value)
+    except (TypeError, ValueError):
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def _classifier_failure_status(exc: Exception, *, terminal: bool) -> str:
+    if terminal:
+        return CLASSIFIER_TERMINAL_FAILED
+    message = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if "truncated" in message or "max_tokens" in message or "output length" in message:
+        return CLASSIFIER_RETRYABLE_TRUNCATED
+    if "timeout" in name or "timeout" in message:
+        return CLASSIFIER_RETRYABLE_TIMEOUT
+    if "missing pair ids" in message or "empty" in message:
+        return CLASSIFIER_RETRYABLE_EMPTY
+    if (
+        "protocol" in name
+        or "invalid json" in message
+        or "must be" in message
+        or "unknown pair ids" in message
+        or "duplicate pair ids" in message
+        or "requires" in message
+    ):
+        return CLASSIFIER_RETRYABLE_PROTOCOL
+    return CLASSIFIER_RETRYABLE_MODEL_ERROR
+
+
+def _terminal_unsupported_decision_for_single_pair(
+    pair: v2.PairOpportunity,
+    exc: Exception | None,
+    raw_response_text: str = "",
+) -> v2.PairClassificationDecision | None:
+    if exc is None or type(exc).__name__ != "ShadowClassificationError":
+        return None
+    message = str(exc).lower()
+    if "missing pair ids" in message and raw_response_text:
+        try:
+            raw = json.loads(raw_response_text)
+        except json.JSONDecodeError:
+            raw = None
+        if isinstance(raw, dict):
+            decision = str(raw.get("decision") or "")
+            hypotheses = raw.get("hypotheses") or []
+            pair_id = str(raw.get("pair_id") or "")
+            if (
+                pair_id == pair.pair_identity
+                and decision in {v2.NO_RELATION, v2.OTHER_UNSUPPORTED}
+                and hypotheses == []
+            ):
+                reason_code = str(raw.get("reason_code") or "")
+                if decision == v2.NO_RELATION and not reason_code.strip():
+                    reason_code = "NO_RELATION_UNSPECIFIED"
+                if decision == v2.OTHER_UNSUPPORTED and not reason_code.strip():
+                    reason_code = "SCHEMA_GAP"
+                return v2.PairClassificationDecision(
+                    pair_identity=pair.pair_identity,
+                    decision=decision,
+                    hypotheses=(),
+                    evidence_spans=(
+                        v2.EvidenceSpan(
+                            start=int(pair.context_span[0]),
+                            end=int(pair.context_span[1]),
+                        ),
+                    ),
+                    reason_code=reason_code,
+                )
+    terminalizable = (
+        "predicate is not allowed" in message
+        or "hypothesis endpoints must be distinct" in message
+        or "positive hypothesis requires evidence" in message
+        or "evidence span is outside frozen context" in message
+        or "classifier confidence is" in message
+    )
+    if not terminalizable:
+        return None
+    return v2.PairClassificationDecision(
+        pair_identity=pair.pair_identity,
+        decision=v2.OTHER_UNSUPPORTED,
+        hypotheses=(),
+        evidence_spans=(
+            v2.EvidenceSpan(
+                start=int(pair.context_span[0]),
+                end=int(pair.context_span[1]),
+            ),
+        ),
+        reason_code="SCHEMA_GAP",
+    )
 
 
 SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION = "shadow-relation-candidate-v3-schema-metadata"
@@ -23,17 +157,26 @@ SHADOW_RELATION_V2_CLASSIFIER_SYSTEM_PROMPT = (
     "JSON value. Do not include <think>, reasoning, markdown, "
     "commentary, or any text outside JSON."
 )
+SHADOW_RELATION_V2_PROPOSER_SYSTEM_PROMPT = (
+    "You are the Shadow relation v2 direct proposer. Return only compact "
+    "schema-valid JSON. Proposals are candidates only and never bypass the "
+    "independent verifier."
+)
 SHADOW_RELATION_V2_POLICY_SET = {
     "candidate_policy_version": SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION,
     "classifier_policy_version": SHADOW_RELATION_V2_CLASSIFIER_POLICY_VERSION,
     "classifier_prompt_version": v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
     "classifier_schema_version": v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
     "classifier_parser_version": v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+    "proposer_prompt_version": v2.SHADOW_RELATION_PROPOSER_PROMPT_VERSION,
+    "proposer_schema_version": v2.SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
+    "proposer_parser_version": v2.SHADOW_RELATION_PROPOSER_PARSER_VERSION,
     "verifier_prompt_version": v2.SHADOW_RELATION_VERIFIER_PROMPT_VERSION,
     "verifier_schema_version": v2.SHADOW_RELATION_VERIFIER_SCHEMA_VERSION,
     "verifier_parser_version": v2.SHADOW_RELATION_VERIFIER_PARSER_VERSION,
     "normalization_version": SHADOW_RELATION_V2_NORMALIZATION_VERSION,
     "materialization_version": SHADOW_RELATION_V2_MATERIALIZATION_VERSION,
+    "schema_overlay_version": SHADOW_RELATION_SCHEMA_OVERLAY_VERSION,
     "fallback": "forbidden",
 }
 
@@ -85,24 +228,46 @@ class ShadowRelationV2Runtime:
         schema_record = self.db.get_active_schema(project_id)
         if not schema_record:
             raise RuntimeError("Shadow relation v2 缺少 active Schema")
-        schema = dict(schema_record.get("schema_json") or {})
+        schema = apply_shadow_relation_schema_overlay(
+            dict(schema_record.get("schema_json") or {})
+        )
         mentions = self.db.list_entity_shadow_mentions(namespace_id)
         snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
-        assignments = list(snapshot.get("assignments") or [])
-        assignment_by_mention = {
-            str(item["mention_key"]): item for item in assignments
+        all_assignments = list(snapshot.get("assignments") or [])
+        all_assignment_by_mention = {
+            str(item["mention_key"]): item for item in all_assignments
         }
-        if len(assignment_by_mention) != len(assignments):
+        if len(all_assignment_by_mention) != len(all_assignments):
             raise RuntimeError("Shadow relation v2 assignment occurrence 不唯一")
         missing = sorted(
             str(item["mention_key"]) for item in mentions
-            if str(item["mention_key"]) not in assignment_by_mention
+            if str(item["mention_key"]) not in all_assignment_by_mention
         )
         if missing:
             raise RuntimeError(
                 "Shadow relation v2 mention 缺少冻结 assignment: "
                 + ",".join(missing[:10])
             )
+        quarantined_canonicals = {
+            str(item["canonical_key"])
+            for item in snapshot.get("canonicals") or []
+            if bool((item.get("metadata") or {}).get("quarantined"))
+        }
+        assignments = all_assignments
+        if quarantined_canonicals:
+            assignments = [
+                item for item in assignments
+                if str(item.get("canonical_key") or "") not in quarantined_canonicals
+            ]
+        assignment_by_mention = {
+            str(item["mention_key"]): item for item in assignments
+        }
+        if len(assignment_by_mention) != len(assignments):
+            raise RuntimeError("Shadow relation v2 assignment occurrence 不唯一")
+        mentions = [
+            item for item in mentions
+            if str(item["mention_key"]) in assignment_by_mention
+        ]
         chunk_by_id = {int(item["id"]): item for item in chunks}
         unknown_chunks = sorted({
             int(item["chunk_id"]) for item in mentions
@@ -141,7 +306,7 @@ class ShadowRelationV2Runtime:
                 } for item in document_chunks],
             })
         mention_payload = [{
-            "occurrence_key": str(item["mention_key"]),
+            "occurrence_key": self._physical_occurrence_key(item),
             "span": [int(item["evidence_start"]), int(item["evidence_end"])],
             "content_hash": str(
                 chunk_by_id[int(item["chunk_id"])].get("content_hash") or ""
@@ -177,6 +342,16 @@ class ShadowRelationV2Runtime:
             "model": model,
             "model_revision": model_revision,
         }
+        proposer = {
+            "prompt_version": v2.SHADOW_RELATION_PROPOSER_PROMPT_VERSION,
+            "schema_version": v2.SHADOW_RELATION_PROPOSER_SCHEMA_VERSION,
+            "parser_version": v2.SHADOW_RELATION_PROPOSER_PARSER_VERSION,
+            "model": model,
+            "model_revision": model_revision,
+            "max_gleaning_rounds": 2,
+            "failure_circuit_breaker":
+                Config.relation_proposer_failure_circuit_breaker,
+        }
         verifier = {
             "prompt_version": v2.SHADOW_RELATION_VERIFIER_PROMPT_VERSION,
             "schema_version": v2.SHADOW_RELATION_VERIFIER_SCHEMA_VERSION,
@@ -186,6 +361,7 @@ class ShadowRelationV2Runtime:
         }
         policy_root = canonical_digest({
             "candidate": candidate,
+            "proposer": proposer,
             "classifier": classifier,
             "verifier": verifier,
             "relation_policy": SHADOW_RELATION_V2_POLICY_SET,
@@ -208,10 +384,12 @@ class ShadowRelationV2Runtime:
                 "predicate_metadata_hash": canonical_digest(predicate_payload),
             },
             candidate=candidate,
+            proposer=proposer,
             classifier=classifier,
             verifier=verifier,
             thresholds={
                 "max_attempts": Config.relation_shadow_max_attempts,
+                "max_gleaning_rounds": 2,
                 "classifier_output_reserve":
                     Config.relation_classifier_output_reserve,
                 "classifier_safety_margin":
@@ -252,6 +430,22 @@ class ShadowRelationV2Runtime:
             "fingerprint": fingerprint,
         }
 
+    @staticmethod
+    def _physical_occurrence_key(mention: dict[str, Any]) -> str:
+        provenance = mention.get("provenance") or {}
+        if isinstance(provenance, str):
+            try:
+                provenance = json.loads(provenance)
+            except json.JSONDecodeError:
+                provenance = {}
+        if not isinstance(provenance, dict):
+            provenance = {}
+        return str(
+            provenance.get("physical_occurrence_key")
+            or mention.get("occurrence_key")
+            or mention["mention_key"]
+        )
+
     def _classify(
         self,
         *,
@@ -286,28 +480,8 @@ class ShadowRelationV2Runtime:
                 return {**value, "hypotheses": []}
             return value
 
-        def bind_singleton_pair(value: Any) -> Any:
-            value = normalize_negative_decision(value)
-            if (
-                len(opportunities) == 1
-                and isinstance(value, dict)
-                and {"decision", "hypotheses"} <= set(value)
-            ):
-                return {
-                    **value,
-                    "pair_id": opportunities[0].pair_identity,
-                }
-            return value
-
         def normalize_decision_list(values: Any) -> Any:
-            if len(opportunities) == 1 and values == []:
-                return [{
-                    "pair_id": opportunities[0].pair_identity,
-                    "decision": v2.NO_RELATION,
-                    "hypotheses": [],
-                    "reason_code": "EMPTY_SINGLETON_CLASSIFIER_RESPONSE",
-                }]
-            return [bind_singleton_pair(value) for value in values]
+            return [normalize_negative_decision(value) for value in values]
 
         if isinstance(raw, dict):
             for key in ("decisions", "items", "result"):
@@ -315,23 +489,65 @@ class ShadowRelationV2Runtime:
                     return normalize_decision_list(raw[key])
         if isinstance(raw, list):
             return normalize_decision_list(raw)
-        raw = bind_singleton_pair(raw)
-        if (
-            len(opportunities) == 1
-            and isinstance(raw, dict)
-            and "pair_id" not in raw
-            and {"decision", "hypotheses"} <= set(raw)
-        ):
-            return [{
-                "pair_id": opportunities[0].pair_identity,
-                **raw,
-            }]
+        raw = normalize_negative_decision(raw)
         if (
             isinstance(raw, dict)
             and {"pair_id", "decision", "hypotheses"} <= set(raw)
         ):
             return [raw]
         return raw
+
+    def _propose(
+        self,
+        *,
+        model: str,
+        context_budget_tokens: int,
+        max_output_tokens: int | None = None,
+        context_id: str,
+        content: str,
+        mentions: list[dict[str, Any]],
+        schema: dict[str, Any],
+        pass_no: int = 0,
+        already_found_keys: list[str] | None = None,
+    ) -> Any:
+        output_budget = int(
+            max_output_tokens
+            or self._proposer_output_budget(
+                context_budget_tokens=context_budget_tokens,
+                attempt_no=pass_no + 1,
+            )
+        )
+        return self.models.json_chat(
+            model=model,
+            system=SHADOW_RELATION_V2_PROPOSER_SYSTEM_PROMPT,
+            prompt=v2.proposer_prompt(
+                context_id=context_id,
+                content=content,
+                mentions=mentions,
+                logical_schema=schema,
+                already_found_keys=already_found_keys or [],
+                pass_no=pass_no,
+            ),
+            schema=v2.proposer_response_schema(),
+            temperature=0.0,
+            context_budget_tokens=context_budget_tokens,
+            max_output_tokens=output_budget,
+            safety_margin_tokens=Config.relation_classifier_safety_margin,
+        )
+
+    @staticmethod
+    def _proposer_output_budget(
+        *, context_budget_tokens: int, attempt_no: int,
+    ) -> int:
+        base = max(2048, int(Config.relation_classifier_output_reserve))
+        requested = base * (2 ** max(0, int(attempt_no) - 1))
+        context_cap = max(
+            base,
+            int(context_budget_tokens)
+            - int(Config.relation_classifier_safety_margin)
+            - 1024,
+        )
+        return max(512, min(requested, context_cap, 8192))
 
     @staticmethod
     def _classifier_output_budget(
@@ -380,6 +596,17 @@ class ShadowRelationV2Runtime:
             return str(opportunity.left_canonical_id)
         if occurrence_key == opportunity.right_occurrence_key:
             return str(opportunity.right_canonical_id)
+        raise RuntimeError("v2 evidence occurrence 不属于 pair")
+
+    @staticmethod
+    def _occurrence_mention_key(
+        opportunity: v2.PairOpportunity,
+        occurrence_key: str,
+    ) -> str:
+        if occurrence_key == opportunity.left_occurrence_key:
+            return str(opportunity.left_mention_id)
+        if occurrence_key == opportunity.right_occurrence_key:
+            return str(opportunity.right_mention_id)
         raise RuntimeError("v2 evidence occurrence 不属于 pair")
 
     def _endpoint_rows(
@@ -434,14 +661,16 @@ class ShadowRelationV2Runtime:
                 and object_canonical == str(fact.object_canonical_id)
             ):
                 source_mention, target_mention = (
-                    subject_occurrence, object_occurrence,
+                    self._occurrence_mention_key(opportunity, subject_occurrence),
+                    self._occurrence_mention_key(opportunity, object_occurrence),
                 )
             elif (
                 object_canonical == str(fact.subject_canonical_id)
                 and subject_canonical == str(fact.object_canonical_id)
             ):
                 source_mention, target_mention = (
-                    object_occurrence, subject_occurrence,
+                    self._occurrence_mention_key(opportunity, object_occurrence),
+                    self._occurrence_mention_key(opportunity, subject_occurrence),
                 )
             else:
                 raise RuntimeError(
@@ -487,6 +716,8 @@ class ShadowRelationV2Runtime:
                     "hypothesis_id": str(evidence.hypothesis_id),
                     "verification_attempt_id":
                         str(evidence.verification_attempt_id),
+                    "source_occurrence_key": subject_occurrence,
+                    "target_occurrence_key": object_occurrence,
                     "evidence_keys": [
                         str(item.evidence_key) for item in evidence_values
                     ],
@@ -536,7 +767,7 @@ class ShadowRelationV2Runtime:
                 mentions_by_chunk.setdefault(
                     int(mention["chunk_id"]), [],
                 ).append({
-                    "occurrence_key": str(mention["mention_key"]),
+                    "occurrence_key": self._physical_occurrence_key(mention),
                     "mention_id": str(mention["mention_key"]),
                     "surface": str(mention["surface"]),
                     "mention_start": int(mention["evidence_start"]),
@@ -551,15 +782,26 @@ class ShadowRelationV2Runtime:
                 })
             plans_by_chunk: dict[int, v2.PairOpportunityPlan] = {}
             all_opportunities: list[v2.PairOpportunity] = []
+            proposal_batches: list[tuple[int, v2.RelationProposalBatch]] = []
+            proposer_calls = 0
+            proposer_failures = 0
+            proposer_consecutive_failed_contexts = 0
+            proposer_circuit_breaker_tripped = False
+            proposer_skipped_by_circuit = 0
             total_chunks = len(context["chunks"])
-            total_progress = max(1, total_chunks * 3)
+            total_progress = max(1, total_chunks * 4)
+            context_budget = int(
+                context["project"].get("model_max_tokens")
+                or self.default_context_tokens
+            )
             for chunk_index, chunk in enumerate(context["chunks"], start=1):
+                chunk_mentions = mentions_by_chunk.get(int(chunk["id"]), [])
                 plan = v2.plan_pair_opportunities(
                     project_id=project_id,
                     document_revision_id=str(chunk["revision_id"]),
                     chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
                     content=str(chunk.get("content") or ""),
-                    mentions=mentions_by_chunk.get(int(chunk["id"]), []),
+                    mentions=chunk_mentions,
                     logical_schema=context["schema"],
                     run_id=run_id,
                     candidate_policy_version=
@@ -592,16 +834,394 @@ class ShadowRelationV2Runtime:
                         total_progress,
                         f"Shadow v2 pair ledger {chunk_index}/{total_chunks}",
                     )
+                proposer_message = (
+                    f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                    "跳过：实体不足"
+                )
+                if len(chunk_mentions) >= 2 and proposer_circuit_breaker_tripped:
+                    proposer_skipped_by_circuit += 1
+                    proposer_message = (
+                        f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                        "熔断跳过（辅助召回已关闭，主链继续）"
+                    )
+                elif len(chunk_mentions) >= 2:
+                    last_proposer_error: Exception | None = None
+                    for proposer_attempt_no in range(
+                        1, int(Config.relation_shadow_max_attempts) + 1,
+                    ):
+                        proposer_calls += 1
+                        try:
+                            raw_proposal = self._propose(
+                                model=context["model"],
+                                context_budget_tokens=context_budget,
+                                max_output_tokens=self._proposer_output_budget(
+                                    context_budget_tokens=context_budget,
+                                    attempt_no=proposer_attempt_no,
+                                ),
+                                context_id=str(
+                                    chunk.get("chunk_key") or chunk["id"]
+                                ),
+                                content=str(chunk.get("content") or ""),
+                                mentions=chunk_mentions,
+                                schema=context["schema"],
+                                pass_no=proposer_attempt_no - 1,
+                            )
+                            proposal_batches.append((
+                                int(chunk["id"]),
+                                v2.parse_proposer_response(
+                                    context_id=str(
+                                        chunk.get("chunk_key") or chunk["id"]
+                                    ),
+                                    content=str(chunk.get("content") or ""),
+                                    mentions=chunk_mentions,
+                                    logical_schema=context["schema"],
+                                    raw=raw_proposal,
+                                    candidate_source=v2.DIRECT_PROPOSER,
+                                    pass_no=proposer_attempt_no - 1,
+                                    proposer_model_revision=
+                                        context["model_revision"],
+                                ),
+                            ))
+                            last_proposer_error = None
+                            proposer_consecutive_failed_contexts = 0
+                            proposer_message = (
+                                f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                                "完成"
+                            )
+                            break
+                        except Exception as exc:
+                            proposer_failures += 1
+                            last_proposer_error = exc
+                            continue
+                    if last_proposer_error is not None:
+                        proposer_consecutive_failed_contexts += 1
+                        proposer_message = (
+                            f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                            f"失败跳过：{type(last_proposer_error).__name__}"
+                        )
+                        circuit_threshold = int(
+                            Config.relation_proposer_failure_circuit_breaker
+                        )
+                        if (
+                            circuit_threshold > 0
+                            and proposer_consecutive_failed_contexts
+                            >= circuit_threshold
+                        ):
+                            proposer_circuit_breaker_tripped = True
+                            proposer_message += "；已熔断后续 chunk"
+                if progress:
+                    progress(
+                        total_chunks + chunk_index,
+                        total_progress,
+                        proposer_message,
+                    )
             self.db.persist_shadow_relation_v2_opportunities(
                 run_id, all_opportunities,
             )
+            opportunity_by_pair = {
+                str(item.pair_identity): item for item in all_opportunities
+            }
+            proposer_hypotheses: list[v2.RelationHypothesis] = []
+            missing_endpoint_mentions = 0
+            for chunk_id, batch in proposal_batches:
+                chunk = context["chunk_by_id"][int(chunk_id)]
+                missing_endpoint_mentions += len(batch.missing_endpoint_mentions)
+                for proposal in batch.proposals:
+                    pair_id = v2.pair_identity(
+                        str(chunk["revision_id"]),
+                        proposal.subject_occurrence_key,
+                        proposal.object_occurrence_key,
+                    )
+                    opportunity = opportunity_by_pair.get(pair_id)
+                    if not opportunity:
+                        raise RuntimeError(
+                            "Shadow v2 proposer pair 缺少 pair ledger"
+                        )
+                    proposer_hypotheses.append(v2.proposal_to_hypothesis(
+                        proposal,
+                        opportunity,
+                        context["schema"],
+                    ))
             decisions: list[v2.PairClassificationDecision] = []
             classifier_calls = 0
             classifier_failures = 0
-            context_budget = int(
-                context["project"].get("model_max_tokens")
-                or self.default_context_tokens
-            )
+            classifier_attempt_counts: Counter[str] = Counter()
+
+            def classify_batch_with_retries(
+                *,
+                chunk: dict[str, Any],
+                batch: list[v2.PairOpportunity],
+                batch_offset: int,
+            ) -> list[v2.PairClassificationDecision]:
+                nonlocal classifier_calls, classifier_failures
+                content = str(chunk.get("content") or "")
+                last_error: Exception | None = None
+                max_attempts = int(Config.relation_shadow_max_attempts)
+                for call_attempt_no in range(1, max_attempts + 1):
+                    classifier_calls += 1
+                    output_budget = self._classifier_output_budget(
+                        context_budget_tokens=context_budget,
+                        attempt_no=call_attempt_no,
+                    )
+                    prompt = v2.classifier_prompt(
+                        batch,
+                        content=content,
+                        logical_schema=context["schema"],
+                    )
+                    response_contract = v2.classifier_response_schema(batch)
+                    request_payload = {
+                        "stage": "classifier",
+                        "model": context["model"],
+                        "model_revision": context["model_revision"],
+                        "system": SHADOW_RELATION_V2_CLASSIFIER_SYSTEM_PROMPT,
+                        "prompt": prompt,
+                        "schema": response_contract,
+                        "temperature": 0.0,
+                        "context_budget_tokens": context_budget,
+                        "max_output_tokens": output_budget,
+                        "safety_margin_tokens":
+                            Config.relation_classifier_safety_margin,
+                        "pair_ids": [
+                            str(pair.pair_identity) for pair in batch
+                        ],
+                    }
+                    request_hash = shadow_model_payload_hash(
+                        "request", request_payload,
+                    )
+                    attempt_numbers: dict[str, int] = {}
+                    for pair in batch:
+                        pair_id = str(pair.pair_identity)
+                        classifier_attempt_counts[pair_id] += 1
+                        attempt_numbers[pair_id] = int(
+                            classifier_attempt_counts[pair_id]
+                        )
+                    token_usage: dict[str, Any] = {}
+                    raw_response_text = ""
+                    parsed_response: Any = {}
+                    try:
+                        raw = self._classify(
+                            model=context["model"],
+                            context_budget_tokens=context_budget,
+                            max_output_tokens=output_budget,
+                            opportunities=batch,
+                            content=content,
+                            schema=context["schema"],
+                        )
+                        parsed_response = raw
+                        raw_response_text = str(
+                            getattr(self.models, "last_raw_response_text", "")
+                            or _safe_json_text(raw)
+                        )
+                        diagnostics = getattr(
+                            self.models, "last_call_diagnostics", None,
+                        )
+                        if diagnostics is not None:
+                            token_usage = asdict(diagnostics)
+                        batch_decisions = list(v2.parse_classifier_response(
+                            batch,
+                            raw,
+                            content=content,
+                            logical_schema=context["schema"],
+                            classifier_policy_version=
+                                SHADOW_RELATION_V2_CLASSIFIER_POLICY_VERSION,
+                            classifier_model_revision=
+                                context["model_revision"],
+                        ))
+                        response_hash = shadow_model_payload_hash(
+                            "response", raw_response_text,
+                        )
+                        for pair in batch:
+                            self.db.record_shadow_relation_v2_classification_attempt(
+                                run_id,
+                                pair.pair_identity,
+                                {
+                                    "attempt_no":
+                                        attempt_numbers[str(pair.pair_identity)],
+                                    "status": CLASSIFIER_ACCEPTED,
+                                    "request_hash": request_hash,
+                                    "response_hash": response_hash,
+                                    "classifier_prompt_version":
+                                        v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+                                    "classifier_schema_version":
+                                        v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+                                    "classifier_parser_version":
+                                        v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+                                    "classifier_model_revision":
+                                        context["model_revision"],
+                                    "model_name": context["model"],
+                                    "request_payload": request_payload,
+                                    "raw_response_text": raw_response_text,
+                                    "parsed_response": parsed_response,
+                                    "token_usage": token_usage,
+                                    "error_type": "",
+                                    "independent_call": True,
+                                    "metadata": {
+                                        "chunk_id": int(chunk["id"]),
+                                        "batch_offset": batch_offset,
+                                        "batch_size": len(batch),
+                                        "max_output_tokens": output_budget,
+                                    },
+                                },
+                            )
+                        return batch_decisions
+                    except Exception as exc:
+                        last_error = exc
+                        classifier_failures += 1
+                        raw_response_text = str(
+                            getattr(self.models, "last_raw_response_text", "")
+                            or ""
+                        )
+                        diagnostics = getattr(
+                            self.models, "last_call_diagnostics", None,
+                        )
+                        if diagnostics is not None:
+                            token_usage = asdict(diagnostics)
+                        terminal = (
+                            len(batch) == 1 and call_attempt_no == max_attempts
+                        )
+                        attempt_status = _classifier_failure_status(
+                            exc, terminal=terminal,
+                        )
+                        response_hash = (
+                            shadow_model_payload_hash(
+                                "response", raw_response_text,
+                            )
+                            if raw_response_text else ""
+                        )
+                        for pair in batch:
+                            self.db.record_shadow_relation_v2_classification_attempt(
+                                run_id,
+                                pair.pair_identity,
+                                {
+                                    "attempt_no":
+                                        attempt_numbers[str(pair.pair_identity)],
+                                    "status": attempt_status,
+                                    "request_hash": request_hash,
+                                    "response_hash": response_hash,
+                                    "classifier_prompt_version":
+                                        v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+                                    "classifier_schema_version":
+                                        v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+                                    "classifier_parser_version":
+                                        v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+                                    "classifier_model_revision":
+                                        context["model_revision"],
+                                    "model_name": context["model"],
+                                    "request_payload": request_payload,
+                                    "raw_response_text": raw_response_text,
+                                    "parsed_response": parsed_response,
+                                    "token_usage": token_usage,
+                                    "error_type": type(exc).__name__,
+                                    "error_message": str(exc)[:2000],
+                                    "independent_call": True,
+                                    "metadata": {
+                                        "chunk_id": int(chunk["id"]),
+                                        "batch_offset": batch_offset,
+                                        "batch_size": len(batch),
+                                        "max_output_tokens": output_budget,
+                                    },
+                                },
+                            )
+                if len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    return [
+                        *classify_batch_with_retries(
+                            chunk=chunk,
+                            batch=batch[:midpoint],
+                            batch_offset=batch_offset,
+                        ),
+                        *classify_batch_with_retries(
+                            chunk=chunk,
+                            batch=batch[midpoint:],
+                            batch_offset=batch_offset + midpoint,
+                        ),
+                    ]
+                terminal_decision = _terminal_unsupported_decision_for_single_pair(
+                    batch[0], last_error, raw_response_text,
+                )
+                if terminal_decision is not None:
+                    pair = batch[0]
+                    pair_id = str(pair.pair_identity)
+                    classifier_attempt_counts[pair_id] += 1
+                    audit_attempt_no = int(
+                        classifier_attempt_counts[pair_id]
+                    )
+                    parsed_response = {
+                        "items": [{
+                            "pair_id": pair_id,
+                            "decision": terminal_decision.decision,
+                            "hypotheses": [],
+                            "reason_code": terminal_decision.reason_code,
+                            "evidence_spans": [
+                                {"start": span.start, "end": span.end}
+                                for span in terminal_decision.evidence_spans
+                            ],
+                            "terminal_from_error": str(last_error or ""),
+                        }],
+                    }
+                    raw_response_text = _safe_json_text(parsed_response)
+                    request_payload = {
+                        "stage": "classifier_terminal_unsupported",
+                        "model": context["model"],
+                        "model_revision": context["model_revision"],
+                        "classifier_prompt_version":
+                            v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+                        "classifier_schema_version":
+                            v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+                        "classifier_parser_version":
+                            v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+                        "pair_ids": [pair_id],
+                        "previous_attempts": audit_attempt_no - 1,
+                        "terminal_from_error_type":
+                            type(last_error).__name__ if last_error else "",
+                        "terminal_from_error_message": str(last_error or ""),
+                    }
+                    self.db.record_shadow_relation_v2_classification_attempt(
+                        run_id,
+                        pair.pair_identity,
+                        {
+                            "attempt_no": audit_attempt_no,
+                            "status": CLASSIFIER_ACCEPTED,
+                            "request_hash": shadow_model_payload_hash(
+                                "request", request_payload,
+                            ),
+                            "response_hash": shadow_model_payload_hash(
+                                "response", raw_response_text,
+                            ),
+                            "classifier_prompt_version":
+                                v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+                            "classifier_schema_version":
+                                v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+                            "classifier_parser_version":
+                                v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+                            "classifier_model_revision":
+                                context["model_revision"],
+                            "model_name": context["model"],
+                            "request_payload": request_payload,
+                            "raw_response_text": raw_response_text,
+                            "parsed_response": parsed_response,
+                            "token_usage": {},
+                            "error_type": "",
+                            "error_message": "",
+                            "independent_call": False,
+                            "metadata": {
+                                "chunk_id": int(chunk["id"]),
+                                "batch_offset": batch_offset,
+                                "batch_size": len(batch),
+                                "terminal_unsupported_from_failed_attempts":
+                                    True,
+                                "previous_error_type":
+                                    type(last_error).__name__
+                                    if last_error else "",
+                                "previous_error_message": str(last_error or ""),
+                            },
+                        },
+                    )
+                    return [terminal_decision]
+                raise RuntimeError(
+                    "Shadow v2 classifier 未收敛且禁止回退旧流程"
+                ) from last_error
+
             for chunk_index, chunk in enumerate(context["chunks"], start=1):
                 admitted = list(plans_by_chunk[int(chunk["id"])].admitted)
                 for offset in range(
@@ -612,131 +1232,49 @@ class ShadowRelationV2Runtime:
                         offset:offset
                         + Config.relation_classifier_max_candidates
                     ]
-                    prompt = v2.classifier_prompt(
-                        batch,
-                        content=str(chunk.get("content") or ""),
-                        logical_schema=context["schema"],
+                    batch_decisions = classify_batch_with_retries(
+                        chunk=chunk,
+                        batch=batch,
+                        batch_offset=offset,
                     )
-                    response_contract = v2.classifier_response_schema(batch)
-                    batch_decisions = None
-                    last_error: Exception | None = None
-                    for attempt_no in range(
-                        1, Config.relation_shadow_max_attempts + 1,
-                    ):
-                        classifier_calls += 1
-                        output_budget = self._classifier_output_budget(
-                            context_budget_tokens=context_budget,
-                            attempt_no=attempt_no,
-                        )
-                        request_hash = canonical_digest({
-                            "system": SHADOW_RELATION_V2_CLASSIFIER_SYSTEM_PROMPT,
-                            "prompt": prompt,
-                            "schema": response_contract,
-                            "max_output_tokens": output_budget,
-                            "safety_margin_tokens":
-                                Config.relation_classifier_safety_margin,
-                        })
-                        try:
-                            raw = self._classify(
-                                model=context["model"],
-                                context_budget_tokens=context_budget,
-                                max_output_tokens=output_budget,
-                                opportunities=batch,
-                                content=str(chunk.get("content") or ""),
-                                schema=context["schema"],
-                            )
-                            batch_decisions = v2.parse_classifier_response(
-                                batch,
-                                raw,
-                                content=str(chunk.get("content") or ""),
-                                logical_schema=context["schema"],
-                                classifier_policy_version=
-                                    SHADOW_RELATION_V2_CLASSIFIER_POLICY_VERSION,
-                                classifier_model_revision=
-                                    context["model_revision"],
-                            )
-                            response_hash = canonical_digest(raw)
-                            for pair in batch:
-                                self.db.record_shadow_relation_v2_classification_attempt(
-                                    run_id,
-                                    pair.pair_identity,
-                                    {
-                                        "attempt_no": attempt_no,
-                                        "status": "accepted",
-                                        "request_hash": request_hash,
-                                        "response_hash": response_hash,
-                                        "classifier_prompt_version":
-                                            v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
-                                        "classifier_schema_version":
-                                            v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-                                        "classifier_parser_version":
-                                            v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
-                                        "classifier_model_revision":
-                                            context["model_revision"],
-                                        "metadata": {
-                                            "chunk_id": int(chunk["id"]),
-                                            "batch_offset": offset,
-                                            "max_output_tokens": output_budget,
-                                        },
-                                    },
-                                )
-                            break
-                        except Exception as exc:
-                            last_error = exc
-                            classifier_failures += 1
-                            attempt_status = (
-                                "permanent_failed"
-                                if attempt_no
-                                == Config.relation_shadow_max_attempts
-                                else "retryable_failed"
-                            )
-                            for pair in batch:
-                                self.db.record_shadow_relation_v2_classification_attempt(
-                                    run_id,
-                                    pair.pair_identity,
-                                    {
-                                        "attempt_no": attempt_no,
-                                        "status": attempt_status,
-                                        "request_hash": request_hash,
-                                        "response_hash": "",
-                                        "classifier_prompt_version":
-                                            v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
-                                        "classifier_schema_version":
-                                            v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-                                        "classifier_parser_version":
-                                            v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
-                                        "classifier_model_revision":
-                                            context["model_revision"],
-                                        "error_message": str(exc)[:2000],
-                                        "metadata": {
-                                            "chunk_id": int(chunk["id"]),
-                                            "batch_offset": offset,
-                                            "max_output_tokens": output_budget,
-                                        },
-                                    },
-                                )
-                    if batch_decisions is None:
-                        raise RuntimeError(
-                            "Shadow v2 classifier 未收敛且禁止回退旧流程"
-                        ) from last_error
                     self.db.persist_shadow_relation_v2_classifications(
                         run_id, batch_decisions,
                     )
                     decisions.extend(batch_decisions)
                 if progress:
                     progress(
-                        total_chunks + chunk_index,
+                        (2 * total_chunks) + chunk_index,
                         total_progress,
                         f"Shadow v2 classifier {chunk_index}/{total_chunks}",
                     )
-            opportunity_by_pair = {
-                str(item.pair_identity): item for item in all_opportunities
-            }
-            hypotheses = [
+            classifier_hypotheses = [
                 hypothesis
                 for decision in decisions
                 for hypothesis in decision.hypotheses
             ]
+            classifier_hypothesis_ids = {
+                str(item.hypothesis_id) for item in classifier_hypotheses
+            }
+            proposer_hypotheses_to_persist = [
+                item for item in proposer_hypotheses
+                if str(item.hypothesis_id) not in classifier_hypothesis_ids
+            ]
+            if proposer_hypotheses_to_persist:
+                self.db.persist_shadow_relation_v2_proposed_hypotheses(
+                    run_id,
+                    proposer_hypotheses_to_persist,
+                    candidate_source=v2.DIRECT_PROPOSER,
+                )
+            hypothesis_by_key: dict[str, v2.RelationHypothesis] = {}
+            for hypothesis in [
+                *classifier_hypotheses,
+                *proposer_hypotheses_to_persist,
+            ]:
+                existing = hypothesis_by_key.get(str(hypothesis.hypothesis_id))
+                if existing is not None and existing != hypothesis:
+                    raise RuntimeError("Shadow v2 hypothesis identity collision")
+                hypothesis_by_key[str(hypothesis.hypothesis_id)] = hypothesis
+            hypotheses = list(hypothesis_by_key.values())
             validations = []
             for hypothesis in hypotheses:
                 opportunity = opportunity_by_pair[hypothesis.pair_identity]
@@ -800,6 +1338,63 @@ class ShadowRelationV2Runtime:
                         break
                 if final_attempt is None:
                     raise RuntimeError("Shadow v2 verifier 未生成终态")
+            terminal_verifier_attempts = {}
+            for item in verification_attempts:
+                current_attempt = terminal_verifier_attempts.get(
+                    str(item.hypothesis_id)
+                )
+                if (
+                    current_attempt is None
+                    or int(item.attempt_no) > int(current_attempt.attempt_no)
+                ):
+                    terminal_verifier_attempts[str(item.hypothesis_id)] = item
+            verifier_terminal_failures = sum(
+                1 for item in terminal_verifier_attempts.values()
+                if item.verdict == v2.RETRYABLE_FAILED
+            )
+            if verifier_terminal_failures:
+                metrics = {
+                    "pair_opportunities_total": len(all_opportunities),
+                    "pair_opportunities_classified": len(decisions),
+                    "pair_statuses": dict(Counter(
+                        str(item.status) for item in all_opportunities
+                    )),
+                    "classification_decisions": dict(Counter(
+                        str(item.decision) for item in decisions
+                    )),
+                    "pair_decision_statuses": dict(Counter(
+                        str(item.decision_status) for item in decisions
+                    )),
+                    "classified_hypotheses": len(hypotheses),
+                    "deterministic_validation": dict(Counter(
+                        str(item.status) for item in validations
+                    )),
+                    "verification_attempts": len(verification_attempts),
+                    "verification_terminal_count":
+                        len(terminal_verifier_attempts),
+                    "verification_verdicts": dict(Counter(
+                        str(item.verdict)
+                        for item in terminal_verifier_attempts.values()
+                    )),
+                    "verifier_terminal_failures": verifier_terminal_failures,
+                    "proposer_model_calls": proposer_calls,
+                    "proposer_failures": proposer_failures,
+                    "proposer_circuit_breaker_tripped":
+                        proposer_circuit_breaker_tripped,
+                    "proposer_skipped_by_circuit": proposer_skipped_by_circuit,
+                    "proposals_total": len(proposer_hypotheses),
+                    "proposer_hypotheses_persisted":
+                        len(proposer_hypotheses_to_persist),
+                    "missing_endpoint_mentions": missing_endpoint_mentions,
+                    "classifier_model_calls": classifier_calls,
+                    "classifier_failures": classifier_failures,
+                    "verifier_model_calls": verifier_calls,
+                    "legacy_pipeline_calls": 0,
+                    "production_approved": False,
+                }
+                raise RuntimeError(
+                    "Shadow v2 verifier 存在终态失败，拒绝标记 ready 或物化"
+                )
             normalization = v2.normalize_verified_hypotheses(
                 project_id=project_id,
                 opportunities=opportunity_by_pair,
@@ -868,11 +1463,17 @@ class ShadowRelationV2Runtime:
                     str(item.status) for item in all_opportunities
                 )),
                 "classification_decisions": dict(decision_counts),
+                "pair_decision_statuses": dict(Counter(
+                    str(item.decision_status) for item in decisions
+                )),
                 "classified_hypotheses": len(hypotheses),
                 "deterministic_validation": dict(validation_counts),
                 "verification_attempts": len(verification_attempts),
                 "verification_terminal_count": len(terminal_attempts),
                 "verification_verdicts": dict(verdict_counts),
+                "verifier_terminal_failures": int(
+                    verdict_counts.get(v2.RETRYABLE_FAILED, 0)
+                ),
                 "verifier_supported": int(
                     verdict_counts.get(v2.SUPPORTED, 0)
                 ),
@@ -883,6 +1484,15 @@ class ShadowRelationV2Runtime:
                     for fact in normalization.facts
                 ),
                 "normalization": dict(normalization.metrics),
+                "proposer_model_calls": proposer_calls,
+                "proposer_failures": proposer_failures,
+                "proposer_circuit_breaker_tripped":
+                    proposer_circuit_breaker_tripped,
+                "proposer_skipped_by_circuit": proposer_skipped_by_circuit,
+                "proposals_total": len(proposer_hypotheses),
+                "proposer_hypotheses_persisted":
+                    len(proposer_hypotheses_to_persist),
+                "missing_endpoint_mentions": missing_endpoint_mentions,
                 "classifier_model_calls": classifier_calls,
                 "classifier_failures": classifier_failures,
                 "verifier_model_calls": verifier_calls,

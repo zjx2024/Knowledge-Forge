@@ -8,6 +8,7 @@ import pytest
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
+from knowledge_forge.config import Config
 from knowledge_forge.database import Database
 
 
@@ -37,12 +38,14 @@ def _database(dsn: str) -> Database:
 
 
 @pytest.mark.integration
-def test_shadow_10k_and_100k_candidates_use_trigram_exact_and_hnsw_indexes():
+def test_shadow_10k_and_100k_candidates_use_trigram_exact_and_hnsw_indexes(monkeypatch):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
     database = _database(dsn)
     database.bootstrap()
+    monkeypatch.setattr(Config, "pgvector_hnsw_m", 8)
+    monkeypatch.setattr(Config, "pgvector_hnsw_ef_construction", 16)
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         project_id = int(conn.execute(
             "INSERT INTO projects(project_key,name) VALUES('shadow-plan','Shadow Plan') RETURNING id"
@@ -178,6 +181,13 @@ def test_shadow_10k_and_100k_candidates_use_trigram_exact_and_hnsw_indexes():
                FROM entity_shadow_canonicals WHERE namespace_id=%s""",
             (namespace_id,),
         )
+        conn.execute(
+            """DELETE FROM entity_shadow_embeddings
+               WHERE namespace_id=%s
+                 AND substring(canonical_key from '[0-9]+')::integer > 20000""",
+            (namespace_id,),
+        )
+        conn.execute("SET maintenance_work_mem='16MB'")
         database._ensure_entity_shadow_hnsw_index(conn, "plan-embed", 8)
         conn.execute("ANALYZE entity_shadow_embeddings")
         vector = _explain(

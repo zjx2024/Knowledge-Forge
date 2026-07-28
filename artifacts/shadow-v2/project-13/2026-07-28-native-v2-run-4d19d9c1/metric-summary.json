@@ -1,0 +1,21 @@
+{
+  "audit_passed": true,
+  "classifier_attempts": 669,
+  "conflicts": 0,
+  "evidence_refs": 0,
+  "fact_evidence": 27,
+  "facts": 27,
+  "hypotheses": 87,
+  "model_calls": 0,
+  "occurrences": 0,
+  "pair_contexts": 0,
+  "pairs": 3594,
+  "proposal_attempts": 0,
+  "proposals": 0,
+  "source_contexts": 0,
+  "source_maps": 0,
+  "supported_verification_for_fact_evidence_ratio": 1.0,
+  "terminal_verifications": 87,
+  "validations": 87,
+  "verification_attempts": 87
+}

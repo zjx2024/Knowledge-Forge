@@ -465,7 +465,9 @@ def test_graphrag_global_adapter_calls_verified_311_api(monkeypatch):
 
 @pytest.mark.integration
 def test_reports_and_global_search_persist_resume_and_fail_closed_when_stale():
-    dsn = os.environ["KNOWLEDGE_FORGE_TEST_POSTGRES_DSN"]
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
 
     class DisposableConfig:
         postgres = psycopg.conninfo.conninfo_to_dict(dsn)

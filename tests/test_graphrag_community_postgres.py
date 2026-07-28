@@ -113,7 +113,9 @@ def test_control_snapshot_query_reuses_fail_closed_active_revision_semantics(mon
 
 @pytest.mark.integration
 def test_detect_persists_shadow_without_mutating_control_graph(active_document_revision):
-    dsn = os.environ["KNOWLEDGE_FORGE_TEST_POSTGRES_DSN"]
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
 
     class DisposableConfig:
         postgres = psycopg.conninfo.conninfo_to_dict(dsn)
@@ -228,7 +230,9 @@ def test_detect_persists_shadow_without_mutating_control_graph(active_document_r
 
 @pytest.mark.integration
 def test_detect_marks_changed_generation_superseded(monkeypatch):
-    dsn = os.environ["KNOWLEDGE_FORGE_TEST_POSTGRES_DSN"]
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
 
     class DisposableConfig:
         postgres = psycopg.conninfo.conninfo_to_dict(dsn)

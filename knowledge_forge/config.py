@@ -201,6 +201,9 @@ class Config:
     relation_shadow_max_attempts = max(
         1, min(20, int(os.getenv("RELATION_SHADOW_MAX_ATTEMPTS", "3"))),
     )
+    relation_proposer_failure_circuit_breaker = max(
+        0, min(100, int(os.getenv("RELATION_PROPOSER_FAILURE_CIRCUIT_BREAKER", "2"))),
+    )
     relation_shadow_lease_seconds = max(
         10, int(os.getenv("RELATION_SHADOW_LEASE_SECONDS", "300")),
     )

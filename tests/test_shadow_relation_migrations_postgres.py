@@ -27,6 +27,17 @@ V2_INDEXES = {
     "idx_shadow_relation_facts_endpoints",
     "idx_shadow_relation_evidence_run",
     "idx_shadow_relation_classification_attempts_pair",
+    "idx_shadow_relation_classification_attempts_status_v2",
+    "idx_shadow_source_contexts_run",
+    "idx_shadow_context_source_maps_context",
+    "idx_entity_shadow_occurrences_namespace",
+    "idx_entity_shadow_occurrence_assignments_canonical",
+    "idx_shadow_model_calls_run_component",
+    "idx_shadow_relation_pair_contexts_context",
+    "idx_shadow_relation_candidate_sources_pair",
+    "idx_shadow_relation_proposal_attempts_run",
+    "idx_shadow_relation_proposals_attempt",
+    "idx_shadow_relation_evidence_refs_run",
 }
 
 V2_UNIQUE_COLUMN_SETS = {
@@ -54,6 +65,45 @@ V2_UNIQUE_COLUMN_SETS = {
     "shadow_relation_classification_attempts": {
         ("pair_opportunity_id", "attempt_no"),
     },
+    "shadow_source_contexts": {
+        ("run_id", "context_identity"),
+    },
+    "shadow_context_source_maps": {
+        ("context_id", "source_kind", "source_record_id", "source_start", "source_end"),
+    },
+    "entity_shadow_occurrences": {
+        ("namespace_id", "occurrence_key"),
+    },
+    "entity_shadow_mention_occurrence_map": {
+        ("namespace_id", "mention_key"),
+    },
+    "entity_shadow_occurrence_assignments": {
+        ("occurrence_id", "assignment_version"),
+    },
+    "entity_shadow_canonical_redirects": {
+        ("namespace_id", "source_canonical_key"),
+    },
+    "shadow_model_calls": {
+        ("run_id", "component", "idempotency_key", "attempt_no"),
+    },
+    "shadow_model_call_members": {
+        ("model_call_id", "source_kind", "source_record_id"),
+    },
+    "shadow_relation_pair_contexts": {
+        ("pair_opportunity_id", "context_id", "context_role"),
+    },
+    "shadow_relation_candidate_sources": {
+        ("pair_opportunity_id", "candidate_source", "source_kind", "source_record_id"),
+    },
+    "shadow_relation_proposal_attempts": {
+        ("run_id", "context_id", "attempt_no", "proposer_prompt_version"),
+    },
+    "shadow_relation_proposals": {
+        ("proposal_attempt_id", "proposal_key"),
+    },
+    "shadow_relation_evidence_refs": {
+        ("run_id", "fact_evidence_id", "context_id", "evidence_hash"),
+    },
 }
 
 V2_FOREIGN_KEY_MINIMUMS = {
@@ -68,6 +118,19 @@ V2_FOREIGN_KEY_MINIMUMS = {
     "shadow_relation_fact_conflicts": 1,
     "shadow_relation_classification_attempts": 1,
     "shadow_relation_hypothesis_validations": 1,
+    "shadow_source_contexts": 4,
+    "shadow_context_source_maps": 1,
+    "entity_shadow_occurrences": 5,
+    "entity_shadow_mention_occurrence_map": 2,
+    "entity_shadow_occurrence_assignments": 2,
+    "entity_shadow_canonical_redirects": 3,
+    "shadow_model_calls": 1,
+    "shadow_model_call_members": 4,
+    "shadow_relation_pair_contexts": 2,
+    "shadow_relation_candidate_sources": 2,
+    "shadow_relation_proposal_attempts": 3,
+    "shadow_relation_proposals": 3,
+    "shadow_relation_evidence_refs": 4,
 }
 
 
@@ -214,7 +277,7 @@ def test_empty_isolated_database_applies_complete_v2_migration_chain():
         database.bootstrap()
         with database.connection() as conn:
             evidence = _assert_v2_catalog(conn)
-            assert evidence["migration_count"] == 6
+            assert evidence["migration_count"] == 8
         assert database.assert_shadow_relation_v2_ready()["migrations"] == list(
             SHADOW_RELATION_V2_REQUIRED_MIGRATIONS
         )
@@ -228,7 +291,7 @@ def test_empty_isolated_database_applies_complete_v2_migration_chain():
 
 
 @pytest.mark.integration
-def test_isolated_0013_to_0019_compatibility_upgrade_and_catalog_contract():
+def test_isolated_0013_to_0021_compatibility_upgrade_and_catalog_contract():
     dsn = _isolated_admin_dsn()
     schema_name = "shadow_v2_upgrade_" + uuid.uuid4().hex
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as admin:
@@ -258,9 +321,9 @@ def test_isolated_0013_to_0019_compatibility_upgrade_and_catalog_contract():
             MigrationRunner().apply(conn)
             evidence = _assert_v2_catalog(conn)
             assert evidence == {
-                "migration_count": 6,
+                "migration_count": 8,
                 "table_count": len(SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS),
-                "index_count": 8,
+                "index_count": len(V2_INDEXES),
                 "foreign_key_count": sum(
                     int(row["count"])
                     for row in conn.execute(
@@ -273,7 +336,9 @@ def test_isolated_0013_to_0019_compatibility_upgrade_and_catalog_contract():
                         (list(V2_FOREIGN_KEY_MINIMUMS),),
                     ).fetchall()
                 ),
-                "unique_contract_count": 6,
+                "unique_contract_count": sum(
+                    len(value) for value in V2_UNIQUE_COLUMN_SETS.values()
+                ),
             }
             assert evidence["foreign_key_count"] >= sum(
                 V2_FOREIGN_KEY_MINIMUMS.values()

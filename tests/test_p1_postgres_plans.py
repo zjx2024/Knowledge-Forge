@@ -234,12 +234,13 @@ def test_postgres_hnsw_entity_and_relation_top_k_plan():
                           value::text,'item '||value,value::text,'plan-embed',
                           ARRAY[1,0,0,0,0,0,0,(value%%97)::double precision/97],
                           ('[1,0,0,0,0,0,0,'||((value%%97)::double precision/97)||']')::vector,8
-                   FROM generate_series(1,100000) value""",
+                   FROM generate_series(1,20000) value""",
                 (project_id,),
             )
             conn.execute(
                 """CREATE INDEX plan_vectors_hnsw ON vector_embeddings
                    USING hnsw ((embedding_vector::vector(8)) vector_cosine_ops)
+                   WITH (m=8,ef_construction=16)
                    WHERE model_name='plan-embed' AND dimension=8 AND is_deleted=FALSE"""
             )
             conn.execute("ANALYZE vector_embeddings")

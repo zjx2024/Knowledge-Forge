@@ -17,7 +17,17 @@ def predicate_policy(
     reflexive: bool = False,
     positive_examples: list[str] | None = None,
     negative_examples: list[str] | None = None,
+    positive_cues: list[str] | None = None,
+    negative_cues: list[str] | None = None,
+    anti_patterns: list[str] | None = None,
     optional_soft_cues: list[str] | None = None,
+    qualifier_schema: dict[str, Any] | None = None,
+    identity_qualifier_keys: list[str] | None = None,
+    conflicts_with: list[str] | None = None,
+    allowed_context_kinds: list[str] | None = None,
+    required_evidence_roles: list[str] | None = None,
+    negation_policy: str = "reject_negated",
+    modality_policy: str = "require_asserted",
 ) -> dict[str, Any]:
     """Build explicit test policy metadata without predicate-name defaults."""
 
@@ -39,14 +49,31 @@ def predicate_policy(
         "domain_types": domains,
         "range_types": ranges,
         "direction_description": direction,
+        "subject_role_description": "The subject endpoint follows the predicate direction.",
+        "object_role_description": "The object endpoint follows the predicate direction.",
         "symmetric": bool(symmetric),
         "inverse_predicate": inverse_predicate,
         "canonical_orientation": orientation,
         "publish_mode": publish_mode,
         "reflexive": bool(reflexive),
+        "reciprocal_allowed": False,
+        "allowed_context_kinds": list(allowed_context_kinds or [
+            "paragraph", "sentence", "table_row", "table_cell", "list_item",
+        ]),
+        "required_evidence_roles": list(required_evidence_roles or [
+            "subject", "predicate_cue", "object",
+        ]),
         "positive_examples": list(positive_examples or []),
         "negative_examples": list(negative_examples or []),
+        "positive_cues": list(positive_cues or []),
+        "negative_cues": list(negative_cues or []),
+        "anti_patterns": list(anti_patterns or []),
         "optional_soft_cues": list(optional_soft_cues or []),
+        "qualifier_schema": dict(qualifier_schema or {}),
+        "identity_qualifier_keys": list(identity_qualifier_keys or []),
+        "conflicts_with": list(conflicts_with or []),
+        "negation_policy": negation_policy,
+        "modality_policy": modality_policy,
     }
 
 

@@ -79,41 +79,112 @@ SHADOW_RELATION_V2_REQUIRED_MIGRATIONS = (
     "0017_shadow_relation_v2_freshness",
     "0018_shadow_relation_v2_gold",
     "0019_shadow_relation_v2_execution",
+    "0020_shadow_relation_v2_model_audit",
+    "0021_shadow_relation_v2_artifact_audit",
 )
 
 SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS = {
     "shadow_relation_v2_runs": {
         "id", "project_id", "input_fingerprint", "fingerprint_components",
-        "source_generation", "status",
+        "source_generation", "status", "pipeline_generation", "audit_quality",
     },
     "shadow_relation_pair_opportunities": {
         "id", "run_id", "pair_identity", "left_occurrence_key",
-        "right_occurrence_key", "status",
+        "right_occurrence_key", "status", "pipeline_generation", "context_id",
+        "source_kind", "source_record_id",
     },
     "shadow_relation_classification_attempts": {
         "id", "pair_opportunity_id", "attempt_no", "status",
+        "model_name", "request_payload", "raw_response_text",
+        "parsed_response", "token_usage", "error_type", "independent_call",
+        "model_call_id", "audit_quality", "terminal_status",
     },
     "shadow_relation_hypotheses": {
         "id", "pair_opportunity_id", "hypothesis_key", "predicate", "status",
+        "qualifiers", "source_kind", "source_record_id",
     },
     "shadow_relation_hypothesis_validations": {
         "hypothesis_id", "status", "reason_code",
     },
     "shadow_relation_verification_attempts": {
         "id", "hypothesis_id", "attempt_no", "verdict", "independent_call",
+        "model_call_id", "audit_quality", "terminal_status",
     },
     "shadow_relation_normalized_facts": {
         "id", "project_id", "semantic_fact_key", "predicate",
+        "qualifiers", "audit_quality",
     },
     "shadow_relation_fact_memberships": {
         "run_id", "fact_id", "input_fingerprint", "status",
     },
     "shadow_relation_fact_evidence": {
         "id", "fact_id", "run_id", "hypothesis_id",
-        "verification_attempt_id", "evidence_spans",
+        "verification_attempt_id", "evidence_spans", "context_id", "source_kind",
+        "source_record_id", "qualifiers", "audit_quality",
     },
     "shadow_relation_current_fingerprints": {
         "project_id", "current_fingerprint", "components", "source_generation",
+    },
+    "shadow_source_contexts": {
+        "id", "run_id", "project_id", "document_revision_id", "chunk_id",
+        "context_kind", "context_identity", "content_hash",
+        "structure_artifact_hash", "parser_version", "payload",
+    },
+    "shadow_context_source_maps": {
+        "id", "context_id", "source_kind", "source_record_id",
+        "source_start", "source_end", "payload_hash", "payload",
+    },
+    "entity_shadow_occurrences": {
+        "id", "namespace_id", "project_id", "document_revision_id",
+        "chunk_id", "occurrence_key", "physical_occurrence_key",
+        "surface", "normalized_surface", "source_context_id",
+    },
+    "entity_shadow_mention_occurrence_map": {
+        "namespace_id", "mention_key", "occurrence_id", "mapping_policy_version",
+    },
+    "entity_shadow_occurrence_assignments": {
+        "occurrence_id", "namespace_id", "canonical_key", "assignment_version",
+        "status", "confidence",
+    },
+    "entity_shadow_canonical_redirects": {
+        "id", "namespace_id", "source_canonical_key", "target_canonical_key",
+        "redirect_policy_version", "reason_code",
+    },
+    "shadow_model_calls": {
+        "id", "run_id", "component", "model_name", "model_digest",
+        "prompt_version", "schema_version", "parser_version", "idempotency_key",
+        "attempt_no", "status", "request_hash", "response_hash",
+        "request_payload", "raw_response_text", "parsed_response",
+        "token_usage", "independent_call", "audit_quality", "terminal_status",
+    },
+    "shadow_model_call_members": {
+        "id", "model_call_id", "run_id", "source_kind", "source_record_id",
+        "pair_opportunity_id", "hypothesis_id",
+    },
+    "shadow_relation_pair_contexts": {
+        "pair_opportunity_id", "context_id", "context_role", "payload",
+    },
+    "shadow_relation_candidate_sources": {
+        "id", "run_id", "pair_opportunity_id", "candidate_source",
+        "source_kind", "source_record_id", "candidate_rank", "admitted",
+        "terminal_status",
+    },
+    "shadow_relation_proposal_attempts": {
+        "id", "run_id", "context_id", "model_call_id", "attempt_no", "status",
+        "proposer_prompt_version", "proposer_schema_version",
+        "proposer_parser_version", "proposer_model_revision",
+        "request_hash", "response_hash", "token_usage",
+    },
+    "shadow_relation_proposals": {
+        "id", "proposal_attempt_id", "pair_opportunity_id", "hypothesis_id",
+        "proposal_key", "predicate", "subject_occurrence_key",
+        "object_occurrence_key", "evidence_spans", "qualifiers",
+        "confidence", "status",
+    },
+    "shadow_relation_evidence_refs": {
+        "id", "run_id", "fact_evidence_id", "verification_attempt_id",
+        "context_id", "source_kind", "source_record_id", "evidence_hash",
+        "qualifiers",
     },
 }
 
@@ -4214,7 +4285,111 @@ class Database:
                 or dict(row.get("fingerprint_components") or {}) != components
             ):
                 raise ValueError("Shadow relation v2 run immutable input mismatch")
+            if str(row.get("status") or "") in {"failed", "cancelled", "stale"}:
+                self._reset_shadow_relation_v2_run_attempt(conn, run_id)
+                row = conn.execute(
+                    """UPDATE shadow_relation_v2_runs
+                       SET status='planning',metrics='{}'::jsonb,error_message='',
+                           completed_at=NULL
+                       WHERE id=%s RETURNING *""",
+                    (run_id,),
+                ).fetchone()
             return row
+
+    def _reset_shadow_relation_v2_run_attempt(self, conn: Any, run_id: str) -> None:
+        """Discard one failed/incomplete Shadow v2 attempt before same-input retry.
+
+        The run id is deterministic over the immutable input fingerprint.  A
+        crashed or failed worker can therefore be retried with exactly the same
+        id.  Before doing that, remove half-written isolated ledgers for this
+        run only; never touch product tables or other runs' normalized facts.
+        """
+
+        pair_ids = (
+            "SELECT id FROM shadow_relation_pair_opportunities WHERE run_id=%s"
+        )
+        hypothesis_ids = (
+            "SELECT hypothesis.id FROM shadow_relation_hypotheses hypothesis "
+            "JOIN shadow_relation_pair_opportunities pair "
+            "ON pair.id=hypothesis.pair_opportunity_id WHERE pair.run_id=%s"
+        )
+        context_ids = "SELECT id FROM shadow_source_contexts WHERE run_id=%s"
+        proposal_attempt_ids = (
+            "SELECT id FROM shadow_relation_proposal_attempts WHERE run_id=%s"
+        )
+        delete_statements = [
+            ("DELETE FROM shadow_relation_evidence_refs WHERE run_id=%s", (run_id,)),
+            (
+                "DELETE FROM shadow_relation_fact_collapse_audit WHERE run_id=%s",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_fact_conflicts WHERE run_id=%s",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_fact_evidence WHERE run_id=%s",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_fact_memberships WHERE run_id=%s",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_proposals "
+                f"WHERE proposal_attempt_id IN ({proposal_attempt_ids}) "
+                f"OR pair_opportunity_id IN ({pair_ids}) "
+                f"OR hypothesis_id IN ({hypothesis_ids})",
+                (run_id, run_id, run_id),
+            ),
+            (
+                "DELETE FROM shadow_relation_proposal_attempts WHERE run_id=%s",
+                (run_id,),
+            ),
+            ("DELETE FROM shadow_model_call_members WHERE run_id=%s", (run_id,)),
+            (
+                "DELETE FROM shadow_relation_verification_attempts "
+                f"WHERE hypothesis_id IN ({hypothesis_ids})",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_hypothesis_validations "
+                f"WHERE hypothesis_id IN ({hypothesis_ids})",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_classification_attempts "
+                f"WHERE pair_opportunity_id IN ({pair_ids})",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_candidate_sources WHERE run_id=%s",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_pair_contexts "
+                f"WHERE pair_opportunity_id IN ({pair_ids})",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_hypotheses "
+                f"WHERE pair_opportunity_id IN ({pair_ids})",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_relation_pair_opportunities WHERE run_id=%s",
+                (run_id,),
+            ),
+            (
+                "DELETE FROM shadow_context_source_maps "
+                f"WHERE context_id IN ({context_ids})",
+                (run_id,),
+            ),
+            ("DELETE FROM shadow_source_contexts WHERE run_id=%s", (run_id,)),
+            ("DELETE FROM shadow_model_calls WHERE run_id=%s", (run_id,)),
+        ]
+        for sql, params in delete_statements:
+            conn.execute(sql, params)
 
     def persist_shadow_relation_v2_opportunities(
         self,
@@ -4245,10 +4420,11 @@ class Database:
                        left_start,left_end,right_start,right_end,left_canonical_id,
                        right_canonical_id,left_assignment_version,right_assignment_version,
                        context_identity,context_start,context_end,allowed_predicate_metadata,
-                       planning_reason,cue,type_status,status,provenance)
+                       planning_reason,cue,type_status,status,provenance,
+                       source_kind,source_record_id)
                        VALUES(
                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb)
+                       %s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s,%s)
                        ON CONFLICT(id) DO NOTHING""",
                     (
                         item.opportunity_identity,
@@ -4281,6 +4457,8 @@ class Database:
                         item.type_status,
                         item.status,
                         self._canonical_json(item.provenance),
+                        "v2_pair_planner",
+                        item.context_identity,
                     ),
                 )
                 persisted = conn.execute(
@@ -4341,7 +4519,19 @@ class Database:
         if attempt_no <= 0:
             raise ValueError("classification attempt number must be positive")
         if status not in {
-            "accepted", "retryable_failed", "permanent_failed", "superseded",
+            "ACCEPTED",
+            "RETRYABLE_EMPTY",
+            "RETRYABLE_PROTOCOL",
+            "RETRYABLE_TRUNCATED",
+            "RETRYABLE_TIMEOUT",
+            "RETRYABLE_MODEL_ERROR",
+            "TERMINAL_FAILED",
+            "SUPERSEDED",
+            # Historical audit rows remain readable during compatibility upgrades.
+            "accepted",
+            "retryable_failed",
+            "permanent_failed",
+            "superseded",
         }:
             raise ValueError("invalid classification attempt status")
         with self.connection() as conn:
@@ -4360,8 +4550,11 @@ class Database:
                 """INSERT INTO shadow_relation_classification_attempts(
                    id,pair_opportunity_id,attempt_no,status,request_hash,response_hash,
                    classifier_prompt_version,classifier_schema_version,
-                   classifier_parser_version,classifier_model_revision,error_message,metadata)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   classifier_parser_version,classifier_model_revision,error_message,
+                   metadata,model_name,request_payload,raw_response_text,
+                   parsed_response,token_usage,error_type,independent_call)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
+                          %s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s)
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     attempt_id,
@@ -4376,6 +4569,13 @@ class Database:
                     str(values.get("classifier_model_revision") or ""),
                     str(values.get("error_message") or ""),
                     self._canonical_json(values.get("metadata") or {}),
+                    str(values.get("model_name") or ""),
+                    self._canonical_json(values.get("request_payload") or {}),
+                    str(values.get("raw_response_text") or ""),
+                    self._canonical_json(values.get("parsed_response") or {}),
+                    self._canonical_json(values.get("token_usage") or {}),
+                    str(values.get("error_type") or ""),
+                    bool(values.get("independent_call", True)),
                 ),
             )
             row = conn.execute(
@@ -4391,6 +4591,13 @@ class Database:
                 str(row["classifier_schema_version"]),
                 str(row["classifier_parser_version"]),
                 str(row["classifier_model_revision"]),
+                str(row.get("model_name") or ""),
+                row.get("request_payload") or {},
+                str(row.get("raw_response_text") or ""),
+                row.get("parsed_response") or {},
+                row.get("token_usage") or {},
+                str(row.get("error_type") or ""),
+                bool(row.get("independent_call", True)),
             )
             expected = (
                 attempt_no,
@@ -4401,6 +4608,13 @@ class Database:
                 str(values.get("classifier_schema_version") or ""),
                 str(values.get("classifier_parser_version") or ""),
                 str(values.get("classifier_model_revision") or ""),
+                str(values.get("model_name") or ""),
+                values.get("request_payload") or {},
+                str(values.get("raw_response_text") or ""),
+                values.get("parsed_response") or {},
+                values.get("token_usage") or {},
+                str(values.get("error_type") or ""),
+                bool(values.get("independent_call", True)),
             )
             if immutable != expected:
                 raise ValueError("classification attempt immutable payload mismatch")
@@ -4426,20 +4640,32 @@ class Database:
                     raise LookupError("classification decision pair does not exist")
                 accepted_attempt = conn.execute(
                     """SELECT 1 FROM shadow_relation_classification_attempts
-                       WHERE pair_opportunity_id=%s AND status='accepted' LIMIT 1""",
+                       WHERE pair_opportunity_id=%s
+                         AND status IN ('ACCEPTED','accepted')
+                       LIMIT 1""",
                     (pair["id"],),
                 ).fetchone()
                 if not accepted_attempt:
                     raise ValueError("classification decision has no accepted attempt")
+                decision_status = str(
+                    getattr(decision, "decision_status", None)
+                    or {
+                        "NO_RELATION": "EXPLICIT_NO_RELATION",
+                        "OTHER_UNSUPPORTED": "SCHEMA_GAP",
+                        "HYPOTHESES": "HYPOTHESES_EMITTED",
+                    }.get(str(decision.decision), str(decision.decision))
+                )
                 current_status = str(pair["status"])
                 if current_status not in {
                     "PENDING_CLASSIFICATION",
+                    decision_status,
                     str(decision.decision),
                 }:
                     raise ValueError("pair already has a different terminal decision")
                 provenance = dict(pair.get("provenance") or {})
                 provenance["classification"] = {
                     "decision": decision.decision,
+                    "decision_status": decision_status,
                     "reason_code": decision.reason_code,
                     "evidence_spans": [
                         [span.start, span.end] for span in decision.evidence_spans
@@ -4450,7 +4676,7 @@ class Database:
                        SET status=%s,provenance=%s::jsonb,updated_at=NOW()
                        WHERE id=%s""",
                     (
-                        decision.decision,
+                        decision_status,
                         self._canonical_json(provenance),
                         pair["id"],
                     ),
@@ -4478,9 +4704,10 @@ class Database:
                            id,pair_opportunity_id,hypothesis_key,predicate,
                            subject_occurrence_key,object_occurrence_key,evidence_start,
                            evidence_end,classifier_policy_version,
-                           classifier_model_revision,status,metadata)
+                           classifier_model_revision,status,metadata,
+                           source_kind,source_record_id)
                            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLASSIFIED_POSITIVE',
-                                  %s::jsonb)
+                                  %s::jsonb,%s,%s)
                            ON CONFLICT(id) DO NOTHING""",
                         (
                             database_id,
@@ -4494,6 +4721,8 @@ class Database:
                             hypothesis.classifier_policy_version,
                             hypothesis.classifier_model_revision,
                             self._canonical_json(metadata),
+                            "v2_classifier",
+                            hypothesis.pair_identity,
                         ),
                     )
                     persisted = conn.execute(
@@ -4589,6 +4818,107 @@ class Database:
                    JOIN shadow_relation_pair_opportunities pair
                      ON pair.id=hypothesis.pair_opportunity_id
                    WHERE pair.run_id=%s ORDER BY validation.hypothesis_id""",
+                (run_id,),
+            ).fetchall()
+
+    def persist_shadow_relation_v2_proposed_hypotheses(
+        self,
+        run_id: str,
+        hypotheses: Any,
+        *,
+        candidate_source: str,
+    ) -> list[dict[str, Any]]:
+        """Persist non-classifier candidate hypotheses into the same Shadow ledger."""
+
+        values = list(hypotheses)
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, run_id)
+            for hypothesis in values:
+                pair = conn.execute(
+                    """SELECT * FROM shadow_relation_pair_opportunities
+                       WHERE run_id=%s AND pair_identity=%s FOR UPDATE""",
+                    (run_id, hypothesis.pair_identity),
+                ).fetchone()
+                if not pair:
+                    raise LookupError("proposed hypothesis pair does not exist")
+                database_id = self._shadow_relation_v2_db_id(
+                    "relhypdb_", run_id, hypothesis.hypothesis_id,
+                )
+                spans = [
+                    [span.start, span.end] for span in hypothesis.evidence_spans
+                ]
+                metadata = {
+                    "stable_hypothesis_id": hypothesis.hypothesis_id,
+                    "candidate_source": str(candidate_source),
+                    "evidence_spans": spans,
+                    "proposal_confidence": hypothesis.classifier_confidence,
+                    "proposer_prompt_version": hypothesis.classifier_prompt_version,
+                    "proposer_schema_version": hypothesis.classifier_schema_version,
+                    "proposer_parser_version": hypothesis.classifier_parser_version,
+                    "predicate_metadata": hypothesis.predicate_metadata,
+                }
+                conn.execute(
+                    """INSERT INTO shadow_relation_hypotheses(
+                       id,pair_opportunity_id,hypothesis_key,predicate,
+                       subject_occurrence_key,object_occurrence_key,evidence_start,
+                       evidence_end,classifier_policy_version,
+                       classifier_model_revision,status,metadata,
+                       source_kind,source_record_id)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PROPOSED_POSITIVE',
+                              %s::jsonb,%s,%s)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (
+                        database_id,
+                        pair["id"],
+                        hypothesis.hypothesis_id,
+                        hypothesis.predicate,
+                        hypothesis.subject_occurrence_key,
+                        hypothesis.object_occurrence_key,
+                        min(span.start for span in hypothesis.evidence_spans),
+                        max(span.end for span in hypothesis.evidence_spans),
+                        hypothesis.classifier_policy_version,
+                        hypothesis.classifier_model_revision,
+                        self._canonical_json(metadata),
+                        f"v2_{candidate_source}",
+                        hypothesis.pair_identity,
+                    ),
+                )
+                persisted = conn.execute(
+                    "SELECT * FROM shadow_relation_hypotheses WHERE id=%s",
+                    (database_id,),
+                ).fetchone()
+                persisted_metadata = dict(persisted.get("metadata") or {})
+                immutable = (
+                    str(persisted["hypothesis_key"]),
+                    str(persisted["predicate"]),
+                    str(persisted["subject_occurrence_key"]),
+                    str(persisted["object_occurrence_key"]),
+                    persisted_metadata.get("evidence_spans"),
+                )
+                expected = (
+                    hypothesis.hypothesis_id,
+                    hypothesis.predicate,
+                    hypothesis.subject_occurrence_key,
+                    hypothesis.object_occurrence_key,
+                    spans,
+                )
+                if immutable != expected:
+                    raise ValueError("proposed hypothesis immutable payload mismatch")
+                provenance = dict(pair.get("provenance") or {})
+                sources = set(provenance.get("candidate_sources") or [])
+                sources.add(str(candidate_source))
+                provenance["candidate_sources"] = sorted(sources)
+                conn.execute(
+                    """UPDATE shadow_relation_pair_opportunities
+                       SET provenance=%s::jsonb,updated_at=NOW()
+                       WHERE id=%s""",
+                    (self._canonical_json(provenance), pair["id"]),
+                )
+            return conn.execute(
+                """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
+                   JOIN shadow_relation_pair_opportunities pair
+                     ON pair.id=hypothesis.pair_opportunity_id
+                   WHERE pair.run_id=%s ORDER BY hypothesis.hypothesis_key""",
                 (run_id,),
             ).fetchall()
 
@@ -4820,8 +5150,9 @@ class Database:
                     """INSERT INTO shadow_relation_fact_evidence(
                        id,fact_id,run_id,evidence_key,document_revision_id,
                        subject_occurrence_key,object_occurrence_key,evidence_spans,
-                       hypothesis_id,verification_attempt_id,provenance)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                       hypothesis_id,verification_attempt_id,provenance,
+                       source_kind,source_record_id)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s,%s)
                        ON CONFLICT(id) DO NOTHING""",
                     (
                         evidence_id,
@@ -4837,6 +5168,8 @@ class Database:
                         hypothesis["id"],
                         verification_id,
                         self._canonical_json(evidence.provenance),
+                        "v2_verifier",
+                        evidence.hypothesis_id,
                     ),
                 )
             for collapse in result.collapse_audit:
@@ -7139,8 +7472,11 @@ class Database:
                 "surface": mention["surface"],
                 "normalized_surface": mention["normalized_surface"],
                 "start": mention["start"], "end": mention["end"],
-                "confidence": mention.get("confidence") or 0.5,
-                "kind": "mention",
+                "confidence": (
+                    0.5 if mention.get("confidence") is None
+                    else mention.get("confidence")
+                ),
+                "kind": "surface_observation",
             }, *aliases]
             for alias in alias_rows:
                 if not alias.get("normalized_surface"):
@@ -7154,7 +7490,11 @@ class Database:
                     (
                         namespace_id, canonical_key, mention["mention_id"], alias["surface"],
                         alias["normalized_surface"], alias.get("kind") or "observed",
-                        alias.get("start"), alias.get("end"), float(alias.get("confidence") or 0.5),
+                        alias.get("start"), alias.get("end"),
+                        float(
+                            0.5 if alias.get("confidence") is None
+                            else alias.get("confidence")
+                        ),
                         mention["policy_version"], self._json(alias.get("metadata")),
                     ),
                 )

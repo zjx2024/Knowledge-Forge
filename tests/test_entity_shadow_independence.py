@@ -75,6 +75,7 @@ def _mention(**overrides):
 def test_entity_shadow_pipeline_reads_active_chunks_not_formal_mentions():
     source = inspect.getsource(KnowledgeForgeService.build_entity_shadow_namespace)
     assert "list_document_chunks" in source
+    assert "build_shadow_context_manifest" in source
     assert "SpanFirstEntityExtractor" in source
     assert "schemas.extract_entities_only" in source
     assert "schemas.extract_chunk" not in source
@@ -168,8 +169,9 @@ def test_multilingual_exact_alias_and_ambiguous_homonym_stay_model_free():
         namespace="ns", policy_version="p2", store=ambiguous_store, models=models,
         reranker=lambda *_args: [],
     ).resolve(_mention(surface="苹果", normalized_surface="苹果"))
-    assert ambiguous["decision"] == "uncertain_ambiguous_exact"
+    assert ambiguous["decision"] == "quarantined_ambiguous_exact"
     assert ambiguous["canonical_key"].startswith("shadow_entity_")
+    assert ambiguous["quarantined"] is True
     assert models.embedding_calls == models.review_calls == 0
 
 
@@ -198,6 +200,38 @@ def test_hard_identifier_and_cannot_link_win_over_similarity():
     assert result["canonical_key"] != "model-2"
     assert any(
         "identifier_conflict" in item["filter_reason"]
+        for item in store.candidate_rows
+    )
+
+
+def test_shadow_type_gate_blocks_material_product_embedding_merge():
+    candidates = [{
+        "canonical_key": "c-carbonate",
+        "name": "lithium carbonate",
+        "normalized_name": "lithiumcarbonate",
+        "primary_type": "Product",
+        "aliases": ["lithium compounds"],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+    }]
+    store = _ShadowCandidates(lexical=candidates, vector=candidates)
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=store, models=models,
+        reranker=lambda _mention, rows: [1.0 for _ in rows],
+        reranker_cap=3,
+    )
+
+    result = resolver.resolve(_mention(
+        surface="lithium compounds",
+        normalized_surface="lithiumcompounds",
+        entity_type="Material",
+    ))
+
+    assert result["decision"] == "new_canonical"
+    assert result["canonical_key"] != "c-carbonate"
+    assert any(
+        "type_incompatible" in item["filter_reason"]
         for item in store.candidate_rows
     )
 

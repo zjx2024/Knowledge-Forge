@@ -130,6 +130,7 @@ def test_structural_cooccurrence_can_be_explicit_no_relation(reason) -> None:
             pair.pair_identity,
             decision=NO_RELATION,
             reason_code=reason,
+            evidence_spans=[{"start": 0, "end": len(CONTENT)}],
         )]},
         content=CONTENT,
         logical_schema=_schema(),
@@ -137,6 +138,25 @@ def test_structural_cooccurrence_can_be_explicit_no_relation(reason) -> None:
 
     assert parsed[0].decision == NO_RELATION
     assert parsed[0].hypotheses == ()
+
+
+def test_no_relation_defaults_missing_reason_and_evidence() -> None:
+    pair = _opportunity()
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(
+            pair.pair_identity,
+            decision=NO_RELATION,
+        )]},
+        content=CONTENT,
+        logical_schema=_schema(),
+    )
+    assert parsed[0].decision == NO_RELATION
+    assert parsed[0].hypotheses == ()
+    assert parsed[0].reason_code == "NO_RELATION_UNSPECIFIED"
+    assert [(span.start, span.end) for span in parsed[0].evidence_spans] == [
+        pair.context_span,
+    ]
 
 
 def test_clear_schema_gap_is_other_unsupported_not_related_to() -> None:
@@ -155,6 +175,109 @@ def test_clear_schema_gap_is_other_unsupported_not_related_to() -> None:
 
     assert parsed[0].decision == OTHER_UNSUPPORTED
     assert parsed[0].hypotheses == ()
+
+
+def test_other_unsupported_reason_is_normalized_to_schema_gap() -> None:
+    pair = _opportunity()
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(
+            pair.pair_identity,
+            decision=OTHER_UNSUPPORTED,
+            reason_code="schema does not contain this predicate",
+        )]},
+        content=CONTENT,
+        logical_schema=_schema(),
+    )
+
+    assert parsed[0].decision == OTHER_UNSUPPORTED
+    assert parsed[0].reason_code == "SCHEMA_GAP"
+    assert parsed[0].hypotheses == ()
+    assert [(span.start, span.end) for span in parsed[0].evidence_spans] == [
+        pair.context_span,
+    ]
+
+
+def test_batch_schema_outside_predicate_only_downgrades_that_pair() -> None:
+    content = "Acme uses Alloy and Bolt."
+    mentions = [
+        {
+            "mention_id": "mention-acme",
+            "occurrence_key": "occ-acme",
+            "surface": "Acme",
+            "mention_start": 0,
+            "mention_end": 4,
+            "canonical_id": "entity-acme",
+            "assignment_version": "assign-v1",
+            "type": "Organization",
+        },
+        {
+            "mention_id": "mention-alloy",
+            "occurrence_key": "occ-alloy",
+            "surface": "Alloy",
+            "mention_start": 10,
+            "mention_end": 15,
+            "canonical_id": "entity-alloy",
+            "assignment_version": "assign-v1",
+            "type": "Product",
+        },
+        {
+            "mention_id": "mention-bolt",
+            "occurrence_key": "occ-bolt",
+            "surface": "Bolt",
+            "mention_start": 20,
+            "mention_end": 24,
+            "canonical_id": "entity-bolt",
+            "assignment_version": "assign-v1",
+            "type": "Product",
+        },
+    ]
+    plan = plan_pair_opportunities(
+        project_id=12,
+        document_revision_id="revision-1",
+        chunk_key="chunk-1",
+        content=content,
+        mentions=mentions,
+        logical_schema=_schema(),
+        run_id="run-1",
+        candidate_policy_version="candidate-v2",
+    )
+    pairs = [
+        item for item in plan.admitted
+        if item.left_occurrence_key == "occ-acme"
+    ][:2]
+    assert len(pairs) == 2
+
+    parsed = parse_classifier_response(
+        pairs,
+        {"decisions": [
+            _decision(
+                pairs[0].pair_identity,
+                decision=NO_RELATION,
+                reason_code="CO_OCCURRENCE_ONLY",
+            ),
+            _decision(
+                pairs[1].pair_identity,
+                hypotheses=[_hypothesis(
+                    subject="occ-acme",
+                    predicate="schema_outside_predicate",
+                    object_="occ-bolt",
+                )],
+            ),
+        ]},
+        content=content,
+        logical_schema=_schema(),
+    )
+
+    assert [item.decision for item in parsed] == [
+        NO_RELATION,
+        OTHER_UNSUPPORTED,
+    ]
+    assert parsed[1].reason_code == "SCHEMA_GAP"
+    assert parsed[1].hypotheses == ()
+    assert [(span.start, span.end) for span in parsed[1].evidence_spans] == [
+        pairs[1].context_span,
+    ]
 
 
 def test_one_pair_can_propose_two_concrete_hypotheses() -> None:
@@ -297,7 +420,6 @@ def test_publish_mode_metadata_controls_review_only() -> None:
 @pytest.mark.parametrize(
     ("mutator", "message"),
     [
-        (lambda pair: _hypothesis(predicate="invented"), "predicate"),
         (
             lambda pair: _hypothesis(subject="occ-drifted"),
             "occurrence",
@@ -326,6 +448,23 @@ def test_classifier_parser_rejects_unknown_predicate_endpoint_drift_and_bad_span
         )
 
 
+def test_classifier_parser_downgrades_schema_outside_predicate_to_gap() -> None:
+    pair = _opportunity()
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(
+            pair.pair_identity,
+            hypotheses=[_hypothesis(predicate="invented")],
+        )]},
+        content=CONTENT,
+        logical_schema=_schema(),
+    )
+
+    assert parsed[0].decision == OTHER_UNSUPPORTED
+    assert parsed[0].reason_code == "SCHEMA_GAP"
+    assert parsed[0].hypotheses == ()
+
+
 def test_classifier_parser_rejects_duplicate_missing_and_unknown_pair_ids() -> None:
     pair = _opportunity()
     valid = _decision(pair.pair_identity, decision=NO_RELATION)
@@ -343,6 +482,32 @@ def test_classifier_parser_rejects_duplicate_missing_and_unknown_pair_ids() -> N
         parse_classifier_response(
             [pair], {"decisions": [_decision("other", decision=NO_RELATION)]},
             content=CONTENT, logical_schema=_schema(),
+        )
+
+
+def test_classifier_parser_repairs_single_negative_abbreviated_pair_id_only() -> None:
+    pair = _opportunity()
+    abbreviated = pair.pair_identity[:40] + pair.pair_identity[-6:]
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(abbreviated, decision=NO_RELATION)]},
+        content=CONTENT,
+        logical_schema=_schema(),
+    )
+
+    assert parsed[0].pair_identity == pair.pair_identity
+    assert parsed[0].decision == NO_RELATION
+
+    with pytest.raises(ShadowClassificationError, match="unknown"):
+        parse_classifier_response(
+            [pair],
+            {"decisions": [_decision(
+                abbreviated,
+                decision=HYPOTHESES,
+                hypotheses=[_hypothesis()],
+            )]},
+            content=CONTENT,
+            logical_schema=_schema(),
         )
 
 

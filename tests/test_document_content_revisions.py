@@ -268,25 +268,8 @@ def test_bootstrap_is_restart_safe_after_revision_migration():
                GROUP BY version ORDER BY version"""
         ).fetchall()
         assert rows == [
-            {"version": "0001_document_content_revisions", "count": 1},
-            {"version": "0002_relation_shadow_work_queue", "count": 1},
-            {"version": "0003_entity_shadow_pipeline", "count": 1},
-            {"version": "0004_policy_snapshot_orchestrator", "count": 1},
-            {"version": "0005_release_gate_artifacts", "count": 1},
-            {"version": "0006_graph_namespace_manifest", "count": 1},
-            {"version": "0007_indexing_failure_status", "count": 1},
-            {"version": "0008_mention_occurrence_identity", "count": 1},
-            {"version": "0009_policy_snapshot_coverage", "count": 1},
-            {"version": "0010_graphrag_communities", "count": 1},
-            {"version": "0011_graphrag_reports_global_search", "count": 1},
-            {"version": "0012_multi_strategy_construction", "count": 1},
-            {"version": "0013_strategy_graph_lease_namespace", "count": 1},
-            {"version": "0014_shadow_relation_v2_ledger", "count": 1},
-            {"version": "0015_shadow_relation_v2_verification", "count": 1},
-            {"version": "0016_shadow_relation_v2_normalization", "count": 1},
-            {"version": "0017_shadow_relation_v2_freshness", "count": 1},
-            {"version": "0018_shadow_relation_v2_gold", "count": 1},
-            {"version": "0019_shadow_relation_v2_execution", "count": 1},
+            {"version": migration.version, "count": 1}
+            for migration in MIGRATIONS
         ]
         assert conn.execute(
             "SELECT to_regclass('uq_chunks_revision_key') AS index_name"

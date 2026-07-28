@@ -1,0 +1,9 @@
+from __future__ import annotations
+
+from tests.test_shadow_relation_runtime_wiring import (
+    test_runtime_direct_proposer_enters_verifier_even_when_classifier_says_no_relation,
+)
+
+
+def test_candidate_union_regression_uses_public_runtime_fixture():
+    test_runtime_direct_proposer_enters_verifier_even_when_classifier_says_no_relation()

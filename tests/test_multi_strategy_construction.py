@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 import json
 import os
+import re
 import uuid
 
 import pytest
@@ -323,6 +324,40 @@ def test_construction_controls_render_together_outside_upload_form():
     assert html.count('class="construction-controls"') == 1
 
 
+def test_construction_controls_disable_build_until_preprocessed():
+    html = _construction_controls(
+        project_id=7,
+        strategy_key=ENHANCED_SHADOW_STRATEGY,
+        strategy_select='<option value="enhanced_shadow">增强实验</option>',
+        latest_job_id="",
+        latest_batch_id="",
+        active_job_id="",
+        build_ready=False,
+    )
+
+    button = re.search(r'<button[^>]+id="build-project-knowledge"[^>]*>', html)
+    assert button
+    assert "disabled" in button.group(0)
+    assert "请先预处理文档" in button.group(0)
+
+
+def test_construction_controls_enable_build_after_preprocessing():
+    html = _construction_controls(
+        project_id=7,
+        strategy_key=ENHANCED_SHADOW_STRATEGY,
+        strategy_select='<option value="enhanced_shadow">增强实验</option>',
+        latest_job_id="",
+        latest_batch_id="",
+        active_job_id="",
+        build_ready=True,
+    )
+
+    button = re.search(r'<button[^>]+id="build-project-knowledge"[^>]*>', html)
+    assert button
+    assert "disabled" not in button.group(0)
+    assert "基于已完成预处理" in button.group(0)
+
+
 def test_enhanced_statistics_do_not_show_deleted_snapshot_for_empty_project(monkeypatch):
     class EmptyProjectDatabase:
         @staticmethod
@@ -339,6 +374,62 @@ def test_enhanced_statistics_do_not_show_deleted_snapshot_for_empty_project(monk
     )
 
     assert result == {"documents": 0, "chunks": 0, "entities": 0, "relations": 0}
+
+
+def test_enhanced_statistics_hide_stale_entity_relation_snapshot(monkeypatch):
+    class StaleProjectDatabase:
+        @staticmethod
+        def count_documents(project_id):
+            assert project_id == 7
+            return 1
+
+        @staticmethod
+        def statistics(project_id):
+            assert project_id == 7
+            return {"documents": 1, "chunks": 8, "entities": 99, "relations": 42}
+
+    monkeypatch.setattr(web, "SERVICE", type("Service", (), {"db": StaleProjectDatabase()})())
+
+    result = _strategy_statistics(
+        7,
+        ENHANCED_SHADOW_STRATEGY,
+        {
+            "status": "stale",
+            "generation": 5,
+            "ready_generation": 4,
+            "stats": {"documents": 2, "chunks": 15, "entities": 266, "relations": 9},
+        },
+    )
+
+    assert result == {"documents": 1, "chunks": 8, "entities": 0, "relations": 0}
+
+
+def test_enhanced_statistics_keep_ready_current_snapshot(monkeypatch):
+    class ReadyProjectDatabase:
+        @staticmethod
+        def count_documents(project_id):
+            assert project_id == 7
+            return 1
+
+        @staticmethod
+        def statistics(project_id):
+            assert project_id == 7
+            return {"documents": 1, "chunks": 8, "entities": 99, "relations": 42}
+
+    monkeypatch.setattr(web, "SERVICE", type("Service", (), {"db": ReadyProjectDatabase()})())
+
+    result = _strategy_statistics(
+        7,
+        ENHANCED_SHADOW_STRATEGY,
+        {
+            "status": "ready",
+            "generation": 4,
+            "ready_generation": 4,
+            "stats": {"documents": 2, "chunks": 15, "entities": 266, "relations": 9},
+        },
+    )
+
+    assert result == {"documents": 2, "chunks": 15, "entities": 266, "relations": 9}
 
 
 def test_enhanced_document_without_shared_content_can_start_build():

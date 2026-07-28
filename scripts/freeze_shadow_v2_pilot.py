@@ -181,55 +181,73 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--native-project-id", type=int, default=13)
     parser.add_argument("--frozen-legacy-project-id", type=int, default=12)
+    parser.add_argument(
+        "--native-entity-namespace-id",
+        default="",
+        help=(
+            "Explicit enhanced_shadow entity namespace to freeze. If omitted, "
+            "the latest ready complete namespace for --native-project-id is used."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-entity-namespace-id",
+        default="",
+        help=(
+            "Explicit legacy comparison namespace to freeze. If omitted, the "
+            "latest ready complete namespace for --frozen-legacy-project-id is used."
+        ),
+    )
     args = parser.parse_args()
 
     database = _database(args.dsn)
     with database.connection() as conn:
         native = _project_freeze(conn, args.native_project_id)
-        assert len(native["documents"]) == 2, "native pilot must freeze two documents"
-        assert len(native["chunks"]) == 15, "native pilot must freeze fifteen chunks"
-        native_namespace_rows = _rows(
-            conn,
-            """SELECT namespace.id
-               FROM entity_shadow_namespaces namespace
-               JOIN LATERAL (
-                 SELECT COUNT(*) AS count
-                 FROM entity_shadow_relation_endpoints endpoint
-                 WHERE endpoint.namespace_id=namespace.id
-               ) endpoint_count ON TRUE
-               WHERE namespace.project_id=%s
-                 AND namespace.status='ready'
-                 AND namespace.snapshot_complete=TRUE
-                 AND endpoint_count.count=164
-               ORDER BY namespace.created_at DESC LIMIT 1""",
-            (args.native_project_id,),
-        )
-        legacy_namespace_rows = _rows(
-            conn,
-            """SELECT namespace.id
-               FROM entity_shadow_namespaces namespace
-               JOIN LATERAL (
-                 SELECT COUNT(*) AS count
-                 FROM entity_shadow_relation_endpoints endpoint
-                 WHERE endpoint.namespace_id=namespace.id
-               ) endpoint_count ON TRUE
-               WHERE namespace.project_id=%s
-                 AND namespace.status='ready'
-                 AND namespace.snapshot_complete=TRUE
-                 AND endpoint_count.count=176
-               ORDER BY namespace.created_at DESC""",
-            (args.frozen_legacy_project_id,),
-        )
-        assert len(native_namespace_rows) == 1
-        assert len(legacy_namespace_rows) == 1
+        if args.native_entity_namespace_id:
+            native_namespace_rows = _rows(
+                conn,
+                """SELECT id FROM entity_shadow_namespaces
+                   WHERE id=%s AND project_id=%s
+                     AND status='ready' AND snapshot_complete=TRUE""",
+                (args.native_entity_namespace_id, args.native_project_id),
+            )
+        else:
+            native_namespace_rows = _rows(
+                conn,
+                """SELECT id FROM entity_shadow_namespaces
+                   WHERE project_id=%s
+                     AND status='ready'
+                     AND snapshot_complete=TRUE
+                   ORDER BY created_at DESC LIMIT 1""",
+                (args.native_project_id,),
+            )
+        if args.legacy_entity_namespace_id:
+            legacy_namespace_rows = _rows(
+                conn,
+                """SELECT id FROM entity_shadow_namespaces
+                   WHERE id=%s AND project_id=%s
+                     AND status='ready' AND snapshot_complete=TRUE""",
+                (args.legacy_entity_namespace_id, args.frozen_legacy_project_id),
+            )
+        else:
+            legacy_namespace_rows = _rows(
+                conn,
+                """SELECT id FROM entity_shadow_namespaces
+                   WHERE project_id=%s
+                     AND status='ready'
+                     AND snapshot_complete=TRUE
+                   ORDER BY created_at DESC LIMIT 1""",
+                (args.frozen_legacy_project_id,),
+            )
+        if len(native_namespace_rows) != 1:
+            raise RuntimeError("native pilot namespace is not explicit/unique")
+        if len(legacy_namespace_rows) != 1:
+            raise RuntimeError("legacy pilot namespace is not explicit/unique")
         native_namespace = _namespace_freeze(
             conn, str(native_namespace_rows[0]["id"])
         )
         frozen_legacy = _namespace_freeze(
             conn, str(legacy_namespace_rows[0]["id"])
         )
-        assert len(native_namespace["endpoints"]) == 164
-        assert len(frozen_legacy["endpoints"]) == 176
         frozen_legacy_project = _project_freeze(
             conn, args.frozen_legacy_project_id
         )
@@ -277,7 +295,7 @@ def main() -> int:
         "native_formal_graph_state": formal_state,
         "frozen_legacy_project": frozen_legacy_project,
         "frozen_legacy_176": frozen_legacy,
-        "legacy_164_secondary_only": {
+        "legacy_secondary_only": {
             "namespace_id": native_namespace["namespace"]["id"],
             "count": len(native_namespace["endpoints"]),
             "sha256": native_namespace["endpoints_sha256"],
@@ -345,8 +363,8 @@ def main() -> int:
         "chunks": len(native["chunks"]),
         "mentions": len(native_namespace["mentions"]),
         "assignments": len(native_namespace["assignments"]),
-        "legacy_176": len(frozen_legacy["endpoints"]),
-        "legacy_164_secondary": len(native_namespace["endpoints"]),
+        "frozen_legacy_relations": len(frozen_legacy["endpoints"]),
+        "native_secondary_relations": len(native_namespace["endpoints"]),
         "model_digest": str(model_context.digest),
     }, ensure_ascii=False))
     return 0

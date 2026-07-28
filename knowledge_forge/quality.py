@@ -66,6 +66,23 @@ def canonical_relation_fact_key(item: dict[str, Any]) -> tuple[str, ...]:
     return tuple(map(str, (project_scope, subject, predicate, object_, direction)))
 
 
+def unordered_relation_endpoint_predicate_key(item: dict[str, Any]) -> tuple[str, ...]:
+    """Return an unordered endpoint+predicate identity for pair-recall metrics."""
+
+    project_scope = _first_value(
+        item, "gold_universe", "project_scope", "project_key", "project_id",
+    )
+    subject = _first_value(
+        item, "subject_canonical_id", "source_canonical_id", "subject", "source",
+    )
+    predicate = _first_value(item, "canonical_predicate", "predicate", "relation_type")
+    object_ = _first_value(
+        item, "object_canonical_id", "target_canonical_id", "object", "target",
+    )
+    left, right = sorted((str(subject), str(object_)))
+    return tuple(map(str, (project_scope, left, right, predicate)))
+
+
 def occurrence_relation_assertion_key(item: dict[str, Any]) -> tuple[Any, ...]:
     """Return a strict occurrence/evidence identity layered over the semantic fact."""
 
@@ -476,6 +493,17 @@ def evaluate_relation_gold_run(
 
     strict = final_metrics(strict_raw)
     canonical = final_metrics(canonical_raw)
+    direction_denominator = sum(
+        min(count, Counter(
+            unordered_relation_endpoint_predicate_key(item)
+            for item in predictions
+        ).get(identity, 0))
+        for identity, count in Counter(
+            unordered_relation_endpoint_predicate_key(item)
+            for item in gold_facts
+        ).items()
+    )
+    direction_true_positive = canonical_raw["true_positive"]
     positive_pair_ids = {str(item["pair_id"]) for item in gold_facts}
     gold_occurrences = {
         str(item[field])
@@ -595,8 +623,8 @@ def evaluate_relation_gold_run(
         ),
         "predicate_metrics": per_predicate,
         "direction_accuracy": (
-            strict_raw["true_positive"] / canonical_raw["true_positive"]
-            if canonical_raw["true_positive"] else float(not gold_facts)
+            direction_true_positive / direction_denominator
+            if direction_denominator else float(not gold_facts)
         ),
         "exact_evidence_coverage": strict_raw["recall"],
         "pair_decisions": {
@@ -637,6 +665,7 @@ def evaluate_relation_gold_run(
             "gold_positive_facts": len(gold_facts),
             "predicted_facts": len(predictions),
             "unadjudicated_predictions": len(unadjudicated),
+            "direction_matched_endpoint_predicate": direction_denominator,
         },
     }
 
@@ -1113,12 +1142,12 @@ def relation_pair_candidate_recall_at_budget(
     *,
     budget: int | None = None,
 ) -> dict[str, Any]:
-    """Recall of directed Gold relation endpoints inside the bounded pair plan."""
+    """Recall of unordered Gold endpoint pairs inside the bounded pair plan."""
 
     return _candidate_recall_details(
         gold_links,
         candidates,
-        directed=True,
+        directed=False,
         metric="relation_pair_candidate_recall_at_budget",
         limit_name="budget",
         limit=budget,

@@ -4,7 +4,9 @@ import pytest
 
 from knowledge_forge.migrations import MIGRATIONS
 from knowledge_forge.relation_shadow_v2 import (
+    EvidenceSpan,
     HYPOTHESES,
+    PASS,
     RETRYABLE_FAILED,
     REVIEW_ONLY,
     SUPPORTED,
@@ -533,6 +535,42 @@ def test_same_pair_hypotheses_are_verified_independently() -> None:
 
     assert [item.verdict for item in attempts] == ["SUPPORTED", "REJECTED"]
     assert [supported_for_normalization(item) for item in attempts] == [True, False]
+
+
+def test_verifier_may_expand_evidence_within_frozen_context_unit() -> None:
+    content = "According to the report, Alpha uses Beta in production."
+    mentions = [_mention("alpha", "Alpha", 25), _mention("beta", "Beta", 36)]
+    schema = _schema(_predicate("uses"))
+    pair, hypothesis = _classified(
+        content,
+        mentions,
+        schema,
+        predicate="uses",
+        subject="occ-alpha",
+        object_="occ-beta",
+        spans=[{"start": 25, "end": 40}],
+    )
+    validation = validate_hypothesis(
+        hypothesis, pair, content=content, logical_schema=schema,
+    )
+    attempt = verify_hypothesis(
+        hypothesis,
+        validation,
+        pair,
+        content=content,
+        logical_schema=schema,
+        verifier=lambda *_args: {
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "verdict": "SUPPORTED",
+            "reason_code": "DIRECTLY_ENTAILED",
+            "supported_evidence_spans": [{"start": 0, "end": len(content)}],
+        },
+        verifier_model_revision="verifier-model-r1",
+    )
+
+    assert validation.status == PASS
+    assert attempt.verdict == SUPPORTED
+    assert attempt.supported_evidence_spans == (EvidenceSpan(0, len(content)),)
 
 
 def test_verifier_prompt_contains_complete_directed_fact_and_exact_occurrences() -> None:

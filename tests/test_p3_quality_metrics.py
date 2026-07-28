@@ -122,8 +122,8 @@ def test_entity_and_relation_candidate_recall_have_distinct_names_and_sample_ids
     assert entity["false_negative_ids"] == ["m3|m4"]
     assert entity["k"] == 10
     assert relation["metric"] == "relation_pair_candidate_recall_at_budget"
-    assert relation["true_positive_ids"] == ["m1->m2"]
-    assert relation["false_negative_ids"] == ["m2->m3"]
+    assert relation["true_positive_ids"] == ["m1|m2"]
+    assert relation["false_negative_ids"] == ["m2|m3"]
     assert relation["budget"] == 32
 
 

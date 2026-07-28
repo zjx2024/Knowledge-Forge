@@ -18,6 +18,29 @@ from .entity_identity import (
 logger = logging.getLogger(__name__)
 
 
+_UNRESOLVED_TYPES = {"", "GenericEntity", "Unknown", "Unresolved"}
+_HARD_INCOMPATIBLE_TYPE_PAIRS = {
+    frozenset(("Location", "Material")),
+    frozenset(("Location", "Product")),
+    frozenset(("Material", "Product")),
+    frozenset(("Person", "Material")),
+    frozenset(("Person", "Product")),
+    frozenset(("Person", "Location")),
+}
+
+
+def shadow_types_are_compatible(left: str, right: str) -> bool:
+    """Enhanced-only hard type gate for shadow canonical assignment."""
+
+    left_type = str(left or "GenericEntity")
+    right_type = str(right or "GenericEntity")
+    if left_type in _UNRESOLVED_TYPES or right_type in _UNRESOLVED_TYPES:
+        return left_type == right_type
+    if frozenset((left_type, right_type)) in _HARD_INCOMPATIBLE_TYPE_PAIRS:
+        return False
+    return left_type == right_type
+
+
 class DatabaseShadowStore:
     """Narrow adapter that can only access entity shadow persistence APIs."""
 
@@ -177,6 +200,11 @@ class ShadowEntityResolver:
             reasons.append("cannot_link")
         if identifiers_conflict(str(mention["surface"]), str(candidate["name"])):
             reasons.append("identifier_conflict")
+        if not shadow_types_are_compatible(
+            str(mention.get("entity_type") or "GenericEntity"),
+            str(candidate.get("primary_type") or "GenericEntity"),
+        ):
+            reasons.append("type_incompatible")
         return ",".join(reasons)
 
     @staticmethod
@@ -184,10 +212,10 @@ class ShadowEntityResolver:
         features = best_name_pair_features(str(mention["surface"]), candidate)
         lexical = max(float(candidate.get("lexical_score") or 0.0), features["lexical"])
         vector = max(0.0, float(candidate.get("vector_score") or 0.0))
-        same_type = str(mention.get("entity_type") or "GenericEntity") == str(
-            candidate.get("primary_type") or "GenericEntity"
-        )
-        type_score = 1.0 if same_type else 0.6
+        type_score = 1.0 if shadow_types_are_compatible(
+            str(mention.get("entity_type") or "GenericEntity"),
+            str(candidate.get("primary_type") or "GenericEntity"),
+        ) else 0.0
         combined = min(1.0, 0.52 * lexical + 0.38 * vector + 0.10 * type_score)
         return {
             "lexical": lexical,
@@ -304,11 +332,12 @@ class ShadowEntityResolver:
         if len(allowed_exact) > 1:
             return {
                 "canonical_key": self._new_key(mention),
-                "decision": "uncertain_ambiguous_exact",
-                "reason": "精确别名对应多个 canonical，保持隔离等待人工裁决",
+                "decision": "quarantined_ambiguous_exact",
+                "reason": "精确别名对应多个 canonical，隔离为 quarantined occurrence 等待人工裁决",
                 "scores": {},
                 "embedding": None,
                 "candidates": exact,
+                "quarantined": True,
             }
         return None
 

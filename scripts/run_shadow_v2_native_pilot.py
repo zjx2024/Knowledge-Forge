@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run native relation v2 through the public enhanced entry in an isolated clone."""
+"""Run native Shadow v2 through the public enhanced entry in an isolated pilot DB."""
 
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ class _ImmediateExecutor:
 class _CountingGateway:
     def __init__(self, gateway: Any):
         self.gateway = gateway
+        self.proposer_calls = 0
         self.classifier_calls = 0
         self.verifier_calls = 0
 
@@ -66,7 +67,9 @@ class _CountingGateway:
 
     def json_chat(self, **kwargs):
         system = str(kwargs.get("system") or "")
-        if "classifier" in system:
+        if "direct proposer" in system or "proposer" in system:
+            self.proposer_calls += 1
+        elif "classifier" in system:
             self.classifier_calls += 1
         elif "verifier" in system:
             self.verifier_calls += 1
@@ -232,6 +235,43 @@ def _formal_state(database: Database, project_id: int) -> dict[str, Any]:
     return payload
 
 
+def _freeze_snapshot_manifest(freeze: dict[str, Any]) -> dict[str, Any]:
+    """Convert the freeze file into the service snapshot_manifest contract."""
+
+    chunk_rows = freeze["native_project"].get("chunks") or []
+    chunks_by_document: dict[int, list[dict[str, Any]]] = {}
+    for chunk in chunk_rows:
+        chunks_by_document.setdefault(int(chunk["document_id"]), []).append({
+            "chunk_id": int(chunk["id"]),
+            "content_hash": str(chunk["content_hash"]),
+        })
+    active_schema_version = 0
+    for schema in freeze["native_project"].get("schemas") or []:
+        if str(schema.get("status") or "") == "active":
+            active_schema_version = int(schema["version"])
+            break
+    documents = []
+    for document in freeze["native_project"].get("documents") or []:
+        document_id = int(document["id"])
+        documents.append({
+            "document_id": document_id,
+            "revision_id": str(document["active_revision_id"]),
+            "content_hash": str(document["doc_hash"]),
+            "chunks": sorted(
+                chunks_by_document.get(document_id, []),
+                key=lambda item: int(item["chunk_id"]),
+            ),
+        })
+    return {
+        "project": {
+            "project_id": int(freeze["native_project"]["project"]["id"]),
+            "schema_version": active_schema_version,
+        },
+        "documents": sorted(documents, key=lambda item: int(item["document_id"])),
+        "freeze_payload_sha256": str(freeze["freeze_payload_sha256"]),
+    }
+
+
 def _preflight(runtime: ShadowRelationV2Runtime, project_id: int, namespace_id: str):
     context = runtime._context(project_id, namespace_id)
     mentions_by_chunk: dict[int, list[dict[str, Any]]] = {}
@@ -359,6 +399,22 @@ def main() -> int:
     parser.add_argument("--freeze", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--rebuild-entity-shadow",
+        action="store_true",
+        help=(
+            "Rebuild enhanced entity shadow from the frozen document/chunk "
+            "manifest before running relation v2."
+        ),
+    )
+    parser.add_argument(
+        "--allow-cloned-entity-shadow-debug",
+        action="store_true",
+        help=(
+            "Debug-only compatibility path: clone the frozen entity namespace. "
+            "This never satisfies the native E2E rebuild gate."
+        ),
+    )
     args = parser.parse_args()
     freeze = json.loads(args.freeze.read_text(encoding="utf-8"))
     if conninfo_to_dict(args.dsn)["dbname"] != freeze["source_database"]:
@@ -384,9 +440,20 @@ def main() -> int:
         print(json.dumps(preflight, ensure_ascii=False, sort_keys=True))
         return 0
 
-    _clone_entity_snapshot(
-        database, source_namespace, namespace_id, freeze_hash,
-    )
+    if not args.rebuild_entity_shadow and not args.allow_cloned_entity_shadow_debug:
+        raise RuntimeError(
+            "native pilot requires --rebuild-entity-shadow; clone mode is "
+            "debug-only and must be requested explicitly"
+        )
+    if args.rebuild_entity_shadow and args.allow_cloned_entity_shadow_debug:
+        raise RuntimeError(
+            "--rebuild-entity-shadow and --allow-cloned-entity-shadow-debug "
+            "are mutually exclusive"
+        )
+    if args.allow_cloned_entity_shadow_debug:
+        _clone_entity_snapshot(
+            database, source_namespace, namespace_id, freeze_hash,
+        )
     runtime = ShadowRelationV2Runtime(database, gateway)
     service.executor = _ImmediateExecutor()
     service.cleanup_executor = _ImmediateExecutor()
@@ -429,33 +496,51 @@ def main() -> int:
 
         setattr(v2, function_name, wrapper)
 
-    def build_runtime(target_project_id: int, *, progress=None, **_kwargs):
-        result = runtime.run_namespace(
-            namespace_id=namespace_id,
-            project_id=target_project_id,
-            progress=progress,
-        )
-        with database.connection() as conn:
-            conn.execute(
-                """UPDATE entity_shadow_namespaces
-                   SET metrics=metrics||%s::jsonb,status='ready',
-                       snapshot_complete=TRUE,completed_at=NOW()
-                   WHERE id=%s""",
-                (
-                    json.dumps({
-                        "relation_v2_run_id": result["run_id"],
-                        "relation_v2_fingerprint": result["input_fingerprint"],
-                        "relation_v2": result["metrics"],
-                    }),
-                    namespace_id,
-                ),
-            )
-        return {
-            "namespace_id": namespace_id,
-            **database.load_entity_shadow_snapshot(namespace_id),
-        }
+    actual_namespace = {"id": namespace_id if args.allow_cloned_entity_shadow_debug else ""}
+    original_build_entity_shadow_namespace = service.build_entity_shadow_namespace
 
-    service.build_entity_shadow_namespace = build_runtime
+    if args.allow_cloned_entity_shadow_debug:
+        def build_runtime(target_project_id: int, *, progress=None, **_kwargs):
+            result = runtime.run_namespace(
+                namespace_id=namespace_id,
+                project_id=target_project_id,
+                progress=progress,
+            )
+            with database.connection() as conn:
+                conn.execute(
+                    """UPDATE entity_shadow_namespaces
+                       SET metrics=metrics||%s::jsonb,status='ready',
+                           snapshot_complete=TRUE,completed_at=NOW()
+                       WHERE id=%s""",
+                    (
+                        json.dumps({
+                            "relation_v2_run_id": result["run_id"],
+                            "relation_v2_fingerprint": result["input_fingerprint"],
+                            "relation_v2": result["metrics"],
+                            "pilot_entity_source": "debug_clone",
+                        }),
+                        namespace_id,
+                    ),
+                )
+            return {
+                "namespace_id": namespace_id,
+                **database.load_entity_shadow_snapshot(namespace_id),
+            }
+
+        service.build_entity_shadow_namespace = build_runtime
+    else:
+        snapshot_manifest = _freeze_snapshot_manifest(freeze)
+
+        def rebuild_runtime(target_project_id: int, *, progress=None, **_kwargs):
+            shadow = original_build_entity_shadow_namespace(
+                target_project_id,
+                snapshot_manifest=snapshot_manifest,
+                progress=progress,
+            )
+            actual_namespace["id"] = str(shadow["namespace_id"])
+            return shadow
+
+        service.build_entity_shadow_namespace = rebuild_runtime
     before = _formal_state(database, project_id)
     document_ids = sorted(
         int(item["id"]) for item in freeze["native_project"]["documents"]
@@ -472,26 +557,66 @@ def main() -> int:
             """SELECT * FROM shadow_relation_v2_runs
                WHERE project_id=%s AND snapshot_id=%s
                ORDER BY created_at DESC LIMIT 1""",
-            (project_id, namespace_id),
+            (project_id, actual_namespace["id"]),
         ).fetchone()
     if not run:
         raise RuntimeError("native public entry produced no v2 run")
     reconciliation = _reconcile(database, str(run["id"]))
+    engineering_passed = (
+        job["status"] == "completed"
+        and run["status"] == "ready"
+        and legacy_calls == {"service": 0, "pipeline": 0}
+        and reconciliation["normalized_facts"]
+        == reconciliation["normalized_facts_with_supported_verification"]
+        and before == after
+        and (
+            int(after["counts"]["activations"])
+            - int(before["counts"]["activations"])
+        ) == 0
+        and (
+            "rebuilt_from_freeze"
+            if args.rebuild_entity_shadow else "debug_clone"
+        ) == "rebuilt_from_freeze"
+    )
     result = {
         "database": conninfo_to_dict(args.dsn)["dbname"],
         "job_id": job_id,
         "job_status": str(job["status"]),
         "run_id": str(run["id"]),
         "run_status": str(run["status"]),
-        "namespace_id": namespace_id,
+        "namespace_id": actual_namespace["id"],
+        "entity_shadow_source": (
+            "rebuilt_from_freeze"
+            if args.rebuild_entity_shadow else "debug_clone"
+        ),
         "preflight": preflight,
         "stage_calls": stage_calls,
         "model_calls": {
+            "proposer": gateway.proposer_calls,
             "classifier": gateway.classifier_calls,
             "verifier": gateway.verifier_calls,
         },
+        "run_metrics": dict(run.get("metrics") or {}),
         "legacy_calls": legacy_calls,
         "reconciliation": reconciliation,
+        "engineering_gate": {
+            "status": "passed" if engineering_passed else "failed",
+            "uses_fresh_entity_shadow": args.rebuild_entity_shadow,
+            "legacy_calls_zero": legacy_calls == {"service": 0, "pipeline": 0},
+            "formal_graph_unchanged": before == after,
+            "activation_delta": (
+                int(after["counts"]["activations"])
+                - int(before["counts"]["activations"])
+            ),
+            "all_normalized_facts_have_supported_verification": (
+                reconciliation["normalized_facts"]
+                == reconciliation["normalized_facts_with_supported_verification"]
+            ),
+        },
+        "quality_gate": {
+            "status": "not_run_no_human_gold",
+            "precision_recall_claims": "not_computed",
+        },
         "formal_graph_unchanged": before == after,
         "formal_graph_before": before,
         "formal_graph_after": after,
@@ -509,14 +634,7 @@ def main() -> int:
         encoding="utf-8",
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0 if (
-        job["status"] == "completed"
-        and run["status"] == "ready"
-        and legacy_calls == {"service": 0, "pipeline": 0}
-        and reconciliation["supported_verification_ratio"] == 1.0
-        and before == after
-        and result["activation_count"] == 0
-    ) else 2
+    return 0 if engineering_passed else 2
 
 
 if __name__ == "__main__":
