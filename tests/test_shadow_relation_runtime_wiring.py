@@ -739,7 +739,9 @@ def test_runtime_invalid_single_pair_hypothesis_becomes_unsupported_not_failure(
         if values["status"] == "ACCEPTED"
     ]
     assert len(accepted) == 1
-    assert accepted[0]["independent_call"] is True
+    assert accepted[0]["independent_call"] is False
+    assert accepted[0]["metadata"]["terminal_unsupported_from_failed_attempts"] is True
+    assert accepted[0]["metadata"]["previous_error_type"] == "ShadowClassificationError"
 
 
 def test_runtime_recovers_single_pair_negative_raw_when_parser_reports_missing(

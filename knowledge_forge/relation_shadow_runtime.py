@@ -957,6 +957,86 @@ class ShadowRelationV2Runtime:
                 content = str(chunk.get("content") or "")
                 last_error: Exception | None = None
                 max_attempts = int(Config.relation_shadow_max_attempts)
+
+                def record_terminal_unsupported(
+                    terminal_decision: v2.PairClassificationDecision,
+                    error: Exception | None,
+                ) -> list[v2.PairClassificationDecision]:
+                    pair = batch[0]
+                    pair_id = str(pair.pair_identity)
+                    classifier_attempt_counts[pair_id] += 1
+                    audit_attempt_no = int(classifier_attempt_counts[pair_id])
+                    parsed_response = {
+                        "items": [{
+                            "pair_id": pair_id,
+                            "decision": terminal_decision.decision,
+                            "hypotheses": [],
+                            "reason_code": terminal_decision.reason_code,
+                            "evidence_spans": [
+                                {"start": span.start, "end": span.end}
+                                for span in terminal_decision.evidence_spans
+                            ],
+                            "terminal_from_error": str(error or ""),
+                        }],
+                    }
+                    raw_response_text = _safe_json_text(parsed_response)
+                    request_payload = {
+                        "stage": "classifier_terminal_unsupported",
+                        "model": context["model"],
+                        "model_revision": context["model_revision"],
+                        "classifier_prompt_version":
+                            v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+                        "classifier_schema_version":
+                            v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+                        "classifier_parser_version":
+                            v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+                        "pair_ids": [pair_id],
+                        "previous_attempts": audit_attempt_no - 1,
+                        "terminal_from_error_type":
+                            type(error).__name__ if error else "",
+                        "terminal_from_error_message": str(error or ""),
+                    }
+                    self.db.record_shadow_relation_v2_classification_attempt(
+                        run_id,
+                        pair.pair_identity,
+                        {
+                            "attempt_no": audit_attempt_no,
+                            "status": CLASSIFIER_ACCEPTED,
+                            "request_hash": shadow_model_payload_hash(
+                                "request", request_payload,
+                            ),
+                            "response_hash": shadow_model_payload_hash(
+                                "response", raw_response_text,
+                            ),
+                            "classifier_prompt_version":
+                                v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+                            "classifier_schema_version":
+                                v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
+                            "classifier_parser_version":
+                                v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
+                            "classifier_model_revision":
+                                context["model_revision"],
+                            "model_name": context["model"],
+                            "request_payload": request_payload,
+                            "raw_response_text": raw_response_text,
+                            "parsed_response": parsed_response,
+                            "token_usage": {},
+                            "error_type": "",
+                            "error_message": "",
+                            "independent_call": False,
+                            "metadata": {
+                                "chunk_id": int(chunk["id"]),
+                                "batch_offset": batch_offset,
+                                "batch_size": len(batch),
+                                "terminal_unsupported_from_failed_attempts": True,
+                                "previous_error_type":
+                                    type(error).__name__ if error else "",
+                                "previous_error_message": str(error or ""),
+                            },
+                        },
+                    )
+                    return [terminal_decision]
+
                 for call_attempt_no in range(1, max_attempts + 1):
                     classifier_calls += 1
                     output_budget = self._classifier_output_budget(
@@ -1066,11 +1146,22 @@ class ShadowRelationV2Runtime:
                         return batch_decisions
                     except Exception as exc:
                         last_error = exc
-                        classifier_failures += 1
                         raw_response_text = str(
                             getattr(self.models, "last_raw_response_text", "")
                             or ""
                         )
+                        if len(batch) == 1:
+                            terminal_decision = (
+                                _terminal_unsupported_decision_for_single_pair(
+                                    batch[0], exc, raw_response_text,
+                                )
+                            )
+                            if terminal_decision is not None:
+                                return record_terminal_unsupported(
+                                    terminal_decision,
+                                    exc,
+                                )
+                        classifier_failures += 1
                         diagnostics = getattr(
                             self.models, "last_call_diagnostics", None,
                         )
@@ -1140,84 +1231,10 @@ class ShadowRelationV2Runtime:
                     batch[0], last_error, raw_response_text,
                 )
                 if terminal_decision is not None:
-                    pair = batch[0]
-                    pair_id = str(pair.pair_identity)
-                    classifier_attempt_counts[pair_id] += 1
-                    audit_attempt_no = int(
-                        classifier_attempt_counts[pair_id]
+                    return record_terminal_unsupported(
+                        terminal_decision,
+                        last_error,
                     )
-                    parsed_response = {
-                        "items": [{
-                            "pair_id": pair_id,
-                            "decision": terminal_decision.decision,
-                            "hypotheses": [],
-                            "reason_code": terminal_decision.reason_code,
-                            "evidence_spans": [
-                                {"start": span.start, "end": span.end}
-                                for span in terminal_decision.evidence_spans
-                            ],
-                            "terminal_from_error": str(last_error or ""),
-                        }],
-                    }
-                    raw_response_text = _safe_json_text(parsed_response)
-                    request_payload = {
-                        "stage": "classifier_terminal_unsupported",
-                        "model": context["model"],
-                        "model_revision": context["model_revision"],
-                        "classifier_prompt_version":
-                            v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
-                        "classifier_schema_version":
-                            v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-                        "classifier_parser_version":
-                            v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
-                        "pair_ids": [pair_id],
-                        "previous_attempts": audit_attempt_no - 1,
-                        "terminal_from_error_type":
-                            type(last_error).__name__ if last_error else "",
-                        "terminal_from_error_message": str(last_error or ""),
-                    }
-                    self.db.record_shadow_relation_v2_classification_attempt(
-                        run_id,
-                        pair.pair_identity,
-                        {
-                            "attempt_no": audit_attempt_no,
-                            "status": CLASSIFIER_ACCEPTED,
-                            "request_hash": shadow_model_payload_hash(
-                                "request", request_payload,
-                            ),
-                            "response_hash": shadow_model_payload_hash(
-                                "response", raw_response_text,
-                            ),
-                            "classifier_prompt_version":
-                                v2.SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
-                            "classifier_schema_version":
-                                v2.SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION,
-                            "classifier_parser_version":
-                                v2.SHADOW_RELATION_CLASSIFIER_PARSER_VERSION,
-                            "classifier_model_revision":
-                                context["model_revision"],
-                            "model_name": context["model"],
-                            "request_payload": request_payload,
-                            "raw_response_text": raw_response_text,
-                            "parsed_response": parsed_response,
-                            "token_usage": {},
-                            "error_type": "",
-                            "error_message": "",
-                            "independent_call": False,
-                            "metadata": {
-                                "chunk_id": int(chunk["id"]),
-                                "batch_offset": batch_offset,
-                                "batch_size": len(batch),
-                                "terminal_unsupported_from_failed_attempts":
-                                    True,
-                                "previous_error_type":
-                                    type(last_error).__name__
-                                    if last_error else "",
-                                "previous_error_message": str(last_error or ""),
-                            },
-                        },
-                    )
-                    return [terminal_decision]
                 raise RuntimeError(
                     "Shadow v2 classifier 未收敛且禁止回退旧流程"
                 ) from last_error

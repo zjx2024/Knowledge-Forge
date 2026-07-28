@@ -1212,32 +1212,6 @@ def parse_classifier_response(
             str(item.get("name") or ""): item
             for item in pair.allowed_predicate_metadata
         }
-        if decision == HYPOTHESES:
-            unsupported_schema_predicate = False
-            for hypothesis in raw_hypotheses:
-                if not isinstance(hypothesis, Mapping):
-                    raise ShadowClassificationError("hypothesis must be an object")
-                predicate = str(hypothesis.get("predicate") or "")
-                if predicate not in schema or predicate not in pair_metadata:
-                    unsupported_schema_predicate = True
-                    break
-            if unsupported_schema_predicate:
-                unsupported_spans = decision_spans or _parse_spans(
-                    [{
-                        "start": pair.context_span[0],
-                        "end": pair.context_span[1],
-                    }],
-                    opportunity=pair,
-                    content=content,
-                )
-                decisions.append(PairClassificationDecision(
-                    pair_identity=pair.pair_identity,
-                    decision=OTHER_UNSUPPORTED,
-                    hypotheses=(),
-                    evidence_spans=unsupported_spans,
-                    reason_code="SCHEMA_GAP",
-                ))
-                continue
         for hypothesis in raw_hypotheses:
             if not isinstance(hypothesis, Mapping):
                 raise ShadowClassificationError("hypothesis must be an object")

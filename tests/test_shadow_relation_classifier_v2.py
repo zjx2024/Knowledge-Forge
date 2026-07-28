@@ -198,7 +198,7 @@ def test_other_unsupported_reason_is_normalized_to_schema_gap() -> None:
     ]
 
 
-def test_batch_schema_outside_predicate_only_downgrades_that_pair() -> None:
+def test_batch_schema_outside_predicate_fails_closed() -> None:
     content = "Acme uses Alloy and Bolt."
     mentions = [
         {
@@ -248,36 +248,27 @@ def test_batch_schema_outside_predicate_only_downgrades_that_pair() -> None:
     ][:2]
     assert len(pairs) == 2
 
-    parsed = parse_classifier_response(
-        pairs,
-        {"decisions": [
-            _decision(
-                pairs[0].pair_identity,
-                decision=NO_RELATION,
-                reason_code="CO_OCCURRENCE_ONLY",
-            ),
-            _decision(
-                pairs[1].pair_identity,
-                hypotheses=[_hypothesis(
-                    subject="occ-acme",
-                    predicate="schema_outside_predicate",
-                    object_="occ-bolt",
-                )],
-            ),
-        ]},
-        content=content,
-        logical_schema=_schema(),
-    )
-
-    assert [item.decision for item in parsed] == [
-        NO_RELATION,
-        OTHER_UNSUPPORTED,
-    ]
-    assert parsed[1].reason_code == "SCHEMA_GAP"
-    assert parsed[1].hypotheses == ()
-    assert [(span.start, span.end) for span in parsed[1].evidence_spans] == [
-        pairs[1].context_span,
-    ]
+    with pytest.raises(ShadowClassificationError, match="predicate"):
+        parse_classifier_response(
+            pairs,
+            {"decisions": [
+                _decision(
+                    pairs[0].pair_identity,
+                    decision=NO_RELATION,
+                    reason_code="CO_OCCURRENCE_ONLY",
+                ),
+                _decision(
+                    pairs[1].pair_identity,
+                    hypotheses=[_hypothesis(
+                        subject="occ-acme",
+                        predicate="schema_outside_predicate",
+                        object_="occ-bolt",
+                    )],
+                ),
+            ]},
+            content=content,
+            logical_schema=_schema(),
+        )
 
 
 def test_one_pair_can_propose_two_concrete_hypotheses() -> None:
@@ -448,21 +439,18 @@ def test_classifier_parser_rejects_unknown_predicate_endpoint_drift_and_bad_span
         )
 
 
-def test_classifier_parser_downgrades_schema_outside_predicate_to_gap() -> None:
+def test_classifier_parser_rejects_schema_outside_predicate() -> None:
     pair = _opportunity()
-    parsed = parse_classifier_response(
-        [pair],
-        {"decisions": [_decision(
-            pair.pair_identity,
-            hypotheses=[_hypothesis(predicate="invented")],
-        )]},
-        content=CONTENT,
-        logical_schema=_schema(),
-    )
-
-    assert parsed[0].decision == OTHER_UNSUPPORTED
-    assert parsed[0].reason_code == "SCHEMA_GAP"
-    assert parsed[0].hypotheses == ()
+    with pytest.raises(ShadowClassificationError, match="predicate"):
+        parse_classifier_response(
+            [pair],
+            {"decisions": [_decision(
+                pair.pair_identity,
+                hypotheses=[_hypothesis(predicate="invented")],
+            )]},
+            content=CONTENT,
+            logical_schema=_schema(),
+        )
 
 
 def test_classifier_parser_rejects_duplicate_missing_and_unknown_pair_ids() -> None:
