@@ -2980,19 +2980,26 @@ class KnowledgeForgeService:
             self.db.update_job(job_id, status="cancelled", progress=100, log=str(exc), error=str(exc))
         except Exception as exc:
             LOGGER.exception("Enhanced strategy ingestion failed: %s", document_id)
+            error_message = str(exc)
+            if "禁止回退旧流程" not in error_message:
+                error_message = (
+                    "Shadow relation v2 构建失败，enhanced_shadow 禁止回退旧流程："
+                    f"{error_message}"
+                )
             if state:
                 self.db.fail_strategy_graph_rebuild(
-                    int(state["project_id"]), strategy_key, int(state["generation"]), str(exc),
+                    int(state["project_id"]), strategy_key, int(state["generation"]),
+                    error_message,
                 )
             for target_id in target_document_ids:
                 self.db.update_document_strategy_build(
                     target_id, strategy_key, status="failed", latest_job_id=job_id,
-                    error_message=str(exc), completed_at=datetime.now(timezone.utc),
+                    error_message=error_message, completed_at=datetime.now(timezone.utc),
                 )
-            self._fail_active_ingestion_subtask(job_id, str(exc))
+            self._fail_active_ingestion_subtask(job_id, error_message)
             self.db.update_job(
                 job_id, status="failed", progress=100,
-                log=f"增强实验构建失败：{exc}", error=str(exc),
+                log=f"增强实验构建失败：{error_message}", error=error_message,
                 metadata={"stage": "failed", "strategy_key": strategy_key},
             )
         finally:
