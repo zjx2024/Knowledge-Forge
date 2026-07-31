@@ -20,6 +20,24 @@ from .shadow_schema_overlay import (
 from .shadow_context import build_shadow_context_manifest, occurrence_scope
 
 
+def _loaded_relation_code_digest() -> str:
+    """Fingerprint the source revision loaded by this worker process once.
+
+    Long-running relation jobs must compare against the code that the Python
+    worker actually imported.  Re-reading source files at the final freshness
+    checkpoint makes an unrelated on-disk deployment look like an in-process
+    code change even though the running worker cannot execute those new bytes.
+    """
+
+    code_hasher = hashlib.sha256()
+    for path in (Path(__file__), Path(str(v2.__file__))):
+        code_hasher.update(path.read_bytes())
+    return code_hasher.hexdigest()
+
+
+LOADED_RELATION_CODE_DIGEST = _loaded_relation_code_digest()
+
+
 CLASSIFIER_ACCEPTED = "ACCEPTED"
 CLASSIFIER_RETRYABLE_EMPTY = "RETRYABLE_EMPTY"
 CLASSIFIER_RETRYABLE_PROTOCOL = "RETRYABLE_PROTOCOL"
@@ -405,9 +423,6 @@ class ShadowRelationV2Runtime:
         } for item in sorted(
             mentions, key=lambda value: str(value["mention_key"]),
         )]
-        code_hasher = hashlib.sha256()
-        for path in (Path(__file__), Path(str(v2.__file__))):
-            code_hasher.update(path.read_bytes())
         candidate = {
             "policy_version": SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION,
             "parameters": {
@@ -498,7 +513,7 @@ class ShadowRelationV2Runtime:
                 "minimum_gold_facts": 200,
             },
             materialization_root={
-                "code_tree": code_hasher.hexdigest(),
+                "code_tree": LOADED_RELATION_CODE_DIGEST,
                 "policy_root": policy_root,
             },
         )
@@ -1896,6 +1911,17 @@ class ShadowRelationV2Runtime:
                         f"{hypothesis_index}/{total_hypotheses} 个关系假设",
                     )
             terminal_verifier_attempts = {}
+            replay_assertion = getattr(
+                self.models, "assert_replay_complete", None,
+            )
+            if callable(replay_assertion):
+                replay_assertion()
+            replay_summary = getattr(self.models, "replay_summary", None)
+            replay_metrics = (
+                dict(replay_summary())
+                if callable(replay_summary)
+                else {}
+            )
             for item in verification_attempts:
                 current_attempt = terminal_verifier_attempts.get(
                     str(item.hypothesis_id)
@@ -1950,6 +1976,7 @@ class ShadowRelationV2Runtime:
                     "classifier_model_calls": classifier_calls,
                     "classifier_failures": classifier_failures,
                     "verifier_model_calls": verifier_calls,
+                    "replay": replay_metrics,
                     "legacy_pipeline_calls": 0,
                     "production_approved": False,
                 }
@@ -2060,6 +2087,7 @@ class ShadowRelationV2Runtime:
                 "classifier_model_calls": classifier_calls,
                 "classifier_failures": classifier_failures,
                 "verifier_model_calls": verifier_calls,
+                "replay": replay_metrics,
                 "legacy_pipeline_calls": 0,
                 "production_approved": False,
             }

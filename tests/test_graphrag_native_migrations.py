@@ -204,7 +204,7 @@ def test_native_migrations_install_on_an_empty_isolated_schema():
 
 @pytest.mark.integration
 def test_native_migrations_upgrade_existing_stable_and_enhanced_state_without_mutation():
-    """0022-0024 upgrade a pre-native schema without rewriting legacy graph state."""
+    """0022-0025 upgrade a pre-native schema without rewriting legacy graph state."""
 
     admin_dsn = _isolated_admin_dsn()
     schema_name = "native_upgrade_" + uuid.uuid4().hex
@@ -233,6 +233,7 @@ def test_native_migrations_upgrade_existing_stable_and_enhanced_state_without_mu
                 "0022_graphrag_native_control_plane",
                 "0023_project_construction_strategy_selection",
                 "0024_project_strategy_binding",
+                "0025_knowledge_forge_communities",
             ]
             assert MigrationRunner().apply(conn) == []
             evidence = _catalog_evidence(conn)

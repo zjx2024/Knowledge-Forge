@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -391,6 +392,29 @@ def _keep_runtime_chunks(database: _RuntimeDatabase, chunk_ids: set[int]) -> Non
         item for item in database.assignments
         if str(item["mention_key"]) in mention_keys
     ]
+
+
+def test_runtime_fingerprint_uses_process_loaded_code_without_rereading_files(
+    monkeypatch,
+):
+    database = _RuntimeDatabase()
+    runtime = ShadowRelationV2Runtime(database, _ScriptedGateway())
+    first = runtime._context(1, "namespace-runtime")["fingerprint"]
+
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("freshness check reread source file"),
+        ),
+    )
+    second = runtime._context(1, "namespace-runtime")["fingerprint"]
+
+    assert second.root == first.root
+    assert (
+        second.components["materialization_root"]["code_tree"]
+        == first.components["materialization_root"]["code_tree"]
+    )
 
 
 def test_runtime_executes_every_v2_stage_and_never_treats_classified_as_verified():

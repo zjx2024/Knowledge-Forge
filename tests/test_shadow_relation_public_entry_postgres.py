@@ -13,10 +13,15 @@ from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 from knowledge_forge import relation_shadow_v2 as v2
+from knowledge_forge import relation_shadow_runtime as relation_runtime
 from knowledge_forge.construction_strategies import ENHANCED_SHADOW_STRATEGY
 from knowledge_forge.database import Database
 from knowledge_forge.relation_shadow_runtime import ShadowRelationV2Runtime
 from knowledge_forge.service import KnowledgeForgeService
+from knowledge_forge.shadow_relation_replay import (
+    PersistedShadowModelReplayGateway,
+    assert_code_only_replay_compatible,
+)
 from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
@@ -679,3 +684,90 @@ def test_public_enhanced_shadow_stale_fingerprint_never_materializes_or_falls_ba
         ).fetchone()["count"])
     assert run["status"] == "stale"
     assert endpoints == 0
+
+
+@pytest.mark.integration
+def test_code_only_stale_run_replays_every_persisted_call_without_model_io(
+    monkeypatch,
+):
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
+    database = _database(dsn)
+    database.bootstrap()
+    suffix = uuid.uuid4().hex
+    seeded = _seed_runtime(database, suffix)
+    source_code = "source-process-code"
+    current_code = "current-process-code"
+    monkeypatch.setattr(
+        relation_runtime, "LOADED_RELATION_CODE_DIGEST", source_code,
+    )
+
+    class DriftAfterVerifier(_ScriptedV2Gateway):
+        def json_chat(self, **kwargs):
+            response = super().json_chat(**kwargs)
+            if "verifier" in str(kwargs["system"]):
+                monkeypatch.setattr(
+                    relation_runtime,
+                    "LOADED_RELATION_CODE_DIGEST",
+                    current_code,
+                )
+            return response
+
+    source_gateway = DriftAfterVerifier()
+    with pytest.raises(v2.StaleRelationSnapshotError):
+        ShadowRelationV2Runtime(database, source_gateway).run_namespace(
+            namespace_id=str(seeded["namespace_id"]),
+            project_id=int(seeded["project_id"]),
+        )
+    with database.connection() as conn:
+        source_run = conn.execute(
+            """SELECT * FROM shadow_relation_v2_runs
+               WHERE project_id=%s ORDER BY created_at DESC LIMIT 1""",
+            (seeded["project_id"],),
+        ).fetchone()
+        assert source_run["status"] == "stale"
+        assert conn.execute(
+            """SELECT COUNT(*) AS count
+               FROM entity_shadow_relation_endpoints WHERE namespace_id=%s""",
+            (seeded["namespace_id"],),
+        ).fetchone()["count"] == 0
+
+    replay = PersistedShadowModelReplayGateway(
+        database,
+        str(source_run["id"]),
+        runtime_model_gateway=_ScriptedV2Gateway(),
+    )
+    runtime = ShadowRelationV2Runtime(database, replay)
+    current = runtime._context(
+        int(seeded["project_id"]), str(seeded["namespace_id"]),
+    )["fingerprint"]
+    compatibility = assert_code_only_replay_compatible(
+        source_run, current,
+    )
+    assert compatibility["changed_components"] == [
+        "materialization_root.code_tree",
+    ]
+
+    recovered = runtime.run_namespace(
+        namespace_id=str(seeded["namespace_id"]),
+        project_id=int(seeded["project_id"]),
+    )
+
+    assert recovered["metrics"]["replay"]["live_model_calls"] == 0
+    assert recovered["metrics"]["replay"]["misses"] == 0
+    assert recovered["metrics"]["replay"]["remaining_calls"] == 0
+    assert recovered["metrics"]["verifier_supported"] == 1
+    assert len(recovered["endpoint_rows"]) == 1
+    with database.connection() as conn:
+        assert conn.execute(
+            """SELECT COUNT(*) AS count
+               FROM entity_shadow_relation_endpoints WHERE namespace_id=%s""",
+            (seeded["namespace_id"],),
+        ).fetchone()["count"] == 1
+        current_run = conn.execute(
+            "SELECT status,metrics FROM shadow_relation_v2_runs WHERE id=%s",
+            (recovered["run_id"],),
+        ).fetchone()
+    assert current_run["status"] == "ready"
+    assert current_run["metrics"]["replay"]["source_run_id"] == source_run["id"]

@@ -222,14 +222,18 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
     assert first["namespace_id"] == second["namespace_id"]
     assert (fake_schemas.calls, fake_ollama.embedding_calls, fake_ollama.review_calls) == first_model_calls
     assert fake_schemas.calls == 2
-    assert fake_ollama.embedding_calls == 1
-    assert fake_ollama.embedding_batch_sizes == [2]
+    # The current conservative identity profile only merges an exact canonical
+    # name.  The explicit "IBM" alias therefore remains a separate canonical
+    # and requires its own embedding batch, while the completed namespace must
+    # still be reused without any additional model calls on restart.
+    assert fake_ollama.embedding_calls == 2
+    assert fake_ollama.embedding_batch_sizes == [2, 1]
     assignments = first["assignments"]
     ibm_assignments = [
         item for item in assignments
         if (item.get("metadata") or {}).get("evidence_start") in (0,)
     ]
-    assert len({item["canonical_key"] for item in ibm_assignments}) == 1
+    assert len({item["canonical_key"] for item in ibm_assignments}) == 2
     assert first["relation_endpoints"] == []
 
     with database.connection() as conn:
