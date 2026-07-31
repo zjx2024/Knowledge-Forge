@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from knowledge_forge.relation_shadow_v2 import (
     FILTERED_DISTANCE,
+    FILTERED_STRUCTURE_INELIGIBLE,
+    FILTERED_SCOPE_BOUNDARY,
     FILTERED_STRUCTURE_PEER,
     PENDING_CLASSIFICATION,
     plan_pair_opportunities,
@@ -105,4 +107,95 @@ def test_plain_far_apart_pair_still_fails_distance_without_structure():
         max_char_distance=10,
     )
 
-    assert plan.opportunities[0].status == FILTERED_DISTANCE
+    assert plan.opportunities[0].status == FILTERED_SCOPE_BOUNDARY
+
+
+def test_list_item_scopes_and_parser_roles_are_hard_generic_boundaries():
+    content = "Alpha Beta; Gamma Delta"
+    plan = plan_pair_opportunities(
+        project_id=1,
+        document_revision_id="revision-1",
+        chunk_key="chunk-1",
+        content=content,
+        mentions=[
+            _mention(
+                "alpha", 0, 5, "Alpha", source_role="list_item",
+                relation_eligible=True, scope_id="item-1", scope_kind="list_item",
+                scope_start=0, scope_end=10,
+            ),
+            _mention(
+                "beta", 6, 10, "Beta", source_role="list_item",
+                relation_eligible=True, scope_id="item-1", scope_kind="list_item",
+                scope_start=0, scope_end=10,
+            ),
+            _mention(
+                "gamma", 12, 17, "Gamma", source_role="list_item",
+                relation_eligible=True, scope_id="item-2", scope_kind="list_item",
+                scope_start=12, scope_end=len(content),
+            ),
+        ],
+        logical_schema=_schema(),
+        run_id="run-1",
+        candidate_policy_version="candidate-v1",
+    )
+
+    by_pair = {
+        frozenset((item.left_occurrence_key, item.right_occurrence_key)): item
+        for item in plan.opportunities
+    }
+    assert by_pair[frozenset(("occ-alpha", "occ-beta"))].status == PENDING_CLASSIFICATION
+    assert by_pair[frozenset(("occ-alpha", "occ-gamma"))].status == FILTERED_SCOPE_BOUNDARY
+
+    header_plan = plan_pair_opportunities(
+        project_id=1,
+        document_revision_id="revision-2",
+        chunk_key="chunk-2",
+        content="Alpha Beta",
+        mentions=[
+            _mention(
+                "alpha", 0, 5, "Alpha", source_role="table_header",
+                relation_eligible=False, scope_id="header", scope_kind="table_header",
+                scope_start=0, scope_end=10,
+            ),
+            _mention(
+                "beta", 6, 10, "Beta", source_role="table_header",
+                relation_eligible=False, scope_id="header", scope_kind="table_header",
+                scope_start=0, scope_end=10,
+            ),
+        ],
+        logical_schema=_schema(),
+        run_id="run-2",
+        candidate_policy_version="candidate-v1",
+    )
+    assert header_plan.opportunities[0].status == FILTERED_STRUCTURE_INELIGIBLE
+
+
+def test_schema_scope_and_source_role_metadata_control_admission_not_predicate_name():
+    content = "Alpha. Beta."
+    beta_start = content.index("Beta")
+    mentions = [
+        _mention("alpha", 0, 5, "Alpha", source_role="body", relation_eligible=True),
+        _mention("beta", beta_start, beta_start + 4, "Beta", source_role="body", relation_eligible=True),
+    ]
+    strict = logical_schema(predicate_policy("alpha_rel"))
+    permissive = logical_schema(predicate_policy(
+        "renamed_rel",
+        scope_policy={
+            "require_same_atomic_scope": False,
+            "allow_cross_scope_with_explicit_evidence": True,
+        },
+    ))
+
+    strict_plan = plan_pair_opportunities(
+        project_id=1, document_revision_id="revision-1", chunk_key="chunk-1",
+        content=content, mentions=mentions, logical_schema=strict,
+        run_id="run-1", candidate_policy_version="candidate-v1",
+    )
+    permissive_plan = plan_pair_opportunities(
+        project_id=1, document_revision_id="revision-1", chunk_key="chunk-1",
+        content=content, mentions=mentions, logical_schema=permissive,
+        run_id="run-1", candidate_policy_version="candidate-v1",
+    )
+
+    assert strict_plan.opportunities[0].status == FILTERED_SCOPE_BOUNDARY
+    assert permissive_plan.opportunities[0].status == PENDING_CLASSIFICATION

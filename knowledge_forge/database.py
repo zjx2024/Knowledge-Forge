@@ -22,6 +22,7 @@ from psycopg.rows import dict_row
 from .config import Config
 from .construction_strategies import (
     ENHANCED_SHADOW_STRATEGY,
+    GRAPHRAG_NATIVE_STRATEGY,
     STABLE_STRATEGY,
     normalize_strategy,
 )
@@ -82,6 +83,39 @@ SHADOW_RELATION_V2_REQUIRED_MIGRATIONS = (
     "0020_shadow_relation_v2_model_audit",
     "0021_shadow_relation_v2_artifact_audit",
 )
+
+GRAPHRAG_NATIVE_REQUIRED_MIGRATIONS = (
+    "0022_graphrag_native_control_plane",
+)
+
+GRAPHRAG_NATIVE_REQUIRED_TABLE_COLUMNS = {
+    "graphrag_native_runs": {
+        "run_id", "project_id", "generation", "state", "base_sha",
+        "worktree_diff_hash", "code_tree_hash", "source_snapshot_hash",
+        "settings_hash", "prompt_profile_hash", "completion_model_id",
+        "completion_model_digest", "embedding_model_id", "embedding_model_digest",
+        "embedding_dimension", "graphrag_version", "python_version",
+        "staging_relative_path", "bundle_relative_path", "validator_version",
+        "validation_report_hash", "lease_owner", "lease_expires_at",
+    },
+    "graphrag_native_run_documents": {
+        "run_id", "project_id", "document_id", "revision_id", "source_hash",
+        "structure_hash", "input_document_count", "input_manifest_hash", "ordinal",
+    },
+    "graphrag_native_artifacts": {
+        "run_id", "logical_name", "relative_path", "sha256", "byte_size",
+        "media_type", "schema_hash", "row_count",
+    },
+    "graphrag_native_project_state": {
+        "project_id", "active_run_id", "active_generation",
+        "desired_source_snapshot_hash", "updated_at",
+    },
+    "graphrag_native_query_runs": {
+        "query_run_id", "project_id", "run_id", "query_mode", "question_hash",
+        "status", "model_id", "latency_ms", "token_usage", "context_reference_count",
+        "failure_class",
+    },
+}
 
 SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS = {
     "shadow_relation_v2_runs": {
@@ -861,13 +895,56 @@ class Database:
                     "missing_columns": missing_columns,
                 }
                 raise RuntimeError(
-                    "Shadow relation v2 数据库结构不完整，enhanced_shadow "
+                    "Knowledge Forge 数据库结构不完整，"
                     "拒绝运行且不会回退旧流程: "
                     + self._canonical_json(details)
                 )
             return {
                 "migrations": list(SHADOW_RELATION_V2_REQUIRED_MIGRATIONS),
                 "tables": sorted(SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS),
+            }
+
+    def assert_graphrag_native_ready(self) -> dict[str, Any]:
+        """Fail closed if the isolated native control-plane migration is incomplete."""
+
+        runner = MigrationRunner()
+        with self.connection() as conn:
+            missing_migrations = [
+                version for version in GRAPHRAG_NATIVE_REQUIRED_MIGRATIONS
+                if not runner.is_applied(conn, version)
+            ]
+            missing_tables: list[str] = []
+            missing_columns: dict[str, list[str]] = {}
+            for table, required_columns in GRAPHRAG_NATIVE_REQUIRED_TABLE_COLUMNS.items():
+                relation = conn.execute(
+                    "SELECT to_regclass(%s) AS table_name", (table,),
+                ).fetchone()
+                if not relation or not relation["table_name"]:
+                    missing_tables.append(table)
+                    continue
+                columns = {
+                    str(row["column_name"])
+                    for row in conn.execute(
+                        """SELECT column_name FROM information_schema.columns
+                           WHERE table_schema=current_schema() AND table_name=%s""",
+                        (table,),
+                    ).fetchall()
+                }
+                absent = sorted(required_columns - columns)
+                if absent:
+                    missing_columns[table] = absent
+            if missing_migrations or missing_tables or missing_columns:
+                raise RuntimeError(
+                    "GraphRAG Native 数据库结构不完整，拒绝运行且不会回退旧流程: "
+                    + self._json({
+                        "missing_migrations": missing_migrations,
+                        "missing_tables": missing_tables,
+                        "missing_columns": missing_columns,
+                    })
+                )
+            return {
+                "migrations": list(GRAPHRAG_NATIVE_REQUIRED_MIGRATIONS),
+                "tables": sorted(GRAPHRAG_NATIVE_REQUIRED_TABLE_COLUMNS),
             }
 
     @staticmethod
@@ -1206,7 +1283,23 @@ class Database:
         normalized = re.sub(r"[^A-Za-z0-9]+", "-", name or "project").strip("-").lower()[:32] or "project"
         return f"{normalized}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{project_id}"
 
-    def create_project(self, name: str, description: str, llm_model: str | None, embedding_model: str | None) -> dict[str, Any]:
+    def create_project(
+        self,
+        name: str,
+        description: str,
+        llm_model: str | None,
+        embedding_model: str | None,
+        *,
+        strategy_key: str | None = None,
+    ) -> dict[str, Any]:
+        selected_strategy = (
+            normalize_strategy(strategy_key) if strategy_key is not None else STABLE_STRATEGY
+        )
+        if strategy_key is not None and selected_strategy not in {
+            ENHANCED_SHADOW_STRATEGY,
+            GRAPHRAG_NATIVE_STRATEGY,
+        }:
+            raise ValueError("新项目只能绑定 Knowledge Forge 或 GraphRAG Native")
         with self.connection() as conn:
             row = conn.execute(
                 """INSERT INTO projects(
@@ -1218,7 +1311,40 @@ class Database:
                 ),
             ).fetchone()
             key = self.project_key(int(row["id"]), name)
-            return conn.execute("UPDATE projects SET project_key=%s,updated_at=NOW() WHERE id=%s RETURNING *", (key, row["id"])).fetchone()
+            result = conn.execute(
+                "UPDATE projects SET project_key=%s,updated_at=NOW() WHERE id=%s RETURNING *",
+                (key, row["id"]),
+            ).fetchone()
+            selection_table = conn.execute(
+                "SELECT to_regclass('project_construction_strategy_state') AS table_name",
+            ).fetchone()
+            if selection_table and selection_table["table_name"]:
+                binding_column = conn.execute(
+                    """SELECT 1 FROM information_schema.columns
+                       WHERE table_schema=current_schema()
+                         AND table_name='project_construction_strategy_state'
+                         AND column_name='association_status'""",
+                ).fetchone()
+                if binding_column:
+                    association_status = "bound" if strategy_key is not None else "unassigned"
+                    conn.execute(
+                        """INSERT INTO project_construction_strategy_state(
+                               project_id,selected_strategy,association_status,bound_at)
+                           VALUES(%s,%s,%s,CASE WHEN %s='bound' THEN NOW() ELSE NULL END)
+                           ON CONFLICT(project_id) DO NOTHING""",
+                        (
+                            int(row["id"]), selected_strategy, association_status,
+                            association_status,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO project_construction_strategy_state(
+                               project_id,selected_strategy)
+                           VALUES(%s,%s) ON CONFLICT(project_id) DO NOTHING""",
+                        (int(row["id"]), selected_strategy),
+                    )
+            return result
 
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -1600,6 +1726,15 @@ class Database:
                     COALESCE(build.status,'uploaded') AS strategy_status,
                     COALESCE(build.error_message,'') AS strategy_error_message,
                     COALESCE(build.stats,'{{}}'::jsonb) AS strategy_stats,
+                    (
+                        SELECT COUNT(*) FROM chunks prepared_chunk
+                        WHERE prepared_chunk.document_id=d.id
+                          AND prepared_chunk.is_deleted=FALSE
+                          AND (
+                              d.active_revision_id IS NULL
+                              OR prepared_chunk.revision_id=d.active_revision_id
+                          )
+                    ) AS prepared_chunk_count,
                     build.latest_job_id AS strategy_job_id,
                     build.content_revision_id AS strategy_revision_id,
                     build.started_at AS strategy_started_at,
@@ -1714,6 +1849,604 @@ class Database:
                 (document_id,),
             ).fetchall()
 
+    @staticmethod
+    def _validate_graphrag_native_relative_path(value: str, *, field: str) -> str:
+        """Reject absolute, traversal, and empty critical bundle paths."""
+
+        candidate = str(value or "").replace("\\", "/")
+        if not candidate or candidate.startswith("/"):
+            raise ValueError(f"{field} 必须是非空相对路径")
+        parts = [part for part in candidate.split("/") if part]
+        if not parts or any(part in {".", ".."} for part in parts):
+            raise ValueError(f"{field} 包含不安全路径")
+        return "/".join(parts)
+
+    def ensure_graphrag_native_project_state(self, project_id: int) -> dict[str, Any]:
+        """Create the native control-plane pointer without touching HugeGraph state."""
+
+        with self.connection() as conn:
+            project = conn.execute(
+                "SELECT id FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            conn.execute(
+                """INSERT INTO graphrag_native_project_state(project_id)
+                   VALUES(%s) ON CONFLICT(project_id) DO NOTHING""",
+                (project_id,),
+            )
+            return conn.execute(
+                "SELECT * FROM graphrag_native_project_state WHERE project_id=%s",
+                (project_id,),
+            ).fetchone()
+
+    def get_graphrag_native_project_state(self, project_id: int) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM graphrag_native_project_state WHERE project_id=%s", (project_id,),
+            ).fetchone()
+
+    def get_graphrag_native_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM graphrag_native_runs WHERE run_id=%s", (run_id,),
+            ).fetchone()
+
+    def list_graphrag_native_runs(self, project_id: int) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM graphrag_native_runs WHERE project_id=%s
+                   ORDER BY generation DESC,created_at DESC""",
+                (project_id,),
+            ).fetchall()
+
+    def create_graphrag_native_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Allocate a fenced generation for one immutable native bundle attempt."""
+
+        required = {
+            "run_id", "project_id", "base_sha", "worktree_diff_hash", "code_tree_hash",
+            "source_snapshot_hash", "settings_hash", "prompt_profile_hash",
+            "completion_model_id", "completion_model_digest", "embedding_model_id",
+            "embedding_model_digest", "graphrag_version", "python_version",
+        }
+        missing = sorted(key for key in required if not str(values.get(key) or ""))
+        if missing:
+            raise ValueError("GraphRAG Native run 缺少不可变身份字段: " + ", ".join(missing))
+        project_id = int(values["project_id"])
+        run_id = str(values["run_id"])
+        state = str(values.get("state") or "PENDING")
+        if state != "PENDING":
+            raise ValueError("GraphRAG Native run 必须从 PENDING 创建")
+        staging_path = self._validate_graphrag_native_relative_path(
+            str(values.get("staging_relative_path") or ""), field="staging_relative_path",
+        )
+        with self.connection() as conn:
+            project = conn.execute(
+                "SELECT id FROM projects WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
+                (project_id,),
+            ).fetchone()
+            if not project:
+                raise LookupError("项目不存在")
+            pointer = conn.execute(
+                """INSERT INTO graphrag_native_project_state(project_id)
+                   VALUES(%s) ON CONFLICT(project_id) DO NOTHING
+                   RETURNING project_id""",
+                (project_id,),
+            ).fetchone()
+            if not pointer:
+                pointer = conn.execute(
+                    """SELECT * FROM graphrag_native_project_state
+                       WHERE project_id=%s FOR UPDATE""",
+                    (project_id,),
+                ).fetchone()
+            else:
+                pointer = conn.execute(
+                    """SELECT * FROM graphrag_native_project_state
+                       WHERE project_id=%s FOR UPDATE""",
+                    (project_id,),
+                ).fetchone()
+            generation = int(pointer.get("active_generation") or 0) + 1
+            row = conn.execute(
+                """INSERT INTO graphrag_native_runs(
+                       run_id,project_id,generation,state,base_sha,worktree_diff_hash,
+                       code_tree_hash,source_snapshot_hash,settings_hash,prompt_profile_hash,
+                       completion_model_id,completion_model_digest,embedding_model_id,
+                       embedding_model_digest,embedding_dimension,graphrag_version,python_version,
+                       staging_relative_path,bundle_relative_path,validator_version
+                   ) VALUES(%s,%s,%s,'PENDING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'','')
+                   RETURNING *""",
+                (
+                    run_id, project_id, generation, values["base_sha"],
+                    values["worktree_diff_hash"], values["code_tree_hash"],
+                    values["source_snapshot_hash"], values["settings_hash"],
+                    values["prompt_profile_hash"], values["completion_model_id"],
+                    values["completion_model_digest"], values["embedding_model_id"],
+                    values["embedding_model_digest"], int(values.get("embedding_dimension") or 0),
+                    values["graphrag_version"], values["python_version"], staging_path,
+                ),
+            ).fetchone()
+            conn.execute(
+                """UPDATE graphrag_native_project_state
+                   SET active_generation=%s,desired_source_snapshot_hash=%s,updated_at=NOW()
+                   WHERE project_id=%s""",
+                (generation, str(values["source_snapshot_hash"]), project_id),
+            )
+            return row
+
+    def acquire_graphrag_native_run_lease(
+        self, run_id: str, owner: str, *, ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        if not owner:
+            raise ValueError("native lease owner 不能为空")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_native_runs SET lease_owner=%s,
+                       lease_expires_at=NOW()+(%s*INTERVAL '1 second'),
+                       heartbeat_at=NOW(),started_at=COALESCE(started_at,NOW()),
+                       state=CASE WHEN state='PENDING' THEN 'PREPARING' ELSE state END
+                   WHERE run_id=%s AND state IN ('PENDING','PREPARING','RUNNING','VALIDATING')
+                     AND (lease_expires_at IS NULL OR lease_expires_at<NOW() OR lease_owner=%s)
+                   RETURNING *""",
+                (owner, max(30, int(ttl_seconds)), run_id, owner),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native run lease 已失效或被其他 worker 持有")
+            return row
+
+    def renew_graphrag_native_run_lease(
+        self, run_id: str, owner: str, *, ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_native_runs SET heartbeat_at=NOW(),
+                       lease_expires_at=NOW()+(%s*INTERVAL '1 second')
+                   WHERE run_id=%s AND lease_owner=%s
+                     AND state IN ('PREPARING','RUNNING','VALIDATING')
+                     AND lease_expires_at>NOW() RETURNING *""",
+                (max(30, int(ttl_seconds)), run_id, owner),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native run lease 已失效")
+            return row
+
+    def release_graphrag_native_run_lease(self, run_id: str, owner: str) -> dict[str, Any]:
+        """Release a completed/terminal native worker lease without deleting its run."""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_native_runs SET lease_owner='',lease_expires_at=NULL,
+                       heartbeat_at=NOW()
+                   WHERE run_id=%s AND lease_owner=%s RETURNING *""",
+                (str(run_id), str(owner)),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native run lease 无法释放：owner 不匹配或 run 不存在")
+            return row
+
+    def fail_graphrag_native_run_after_lease_loss(
+        self,
+        run_id: str,
+        *,
+        owner: str,
+        state: str,
+        failure_class: str,
+        failure_message: str,
+    ) -> dict[str, Any]:
+        """Close the owning worker's run after its lease has already expired.
+
+        Normal state changes deliberately require an unexpired lease.  That is
+        essential for publishing.  A worker which *used* to own a lease still
+        needs one safe, non-publishing operation though: recording that it
+        stopped after losing that lease.  Requiring the same owner and an
+        active (non-terminal) state prevents an old worker from modifying a
+        run reclaimed by a different owner or from changing a published run.
+        """
+
+        if state not in {"FAILED", "CANCELLED", "NO_GRAPH_UNSUPPORTED"}:
+            raise ValueError("GraphRAG Native lease-loss terminal state 非法")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_native_runs
+                   SET state=%s,failure_class=%s,failure_message=%s,
+                       failed_at=COALESCE(failed_at,NOW()),heartbeat_at=NOW(),
+                       lease_owner='',lease_expires_at=NULL
+                   WHERE run_id=%s AND lease_owner=%s
+                     AND state IN ('PREPARING','RUNNING','VALIDATING','EXECUTION_COMPLETE')
+                   RETURNING *""",
+                (
+                    state, str(failure_class)[:255], str(failure_message)[:4000],
+                    str(run_id), str(owner),
+                ),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native run 无法以 lease-loss 方式收尾")
+            return row
+
+    def update_graphrag_native_run(
+        self, run_id: str, *, owner: str = "", **values: Any,
+    ) -> dict[str, Any]:
+        allowed = {
+            "state", "bundle_relative_path", "validator_version", "validation_report_hash",
+            "embedding_dimension", "failure_class", "failure_message", "started_at",
+            "execution_completed_at", "validated_at", "ready_at", "failed_at",
+        }
+        illegal = sorted(set(values) - allowed)
+        if illegal:
+            raise ValueError("不允许更新 GraphRAG Native 不可变字段: " + ", ".join(illegal))
+        if not values:
+            existing = self.get_graphrag_native_run(run_id)
+            if not existing:
+                raise LookupError("GraphRAG Native run 不存在")
+            return existing
+        if "bundle_relative_path" in values and values["bundle_relative_path"]:
+            values["bundle_relative_path"] = self._validate_graphrag_native_relative_path(
+                str(values["bundle_relative_path"]), field="bundle_relative_path",
+            )
+        assignments = [f"{key}=%s" for key in values]
+        params: list[Any] = [values[key] for key in values]
+        # State timestamps are database timestamps, not caller-provided clock
+        # values.  This preserves a trustworthy execution/validation trail.
+        if values.get("state") == "EXECUTION_COMPLETE" and "execution_completed_at" not in values:
+            assignments.append("execution_completed_at=COALESCE(execution_completed_at,NOW())")
+        if values.get("state") == "VALIDATING" and "validated_at" not in values:
+            assignments.append("validated_at=COALESCE(validated_at,NOW())")
+        if values.get("state") in {"FAILED", "CANCELLED", "STALE", "SUPERSEDED"} and "failed_at" not in values:
+            assignments.append("failed_at=COALESCE(failed_at,NOW())")
+        clause = "run_id=%s"
+        params.append(run_id)
+        if owner:
+            # A source mutation fences the run by moving it to STALE or
+            # SUPERSEDED.  A late worker must never turn that terminal state
+            # back into EXECUTION_COMPLETE/READY merely because it still owns
+            # an old process lease.
+            clause += " AND lease_owner=%s AND lease_expires_at>NOW() AND state NOT IN ('READY','EMPTY_INPUT','NO_GRAPH_UNSUPPORTED','FAILED','CANCELLED','STALE','SUPERSEDED')"
+            params.append(owner)
+        with self.connection() as conn:
+            row = conn.execute(
+                f"""UPDATE graphrag_native_runs SET {','.join(assignments)},
+                       heartbeat_at=NOW() WHERE {clause} RETURNING *""",
+                params,
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native run 已过期、丢失 lease 或不存在")
+            return row
+
+    def replace_graphrag_native_run_documents(
+        self, run_id: str, documents: list[dict[str, Any]], *, owner: str,
+    ) -> None:
+        if not documents:
+            raise ValueError("GraphRAG Native run 至少需要一个输入文档")
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT * FROM graphrag_native_runs WHERE run_id=%s FOR UPDATE""", (run_id,),
+            ).fetchone()
+            if not run or run["lease_owner"] != owner or not run.get("lease_expires_at") or run["lease_expires_at"] <= datetime.now(timezone.utc):
+                raise RuntimeError("GraphRAG Native run document 写入需要有效 lease")
+            conn.execute("DELETE FROM graphrag_native_run_documents WHERE run_id=%s", (run_id,))
+            for ordinal, item in enumerate(documents):
+                if int(item["project_id"]) != int(run["project_id"]):
+                    raise ValueError("GraphRAG Native run document 跨项目")
+                conn.execute(
+                    """INSERT INTO graphrag_native_run_documents(
+                           run_id,project_id,document_id,revision_id,source_hash,structure_hash,
+                           input_document_count,input_manifest_hash,ordinal
+                       ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        run_id, int(item["project_id"]), int(item["document_id"]),
+                        str(item["revision_id"]), str(item["source_hash"]),
+                        str(item["structure_hash"]), int(item["input_document_count"]),
+                        str(item["input_manifest_hash"]), ordinal,
+                    ),
+                )
+
+    def replace_graphrag_native_artifacts(
+        self, run_id: str, artifacts: list[dict[str, Any]], *, owner: str,
+    ) -> None:
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_native_runs WHERE run_id=%s FOR UPDATE", (run_id,),
+            ).fetchone()
+            if not run or run["lease_owner"] != owner or not run.get("lease_expires_at") or run["lease_expires_at"] <= datetime.now(timezone.utc):
+                raise RuntimeError("GraphRAG Native artifact 写入需要有效 lease")
+            conn.execute("DELETE FROM graphrag_native_artifacts WHERE run_id=%s", (run_id,))
+            seen: set[str] = set()
+            for item in artifacts:
+                logical_name = str(item.get("logical_name") or "")
+                if not logical_name or logical_name in seen:
+                    raise ValueError("GraphRAG Native artifact logical_name 必须唯一")
+                seen.add(logical_name)
+                relative_path = self._validate_graphrag_native_relative_path(
+                    str(item.get("relative_path") or ""), field="artifact.relative_path",
+                )
+                digest = str(item.get("sha256") or "")
+                if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    raise ValueError("GraphRAG Native artifact SHA-256 非法")
+                conn.execute(
+                    """INSERT INTO graphrag_native_artifacts(
+                           run_id,logical_name,relative_path,sha256,byte_size,media_type,
+                           schema_hash,row_count
+                       ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        run_id, logical_name, relative_path, digest,
+                        int(item.get("byte_size") or 0), str(item.get("media_type") or ""),
+                        str(item.get("schema_hash") or ""), int(item.get("row_count", -1)),
+                    ),
+                )
+
+    def mark_graphrag_native_stale(self, project_id: int, reason: str) -> int:
+        """Fence all native attempts after a source mutation; never touch old graphs."""
+
+        with self.connection() as conn:
+            self.ensure_graphrag_native_project_state(project_id)
+            result = conn.execute(
+                """UPDATE graphrag_native_runs SET state=CASE
+                           WHEN state IN ('PENDING','PREPARING','RUNNING','VALIDATING') THEN 'SUPERSEDED'
+                           WHEN state='READY' THEN 'STALE' ELSE state END,
+                       failure_class=CASE WHEN state IN ('PENDING','PREPARING','RUNNING','VALIDATING')
+                                          THEN 'source_changed' ELSE failure_class END,
+                       failure_message=CASE WHEN state IN ('PENDING','PREPARING','RUNNING','VALIDATING')
+                                            THEN %s ELSE failure_message END,
+                       failed_at=CASE WHEN state IN ('PENDING','PREPARING','RUNNING','VALIDATING')
+                                      THEN NOW() ELSE failed_at END
+                   WHERE project_id=%s AND state IN ('PENDING','PREPARING','RUNNING','VALIDATING','READY')""",
+                (str(reason)[:2000], project_id),
+            )
+            conn.execute(
+                """UPDATE graphrag_native_project_state
+                   SET desired_source_snapshot_hash='',updated_at=NOW() WHERE project_id=%s""",
+                (project_id,),
+            )
+            return max(0, int(result.rowcount or 0))
+
+    def activate_graphrag_native_run(
+        self, run_id: str, *, owner: str, validation_report_hash: str,
+        expected_source_snapshot_hash: str,
+    ) -> dict[str, Any]:
+        """CAS the native pointer only after validation and unchanged source fingerprint."""
+
+        if not re.fullmatch(r"[0-9a-f]{64}", str(validation_report_hash)):
+            raise ValueError("validation_report_hash 必须是 SHA-256")
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM graphrag_native_runs WHERE run_id=%s FOR UPDATE", (run_id,),
+            ).fetchone()
+            if not run or run["lease_owner"] != owner or not run.get("lease_expires_at") or run["lease_expires_at"] <= datetime.now(timezone.utc):
+                raise RuntimeError("GraphRAG Native 激活需要有效 lease")
+            if run["state"] != "VALIDATING":
+                raise RuntimeError("只有 VALIDATING 的 GraphRAG Native run 可以激活")
+            if run["source_snapshot_hash"] != expected_source_snapshot_hash:
+                raise RuntimeError("GraphRAG Native source snapshot 已变化，拒绝激活")
+            if not self._graphrag_native_run_source_is_current(conn, int(run["project_id"]), run_id):
+                raise RuntimeError("GraphRAG Native source revision 已变化，拒绝激活旧 snapshot")
+            pointer = conn.execute(
+                """SELECT * FROM graphrag_native_project_state WHERE project_id=%s FOR UPDATE""",
+                (run["project_id"],),
+            ).fetchone()
+            if not pointer or pointer["desired_source_snapshot_hash"] != expected_source_snapshot_hash or int(pointer["active_generation"] or 0) != int(run["generation"]):
+                raise RuntimeError("GraphRAG Native generation 已被更新 source 或后续 run 取代")
+            ready = conn.execute(
+                """UPDATE graphrag_native_runs SET state='READY',validation_report_hash=%s,
+                       validated_at=COALESCE(validated_at,NOW()),ready_at=NOW(),
+                       lease_owner='',lease_expires_at=NULL WHERE run_id=%s RETURNING *""",
+                (validation_report_hash, run_id),
+            ).fetchone()
+            conn.execute(
+                """UPDATE graphrag_native_project_state SET active_run_id=%s,updated_at=NOW()
+                   WHERE project_id=%s""",
+                (run_id, run["project_id"]),
+            )
+            return ready
+
+    @staticmethod
+    def _graphrag_native_run_source_is_current(
+        conn: psycopg.Connection, project_id: int, run_id: str,
+    ) -> bool:
+        """Compare a frozen run's document/revision set with current sources.
+
+        This is intentionally database-local rather than relying only on a
+        service invalidation callback: a direct revision mutation, restart, or
+        late worker cannot activate an obsolete immutable bundle.
+        """
+
+        row = conn.execute(
+            """SELECT NOT EXISTS(
+                     SELECT 1 FROM graphrag_native_run_documents frozen
+                     LEFT JOIN documents document ON document.id=frozen.document_id
+                     LEFT JOIN document_content_revisions revision
+                       ON revision.revision_id=document.active_revision_id
+                     WHERE frozen.run_id=%s AND (
+                       document.is_deleted=TRUE OR revision.revision_id IS NULL
+                       OR revision.revision_id<>frozen.revision_id
+                       OR revision.source_hash<>frozen.source_hash
+                     )
+                   ) AND NOT EXISTS(
+                     SELECT 1 FROM documents current_document
+                     WHERE current_document.project_id=%s AND current_document.is_deleted=FALSE
+                       AND NOT EXISTS(
+                         SELECT 1 FROM graphrag_native_run_documents frozen
+                         WHERE frozen.run_id=%s AND frozen.document_id=current_document.id
+                       )
+                   ) AS current""",
+            (str(run_id), int(project_id), str(run_id)),
+        ).fetchone()
+        return bool(row and row["current"])
+
+    def rollback_graphrag_native_active_run(
+        self, project_id: int, target_run_id: str, *, expected_active_run_id: str,
+    ) -> dict[str, Any]:
+        """CAS only the native pointer; no bundle, legacy graph, or strategy is changed."""
+
+        with self.connection() as conn:
+            pointer = conn.execute(
+                """SELECT * FROM graphrag_native_project_state WHERE project_id=%s FOR UPDATE""",
+                (int(project_id),),
+            ).fetchone()
+            if not pointer or str(pointer.get("active_run_id") or "") != str(expected_active_run_id):
+                raise RuntimeError("GraphRAG Native rollback CAS 失败：active run 已变化")
+            target = conn.execute(
+                """SELECT * FROM graphrag_native_runs
+                   WHERE run_id=%s AND project_id=%s FOR KEY SHARE""",
+                (str(target_run_id), int(project_id)),
+            ).fetchone()
+            if not target or target.get("state") != "READY":
+                raise RuntimeError("GraphRAG Native rollback target 必须是同项目 READY run")
+            if not self._graphrag_native_run_source_is_current(conn, int(project_id), str(target_run_id)):
+                raise RuntimeError("GraphRAG Native rollback target 已不对应当前 source")
+            row = conn.execute(
+                """UPDATE graphrag_native_project_state SET active_run_id=%s,
+                       desired_source_snapshot_hash=%s,updated_at=NOW()
+                   WHERE project_id=%s AND active_run_id=%s RETURNING *""",
+                (str(target_run_id), str(target["source_snapshot_hash"]), int(project_id), str(expected_active_run_id)),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native rollback CAS 失败")
+            return row
+
+    def get_project_construction_strategy_selection(self, project_id: int) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM project_construction_strategy_state WHERE project_id=%s", (int(project_id),),
+            ).fetchone()
+
+    def bind_project_construction_strategy(
+        self, project_id: int, strategy_key: str, *, expected_generation: int,
+    ) -> dict[str, Any]:
+        """Bind an unassigned project exactly once using a generation CAS."""
+
+        strategy_key = normalize_strategy(strategy_key)
+        if strategy_key not in {ENHANCED_SHADOW_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
+            raise ValueError("项目只能绑定 Knowledge Forge 或 GraphRAG Native")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE project_construction_strategy_state
+                   SET selected_strategy=%s,association_status='bound',bound_at=NOW(),
+                       generation=generation+1,updated_at=NOW()
+                   WHERE project_id=%s AND generation=%s
+                     AND association_status='unassigned'
+                     AND selected_strategy='stable'
+                   RETURNING *""",
+                (strategy_key, int(project_id), int(expected_generation)),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("项目策略绑定失败：项目已绑定或页面状态已过期")
+            return row
+
+    def assert_project_construction_strategy(
+        self, project_id: int, expected_strategy: str | None = None,
+    ) -> str:
+        """Return the immutable project strategy or fail closed."""
+
+        selection = self.get_project_construction_strategy_selection(project_id)
+        if not selection:
+            raise RuntimeError("项目缺少知识图谱策略状态，请先完成数据库迁移")
+        if str(selection.get("association_status") or "") != "bound":
+            raise ValueError("项目尚未绑定知识图谱策略，请先在项目首页完成一次性选择")
+        strategy_key = normalize_strategy(str(selection.get("selected_strategy") or ""))
+        if strategy_key not in {ENHANCED_SHADOW_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
+            raise RuntimeError("项目绑定了不可用于当前界面的知识图谱策略")
+        if expected_strategy is not None and strategy_key != normalize_strategy(expected_strategy):
+            raise ValueError("请求的知识图谱策略与项目绑定策略不一致")
+        return strategy_key
+
+    def select_project_construction_strategy(
+        self, project_id: int, strategy_key: str, *, expected_generation: int,
+    ) -> dict[str, Any]:
+        """Compatibility name for the one-time binding operation."""
+
+        return self.bind_project_construction_strategy(
+            project_id, strategy_key, expected_generation=expected_generation,
+        )
+
+    def rollback_project_construction_strategy(
+        self, project_id: int, target_strategy: str, *, expected_generation: int,
+    ) -> dict[str, Any]:
+        """Normal product workflows never rebind an existing project."""
+
+        raise RuntimeError("项目知识图谱策略已固定，不能回滚或切换")
+
+    def get_active_graphrag_native_run(self, project_id: int) -> dict[str, Any] | None:
+        """Return the native-only active pointer, never a legacy strategy graph."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT run.* FROM graphrag_native_project_state state
+                   JOIN graphrag_native_runs run ON run.run_id=state.active_run_id
+                   WHERE state.project_id=%s""",
+                (int(project_id),),
+            ).fetchone()
+
+    def list_graphrag_native_runs(self, project_id: int) -> list[dict[str, Any]]:
+        """List native control-plane rows for operator retention planning only."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM graphrag_native_runs WHERE project_id=%s
+                   ORDER BY created_at DESC,run_id DESC""",
+                (int(project_id),),
+            ).fetchall()
+
+    def list_graphrag_native_run_documents(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM graphrag_native_run_documents
+                   WHERE run_id=%s ORDER BY ordinal,document_id""",
+                (str(run_id),),
+            ).fetchall()
+
+    def list_graphrag_native_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM graphrag_native_artifacts
+                   WHERE run_id=%s ORDER BY logical_name""",
+                (str(run_id),),
+            ).fetchall()
+
+    def create_graphrag_native_query_run(
+        self, *, query_run_id: str, project_id: int, run_id: str,
+        query_mode: str, question_hash: str, model_id: str,
+    ) -> dict[str, Any]:
+        if query_mode not in {"local", "global", "drift", "basic"}:
+            raise ValueError("不支持的 GraphRAG Native query mode")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(question_hash)):
+            raise ValueError("GraphRAG Native question_hash 必须是 SHA-256")
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT * FROM graphrag_native_runs WHERE run_id=%s AND project_id=%s
+                   FOR KEY SHARE""",
+                (str(run_id), int(project_id)),
+            ).fetchone()
+            if not run:
+                raise LookupError("GraphRAG Native run 不属于当前项目")
+            return conn.execute(
+                """INSERT INTO graphrag_native_query_runs(
+                       query_run_id,project_id,run_id,query_mode,question_hash,status,model_id,started_at
+                   ) VALUES(%s,%s,%s,%s,%s,'RUNNING',%s,NOW()) RETURNING *""",
+                (str(query_run_id), int(project_id), str(run_id), query_mode,
+                 str(question_hash), str(model_id or "")),
+            ).fetchone()
+
+    def complete_graphrag_native_query_run(
+        self, query_run_id: str, *, status: str, latency_ms: int,
+        context_reference_count: int = 0, token_usage: dict[str, Any] | None = None,
+        failure_class: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"READY", "FAILED", "CANCELLED"}:
+            raise ValueError("GraphRAG Native query 终态非法")
+        payload = json.dumps(token_usage or {}, ensure_ascii=False, sort_keys=True)
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE graphrag_native_query_runs SET status=%s,completed_at=NOW(),
+                       latency_ms=%s,context_reference_count=%s,token_usage=%s::jsonb,
+                       failure_class=%s
+                   WHERE query_run_id=%s AND status='RUNNING' RETURNING *""",
+                (status, max(0, int(latency_ms)), max(0, int(context_reference_count)),
+                 payload, str(failure_class or ""), str(query_run_id)),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("GraphRAG Native query run 不存在或已终态")
+            return row
+
     def get_document_strategy_build(
         self, document_id: int, strategy_key: str,
     ) -> dict[str, Any] | None:
@@ -1816,7 +2549,7 @@ class Database:
                        lease_token='',lease_expires_at=NULL,updated_at=NOW()
                    WHERE project_id=%s AND strategy_key=%s AND status<>'empty'""",
                 (
-                    reason or "稳定基线已更新，增强实验需要重新构建",
+                    reason or "稳定基线已更新，Knowledge Forge 需要重新构建",
                     document["project_id"], ENHANCED_SHADOW_STRATEGY,
                 ),
             )
@@ -2017,6 +2750,7 @@ class Database:
         *,
         reason: str,
         document_values: dict[str, Any] | None = None,
+        mutate_legacy_graph: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Atomically publish a complete revision and advance the graph generation."""
 
@@ -2093,13 +2827,19 @@ class Database:
                     WHERE id=%s AND is_deleted=FALSE RETURNING *""",
                 [*params, document_id],
             ).fetchone()
-            self._retire_orphan_entities(conn, int(document["project_id"]))
-            project = conn.execute(
-                """UPDATE projects SET graph_generation=graph_generation+1,graph_status=%s,
-                       graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
-                   WHERE id=%s AND is_deleted=FALSE RETURNING *""",
-                (GRAPH_STALE, reason, document["project_id"]),
-            ).fetchone()
+            if mutate_legacy_graph:
+                self._retire_orphan_entities(conn, int(document["project_id"]))
+                project = conn.execute(
+                    """UPDATE projects SET graph_generation=graph_generation+1,graph_status=%s,
+                           graph_policy_version='',graph_policy_hash='',graph_error=%s,updated_at=NOW()
+                       WHERE id=%s AND is_deleted=FALSE RETURNING *""",
+                    (GRAPH_STALE, reason, document["project_id"]),
+                ).fetchone()
+            else:
+                project = conn.execute(
+                    "SELECT * FROM projects WHERE id=%s AND is_deleted=FALSE",
+                    (document["project_id"],),
+                ).fetchone()
             if not project:
                 raise LookupError("项目不存在")
             return document, project
@@ -7696,7 +8436,10 @@ class Database:
                     (
                         namespace_id, revision_id, document_id, chunk_id,
                         item["reason"], self._json(item.get("raw") or {}),
-                        str(item.get("policy_version") or "entity-extraction-p2-shadow-v1"),
+                        str(
+                            item.get("policy_version")
+                            or "entity-extraction-p2-structure-gate-v2"
+                        ),
                     ),
                 )
 
@@ -8119,6 +8862,172 @@ class Database:
                 "relation_endpoints": endpoints,
             }
 
+    def search_knowledge_forge_entities(
+        self, namespace_id: str, query: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search canonicals inside one immutable Knowledge Forge namespace."""
+
+        query = str(query or "").strip()
+        if not query:
+            return []
+        normalized = normalize_name(query)
+        pattern = f"%{query}%"
+        normalized_pattern = f"%{normalized}%"
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT canonical.*,
+                   GREATEST(
+                     CASE WHEN canonical.name ILIKE %s THEN 1.0 ELSE 0.0 END,
+                     CASE WHEN canonical.normalized_name ILIKE %s THEN 1.0 ELSE 0.0 END,
+                     CASE WHEN COALESCE(canonical.metadata->>'description','') ILIKE %s
+                          THEN 0.8 ELSE 0.0 END,
+                     similarity(canonical.normalized_name,%s),
+                     COALESCE(alias_score.score,0.0)
+                   ) AS lexical_score
+                   FROM entity_shadow_canonicals canonical
+                   LEFT JOIN LATERAL (
+                     SELECT MAX(GREATEST(
+                       CASE WHEN alias.alias ILIKE %s THEN 1.0 ELSE 0.0 END,
+                       CASE WHEN alias.normalized_alias ILIKE %s THEN 1.0 ELSE 0.0 END,
+                       similarity(alias.normalized_alias,%s)
+                     )) AS score
+                     FROM entity_shadow_aliases alias
+                     WHERE alias.namespace_id=canonical.namespace_id
+                       AND alias.canonical_key=canonical.canonical_key
+                   ) alias_score ON TRUE
+                   WHERE canonical.namespace_id=%s AND (
+                     canonical.name ILIKE %s
+                     OR canonical.normalized_name ILIKE %s
+                     OR COALESCE(canonical.metadata->>'description','') ILIKE %s
+                     OR COALESCE(alias_score.score,0.0)>0.15
+                   )
+                   ORDER BY lexical_score DESC,canonical.source_count DESC,
+                            canonical.canonical_key
+                   LIMIT %s""",
+                (
+                    pattern, normalized_pattern, pattern, normalized,
+                    pattern, normalized_pattern, normalized,
+                    namespace_id, pattern, normalized_pattern, pattern,
+                    max(1, min(100, int(limit))),
+                ),
+            ).fetchall()
+
+    def get_shadow_relation_v2_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return the immutable relation run referenced by a Knowledge Forge graph."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM shadow_relation_v2_runs WHERE id=%s",
+                (str(run_id),),
+            ).fetchone()
+
+    def search_knowledge_forge_relations(
+        self,
+        namespace_id: str,
+        relation_run_id: str,
+        query: str,
+        *,
+        chunk_ids: list[int] | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search only materialized, independently verified facts for one run."""
+
+        query = str(query or "").strip()
+        if not query:
+            return []
+        pattern = f"%{query}%"
+        chunk_ids = sorted({int(value) for value in (chunk_ids or [])})
+        chunk_clause = (
+            " OR endpoint.chunk_id=ANY(%s)"
+            if chunk_ids else ""
+        )
+        params: list[Any] = [
+            pattern, pattern, pattern, pattern,
+            query, query, query, query,
+            relation_run_id, relation_run_id,
+            namespace_id, relation_run_id,
+            pattern, pattern, pattern, pattern,
+        ]
+        if chunk_ids:
+            params.append(chunk_ids)
+        params.append(max(1, min(100, int(limit))))
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT endpoint.relation_key AS id,endpoint.namespace_id,
+                   endpoint.document_id,endpoint.revision_id,endpoint.chunk_id,
+                   endpoint.source_canonical_key,source.name AS source_name,
+                   endpoint.relation_type,endpoint.target_canonical_key,
+                   target.name AS target_name,endpoint.evidence_text,
+                   endpoint.evidence_start,endpoint.evidence_end,endpoint.metadata,
+                   fact.semantic_fact_key,fact.qualifiers,fact.audit_quality,
+                   evidence.evidence_count,evidence.evidence_records,
+                   document.original_filename,document.storage_path,chunk.chunk_key,
+                   GREATEST(
+                     CASE WHEN source.name ILIKE %s THEN 1.0 ELSE 0.0 END,
+                     CASE WHEN target.name ILIKE %s THEN 1.0 ELSE 0.0 END,
+                     CASE WHEN endpoint.relation_type ILIKE %s THEN 1.0 ELSE 0.0 END,
+                     CASE WHEN endpoint.evidence_text ILIKE %s THEN 0.9 ELSE 0.0 END,
+                     similarity(LOWER(source.name),LOWER(%s)),
+                     similarity(LOWER(target.name),LOWER(%s)),
+                     similarity(LOWER(endpoint.relation_type),LOWER(%s)),
+                     similarity(LOWER(endpoint.evidence_text),LOWER(%s))
+                   ) AS lexical_score
+                   FROM entity_shadow_relation_endpoints endpoint
+                   JOIN entity_shadow_canonicals source
+                     ON source.namespace_id=endpoint.namespace_id
+                    AND source.canonical_key=endpoint.source_canonical_key
+                   JOIN entity_shadow_canonicals target
+                     ON target.namespace_id=endpoint.namespace_id
+                    AND target.canonical_key=endpoint.target_canonical_key
+                   JOIN shadow_relation_normalized_facts fact
+                     ON fact.id=endpoint.relation_key
+                    AND fact.subject_canonical_id=endpoint.source_canonical_key
+                    AND fact.predicate=endpoint.relation_type
+                    AND fact.object_canonical_id=endpoint.target_canonical_key
+                    AND fact.is_review_only=FALSE
+                   JOIN shadow_relation_fact_memberships membership
+                     ON membership.fact_id=fact.id AND membership.run_id=%s
+                    AND membership.status='ELIGIBLE'
+                   JOIN LATERAL (
+                     SELECT COUNT(*) AS evidence_count,
+                       JSONB_AGG(JSONB_BUILD_OBJECT(
+                         'id',item.id,'evidence_key',item.evidence_key,
+                         'evidence_spans',item.evidence_spans,
+                         'document_revision_id',item.document_revision_id,
+                         'verification_attempt_id',item.verification_attempt_id,
+                         'provenance',item.provenance
+                       ) ORDER BY item.evidence_key) AS evidence_records,
+                       BOOL_AND(verification.verdict='SUPPORTED'
+                         AND verification.independent_call=TRUE) AS all_supported
+                     FROM shadow_relation_fact_evidence item
+                     JOIN shadow_relation_verification_attempts verification
+                       ON verification.id=item.verification_attempt_id
+                     WHERE item.run_id=%s AND item.fact_id=fact.id
+                   ) evidence ON evidence.evidence_count>0
+                              AND evidence.all_supported=TRUE
+                   JOIN documents document
+                     ON document.id=endpoint.document_id
+                    AND document.project_id=fact.project_id
+                    AND document.active_revision_id=endpoint.revision_id
+                    AND document.is_deleted=FALSE
+                   JOIN chunks chunk
+                     ON chunk.id=endpoint.chunk_id
+                    AND chunk.revision_id=endpoint.revision_id
+                    AND chunk.is_deleted=FALSE
+                   WHERE endpoint.namespace_id=%s
+                     AND endpoint.metadata->>'shadow_relation_v2_run_id'=%s
+                     AND (
+                       source.name ILIKE %s OR target.name ILIKE %s
+                       OR endpoint.relation_type ILIKE %s
+                       OR endpoint.evidence_text ILIKE %s"""
+                + chunk_clause
+                + """)
+                   ORDER BY lexical_score DESC,evidence.evidence_count DESC,
+                            endpoint.relation_key
+                   LIMIT %s""",
+                tuple(params),
+            ).fetchall()
+
     def persist_entity_shadow_snapshot(
         self,
         namespace_id: str,
@@ -8290,6 +9199,125 @@ class Database:
                 relations=tuple(dict(item) for item in relations),
                 entities=tuple(dict(item) for item in entities),
             )
+
+    def get_knowledge_forge_community_run(
+        self,
+        project_id: int,
+        graph_generation: int,
+        entity_namespace_id: str,
+        *,
+        input_hash: str = "",
+    ) -> dict[str, Any] | None:
+        clauses = [
+            "project_id=%s", "strategy_key=%s", "graph_generation=%s",
+            "entity_namespace_id=%s",
+        ]
+        params: list[Any] = [
+            int(project_id), ENHANCED_SHADOW_STRATEGY,
+            int(graph_generation), str(entity_namespace_id),
+        ]
+        if input_hash:
+            clauses.append("input_hash=%s")
+            params.append(str(input_hash))
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM knowledge_forge_community_runs
+                   WHERE """ + " AND ".join(clauses) + """
+                     AND status IN ('completed','completed_empty')
+                   ORDER BY created_at DESC LIMIT 1""",
+                tuple(params),
+            ).fetchone()
+
+    def create_knowledge_forge_community_run(
+        self,
+        *,
+        run_id: str,
+        project_id: int,
+        graph_generation: int,
+        entity_namespace_id: str,
+        input_hash: str,
+        node_count: int,
+        edge_count: int,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO knowledge_forge_community_runs(
+                   run_id,project_id,strategy_key,graph_generation,
+                   entity_namespace_id,input_hash,status,node_count,edge_count,config)
+                   VALUES(%s,%s,%s,%s,%s,%s,'running',%s,%s,%s::jsonb)
+                   ON CONFLICT(
+                     project_id,strategy_key,graph_generation,entity_namespace_id,input_hash
+                   ) DO NOTHING RETURNING *""",
+                (
+                    str(run_id), int(project_id), ENHANCED_SHADOW_STRATEGY,
+                    int(graph_generation), str(entity_namespace_id), str(input_hash),
+                    int(node_count), int(edge_count), self._json(config),
+                ),
+            ).fetchone()
+            if row:
+                return row
+            existing = conn.execute(
+                """SELECT * FROM knowledge_forge_community_runs
+                   WHERE project_id=%s AND strategy_key=%s AND graph_generation=%s
+                     AND entity_namespace_id=%s AND input_hash=%s
+                   ORDER BY created_at DESC LIMIT 1""",
+                (
+                    int(project_id), ENHANCED_SHADOW_STRATEGY,
+                    int(graph_generation), str(entity_namespace_id), str(input_hash),
+                ),
+            ).fetchone()
+            if not existing:
+                raise RuntimeError("Knowledge Forge 社区运行幂等创建失败")
+            return existing
+
+    def complete_knowledge_forge_community_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        communities: list[dict[str, Any]],
+        hierarchy_levels: int,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        if status not in {"completed", "completed_empty"}:
+            raise ValueError("非法 Knowledge Forge 社区完成状态")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE knowledge_forge_community_runs
+                   SET status=%s,community_count=%s,hierarchy_levels=%s,
+                       communities=%s::jsonb,metadata=%s::jsonb,
+                       error_message='',completed_at=NOW()
+                   WHERE run_id=%s AND status='running' RETURNING *""",
+                (
+                    status, len(communities), int(hierarchy_levels),
+                    self._json(communities), self._json(metadata), str(run_id),
+                ),
+            ).fetchone()
+            if row:
+                return row
+            existing = conn.execute(
+                "SELECT * FROM knowledge_forge_community_runs WHERE run_id=%s",
+                (str(run_id),),
+            ).fetchone()
+            if (
+                existing
+                and existing["status"] == status
+                and int(existing["community_count"]) == len(communities)
+            ):
+                return existing
+            raise RuntimeError("Knowledge Forge 社区运行已终止或完成内容不一致")
+
+    def fail_knowledge_forge_community_run(
+        self, run_id: str, error: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE knowledge_forge_community_runs
+                   SET status='failed',error_message=%s,completed_at=NOW()
+                   WHERE run_id=%s AND status='running' RETURNING *""",
+                (str(error)[-4000:], str(run_id)),
+            ).fetchone() or {}
 
     def create_graphrag_community_run(
         self,

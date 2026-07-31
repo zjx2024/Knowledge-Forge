@@ -6,7 +6,9 @@ import pytest
 import psycopg
 from psycopg import sql
 
+from knowledge_forge.construction_strategies import ENHANCED_SHADOW_STRATEGY
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_policy import GraphNotReadyError
 from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import GRAPH_POLICY_VERSION
 from knowledge_forge.relation_verification import PUBLISHABLE_RELATION_STATUSES
@@ -28,61 +30,150 @@ class Rows:
 
 class SearchDatabase:
     def __init__(self):
-        self.statuses = [
-            "rules_verified", "llm_verified", "manual_verified",
-            "rejected", "uncertain", "verification_failed", "verification_missing",
-        ]
-        self.refiltered_ids = []
+        self.snapshot_calls = []
 
     def get_project(self, project_id):
         return {"id": project_id, "embedding_model": "embed"}
 
-    def search_graph_text(self, project_id, query, limit):
-        # Deliberately simulate stale/unsafe lexical input. Service must re-filter it.
+    def assert_project_construction_strategy(self, project_id, expected):
+        assert project_id == 4
+        assert expected == ENHANCED_SHADOW_STRATEGY
+        return expected
+
+    def get_project_strategy_graph(self, project_id, strategy):
+        assert project_id == 4
+        assert strategy == ENHANCED_SHADOW_STRATEGY
         return {
-            "entities": [],
-            "relations": [
-                {"id": index, "verification_status": status}
-                for index, status in enumerate(self.statuses, 1)
-            ],
+            "status": "ready", "generation": 3, "ready_generation": 3,
+            "policy_summary": {
+                "entity_namespace_id": "namespace-current",
+                "entity_metrics": {"relation_v2_run_id": "relation-run-current"},
+            },
         }
 
-    def get_entities_by_ids(self, project_id, ids):
-        return []
+    def get_entity_shadow_namespace(self, namespace_id):
+        assert namespace_id == "namespace-current"
+        return {
+            "id": namespace_id, "project_id": 4, "status": "ready",
+            "snapshot_complete": True, "embedding_model": "embed",
+        }
 
-    def get_relations_by_ids(self, project_id, ids):
-        self.refiltered_ids = sorted(ids)
-        return [
-            {"id": index, "verification_status": status, "confidence": 0.8}
-            for index, status in enumerate(self.statuses, 1)
-            if index in ids and status in PUBLISHABLE_RELATION_STATUSES
-        ]
+    def get_shadow_relation_v2_run(self, run_id):
+        assert run_id == "relation-run-current"
+        return {
+            "id": run_id, "project_id": 4, "status": "ready",
+        }
+
+    def search_knowledge_forge_entities(self, namespace_id, query, limit):
+        self.snapshot_calls.append(("entities", namespace_id, query))
+        return [{
+            "canonical_key": "entity-current", "name": "Alpha",
+            "primary_type": "Thing", "aliases": [], "metadata": {},
+            "source_count": 2, "lexical_score": 1.0,
+        }]
+
+    def search_entity_shadow_vector_candidates(
+        self, namespace_id, model_name, query_vector, limit,
+    ):
+        self.snapshot_calls.append(("entity-vectors", namespace_id, model_name))
+        return [{
+            "canonical_key": "entity-current", "name": "Alpha",
+            "primary_type": "Thing", "aliases": [], "metadata": {},
+            "source_count": 2, "vector_score": 0.9,
+        }]
+
+    def search_knowledge_forge_relations(
+        self, namespace_id, relation_run_id, query, *, chunk_ids, limit,
+    ):
+        self.snapshot_calls.append((
+            "relations", namespace_id, relation_run_id, tuple(chunk_ids),
+        ))
+        return [{
+            "id": "fact-current", "source_name": "Alpha",
+            "relation_type": "connected_to", "target_name": "Beta",
+            "evidence_text": "Alpha connects to Beta.", "chunk_id": 7,
+            "metadata": {"confidence": 0.91}, "evidence_count": 1,
+            "evidence_records": [{
+                "verification_attempt_id": "supported-verification",
+            }],
+            "lexical_score": 1.0, "original_filename": "current.pdf",
+            "storage_path": "/files/current.pdf",
+        }]
+
+    def search_graph_text(self, *_args, **_kwargs):
+        raise AssertionError("Knowledge Forge search must not read legacy graph text")
+
+    def get_entities_by_ids(self, *_args, **_kwargs):
+        raise AssertionError("Knowledge Forge search must not read legacy entities")
+
+    def get_relations_by_ids(self, *_args, **_kwargs):
+        raise AssertionError("Knowledge Forge search must not read legacy relations")
 
 
 class SearchVectors:
-    def search_type(self, project, query, object_type, limit):
-        if object_type == "relation":
-            return [
-                {"object_key": str(index), "score": 1 - index / 100}
-                for index in range(1, 8)
-            ]
-        return []
-
     def search(self, project, query, top_k):
-        return []
+        return [{
+            "chunk_id": 7, "object_key": "chunk-current",
+            "content": "Alpha connects to Beta.", "score": 0.8,
+        }]
 
 
-def test_service_search_refilters_lexical_and_vector_relation_ids():
+class SearchOllama:
+    def embed(self, texts, model):
+        assert texts == ["Alpha"]
+        assert model == "embed"
+        return [[0.1, 0.2]]
+
+
+def test_service_search_reads_only_current_knowledge_forge_snapshot():
     service = object.__new__(KnowledgeForgeService)
     service.db = SearchDatabase()
     service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
 
     result = service.search(4, "Alpha")
 
-    assert service.db.refiltered_ids == list(range(1, 8))
-    assert {item["verification_status"] for item in result["relations"]} == set(
-        PUBLISHABLE_RELATION_STATUSES
-    )
+    assert result["strategy"] == ENHANCED_SHADOW_STRATEGY
+    assert result["graph_generation"] == 3
+    assert result["entity_namespace_id"] == "namespace-current"
+    assert result["relation_run_id"] == "relation-run-current"
+    assert result["entities"][0]["canonical_key"] == "entity-current"
+    assert result["relations"][0]["id"] == "fact-current"
+    assert result["relations"][0]["verification_status"] == "SUPPORTED"
+    assert result["relations"][0]["evidence_count"] == 1
+    assert ("entities", "namespace-current", "Alpha") in service.db.snapshot_calls
+    assert (
+        "relations", "namespace-current", "relation-run-current", (7,)
+    ) in service.db.snapshot_calls
+
+
+def test_service_search_fails_closed_when_knowledge_forge_graph_is_stale():
+    database = SearchDatabase()
+    database.get_project_strategy_graph = lambda *_args: {
+        "status": "stale", "generation": 4, "ready_generation": 3,
+        "error_message": "source changed",
+    }
+    service = object.__new__(KnowledgeForgeService)
+    service.db = database
+    service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
+
+    with pytest.raises(GraphNotReadyError, match="source changed"):
+        service.search(4, "Alpha")
+
+
+def test_service_search_fails_closed_for_cross_project_relation_run():
+    database = SearchDatabase()
+    database.get_shadow_relation_v2_run = lambda *_args: {
+        "id": "relation-run-current", "project_id": 99, "status": "ready",
+    }
+    service = object.__new__(KnowledgeForgeService)
+    service.db = database
+    service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
+
+    with pytest.raises(GraphNotReadyError, match="关系快照不完整"):
+        service.search(4, "Alpha")
 
 
 class QueryRecorder:

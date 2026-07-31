@@ -140,6 +140,37 @@ def test_exact_alias_hit_skips_embedding_reranker_and_llm():
     assert models.review_calls == 0
 
 
+def test_exact_canonical_name_profile_does_not_merge_an_alias_like_near_match():
+    candidate = {
+        "canonical_key": "c-base",
+        "name": "Module Base",
+        "normalized_name": "module base",
+        "primary_type": "Technology",
+        "aliases": ["Module Variant"],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+    }
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns",
+        policy_version="p2-evidence",
+        store=_ShadowCandidates(exact=[candidate], lexical=[candidate], vector=[candidate]),
+        models=models,
+        reranker=lambda *_args: (_ for _ in ()).throw(AssertionError("reranker called")),
+        identity_profile="exact_canonical_name_only",
+    )
+
+    result = resolver.resolve(_mention(
+        surface="Module Variant",
+        normalized_surface="module variant",
+        entity_type="Technology",
+    ))
+
+    assert result["decision"] == "new_canonical_exact_name_policy"
+    assert result["canonical_key"] != "c-base"
+    assert models.review_calls == 0
+
+
 def test_multilingual_exact_alias_and_ambiguous_homonym_stay_model_free():
     exact = [{
         "canonical_key": "c-cn",

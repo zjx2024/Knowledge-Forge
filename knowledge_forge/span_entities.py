@@ -31,6 +31,8 @@ _NON_REFERENTIAL_MODIFIERS = frozenset({
 _STRUCTURAL_ROLES = frozenset({
     "table_of_contents", "header", "footer", "page_number", "index_entry",
     "empty_cell", "reference_heading", "table_header", "unit_header",
+    "heading", "title", "page_header", "page_footer", "table_container",
+    "caption", "footnote",
 })
 
 
@@ -130,17 +132,48 @@ class SpanFirstEntityExtractor:
         return "occurrence_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _reject_reason(surface: str, metadata: dict[str, Any], raw: dict[str, Any]) -> str:
+    def _reject_reason(
+        surface: str,
+        metadata: dict[str, Any],
+        raw: dict[str, Any],
+        *,
+        start: int,
+        end: int,
+    ) -> str:
         stripped = surface.strip()
         normalized = normalize_name(stripped)
+        # Parser-owned source structure wins over a model-supplied label.  A
+        # model must not be able to reclassify a page header/table header as
+        # body text simply by emitting a different structural_role.
         role = str(
-            raw.get("structural_role")
-            or metadata.get("structural_role")
+            metadata.get("structural_role")
+            or metadata.get("source_role")
             or metadata.get("chunk_role")
             or metadata.get("cell_role")
+            or raw.get("structural_role")
             or ""
-        ).lower()
+        ).lower().replace("-", "_").replace(" ", "_")
+        block_types = {
+            str(value).strip().lower().replace("-", "_")
+            for value in metadata.get("block_types") or []
+            if str(value).strip()
+        }
+        if not role and len(block_types) == 1:
+            role = next(iter(block_types))
         entity_type = str(raw.get("type") or "GenericEntity")
+        for structural_span in metadata.get("structural_spans") or []:
+            if not isinstance(structural_span, dict):
+                continue
+            try:
+                span_start = int(structural_span["start"])
+                span_end = int(structural_span["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            span_role = str(
+                structural_span.get("source_role") or ""
+            ).lower().replace("-", "_")
+            if span_start <= start < end <= span_end and span_role in _STRUCTURAL_ROLES:
+                return "structural_node"
         if role in _STRUCTURAL_ROLES:
             return "structural_node"
         if entity_type in _NOISE_ENTITY_TYPES:
@@ -182,7 +215,13 @@ class SpanFirstEntityExtractor:
             if span is None:
                 result.rejected.append({"raw": dict(raw), "reason": "invalid_exact_span"})
                 continue
-            reject_reason = self._reject_reason(surface, chunk_metadata, raw)
+            reject_reason = self._reject_reason(
+                surface,
+                chunk_metadata,
+                raw,
+                start=span[0],
+                end=span[1],
+            )
             if reject_reason:
                 result.rejected.append({"raw": dict(raw), "reason": reject_reason})
                 continue

@@ -171,6 +171,7 @@ class ShadowEntityResolver:
         reranker_cap: int = 10,
         auto_merge_threshold: float = 0.94,
         review_threshold: float = 0.72,
+        identity_profile: str = "bounded_similarity",
     ):
         self.namespace = namespace
         self.policy_version = policy_version
@@ -184,6 +185,11 @@ class ShadowEntityResolver:
         self.reranker_cap = max(1, min(30, int(reranker_cap)))
         self.auto_merge_threshold = float(auto_merge_threshold)
         self.review_threshold = float(review_threshold)
+        self.identity_profile = str(identity_profile or "").strip()
+        if self.identity_profile not in {
+            "bounded_similarity", "exact_canonical_name_only",
+        }:
+            raise ValueError("unknown entity shadow identity profile")
 
     def _new_key(self, mention: dict[str, Any]) -> str:
         material = "\x1f".join((
@@ -310,6 +316,11 @@ class ShadowEntityResolver:
         for candidate in exact:
             reason = self._blocked_reason(mention, candidate)
             candidate = dict(candidate)
+            if (
+                self.identity_profile == "exact_canonical_name_only"
+                and str(candidate.get("normalized_name") or "") != normalized
+            ):
+                reason = ",".join(filter(None, [reason, "not_exact_canonical_name"]))
             candidate["resolution_scores"] = {
                 **self._scores(mention, candidate),
                 "combined": 1.0,
@@ -353,6 +364,19 @@ class ShadowEntityResolver:
         normalized = str(
             mention.get("normalized_surface") or normalize_name(str(mention["surface"]))
         )
+
+        if self.identity_profile == "exact_canonical_name_only":
+            return {
+                "canonical_key": self._new_key(mention),
+                "decision": "new_canonical_exact_name_policy",
+                "reason": (
+                    "当前归一策略只允许规范名称精确匹配；"
+                    "相似名称与向量近邻保留为独立 canonical"
+                ),
+                "scores": {},
+                "embedding": embedding,
+                "candidates": [],
+            }
 
         lexical = list(self.store.search_lexical(
             self.namespace, normalized, self.lexical_cap,

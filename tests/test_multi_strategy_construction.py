@@ -11,6 +11,7 @@ from psycopg.conninfo import conninfo_to_dict
 
 from knowledge_forge.construction_strategies import (
     ENHANCED_SHADOW_STRATEGY,
+    GRAPHRAG_NATIVE_STRATEGY,
     STABLE_STRATEGY,
     normalize_strategy,
     strategy_options,
@@ -21,7 +22,12 @@ from knowledge_forge.policy import POLICY_AXES
 from knowledge_forge.policy import P1_RELATION_SHADOW_POLICY_SET
 from knowledge_forge.service import KnowledgeForgeService
 from knowledge_forge import web
-from knowledge_forge.web import _construction_controls, _document_rows, _strategy_statistics
+from knowledge_forge.web import (
+    _construction_controls,
+    _document_rows,
+    _schema_reassessment_available,
+    _strategy_statistics,
+)
 
 
 class _ImmediateRecorder:
@@ -140,10 +146,47 @@ def test_strategy_registry_is_stable_and_rejects_unknown_values():
     assert [item.key for item in strategy_options()] == [
         STABLE_STRATEGY,
         ENHANCED_SHADOW_STRATEGY,
+        GRAPHRAG_NATIVE_STRATEGY,
     ]
     assert normalize_strategy(None) == STABLE_STRATEGY
+    assert [item.key for item in strategy_options(include_hidden=False)] == [
+        ENHANCED_SHADOW_STRATEGY,
+        GRAPHRAG_NATIVE_STRATEGY,
+    ]
     with pytest.raises(ValueError, match="未知知识构建方案"):
         normalize_strategy("typo")
+
+
+def test_schema_reassessment_is_owned_by_idle_knowledge_forge_projects():
+    assert _schema_reassessment_available(ENHANCED_SHADOW_STRATEGY)
+    assert not _schema_reassessment_available(
+        ENHANCED_SHADOW_STRATEGY, "schema-job-running",
+    )
+    assert not _schema_reassessment_available(STABLE_STRATEGY)
+    assert not _schema_reassessment_available(GRAPHRAG_NATIVE_STRATEGY)
+
+
+def test_schema_reassessment_job_keeps_knowledge_forge_strategy_identity():
+    database = _StrategyDatabase()
+    created: list[tuple[str, int, str]] = []
+
+    def create_job(
+        kind, project_id, document_id=None, *, metadata=None,
+        strategy_key=STABLE_STRATEGY,
+    ):
+        created.append((kind, project_id, strategy_key))
+        return {"id": "schema-job", "status": "queued", "metadata": {}}
+
+    database.create_job = create_job
+    service = _service(database)
+
+    assert service.submit_schema_reassessment(7) == "schema-job"
+    assert created == [
+        ("schema_reassessment", 7, ENHANCED_SHADOW_STRATEGY),
+    ]
+    assert service.executor.calls == [
+        ("_reassess_project_schema", ("schema-job", 7)),
+    ]
 
 
 def test_stable_rebuild_preserves_ready_enhanced_snapshot_before_dispatch():
@@ -182,7 +225,7 @@ def test_stable_documents_can_queue_sequentially_but_cannot_overlap_enhanced_wor
         "id": "enhanced-running", "status": "running",
     }
     service = _service(database)
-    with pytest.raises(ValueError, match="增强实验正在构建"):
+    with pytest.raises(ValueError, match="Knowledge Forge 正在构建"):
         service.submit_ingestion(11, strategy_key=STABLE_STRATEGY)
     assert service.executor.calls == []
     assert database.invalidated == []
@@ -300,7 +343,7 @@ def test_document_rows_show_selected_strategy_without_overwriting_shared_readine
 
     html = _document_rows([document], ENHANCED_SHADOW_STRATEGY)
 
-    assert "等待增强实验构建" in html
+    assert "等待 Knowledge Forge 构建" in html
     assert 'data-ingest="11"' not in html
     assert "构建知识" not in html
     assert 'data-view-structure="11" disabled' not in html
@@ -311,24 +354,47 @@ def test_construction_controls_render_together_outside_upload_form():
     html = _construction_controls(
         project_id=7,
         strategy_key=ENHANCED_SHADOW_STRATEGY,
-        strategy_select='<option value="enhanced_shadow">增强实验</option>',
+        strategy_select='<option value="enhanced_shadow">Knowledge Forge</option>',
         latest_job_id="job-7",
         latest_batch_id="batch-7",
         active_job_id="",
     )
 
-    assert '<label><span>构建方案</span><select' in html
+    assert 'class="fixed-strategy"' not in html
+    assert "<select" not in html
     assert 'id="prepare-project-documents"' in html
     assert 'id="build-project-knowledge"' in html
     assert 'id="view-ingestion-log"' in html
     assert html.count('class="construction-controls"') == 1
 
 
+def test_construction_controls_can_be_split_between_preparation_and_graph_pages():
+    common = {
+        "project_id": 7,
+        "strategy_key": ENHANCED_SHADOW_STRATEGY,
+        "latest_job_id": "job-7",
+        "latest_batch_id": "batch-7",
+        "active_job_id": "",
+    }
+
+    preparation = _construction_controls(**common, scope="preparation")
+    graph = _construction_controls(**common, scope="graph")
+
+    assert 'id="prepare-project-documents"' in preparation
+    assert 'id="view-preparation-log"' in preparation
+    assert 'id="build-project-knowledge"' not in preparation
+    assert 'id="view-ingestion-log"' not in preparation
+    assert 'id="prepare-project-documents"' not in graph
+    assert 'id="view-preparation-log"' not in graph
+    assert 'id="build-project-knowledge"' in graph
+    assert 'id="view-ingestion-log"' in graph
+
+
 def test_construction_controls_disable_build_until_preprocessed():
     html = _construction_controls(
         project_id=7,
         strategy_key=ENHANCED_SHADOW_STRATEGY,
-        strategy_select='<option value="enhanced_shadow">增强实验</option>',
+        strategy_select='<option value="enhanced_shadow">Knowledge Forge</option>',
         latest_job_id="",
         latest_batch_id="",
         active_job_id="",
@@ -337,6 +403,7 @@ def test_construction_controls_disable_build_until_preprocessed():
 
     button = re.search(r'<button[^>]+id="build-project-knowledge"[^>]*>', html)
     assert button
+    assert 'class="button primary"' in button.group(0)
     assert "disabled" in button.group(0)
     assert "请先预处理文档" in button.group(0)
 
@@ -345,7 +412,7 @@ def test_construction_controls_enable_build_after_preprocessing():
     html = _construction_controls(
         project_id=7,
         strategy_key=ENHANCED_SHADOW_STRATEGY,
-        strategy_select='<option value="enhanced_shadow">增强实验</option>',
+        strategy_select='<option value="enhanced_shadow">Knowledge Forge</option>',
         latest_job_id="",
         latest_batch_id="",
         active_job_id="",
@@ -354,6 +421,7 @@ def test_construction_controls_enable_build_after_preprocessing():
 
     button = re.search(r'<button[^>]+id="build-project-knowledge"[^>]*>', html)
     assert button
+    assert 'class="button primary"' in button.group(0)
     assert "disabled" not in button.group(0)
     assert "基于已完成预处理" in button.group(0)
 
@@ -450,7 +518,7 @@ def test_enhanced_document_without_shared_content_can_start_build():
 
     html = _document_rows([document], ENHANCED_SHADOW_STRATEGY)
 
-    assert "等待文档预处理与增强实验构建" in html
+    assert "等待文档预处理与 Knowledge Forge 构建" in html
     assert 'data-ingest="12"' not in html
 
 
@@ -548,16 +616,60 @@ def test_project_enhanced_build_uses_one_project_job_with_all_pending_documents(
     assert result["document_count"] == 2
 
 
-def test_project_preparation_queues_strategy_neutral_content_job():
+def test_project_preparation_queues_knowledge_forge_content_job():
     service = KnowledgeForgeService.__new__(KnowledgeForgeService)
     service.db = _PreparationDatabase()
+    service.db.assert_project_construction_strategy = (
+        lambda _project_id, _expected=None: ENHANCED_SHADOW_STRATEGY
+    )
     service.executor = _ImmediateRecorder()
 
     result = service.submit_project_preparation(7)
 
     assert result["job_ids"] == ["prepare-21"]
     assert result["document_count"] == 1
-    assert service.executor.calls == [("_prepare_document_content", ("prepare-21", 21))]
+    assert service.executor.calls == [
+        (
+            "_prepare_document_content",
+            ("prepare-21", 21, ENHANCED_SHADOW_STRATEGY),
+        )
+    ]
+
+
+def test_project_preparation_queues_native_source_job_without_chunk_contract():
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = _PreparationDatabase()
+    service.db.assert_project_construction_strategy = (
+        lambda _project_id, _expected=None: GRAPHRAG_NATIVE_STRATEGY
+    )
+    service.executor = _ImmediateRecorder()
+    service._mark_graphrag_native_source_changed = lambda *_args: None
+
+    result = service.submit_project_preparation(7)
+
+    assert result["job_ids"] == ["prepare-21"]
+    assert service.executor.calls == [
+        (
+            "_prepare_document_content",
+            ("prepare-21", 21, GRAPHRAG_NATIVE_STRATEGY),
+        )
+    ]
+
+
+def test_native_source_readiness_does_not_require_knowledge_forge_chunks():
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = _PreparationDatabase()
+    service.db.documents[0].update({
+        "active_revision_id": "native-revision",
+        "structure_ready_at": "now",
+    })
+    service.db.assert_project_construction_strategy = (
+        lambda _project_id, _expected=None: GRAPHRAG_NATIVE_STRATEGY
+    )
+    service._shared_content_is_current = lambda *_args: True
+
+    with pytest.raises(ValueError, match="均已完成预处理"):
+        service.submit_project_preparation(7)
 
 
 def test_strategy_neutral_preparation_does_not_begin_graph_mutation():

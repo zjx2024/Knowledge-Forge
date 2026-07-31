@@ -25,6 +25,8 @@ def predicate_policy(
     identity_qualifier_keys: list[str] | None = None,
     conflicts_with: list[str] | None = None,
     allowed_context_kinds: list[str] | None = None,
+    allowed_source_roles: list[str] | None = None,
+    scope_policy: dict[str, Any] | None = None,
     required_evidence_roles: list[str] | None = None,
     negation_policy: str = "reject_negated",
     modality_policy: str = "require_asserted",
@@ -60,6 +62,13 @@ def predicate_policy(
         "allowed_context_kinds": list(allowed_context_kinds or [
             "paragraph", "sentence", "table_row", "table_cell", "list_item",
         ]),
+        "allowed_source_roles": list(allowed_source_roles or [
+            "body", "list_item", "table_row", "table_cell",
+        ]),
+        "scope_policy": dict(scope_policy or {
+            "require_same_atomic_scope": True,
+            "allow_cross_scope_with_explicit_evidence": False,
+        }),
         "required_evidence_roles": list(required_evidence_roles or [
             "subject", "predicate_cue", "object",
         ]),

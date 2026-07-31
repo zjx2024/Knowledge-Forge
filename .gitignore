@@ -14,9 +14,11 @@ KnowledgeFiles/docs/*
 KnowledgeFiles/chunks/*
 KnowledgeFiles/media/*
 KnowledgeFiles/.trash/*
+KnowledgeFiles/graphrag_native/*
 !KnowledgeFiles/docs/.gitkeep
 !KnowledgeFiles/chunks/.gitkeep
 !KnowledgeFiles/.trash/.gitkeep
+!KnowledgeFiles/graphrag_native/.gitkeep
 logs/*
 !logs/.gitkeep
 external/

@@ -2100,6 +2100,255 @@ CREATE INDEX IF NOT EXISTS idx_shadow_relation_evidence_refs_run
 """
 
 
+# GraphRAG Native intentionally has its own control plane.  Final GraphRAG
+# entities, semantic relationships, communities, reports, and LanceDB vectors
+# remain immutable files in the per-run bundle; none are copied into the
+# formal stable/enhanced entity or relation tables.
+GRAPHRAG_NATIVE_CONTROL_PLANE_SQL = r"""
+CREATE TABLE IF NOT EXISTS graphrag_native_runs (
+    run_id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    generation BIGINT NOT NULL CHECK(generation>0),
+    state TEXT NOT NULL CHECK(state IN (
+        'PENDING','PREPARING','RUNNING','EXECUTION_COMPLETE',
+        'COMPLETED_WITH_FAILURES','VALIDATING','READY','EMPTY_INPUT',
+        'NO_GRAPH_UNSUPPORTED','FAILED','CANCELLED','STALE','SUPERSEDED'
+    )),
+    base_sha TEXT NOT NULL,
+    worktree_diff_hash TEXT NOT NULL,
+    code_tree_hash TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    settings_hash TEXT NOT NULL,
+    prompt_profile_hash TEXT NOT NULL,
+    completion_model_id TEXT NOT NULL,
+    completion_model_digest TEXT NOT NULL,
+    embedding_model_id TEXT NOT NULL,
+    embedding_model_digest TEXT NOT NULL,
+    embedding_dimension INTEGER NOT NULL DEFAULT 0 CHECK(embedding_dimension>=0),
+    graphrag_version TEXT NOT NULL,
+    python_version TEXT NOT NULL,
+    staging_relative_path TEXT NOT NULL DEFAULT '' CHECK(
+        staging_relative_path='' OR (
+            left(staging_relative_path,1)<>'/'
+            AND staging_relative_path !~ '(^|/)\\.\\.(/|$)'
+        )
+    ),
+    bundle_relative_path TEXT NOT NULL DEFAULT '' CHECK(
+        bundle_relative_path='' OR (
+            left(bundle_relative_path,1)<>'/'
+            AND bundle_relative_path !~ '(^|/)\\.\\.(/|$)'
+        )
+    ),
+    validator_version TEXT NOT NULL DEFAULT '',
+    validation_report_hash TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    heartbeat_at TIMESTAMPTZ,
+    execution_completed_at TIMESTAMPTZ,
+    validated_at TIMESTAMPTZ,
+    ready_at TIMESTAMPTZ,
+    failed_at TIMESTAMPTZ,
+    failure_class TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TIMESTAMPTZ,
+    superseded_by TEXT REFERENCES graphrag_native_runs(run_id),
+    UNIQUE(project_id,generation)
+);
+CREATE INDEX IF NOT EXISTS idx_graphrag_native_runs_project_state
+    ON graphrag_native_runs(project_id,state,generation DESC);
+CREATE INDEX IF NOT EXISTS idx_graphrag_native_runs_lease
+    ON graphrag_native_runs(state,lease_expires_at)
+    WHERE state IN ('PENDING','PREPARING','RUNNING','VALIDATING');
+
+CREATE TABLE IF NOT EXISTS graphrag_native_run_documents (
+    run_id TEXT NOT NULL REFERENCES graphrag_native_runs(run_id) ON DELETE RESTRICT,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    document_id BIGINT NOT NULL,
+    revision_id TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    structure_hash TEXT NOT NULL,
+    input_document_count INTEGER NOT NULL CHECK(input_document_count>0),
+    input_manifest_hash TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+    PRIMARY KEY(run_id,document_id),
+    UNIQUE(run_id,ordinal),
+    FOREIGN KEY(revision_id,project_id,document_id)
+        REFERENCES document_content_revisions(revision_id,project_id,document_id)
+);
+CREATE INDEX IF NOT EXISTS idx_graphrag_native_run_documents_project
+    ON graphrag_native_run_documents(project_id,document_id,revision_id);
+
+CREATE TABLE IF NOT EXISTS graphrag_native_artifacts (
+    run_id TEXT NOT NULL REFERENCES graphrag_native_runs(run_id) ON DELETE RESTRICT,
+    logical_name TEXT NOT NULL,
+    relative_path TEXT NOT NULL CHECK(
+        left(relative_path,1)<>'/'
+        AND relative_path !~ '(^|/)\\.\\.(/|$)'
+    ),
+    sha256 TEXT NOT NULL CHECK(sha256 ~ '^[0-9a-f]{64}$'),
+    byte_size BIGINT NOT NULL CHECK(byte_size>=0),
+    media_type TEXT NOT NULL,
+    schema_hash TEXT NOT NULL DEFAULT '',
+    row_count BIGINT NOT NULL DEFAULT -1 CHECK(row_count>=-1),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(run_id,logical_name),
+    UNIQUE(run_id,relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_graphrag_native_artifacts_run
+    ON graphrag_native_artifacts(run_id,logical_name);
+
+CREATE TABLE IF NOT EXISTS graphrag_native_project_state (
+    project_id BIGINT PRIMARY KEY REFERENCES projects(id),
+    active_run_id TEXT REFERENCES graphrag_native_runs(run_id),
+    active_generation BIGINT NOT NULL DEFAULT 0 CHECK(active_generation>=0),
+    desired_source_snapshot_hash TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_graphrag_native_project_state_active
+    ON graphrag_native_project_state(active_run_id) WHERE active_run_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS graphrag_native_query_runs (
+    query_run_id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    run_id TEXT NOT NULL REFERENCES graphrag_native_runs(run_id) ON DELETE RESTRICT,
+    query_mode TEXT NOT NULL CHECK(query_mode IN ('local','global','drift','basic')),
+    question_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PENDING','RUNNING','READY','FAILED','CANCELLED')),
+    model_id TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    latency_ms BIGINT NOT NULL DEFAULT 0 CHECK(latency_ms>=0),
+    token_usage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    context_reference_count INTEGER NOT NULL DEFAULT 0 CHECK(context_reference_count>=0),
+    failure_class TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_graphrag_native_queries_project_run
+    ON graphrag_native_query_runs(project_id,run_id,created_at DESC);
+
+INSERT INTO graphrag_native_project_state(project_id)
+SELECT id FROM projects
+ON CONFLICT(project_id) DO NOTHING;
+"""
+
+
+# This pointer is intentionally independent from both the native active-run
+# pointer and existing stable/enhanced graph state.  No migration selects
+# GraphRAG Native automatically; existing projects remain Stable by default.
+PROJECT_CONSTRUCTION_SELECTION_SQL = r"""
+CREATE TABLE IF NOT EXISTS project_construction_strategy_state (
+    project_id BIGINT PRIMARY KEY REFERENCES projects(id),
+    selected_strategy TEXT NOT NULL DEFAULT 'stable' CHECK(
+        selected_strategy IN ('stable','enhanced_shadow','graphrag_native')
+    ),
+    generation BIGINT NOT NULL DEFAULT 0 CHECK(generation>=0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO project_construction_strategy_state(project_id,selected_strategy)
+SELECT id,'stable' FROM projects
+ON CONFLICT(project_id) DO NOTHING;
+"""
+
+PROJECT_STRATEGY_BINDING_SQL = r"""
+ALTER TABLE project_construction_strategy_state
+    ADD COLUMN IF NOT EXISTS association_status TEXT NOT NULL DEFAULT 'unassigned',
+    ADD COLUMN IF NOT EXISTS bound_at TIMESTAMPTZ;
+
+UPDATE project_construction_strategy_state
+SET association_status=CASE
+        WHEN selected_strategy IN ('enhanced_shadow','graphrag_native') THEN 'bound'
+        ELSE 'unassigned'
+    END,
+    bound_at=CASE
+        WHEN selected_strategy IN ('enhanced_shadow','graphrag_native')
+            THEN COALESCE(bound_at,updated_at,NOW())
+        ELSE NULL
+    END;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname='project_construction_strategy_association_status_check'
+          AND conrelid='project_construction_strategy_state'::regclass
+    ) THEN
+        ALTER TABLE project_construction_strategy_state
+            ADD CONSTRAINT project_construction_strategy_association_status_check
+            CHECK(association_status IN ('unassigned','bound'));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname='project_construction_strategy_binding_check'
+          AND conrelid='project_construction_strategy_state'::regclass
+    ) THEN
+        ALTER TABLE project_construction_strategy_state
+            ADD CONSTRAINT project_construction_strategy_binding_check
+            CHECK(
+                (association_status='unassigned' AND selected_strategy='stable' AND bound_at IS NULL)
+                OR
+                (association_status='bound'
+                 AND selected_strategy IN ('enhanced_shadow','graphrag_native')
+                 AND bound_at IS NOT NULL)
+            );
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_project_construction_strategy_binding
+    ON project_construction_strategy_state(association_status,selected_strategy,project_id);
+
+CREATE OR REPLACE FUNCTION kf_guard_project_strategy_binding()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.association_status='bound' AND (
+        NEW.association_status IS DISTINCT FROM OLD.association_status
+        OR NEW.selected_strategy IS DISTINCT FROM OLD.selected_strategy
+        OR NEW.bound_at IS DISTINCT FROM OLD.bound_at
+    ) THEN
+        RAISE EXCEPTION 'project construction strategy is immutable after binding';
+    END IF;
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS trg_guard_project_strategy_binding
+    ON project_construction_strategy_state;
+CREATE TRIGGER trg_guard_project_strategy_binding
+BEFORE UPDATE ON project_construction_strategy_state
+FOR EACH ROW EXECUTE FUNCTION kf_guard_project_strategy_binding();
+"""
+
+KNOWLEDGE_FORGE_COMMUNITIES_SQL = r"""
+CREATE TABLE knowledge_forge_community_runs (
+    run_id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    strategy_key TEXT NOT NULL DEFAULT 'enhanced_shadow'
+        CHECK(strategy_key='enhanced_shadow'),
+    graph_generation BIGINT NOT NULL CHECK(graph_generation>0),
+    entity_namespace_id TEXT NOT NULL REFERENCES entity_shadow_namespaces(id),
+    input_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(
+        status IN ('running','completed','completed_empty','failed','superseded')
+    ),
+    node_count INTEGER NOT NULL DEFAULT 0 CHECK(node_count>=0),
+    edge_count INTEGER NOT NULL DEFAULT 0 CHECK(edge_count>=0),
+    community_count INTEGER NOT NULL DEFAULT 0 CHECK(community_count>=0),
+    hierarchy_levels INTEGER NOT NULL DEFAULT 0 CHECK(hierarchy_levels>=0),
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    communities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(project_id,strategy_key,graph_generation,entity_namespace_id,input_hash)
+);
+CREATE INDEX idx_knowledge_forge_community_current
+    ON knowledge_forge_community_runs(
+        project_id,strategy_key,graph_generation,entity_namespace_id,created_at DESC
+    ) WHERE status IN ('completed','completed_empty');
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -2210,6 +2459,28 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0021_shadow_relation_v2_artifact_audit",
         description="Persist enhanced Shadow v2 source contexts, model calls, proposals, and export audit refs",
         sql=SHADOW_RELATION_V2_ARTIFACT_AUDIT_SQL,
+    ),
+    Migration(
+        version="0022_graphrag_native_control_plane",
+        description="Create isolated GraphRAG Native run control plane and audit metadata",
+        sql=GRAPHRAG_NATIVE_CONTROL_PLANE_SQL,
+    ),
+    Migration(
+        version="0023_project_construction_strategy_selection",
+        description="Persist a separately authorized project construction-strategy pointer",
+        sql=PROJECT_CONSTRUCTION_SELECTION_SQL,
+    ),
+    Migration(
+        version="0024_project_strategy_binding",
+        description="Bind each project once to exactly one user-visible construction strategy",
+        sql=PROJECT_STRATEGY_BINDING_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0025_knowledge_forge_communities",
+        description="Persist strategy-owned Knowledge Forge community clustering snapshots",
+        sql=KNOWLEDGE_FORGE_COMMUNITIES_SQL,
+        startup_safe=True,
     ),
 )
 

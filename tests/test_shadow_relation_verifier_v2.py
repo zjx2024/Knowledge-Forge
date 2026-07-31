@@ -7,6 +7,7 @@ from knowledge_forge.relation_shadow_v2 import (
     EvidenceSpan,
     HYPOTHESES,
     PASS,
+    REJECTED,
     RETRYABLE_FAILED,
     REVIEW_ONLY,
     SUPPORTED,
@@ -436,6 +437,41 @@ def test_verifier_timeout_missing_or_invalid_output_is_retryable_failed(verifier
     )
 
     assert attempt.verdict == RETRYABLE_FAILED
+    assert supported_for_normalization(attempt) is False
+
+
+def test_supported_claim_without_exact_endpoint_evidence_is_rejected() -> None:
+    content = "Alpha uses Beta."
+    mentions = [_mention("alpha", "Alpha", 0), _mention("beta", "Beta", 11)]
+    schema = _schema(_predicate("uses"))
+    pair, hypothesis = _classified(
+        content,
+        mentions,
+        schema,
+        predicate="uses",
+        subject="occ-alpha",
+        object_="occ-beta",
+    )
+
+    attempt = verify_hypothesis(
+        hypothesis,
+        validate_hypothesis(
+            hypothesis, pair, content=content, logical_schema=schema,
+        ),
+        pair,
+        content=content,
+        logical_schema=schema,
+        verifier=lambda *_args: {
+            "verdict": "SUPPORTED",
+            "reason_code": "DIRECTLY_ENTAILED",
+            "supported_evidence_spans": [{"start": 0, "end": 5}],
+        },
+        verifier_model_revision="verifier-model-r1",
+    )
+
+    assert attempt.verdict == REJECTED
+    assert attempt.reason_code == "SUPPORTED_EVIDENCE_MISSING_ENDPOINT"
+    assert attempt.independent_call is True
     assert supported_for_normalization(attempt) is False
 
 

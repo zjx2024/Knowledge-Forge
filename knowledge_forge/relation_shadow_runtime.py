@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -16,7 +17,7 @@ from .shadow_schema_overlay import (
     SHADOW_RELATION_SCHEMA_OVERLAY_VERSION,
     apply_shadow_relation_schema_overlay,
 )
-from .shadow_context import build_shadow_context_manifest
+from .shadow_context import build_shadow_context_manifest, occurrence_scope
 
 
 CLASSIFIER_ACCEPTED = "ACCEPTED"
@@ -91,9 +92,11 @@ def _with_direct_proposer_source(
     sources.add(v2.DIRECT_PROPOSER)
     provenance["candidate_sources"] = sorted(sources)
     provenance["direct_proposer_union"] = True
+    if opportunity.status != v2.PENDING_CLASSIFICATION:
+        provenance["direct_proposer_rejected_by_planner"] = True
+        return replace(opportunity, provenance=provenance)
     return replace(
         opportunity,
-        status=v2.PENDING_CLASSIFICATION,
         provenance=provenance,
     )
 
@@ -157,10 +160,10 @@ def _terminal_classifier_fail_closed_decision(
     )
 
 
-SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION = "shadow-relation-candidate-v3-schema-metadata"
-SHADOW_RELATION_V2_CLASSIFIER_POLICY_VERSION = "shadow-relation-classifier-v4-compact-json-retry-budget"
-SHADOW_RELATION_V2_NORMALIZATION_VERSION = "shadow-relation-normalization-v3-schema-metadata"
-SHADOW_RELATION_V2_MATERIALIZATION_VERSION = "shadow-relation-materialization-v3-schema-metadata"
+SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION = "knowledge-forge-candidate-v4-structure-gate"
+SHADOW_RELATION_V2_CLASSIFIER_POLICY_VERSION = "knowledge-forge-classifier-v5-structure-gate"
+SHADOW_RELATION_V2_NORMALIZATION_VERSION = "knowledge-forge-normalization-v4-structure-gate"
+SHADOW_RELATION_V2_MATERIALIZATION_VERSION = "knowledge-forge-materialization-v4-structure-gate"
 SHADOW_RELATION_V2_CLASSIFIER_SYSTEM_PROMPT = (
     "You are the Shadow relation v2 classifier. Follow the supplied "
     "pair contract exactly and return only one compact schema-valid "
@@ -533,6 +536,57 @@ class ShadowRelationV2Runtime:
         )
 
     @staticmethod
+    def _mentions_for_context(
+        chunk: dict[str, Any],
+        mentions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Attach parser-role and atomic-scope facts to frozen occurrences.
+
+        This adapter is intentionally structure-only.  It does not inspect a
+        predicate, domain word, document title or model output when deciding a
+        relation boundary.
+        """
+
+        content = str(chunk.get("content") or "")
+        structure = chunk.get("shadow_structure")
+        if not isinstance(structure, dict):
+            structure = {}
+        metadata = chunk.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        context_kind = str(chunk.get("shadow_context_kind") or "")
+        enriched: list[dict[str, Any]] = []
+        for mention in mentions:
+            profile = occurrence_scope(
+                content=content,
+                mention_start=int(mention["mention_start"]),
+                mention_end=int(mention["mention_end"]),
+                structure=structure,
+                context_kind=context_kind,
+                metadata=metadata,
+            )
+            scope = dict(profile["occurrence_scope"])
+            enriched.append({
+                **mention,
+                "source_role": str(profile["source_role"]),
+                "relation_eligible": bool(profile["relation_eligible"]),
+                "scope_id": str(scope["scope_id"]),
+                "scope_kind": str(scope["scope_kind"]),
+                "scope_start": int(scope["start"]),
+                "scope_end": int(scope["end"]),
+                "table_id": str(
+                    mention.get("table_id") or structure.get("table_id") or ""
+                ),
+                "row_id": str(
+                    mention.get("row_id") or structure.get("row_id") or ""
+                ),
+                "cell_id": str(
+                    mention.get("cell_id") or structure.get("cell_id") or ""
+                ),
+            })
+        return enriched
+
+    @staticmethod
     def _direct_proposer_opportunity(
         *,
         run_id: str,
@@ -541,8 +595,14 @@ class ShadowRelationV2Runtime:
         proposal: v2.RelationProposal,
         mentions: list[dict[str, Any]],
         logical_schema: dict[str, Any],
-    ) -> v2.PairOpportunity:
-        """Create a pair-ledger row for a legal direct-proposer-only pair."""
+    ) -> v2.PairOpportunity | None:
+        """Attach a proposer source only to a planner-admitted pair.
+
+        The proposer is recall assistance, never a second candidate policy. A
+        malformed or structurally inadmissible proposal remains audited by its
+        proposal attempt but cannot manufacture a ledger row or bypass a
+        source/scope boundary.
+        """
 
         mentions_by_occurrence = {
             str(item["occurrence_key"]): item for item in mentions
@@ -554,95 +614,36 @@ class ShadowRelationV2Runtime:
             raise RuntimeError(
                 "Shadow v2 direct proposer endpoint missing from context"
             ) from exc
-        left, right = sorted(
-            (subject, object_),
-            key=lambda item: (
-                str(item["occurrence_key"]),
-                int(item["mention_start"]),
-                int(item["mention_end"]),
-            ),
-        )
         content = str(chunk.get("content") or "")
         if not content:
             raise RuntimeError("Shadow v2 direct proposer context is empty")
-        evidence_start = min(span.start for span in proposal.evidence_spans)
-        evidence_end = max(span.end for span in proposal.evidence_spans)
-        context_start = max(
-            0,
-            min(
-                evidence_start,
-                int(left["mention_start"]),
-                int(right["mention_start"]),
-            ),
-        )
-        context_end = min(
-            len(content),
-            max(
-                evidence_end,
-                int(left["mention_end"]),
-                int(right["mention_end"]),
-            ),
-        )
-        if context_end <= context_start:
-            raise RuntimeError(
-                "Shadow v2 direct proposer context span is invalid"
-            )
-        document_revision_id = str(chunk["revision_id"])
-        stable_pair = v2.pair_identity(
-            document_revision_id,
-            str(left["occurrence_key"]),
-            str(right["occurrence_key"]),
-        )
-        spec = v2.normalize_predicate_schema(logical_schema).get(
-            proposal.predicate,
-        )
-        if spec is None:
-            raise RuntimeError(
-                "Shadow v2 direct proposer predicate missing from schema"
-            )
-        source_context_id = str(chunk.get("shadow_context_id") or chunk["id"])
-        return v2.PairOpportunity(
-            opportunity_identity=v2.opportunity_identity(
-                run_id,
-                SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION,
-                stable_pair,
-            ),
-            pair_identity=stable_pair,
-            run_id=run_id,
+        plan = v2.plan_pair_opportunities(
             project_id=int(project_id),
-            document_revision_id=document_revision_id,
+            document_revision_id=str(chunk["revision_id"]),
             chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
+            content=content,
+            mentions=[subject, object_],
+            logical_schema=logical_schema,
+            run_id=run_id,
             candidate_policy_version=SHADOW_RELATION_V2_CANDIDATE_POLICY_VERSION,
-            left_occurrence_key=str(left["occurrence_key"]),
-            right_occurrence_key=str(right["occurrence_key"]),
-            left_mention_id=str(left["mention_id"]),
-            right_mention_id=str(right["mention_id"]),
-            left_span=(
-                int(left["mention_start"]),
-                int(left["mention_end"]),
-            ),
-            right_span=(
-                int(right["mention_start"]),
-                int(right["mention_end"]),
-            ),
-            left_canonical_id=str(left.get("canonical_id") or ""),
-            right_canonical_id=str(right.get("canonical_id") or ""),
-            left_assignment_version=str(left.get("assignment_version") or ""),
-            right_assignment_version=str(right.get("assignment_version") or ""),
-            left_type=str(left.get("type") or ""),
-            right_type=str(right.get("type") or ""),
-            context_identity="relctx_direct_" + canonical_digest({
-                "source_context_id": source_context_id,
-                "pair_identity": stable_pair,
-                "context_span": [context_start, context_end],
-            }),
-            context_span=(context_start, context_end),
-            allowed_predicate_metadata=(asdict(spec),),
-            planning_reason="direct_proposer_pair_not_in_planner",
+            max_pair_opportunities=None,
+        )
+        if len(plan.opportunities) != 1:
+            raise RuntimeError("Shadow v2 direct proposer pair planning is not unique")
+        planned = plan.opportunities[0]
+        allowed = {
+            str(item.get("name") or "")
+            for item in planned.allowed_predicate_metadata
+        }
+        if planned.status != v2.PENDING_CLASSIFICATION or proposal.predicate not in allowed:
+            return None
+        source_context_id = str(chunk.get("shadow_context_id") or chunk["id"])
+        return replace(
+            planned,
+            planning_reason="direct_proposer_pair_admitted_by_planner",
             cue=v2.DIRECT_PROPOSER,
-            type_status="direct_proposer",
-            status=v2.PENDING_CLASSIFICATION,
             provenance={
+                **planned.provenance,
                 "candidate_sources": [v2.DIRECT_PROPOSER],
                 "source_kind": "v2_direct_proposer",
                 "source_record_id": proposal.proposal_id,
@@ -1025,6 +1026,7 @@ class ShadowRelationV2Runtime:
                     ),
                 })
             plans_by_context: dict[str, v2.PairOpportunityPlan] = {}
+            mentions_by_context: dict[str, list[dict[str, Any]]] = {}
             all_opportunities: list[v2.PairOpportunity] = []
             proposal_batches: list[tuple[str, v2.RelationProposalBatch]] = []
             proposer_calls = 0
@@ -1034,6 +1036,7 @@ class ShadowRelationV2Runtime:
             proposer_circuit_breaker_tripped = False
             proposer_skipped_by_circuit = 0
             proposer_terminal_statuses: Counter[str] = Counter()
+            proposer_hypothesis_rejections: Counter[str] = Counter()
             relation_chunks = list(context["relation_chunks"])
             total_chunks = len(relation_chunks)
             total_progress = max(1, total_chunks * 4)
@@ -1043,7 +1046,11 @@ class ShadowRelationV2Runtime:
             )
             for chunk_index, chunk in enumerate(relation_chunks, start=1):
                 context_key = str(chunk.get("shadow_context_id") or chunk["id"])
-                chunk_mentions = mentions_by_chunk.get(int(chunk["id"]), [])
+                chunk_mentions = self._mentions_for_context(
+                    chunk,
+                    mentions_by_chunk.get(int(chunk["id"]), []),
+                )
+                mentions_by_context[context_key] = chunk_mentions
                 plan = v2.plan_pair_opportunities(
                     project_id=project_id,
                     document_revision_id=str(chunk["revision_id"]),
@@ -1087,13 +1094,18 @@ class ShadowRelationV2Runtime:
                     progress(
                         chunk_index,
                         total_progress,
-                        f"Shadow v2 pair ledger {chunk_index}/{total_chunks}",
+                        f"Knowledge Forge 候选对规划 {chunk_index}/{total_chunks}",
                     )
                 proposer_message = (
-                    f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                    f"Knowledge Forge 候选补充 {chunk_index}/{total_chunks} "
                     "跳过：实体不足"
                 )
-                if len(chunk_mentions) >= 2:
+                if len(chunk_mentions) >= 2 and not plan.admitted:
+                    proposer_message = (
+                        f"Knowledge Forge 候选补充 {chunk_index}/{total_chunks} "
+                        "跳过：没有通过结构与范围门禁的候选对"
+                    )
+                elif len(chunk_mentions) >= 2 and plan.admitted:
                     context_kind = str(
                         chunk.get("shadow_context_kind") or "legacy_chunk"
                     )
@@ -1114,7 +1126,7 @@ class ShadowRelationV2Runtime:
                             "TERMINAL_FAILED_WITH_PLANNER_FALLBACK"
                         ] += 1
                         proposer_message = (
-                            f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                            f"Knowledge Forge 候选补充 {chunk_index}/{total_chunks} "
                             "辅助召回已达异常阈值，本轮后续不再调用（主链继续）"
                         )
                     else:
@@ -1391,7 +1403,7 @@ class ShadowRelationV2Runtime:
                                     "TERMINAL_FAILED_WITH_PLANNER_FALLBACK"
                                 ] += 1
                                 proposer_message = (
-                                    f"Shadow v2 proposer "
+                                    f"Knowledge Forge 候选补充 "
                                     f"{chunk_index}/{total_chunks} "
                                     f"辅助召回未采用：{error_class}（已审计，主链继续）"
                                 )
@@ -1415,7 +1427,7 @@ class ShadowRelationV2Runtime:
                                 if already_found_keys else "SUCCESS_EMPTY"
                             ] += 1
                             proposer_message = (
-                                f"Shadow v2 proposer {chunk_index}/{total_chunks} "
+                                f"Knowledge Forge 候选补充 {chunk_index}/{total_chunks} "
                                 "完成"
                             )
                 if progress:
@@ -1483,12 +1495,11 @@ class ShadowRelationV2Runtime:
                             project_id=project_id,
                             chunk=chunk,
                             proposal=proposal,
-                            mentions=mentions_by_chunk.get(
-                                int(chunk["id"]), [],
-                            ),
+                            mentions=mentions_by_context[context_key],
                             logical_schema=context["schema"],
                         )
-                        add_direct_opportunity(context_key, opportunity)
+                        if opportunity is not None:
+                            add_direct_opportunity(context_key, opportunity)
                     else:
                         updated = _with_direct_proposer_source(opportunity)
                         if updated != opportunity:
@@ -1511,12 +1522,26 @@ class ShadowRelationV2Runtime:
                         proposal.subject_occurrence_key,
                         proposal.object_occurrence_key,
                     )
-                    opportunity = opportunity_by_pair[pair_id]
-                    proposer_hypotheses.append(v2.proposal_to_hypothesis(
-                        proposal,
-                        opportunity,
-                        context["schema"],
-                    ))
+                    opportunity = opportunity_by_pair.get(pair_id)
+                    if (
+                        opportunity is None
+                        or opportunity.status != v2.PENDING_CLASSIFICATION
+                    ):
+                        continue
+                    try:
+                        hypothesis = v2.proposal_to_hypothesis(
+                            proposal,
+                            opportunity,
+                            context["schema"],
+                        )
+                    except v2.ShadowClassificationError as exc:
+                        # A direct proposer is auxiliary recall.  If its
+                        # candidate violates the frozen planner/schema/scope
+                        # contract, reject only that candidate; the admitted
+                        # planner pair still proceeds through the classifier.
+                        proposer_hypothesis_rejections[str(exc)] += 1
+                        continue
+                    proposer_hypotheses.append(hypothesis)
             decisions: list[v2.PairClassificationDecision] = []
             classifier_calls = 0
             classifier_failures = 0
@@ -1759,7 +1784,7 @@ class ShadowRelationV2Runtime:
                     progress(
                         (2 * total_chunks) + chunk_index,
                         total_progress,
-                        f"Shadow v2 classifier {chunk_index}/{total_chunks}",
+                        f"Knowledge Forge 关系分类 {chunk_index}/{total_chunks}",
                     )
             classifier_hypotheses = [
                 hypothesis
@@ -1809,7 +1834,10 @@ class ShadowRelationV2Runtime:
             }
             verification_attempts: list[v2.VerificationAttempt] = []
             verifier_calls = 0
-            for hypothesis in hypotheses:
+            total_hypotheses = len(hypotheses)
+            for hypothesis_index, hypothesis in enumerate(
+                hypotheses, start=1,
+            ):
                 opportunity = opportunity_by_pair[hypothesis.pair_identity]
                 content = str(
                     context["chunk_by_id"][
@@ -1852,6 +1880,21 @@ class ShadowRelationV2Runtime:
                         break
                 if final_attempt is None:
                     raise RuntimeError("Shadow v2 verifier 未生成终态")
+                if progress:
+                    verified_progress = (
+                        (3 * total_chunks)
+                        + math.ceil(
+                            hypothesis_index
+                            / max(1, total_hypotheses)
+                            * total_chunks
+                        )
+                    )
+                    progress(
+                        min(total_progress, verified_progress),
+                        total_progress,
+                        "Knowledge Forge 关系验证 "
+                        f"{hypothesis_index}/{total_hypotheses} 个关系假设",
+                    )
             terminal_verifier_attempts = {}
             for item in verification_attempts:
                 current_attempt = terminal_verifier_attempts.get(
@@ -1898,6 +1941,8 @@ class ShadowRelationV2Runtime:
                     "proposer_skipped_by_circuit": proposer_skipped_by_circuit,
                     "proposer_terminal_statuses":
                         dict(proposer_terminal_statuses),
+                    "proposer_hypothesis_rejections":
+                        dict(proposer_hypothesis_rejections),
                     "proposals_total": len(proposer_hypotheses),
                     "proposer_hypotheses_persisted":
                         len(proposer_hypotheses_to_persist),
@@ -2006,6 +2051,8 @@ class ShadowRelationV2Runtime:
                     proposer_circuit_breaker_tripped,
                 "proposer_skipped_by_circuit": proposer_skipped_by_circuit,
                 "proposer_terminal_statuses": dict(proposer_terminal_statuses),
+                "proposer_hypothesis_rejections":
+                    dict(proposer_hypothesis_rejections),
                 "proposals_total": len(proposer_hypotheses),
                 "proposer_hypotheses_persisted":
                     len(proposer_hypotheses_to_persist),
@@ -2055,8 +2102,8 @@ class ShadowRelationV2Runtime:
                 progress(
                     total_progress,
                     total_progress,
-                    f"Shadow v2 完成：{len(hypotheses)} 个 hypotheses，"
-                    f"{len(normalization.facts)} 个 normalized facts，"
+                    f"Knowledge Forge 完成：{len(hypotheses)} 个关系假设，"
+                    f"{len(normalization.facts)} 个规范事实，"
                     f"{len(endpoint_rows)} 个隔离物化事实",
                 )
             return {

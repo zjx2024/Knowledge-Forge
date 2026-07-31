@@ -129,3 +129,45 @@ def test_restart_recovers_all_durable_job_kinds_and_orphaned_graph_generation():
     assert any(job_id == "invalid" and values.get("status") == "failed"
                for job_id, values in service.db.updates)
     assert service.db.cleanup_calls == 1
+
+
+def test_restart_does_not_create_stable_graph_job_for_fixed_strategy_project():
+    class ImmediateExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def submit(self, callback, *args):
+            self.calls.append((callback.__name__, args))
+
+    class FixedStrategyRecoveryDatabase:
+        def __init__(self):
+            self.created = []
+
+        def list_recoverable_jobs(self):
+            return []
+
+        def list_orphaned_graph_projects(self):
+            return [{"id": 8}]
+
+        def get_project_construction_strategy_selection(self, project_id):
+            assert project_id == 8
+            return {
+                "project_id": 8,
+                "association_status": "bound",
+                "selected_strategy": "enhanced_shadow",
+            }
+
+        def create_graph_rebuild_job(self, project_id):
+            self.created.append(project_id)
+            raise AssertionError("fixed strategy must not create a Stable graph job")
+
+        def cleanup_indexing_failures(self):
+            return None
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = FixedStrategyRecoveryDatabase()
+    service.executor = ImmediateExecutor()
+
+    assert service.recover_interrupted_jobs() == 0
+    assert service.db.created == []
+    assert service.executor.calls == []

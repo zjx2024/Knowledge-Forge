@@ -22,9 +22,15 @@ from .chunking import ProcessingResult, build_processing_result, parse_document_
 from .config import Config
 from .construction_strategies import (
     ENHANCED_SHADOW_STRATEGY,
+    GRAPHRAG_NATIVE_STRATEGY,
     STABLE_STRATEGY,
     normalize_strategy,
 )
+from .graphrag_native_executor import GraphRAGNativeExecutor
+from .graphrag_native_inputs import GraphRAGNativeInputBuilder
+from .graphrag_native_runtime import GraphRAGNativeRuntime
+from .graphrag_community import CommunityConfig
+from .knowledge_forge_communities import KnowledgeForgeCommunityService
 from .database import Database
 from .entity_resolution import EntityResolver
 from .entity_shadow import DatabaseShadowStore, ShadowEntityResolver, ShadowModelGateway
@@ -59,7 +65,7 @@ from .relation_shadow_runtime import (
 from .schema_evolution import SchemaEvolutionService
 from .shadow_context import build_shadow_context_manifest
 from .span_entities import SpanFirstEntityExtractor
-from .vector_store import VectorStore
+from .vector_store import VectorStore, lexical_similarity
 
 
 LOGGER = logging.getLogger(__name__)
@@ -184,18 +190,95 @@ class KnowledgeForgeService:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="knowledge-forge")
         # Cleanup must be able to wait for an active document without blocking queued ingestion work.
         self.cleanup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="knowledge-forge-cleanup")
+        self.graphrag_native = GraphRAGNativeExecutor(self)
+        self.graphrag_native_runtime = GraphRAGNativeRuntime(self)
+        self.knowledge_forge_communities = KnowledgeForgeCommunityService(self.db)
+
+    def _mark_graphrag_native_source_changed(self, project_id: int, reason: str) -> None:
+        """Invalidate only the immutable native pointer after source mutation."""
+
+        # The native migration is additive.  On an older database where the
+        # feature cannot exist yet, ordinary upload/delete must remain usable;
+        # once the control plane exists, an invalidation failure is surfaced by
+        # a native build/status rather than silently queried as fresh.
+        marker = getattr(self.db, "mark_graphrag_native_stale", None)
+        readiness = getattr(self.db, "assert_graphrag_native_ready", None)
+        if marker is None or readiness is None:
+            return
+        try:
+            readiness()
+        except RuntimeError as exc:
+            # Before migration 0022 is applied no native pointer can be
+            # queryable.  Do not make ordinary uploads/deletes unavailable on
+            # a pre-feature database; a native build itself remains fail-closed.
+            if "数据库结构不完整" in str(exc):
+                return
+            raise
+        cancel = getattr(self.db, "cancel_project_jobs", None)
+        if cancel is not None:
+            cancel(int(project_id), ["graphrag_native_build"], reason)
+        marker(int(project_id), reason)
+
+    def _strategy_executor(self, strategy_key: str) -> Callable[..., None]:
+        """Resolve all ingestion strategies explicitly; never use an ``else`` fallback."""
+
+        strategy_key = normalize_strategy(strategy_key)
+        registry: dict[str, Callable[..., None]] = {
+            STABLE_STRATEGY: self._ingest_document,
+            ENHANCED_SHADOW_STRATEGY: self._ingest_enhanced_strategy,
+            GRAPHRAG_NATIVE_STRATEGY: self._ingest_graphrag_native,
+        }
+        try:
+            return registry[strategy_key]
+        except KeyError as exc:  # normalize_strategy currently catches this first.
+            raise ValueError(f"未注册的知识构建方案: {strategy_key}") from exc
+
+    def _ingest_graphrag_native(self, job_id: str, project_id: int) -> None:
+        """Execute only the isolated native strategy; it has no fallback chain."""
+
+        self.graphrag_native.run(job_id=job_id, project_id=project_id)
 
     def bootstrap(self) -> None:
-        for directory in (Config.docs_root, Config.chunks_root, Config.media_root, Config.trash_root):
+        for directory in (
+            Config.docs_root, Config.chunks_root, Config.media_root, Config.trash_root,
+            Config.files_root / "graphrag_native",
+        ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db.bootstrap()
         for project in self.db.list_projects():
-            self.schemas.ensure_base(int(project["id"]))
-            self.db.ensure_project_strategy_graphs(int(project["id"]))
+            selection = self.db.get_project_construction_strategy_selection(int(project["id"]))
+            if (
+                selection
+                and str(selection.get("association_status") or "") == "bound"
+                and str(selection.get("selected_strategy") or "") == ENHANCED_SHADOW_STRATEGY
+            ):
+                self.schemas.ensure_base(int(project["id"]))
+                self.db.ensure_project_strategy_graphs(int(project["id"]))
         try:
             self.graph.ensure_schema()
         except Exception as exc:
             LOGGER.warning("HugeGraph bootstrap deferred: %s", exc)
+
+    def _legacy_graph_recovery_allowed(self, project_id: int) -> bool:
+        """Return whether an old production Stable graph may be recovered.
+
+        Fixed Knowledge Forge and GraphRAG Native projects own independent
+        graph products and must never acquire a background Stable graph job.
+        The compatibility branch is only for older narrow test doubles that
+        do not expose the project-strategy control plane.
+        """
+
+        getter = getattr(
+            self.db, "get_project_construction_strategy_selection", None,
+        )
+        if getter is None:
+            return True
+        selection = getter(project_id)
+        return bool(
+            selection
+            and str(selection.get("association_status") or "") == "bound"
+            and str(selection.get("selected_strategy") or "") == STABLE_STRATEGY
+        )
 
     def recover_interrupted_jobs(self) -> int:
         recovered = 0
@@ -209,19 +292,42 @@ class KnowledgeForgeService:
             )
             if job["kind"] == "ingestion" and job.get("document_id"):
                 strategy_key = normalize_strategy(job.get("strategy_key"))
-                worker = (
-                    self._ingest_enhanced_strategy
-                    if strategy_key == ENHANCED_SHADOW_STRATEGY
-                    else self._ingest_document
-                )
+                if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
+                    self.db.update_job(
+                        job_id, status="failed", progress=100,
+                        log="native 策略不支持文档级恢复",
+                        error="GraphRAG Native 仅支持项目级全量构建",
+                    )
+                    continue
+                worker = self._strategy_executor(strategy_key)
                 self.executor.submit(worker, job_id, int(job["document_id"]))
                 recovered += 1
+            elif job["kind"] == "graphrag_native_build" and job.get("project_id"):
+                self.executor.submit(
+                    self._strategy_executor(GRAPHRAG_NATIVE_STRATEGY),
+                    job_id, int(job["project_id"]),
+                )
+                recovered += 1
             elif job["kind"] == "content_preparation" and job.get("document_id"):
+                metadata = job.get("metadata") or {}
+                strategy_key = str(
+                    metadata.get("strategy_key")
+                    or job.get("strategy_key")
+                    or ENHANCED_SHADOW_STRATEGY
+                )
                 self.executor.submit(
                     self._prepare_document_content, job_id, int(job["document_id"]),
+                    strategy_key,
                 )
                 recovered += 1
             elif job["kind"] == "graph_sync" and job.get("project_id"):
+                if not self._legacy_graph_recovery_allowed(int(job["project_id"])):
+                    self.db.update_job(
+                        job_id, status="failed", progress=100,
+                        log="项目已绑定独立构建策略，不恢复旧 Stable 图谱任务",
+                        error="固定策略项目禁止旧 Stable 图谱恢复",
+                    )
+                    continue
                 self.executor.submit(self._sync_project_graph, job_id, int(job["project_id"]))
                 recovered += 1
             elif job["kind"] == "schema_reassessment" and job.get("project_id"):
@@ -240,6 +346,8 @@ class KnowledgeForgeService:
                                    log="任务缺少恢复所需参数", error="任务无法恢复")
         if hasattr(self.db, "list_orphaned_graph_projects"):
             for project in self.db.list_orphaned_graph_projects():
+                if not self._legacy_graph_recovery_allowed(int(project["id"])):
+                    continue
                 try:
                     job = self.db.create_graph_rebuild_job(int(project["id"]))
                     if not job.get("_coalesced"):
@@ -326,13 +434,40 @@ class KnowledgeForgeService:
             "chunk_context_max": min(llm_context, embedding_context),
         }
 
-    def create_project(self, name: str, description: str, llm_model: str = "", embedding_model: str = "") -> dict[str, Any]:
+    def _assert_project_strategy(
+        self, project_id: int, expected_strategy: str | None = None,
+    ) -> str:
+        """Resolve the fixed project strategy and reject cross-strategy calls."""
+
+        checker = getattr(self.db, "assert_project_construction_strategy", None)
+        if checker is None:
+            # Narrow unit-test doubles created before the binding control plane
+            # may not implement this persistence method.  The real Database
+            # always does and therefore always fails closed.
+            if expected_strategy is None:
+                raise RuntimeError("项目策略校验接口不可用")
+            return normalize_strategy(expected_strategy)
+        return str(checker(project_id, expected_strategy))
+
+    def create_project(
+        self,
+        name: str,
+        description: str,
+        llm_model: str = "",
+        embedding_model: str = "",
+        *,
+        strategy_key: str,
+    ) -> dict[str, Any]:
         name = (name or "").strip()
         if not name:
             raise ValueError("项目名称不能为空")
+        strategy_key = normalize_strategy(strategy_key)
+        if strategy_key not in {ENHANCED_SHADOW_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
+            raise ValueError("请选择 Knowledge Forge 或 GraphRAG Native")
         project = self.db.create_project(
             name, (description or "").strip(), llm_model or Config.default_llm_model,
             embedding_model or Config.default_embedding_model,
+            strategy_key=strategy_key,
         )
         try:
             limits = self.project_token_limits(project["llm_model"], project["embedding_model"])
@@ -343,9 +478,23 @@ class KnowledgeForgeService:
             )
         except Exception as exc:
             LOGGER.warning("Using default project token limits: %s", exc)
-        self.schemas.ensure_base(int(project["id"]))
-        self.db.ensure_project_strategy_graphs(int(project["id"]))
+        if strategy_key == ENHANCED_SHADOW_STRATEGY:
+            self.schemas.ensure_base(int(project["id"]))
+            self.db.ensure_project_strategy_graphs(int(project["id"]))
         return self.db.get_project(int(project["id"])) or project
+
+    def bind_existing_project_strategy(
+        self, project_id: int, strategy_key: str, *, expected_generation: int,
+    ) -> dict[str, Any]:
+        if not self.db.get_project(project_id):
+            raise LookupError("项目不存在")
+        row = self.db.bind_project_construction_strategy(
+            project_id, strategy_key, expected_generation=expected_generation,
+        )
+        if str(row["selected_strategy"]) == ENHANCED_SHADOW_STRATEGY:
+            self.schemas.ensure_base(project_id)
+            self.db.ensure_project_strategy_graphs(project_id)
+        return row
 
     def update_project_settings(
         self,
@@ -408,9 +557,13 @@ class KnowledgeForgeService:
     ) -> dict[str, Any]:
         project = self.db.get_project(project_id)
         if not project: raise LookupError("项目不存在")
+        strategy_key = self._assert_project_strategy(project_id)
         source_name = Path(filename or "").name; suffix = Path(source_name).suffix.lower()
         requested_parser = requested_parser or "auto"
-        requested_strategy = requested_strategy or "auto"
+        requested_strategy = (
+            "auto" if strategy_key == GRAPHRAG_NATIVE_STRATEGY
+            else requested_strategy or "auto"
+        )
         validate_processing_request(source_name, requested_parser, requested_strategy)
         if not body: raise ValueError("上传文件为空")
         if len(body) > Config.upload_max_bytes: raise ValueError(f"文件超过 {Config.upload_max_bytes // 1024 // 1024} MB 限制")
@@ -436,10 +589,20 @@ class KnowledgeForgeService:
                     "effective_parser": None, "effective_chunk_strategy": None, "parse_quality": {},
                     "routing_reason": None, "processing_stage": "uploaded", "structure_ready_at": None,
                     "chunks_ready_at": None, "graph_ready_at": None})
-                self.db.ensure_document_strategy_builds(int(restored["id"]), reset=True)
+                if strategy_key == ENHANCED_SHADOW_STRATEGY:
+                    self.db.ensure_document_strategy_builds(int(restored["id"]), reset=True)
+                else:
+                    self._mark_graphrag_native_source_changed(
+                        project_id, "文档恢复，native source snapshot 已失效",
+                    )
                 return restored
             document = self.db.create_document(values)
-            self.db.ensure_document_strategy_builds(int(document["id"]), reset=True)
+            if strategy_key == ENHANCED_SHADOW_STRATEGY:
+                self.db.ensure_document_strategy_builds(int(document["id"]), reset=True)
+            else:
+                self._mark_graphrag_native_source_changed(
+                    project_id, "新增文档，native source snapshot 已失效",
+                )
             return document
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -453,6 +616,8 @@ class KnowledgeForgeService:
         target_document_ids: list[int] | None = None,
     ) -> str:
         strategy_key = normalize_strategy(strategy_key)
+        if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
+            raise ValueError("GraphRAG Native 仅支持项目级全量构建，请使用“构建知识”")
         document = self.db.get_document(document_id)
         if not document: raise LookupError("文档不存在")
         target_documents = [document]
@@ -461,7 +626,7 @@ class KnowledgeForgeService:
             for target_id in dict.fromkeys(int(value) for value in target_document_ids):
                 target = self.db.get_document(target_id)
                 if not target or int(target["project_id"]) != int(document["project_id"]):
-                    raise ValueError("增强实验包含不存在或不属于当前项目的文档")
+                    raise ValueError("Knowledge Forge 包含不存在或不属于当前项目的文档")
                 target_documents.append(target)
             if document_id not in {int(item["id"]) for item in target_documents}:
                 target_documents.insert(0, document)
@@ -480,7 +645,7 @@ class KnowledgeForgeService:
                 int(document["project_id"]), "ingestion", ENHANCED_SHADOW_STRATEGY,
             )
             if active_enhanced:
-                raise ValueError("当前项目的增强实验正在构建，请等待任务完成")
+                raise ValueError("当前项目的 Knowledge Forge 正在构建，请等待任务完成")
             active_stable = self.db.latest_active_job(
                 int(document["project_id"]), "ingestion", STABLE_STRATEGY,
             )
@@ -491,7 +656,7 @@ class KnowledgeForgeService:
                 int(document["project_id"]), "ingestion", ENHANCED_SHADOW_STRATEGY,
             )
             if active_enhanced:
-                raise ValueError("增强实验正在构建，完成后才能更新稳定基线")
+                raise ValueError("Knowledge Forge 正在构建，完成后才能更新稳定基线")
             # Stable and enhanced_shadow are independent construction products.
             # A stable rebuild must not preemptively mark a ready enhanced
             # snapshot as stale; source/document mutations have their own
@@ -524,11 +689,13 @@ class KnowledgeForgeService:
         if strategy_key == ENHANCED_SHADOW_STRATEGY:
             self.db.mark_strategy_graph_stale(
                 int(document["project_id"]), strategy_key,
-                "增强实验事实将重新计算",
+                "Knowledge Forge 事实将重新计算",
             )
-            self.executor.submit(self._ingest_enhanced_strategy, str(job["id"]), document_id)
+            self.executor.submit(self._strategy_executor(strategy_key), str(job["id"]), document_id)
+        elif strategy_key == STABLE_STRATEGY:
+            self.executor.submit(self._strategy_executor(strategy_key), str(job["id"]), document_id)
         else:
-            self.executor.submit(self._ingest_document, str(job["id"]), document_id)
+            raise ValueError(f"策略不支持文档级构建: {strategy_key}")
         return str(job["id"])
 
     def submit_project_ingestion(
@@ -539,6 +706,9 @@ class KnowledgeForgeService:
         strategy_key = normalize_strategy(strategy_key)
         if not self.db.get_project(project_id):
             raise LookupError("项目不存在")
+        self._assert_project_strategy(project_id, strategy_key)
+        if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
+            return self.submit_graphrag_native_build(project_id)
         documents = self.db.list_documents(project_id, strategy_key)
         pending = [
             item for item in documents
@@ -568,25 +738,449 @@ class KnowledgeForgeService:
             "document_count": len(pending),
         }
 
+    def submit_graphrag_native_build(self, project_id: int) -> dict[str, Any]:
+        """Queue one full-snapshot native build without creating document strategy rows."""
+
+        self.db.assert_graphrag_native_ready()
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        documents = self.db.list_documents(project_id)
+        if not documents:
+            raise ValueError("GraphRAG Native 需要至少一份已预处理文档")
+        if not all(
+            bool(item.get("active_revision_id"))
+            and str(item.get("status") or "") == "indexed"
+            and bool(item.get("structure_ready_at"))
+            for item in documents
+        ):
+            raise ValueError("GraphRAG Native 只能从所有已完成预处理的当前文档创建全量快照")
+        active = self.db.latest_active_job(
+            project_id, "graphrag_native_build", GRAPHRAG_NATIVE_STRATEGY,
+        )
+        if active:
+            raise ValueError("当前项目已有 GraphRAG Native 全量构建正在执行")
+        job = self.db.create_job(
+            "graphrag_native_build", project_id, None,
+            metadata={
+                "strategy_key": GRAPHRAG_NATIVE_STRATEGY,
+                "scope": "project_full_snapshot",
+                "document_ids": [int(item["id"]) for item in documents],
+            },
+            strategy_key=GRAPHRAG_NATIVE_STRATEGY,
+        )
+        self.executor.submit(
+            self._strategy_executor(GRAPHRAG_NATIVE_STRATEGY), str(job["id"]), project_id,
+        )
+        return {
+            "job_id": str(job["id"]),
+            "job_ids": [str(job["id"])],
+            "document_count": len(documents),
+            "scope": "project_full_snapshot",
+        }
+
+    def cancel_graphrag_native_build(self, project_id: int) -> dict[str, Any]:
+        """Request cancellation; the isolated subprocess observes it safely."""
+
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        job = self.db.latest_active_job(
+            project_id, "graphrag_native_build", GRAPHRAG_NATIVE_STRATEGY,
+        )
+        if not job:
+            raise LookupError("当前项目没有可取消的 GraphRAG Native 构建")
+        return self.db.update_job(
+            str(job["id"]), status="cancelled", progress=100,
+            log="用户请求取消 GraphRAG Native 构建；正在终止独立子进程",
+        )
+
+    def graphrag_native_status(self, project_id: int) -> dict[str, Any]:
+        if not self.db.get_project(project_id):
+            raise LookupError("项目不存在")
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        self.db.assert_graphrag_native_ready()
+        return self.graphrag_native_runtime.status(project_id)
+
+    def graphrag_native_graph(
+        self, project_id: int, *, offset: int = 0, limit: int = 200,
+        include_isolates: bool = False,
+    ) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        return self.graphrag_native_runtime.graph(
+            project_id, offset=offset, limit=limit, include_isolates=include_isolates,
+        )
+
+    def _current_knowledge_forge_snapshot_reference(
+        self, project_id: int,
+    ) -> dict[str, Any]:
+        """Resolve the only snapshot that Knowledge Forge may query."""
+
+        self._assert_project_strategy(project_id, ENHANCED_SHADOW_STRATEGY)
+        graph = self.db.get_project_strategy_graph(
+            project_id, ENHANCED_SHADOW_STRATEGY,
+        )
+        if not graph:
+            raise GraphNotReadyError("Knowledge Forge 图谱尚未初始化")
+        if (
+            str(graph.get("status") or "") != GRAPH_READY
+            or int(graph.get("generation") or 0)
+            != int(graph.get("ready_generation") or 0)
+        ):
+            raise GraphNotReadyError(
+                str(graph.get("error_message") or "Knowledge Forge 图谱尚未就绪")
+            )
+        policy_summary = (
+            graph.get("policy_summary")
+            if isinstance(graph.get("policy_summary"), dict) else {}
+        )
+        entity_metrics = (
+            policy_summary.get("entity_metrics")
+            if isinstance(policy_summary.get("entity_metrics"), dict) else {}
+        )
+        entity_namespace_id = str(
+            policy_summary.get("entity_namespace_id") or ""
+        ).strip()
+        relation_run_id = str(
+            entity_metrics.get("relation_v2_run_id") or ""
+        ).strip()
+        if not entity_namespace_id or not relation_run_id:
+            raise GraphNotReadyError(
+                "Knowledge Forge 图谱缺少当前实体或关系快照引用，拒绝读取旧流程数据"
+            )
+        namespace = self.db.get_entity_shadow_namespace(entity_namespace_id)
+        if (
+            not namespace
+            or int(namespace.get("project_id") or 0) != int(project_id)
+            or str(namespace.get("status") or "") != GRAPH_READY
+            or not bool(namespace.get("snapshot_complete"))
+        ):
+            raise GraphNotReadyError(
+                "Knowledge Forge 实体快照不完整或不属于当前项目"
+            )
+        relation_run = self.db.get_shadow_relation_v2_run(relation_run_id)
+        if (
+            not relation_run
+            or int(relation_run.get("project_id") or 0) != int(project_id)
+            or str(relation_run.get("status") or "") != GRAPH_READY
+        ):
+            raise GraphNotReadyError(
+                "Knowledge Forge 关系快照不完整或不属于当前项目"
+            )
+        return {
+            "graph": graph,
+            "policy_summary": policy_summary,
+            "entity_namespace_id": entity_namespace_id,
+            "relation_run_id": relation_run_id,
+            "namespace": namespace,
+            "relation_run": relation_run,
+        }
+
+    def knowledge_forge_graph(
+        self, project_id: int, *, limit: int = 1000,
+        include_isolates: bool = True,
+    ) -> dict[str, Any]:
+        """Return the current ready Knowledge Forge snapshot for the web viewer.
+
+        The browser reads the same immutable entity/relation snapshot that was
+        materialized to the isolated graph namespace.  It does not query
+        Hubble and never falls back to Stable data.
+        """
+
+        reference = self._current_knowledge_forge_snapshot_reference(project_id)
+        graph = reference["graph"]
+        entity_namespace_id = str(reference["entity_namespace_id"])
+        snapshot = self.db.load_entity_shadow_snapshot(entity_namespace_id)
+        canonicals = list(snapshot.get("canonicals") or [])
+        relations = list(snapshot.get("relation_endpoints") or [])
+        limit = max(1, min(int(limit), 5000))
+
+        canonical_by_key = {
+            str(item.get("canonical_key") or ""): item
+            for item in canonicals
+            if str(item.get("canonical_key") or "")
+        }
+        degree: dict[str, int] = {key: 0 for key in canonical_by_key}
+        valid_relations: list[dict[str, Any]] = []
+        connected: set[str] = set()
+        for relation in relations:
+            source = str(relation.get("source_canonical_key") or "")
+            target = str(relation.get("target_canonical_key") or "")
+            if source not in canonical_by_key or target not in canonical_by_key:
+                continue
+            degree[source] = degree.get(source, 0) + 1
+            degree[target] = degree.get(target, 0) + 1
+            connected.update((source, target))
+            valid_relations.append(relation)
+
+        ordered = sorted(
+            canonicals,
+            key=lambda item: (
+                0 if str(item.get("canonical_key") or "") in connected else 1,
+                str(item.get("primary_type") or ""),
+                str(item.get("normalized_name") or item.get("name") or ""),
+                str(item.get("canonical_key") or ""),
+            ),
+        )
+        if not include_isolates:
+            ordered = [
+                item for item in ordered
+                if str(item.get("canonical_key") or "") in connected
+            ]
+        selected = ordered[:limit]
+        selected_keys = {
+            str(item.get("canonical_key") or "") for item in selected
+        }
+        visible_relations = [
+            item for item in valid_relations
+            if str(item.get("source_canonical_key") or "") in selected_keys
+            and str(item.get("target_canonical_key") or "") in selected_keys
+        ][:limit]
+
+        community_run = self.db.get_knowledge_forge_community_run(
+            project_id,
+            int(graph.get("ready_generation") or 0),
+            entity_namespace_id,
+        )
+        community_items = (
+            list(community_run.get("communities") or [])
+            if community_run else []
+        )
+        singleton_communities = [
+            item for item in community_items
+            if int(item.get("size") or 0) == 1
+            and int(item.get("relationship_count") or 0) == 0
+        ]
+        if singleton_communities:
+            singleton_keys = [
+                str(key)
+                for item in singleton_communities
+                for key in (item.get("entity_keys") or [])
+            ]
+            community_items = [
+                item for item in community_items
+                if item not in singleton_communities
+            ] + [{
+                "key": "knowledge-forge-unconnected",
+                "label": "未连接实体",
+                "level": 0,
+                "community": 2_147_483_647,
+                "size": len(singleton_keys),
+                "relationship_count": 0,
+                "entity_keys": singleton_keys,
+                "relationship_keys": [],
+                "summary": (
+                    f"{len(singleton_keys)} 个规范实体当前没有已验证关系，"
+                    "因此不参与连通社区；它们仍完整保留在图中。"
+                ),
+            }]
+        community_by_entity: dict[str, dict[str, Any]] = {}
+        for community in sorted(
+            community_items,
+            key=lambda item: (
+                int(item.get("level") or 0),
+                int(item.get("community") or 0),
+                str(item.get("key") or ""),
+            ),
+        ):
+            for canonical_key in community.get("entity_keys") or []:
+                community_by_entity.setdefault(str(canonical_key), community)
+
+        nodes: list[dict[str, Any]] = []
+        groups: dict[str, dict[str, Any]] = {}
+        for item in selected:
+            key = str(item.get("canonical_key") or "")
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            entity_type = str(item.get("primary_type") or "GenericEntity")
+            community = community_by_entity.get(key)
+            group_key = str(
+                community.get("key") if community else entity_type
+            )
+            nodes.append({
+                "id": key,
+                "title": str(item.get("name") or key),
+                "type": entity_type,
+                "description": str(metadata.get("description") or ""),
+                "aliases": list(item.get("aliases") or []),
+                "degree": int(degree.get(key) or 0),
+                "group": group_key,
+            })
+            group = groups.setdefault(group_key, {
+                "key": group_key,
+                "label": str(
+                    community.get("label") if community else entity_type
+                ),
+                "level": int(community.get("level") or 0) if community else 0,
+                "size": 0,
+                "relationship_count": 0,
+                "summary": str(
+                    community.get("summary")
+                    if community else f"{entity_type} 类型的规范实体"
+                ),
+            })
+            group["size"] = int(group["size"]) + 1
+
+        edges: list[dict[str, Any]] = []
+        for item in visible_relations:
+            source = str(item.get("source_canonical_key") or "")
+            target = str(item.get("target_canonical_key") or "")
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            relation_type = str(item.get("relation_type") or "related_to")
+            source_group = str(
+                community_by_entity.get(source, {}).get("key")
+                or canonical_by_key[source].get("primary_type")
+                or "GenericEntity"
+            )
+            target_group = str(
+                community_by_entity.get(target, {}).get("key")
+                or canonical_by_key[target].get("primary_type")
+                or "GenericEntity"
+            )
+            if source_group == target_group and source_group in groups:
+                groups[source_group]["relationship_count"] = (
+                    int(groups[source_group]["relationship_count"]) + 1
+                )
+            edges.append({
+                "id": str(item.get("relation_key") or ""),
+                "source": source,
+                "target": target,
+                "source_title": str(canonical_by_key[source].get("name") or source),
+                "target_title": str(canonical_by_key[target].get("name") or target),
+                "predicate": relation_type,
+                "description": relation_type,
+                "evidence_text": str(item.get("evidence_text") or ""),
+                "confidence": float(metadata.get("confidence") or 1.0),
+                "weight": float(metadata.get("confidence") or 1.0),
+                "document_id": int(item.get("document_id") or 0),
+                "chunk_id": int(item.get("chunk_id") or 0),
+            })
+
+        return {
+            "strategy": ENHANCED_SHADOW_STRATEGY,
+            "generation": int(graph.get("ready_generation") or 0),
+            "entity_namespace_id": entity_namespace_id,
+            "community_run_id": str(
+                community_run.get("run_id") if community_run else ""
+            ),
+            "community_ready": bool(community_run),
+            "total_communities": int(
+                community_run.get("community_count") if community_run else 0
+            ),
+            "total_entities": len(canonicals),
+            "total_relationships": len(valid_relations),
+            "nodes": nodes,
+            "edges": edges,
+            "groups": sorted(groups.values(), key=lambda item: str(item["label"])),
+            "truncated": len(selected) < len(ordered)
+            or len(visible_relations) < len(valid_relations),
+        }
+
+    def graphrag_native_communities(self, project_id: int, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        return self.graphrag_native_runtime.communities(project_id, offset=offset, limit=limit)
+
+    def graphrag_native_community_reports(self, project_id: int, *, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        return self.graphrag_native_runtime.community_reports(project_id, offset=offset, limit=limit)
+
+    def graphrag_native_source_documents(
+        self,
+        project_id: int,
+        *,
+        document_id: int | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        return GraphRAGNativeInputBuilder(self).preview(
+            project_id=project_id, document_id=document_id,
+            offset=offset, limit=limit,
+        )
+
+    def graphrag_native_artifact_catalog(self, project_id: int) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        return self.graphrag_native_runtime.artifact_catalog(project_id)
+
+    def graphrag_native_artifact_rows(
+        self,
+        project_id: int,
+        artifact_key: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        return self.graphrag_native_runtime.artifact_rows(
+            project_id, artifact_key, offset=offset, limit=limit,
+        )
+
+    def graphrag_native_query(self, project_id: int, *, mode: str, question: str) -> dict[str, Any]:
+        self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
+        result = self.graphrag_native_runtime.query(
+            project_id, mode=mode, question=question,
+        )
+        documents: dict[int, dict[str, Any] | None] = {}
+        for context in result.get("context_records") or []:
+            if not isinstance(context, dict):
+                continue
+            source_map = (
+                context.get("source_map")
+                if isinstance(context.get("source_map"), dict) else {}
+            )
+            try:
+                document_id = int(source_map.get("document_id") or 0)
+            except (TypeError, ValueError):
+                document_id = 0
+            if not document_id:
+                continue
+            if document_id not in documents:
+                documents[document_id] = self.db.get_document(document_id)
+            document = documents[document_id]
+            if (
+                not document
+                or int(document.get("project_id") or 0) != int(project_id)
+            ):
+                continue
+            context["source_document"] = {
+                "id": document_id,
+                "original_filename": str(
+                    document.get("original_filename") or f"文档 {document_id}"
+                ),
+                "download_path": f"/api/documents/{document_id}/download",
+            }
+        return result
+
     def submit_project_preparation(self, project_id: int) -> dict[str, Any]:
-        """Prepare strategy-neutral document content without extracting graph facts."""
+        """Prepare documents according to the project's immutable strategy."""
 
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
+        strategy_key = self._assert_project_strategy(project_id)
         active = self.db.latest_active_job(project_id)
         if active:
             raise ValueError("当前项目已有任务正在执行，请等待任务完成")
         pending: list[dict[str, Any]] = []
         for document in self.db.list_documents(project_id):
-            manifest = self._document_revision_manifest(document, project)
+            manifest = (
+                self._native_source_revision_manifest(document, project)
+                if strategy_key == GRAPHRAG_NATIVE_STRATEGY
+                else self._document_revision_manifest(document, project)
+            )
             if not self._shared_content_is_current(document, manifest):
                 pending.append(document)
                 continue
-            if not self.db.list_document_chunks(int(document["id"])):
+            if (
+                strategy_key == ENHANCED_SHADOW_STRATEGY
+                and not self.db.list_document_chunks(int(document["id"]))
+            ):
                 pending.append(document)
         if not pending:
             raise ValueError("当前项目的文档均已完成预处理")
+        if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
+            self._mark_graphrag_native_source_changed(
+                project_id,
+                "源文档准备将生成新的 active revision，native source snapshot 已失效",
+            )
         pending.sort(key=lambda item: int(item["id"]))
         batch_id = uuid.uuid4().hex
         job_ids: list[str] = []
@@ -597,12 +1191,14 @@ class KnowledgeForgeService:
                     "batch_id": batch_id,
                     "document_name": document["original_filename"],
                     "target_document_ids": [int(document["id"])],
+                    "strategy_key": strategy_key,
                 },
+                strategy_key=strategy_key,
             )
             job_id = str(job["id"])
             job_ids.append(job_id)
             self.executor.submit(
-                self._prepare_document_content, job_id, int(document["id"]),
+                self._prepare_document_content, job_id, int(document["id"]), strategy_key,
             )
         return {
             "job_id": job_ids[0], "job_ids": job_ids, "batch_id": batch_id,
@@ -611,6 +1207,7 @@ class KnowledgeForgeService:
 
     def submit_graph_build(self, project_id: int) -> str:
         if not self.db.get_project(project_id): raise LookupError("项目不存在")
+        self._assert_project_strategy(project_id, ENHANCED_SHADOW_STRATEGY)
         job = self.db.create_graph_rebuild_job(project_id)
         if not job.get("_coalesced"):
             self.executor.submit(self._sync_project_graph, job["id"], project_id)
@@ -619,10 +1216,15 @@ class KnowledgeForgeService:
     def submit_schema_reassessment(self, project_id: int) -> str:
         if not self.db.get_project(project_id):
             raise LookupError("项目不存在")
+        self._assert_project_strategy(project_id, ENHANCED_SHADOW_STRATEGY)
         active = self.db.latest_active_job(project_id)
         if active:
             raise ValueError("当前项目已有任务正在执行，请等待任务完成后再重新评估 Schema")
-        job = self.db.create_job("schema_reassessment", project_id)
+        job = self.db.create_job(
+            "schema_reassessment",
+            project_id,
+            strategy_key=ENHANCED_SHADOW_STRATEGY,
+        )
         self.executor.submit(self._reassess_project_schema, str(job["id"]), project_id)
         return str(job["id"])
 
@@ -846,6 +1448,11 @@ class KnowledgeForgeService:
             chunks_by_document=chunks_by_document,
             payload_loader=load_processing_payload,
         )
+        structure_by_chunk = {
+            int(unit.structure.get("chunk_id") or 0): dict(unit.structure)
+            for unit in shadow_context.context_units
+            if int(unit.structure.get("chunk_id") or 0) > 0
+        }
         policy_set = {
             **P2_ENTITY_SHADOW_POLICY_SET,
             "shadow_context_policy_version": shadow_context.policy_version,
@@ -867,7 +1474,7 @@ class KnowledgeForgeService:
         } for chunk in chunks]
         self.db.assert_shadow_relation_v2_ready()
         code_version = (
-            "entity-shadow-p2-relation-v2-runtime-v2-predicate-metadata"
+            "entity-shadow-p2-structure-gate-v3-evidence-identity"
         )
         config_payload = {
             "policy_set": policy_set,
@@ -984,6 +1591,7 @@ class KnowledgeForgeService:
             reranker_cap=config_payload["reranker_cap"],
             auto_merge_threshold=Config.entity_merge_threshold,
             review_threshold=Config.entity_llm_review_threshold,
+            identity_profile=policy_set["entity_identity_profile"],
         )
         worker_id = f"entity-shadow:{uuid.uuid4().hex}"
         while True:
@@ -1018,14 +1626,32 @@ class KnowledgeForgeService:
                 self.db.reset_entity_shadow_chunk_attempt(
                     namespace_id, int(chunk["id"]),
                 )
-                extraction = self.schemas.extract_entities_only(project, active_schema, chunk)
+                structure = structure_by_chunk.get(int(chunk["id"]), {})
+                extraction_chunk = {
+                    **chunk,
+                    "metadata": {
+                        **self._metadata(chunk.get("metadata")),
+                        "structural_role": str(
+                            structure.get("source_role") or "body"
+                        ),
+                        "structural_spans": list(
+                            structure.get("structural_spans") or []
+                        ),
+                        "structure_policy_version": str(
+                            structure.get("structure_policy_version") or ""
+                        ),
+                    },
+                }
+                extraction = self.schemas.extract_entities_only(
+                    project, active_schema, extraction_chunk,
+                )
                 normalized = extractor.normalize(
                     project_scope=str(project.get("project_key") or project_id),
                     document_key=str(chunk.get("revision_id") or chunk["document_id"]),
                     chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
                     content=str(chunk.get("content") or ""),
                     raw_entities=extraction.get("entities") or [],
-                    chunk_metadata=self._metadata(chunk.get("metadata")),
+                    chunk_metadata=self._metadata(extraction_chunk.get("metadata")),
                 )
                 mention_rows = [{
                     **asdict(item),
@@ -1800,7 +2426,15 @@ class KnowledgeForgeService:
             subtasks[key] = {
                 "status": step_status,
                 "progress": int(sum(int(value.get("progress") or 0) for value in values) / len(values)),
-                "detail": f"{completed_documents}/{document_count} 个文档",
+                # A project-wide Knowledge Forge build is one durable job that
+                # internally processes many chunks/pairs/facts.  Preserve that
+                # job's real stage detail instead of replacing it with the
+                # misleading batch-level ``0/N 个文档`` label.
+                "detail": (
+                    str(values[0].get("detail") or "")
+                    if len(values) == 1
+                    else f"{completed_documents}/{document_count} 个文档"
+                ),
             }
 
         log: list[str] = []
@@ -1917,6 +2551,9 @@ class KnowledgeForgeService:
         document = self.db.get_document(document_id)
         if not document:
             raise LookupError("文档不存在")
+        self._assert_project_strategy(
+            int(document["project_id"]), ENHANCED_SHADOW_STRATEGY,
+        )
         if not document.get("chunks_ready_at"):
             raise LookupError("知识块尚未生成，请等待第二阶段完成")
         chunks = self.db.list_document_chunks(document_id)
@@ -1983,11 +2620,29 @@ class KnowledgeForgeService:
                 existing_subtasks.items() if isinstance(existing_subtasks, dict) else self._empty_ingestion_subtasks().items()
             )
         }
+        previous_subtask = (
+            subtasks.get(subtask)
+            if isinstance(subtasks.get(subtask), dict)
+            else {}
+        )
+        bounded_subtask_progress = max(
+            0, min(100, int(subtask_progress)),
+        )
+        # A durable job exposes one public progress timeline. Nested workers
+        # may start a fresh local counter for a later phase, but that must not
+        # make an already-rendered progress bar move backwards.
+        if subtask_status in {"running", "completed"}:
+            bounded_subtask_progress = max(
+                int(previous_subtask.get("progress") or 0),
+                bounded_subtask_progress,
+            )
         subtasks[subtask] = {
             "status": subtask_status,
-            "progress": max(0, min(100, int(subtask_progress))),
+            "progress": bounded_subtask_progress,
             "detail": detail,
         }
+        if progress is not None and status not in {"queued"}:
+            progress = max(int(job.get("progress") or 0), int(progress))
         self._job(
             job_id,
             status,
@@ -1997,6 +2652,34 @@ class KnowledgeForgeService:
             subtasks=subtasks,
             **metadata,
         )
+
+    @staticmethod
+    def _knowledge_forge_extraction_progress(
+        done: int,
+        total: int,
+        message: str,
+    ) -> tuple[int, str]:
+        """Map nested entity/relation phases onto one monotonic UI range."""
+
+        done = max(0, int(done))
+        total = max(1, int(total))
+        message = " ".join(str(message or "").split())
+        relation_phase = message.startswith((
+            "Knowledge Forge 候选对规划",
+            "Knowledge Forge 候选补充",
+            "Knowledge Forge 关系分类",
+            "Knowledge Forge 关系验证",
+        ))
+        if message.startswith("Knowledge Forge 完成"):
+            return 95, message.removeprefix("Knowledge Forge ").strip()
+        if relation_phase:
+            progress = 45 + int(min(done, total) / total * 50)
+            return min(95, progress), message.removeprefix("Knowledge Forge ").strip()
+        progress = 5 + int(min(done, total) / total * 40)
+        detail = f"实体抽取 {min(done, total)}/{total} 个知识块"
+        if "复用已完成" in message:
+            detail = "已复用完整实体与关系快照"
+        return min(45, progress), detail
 
     def _fail_active_ingestion_subtask(self, job_id: str, detail: str, *, cancelled: bool = False) -> None:
         job = self.db.get_job(job_id) or {}
@@ -2053,6 +2736,23 @@ class KnowledgeForgeService:
                 {axis: str(project.get(axis) or "") for axis in POLICY_AXES},
                 schema_version=int(project.get("active_schema_version") or 1),
             ),
+            "document_id": int(document["id"]),
+            "project_id": int(project["id"]),
+        }
+
+    def _native_source_revision_manifest(
+        self, document: dict[str, Any], project: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fingerprint only parser output consumed by GraphRAG Native."""
+
+        return {
+            "content_hash": document["doc_hash"],
+            "source_hash": document["doc_hash"],
+            "config_hash": hashlib.sha256(json.dumps({
+                "profile": "graphrag_native_source_v1",
+                "requested_parser": document.get("requested_parser") or "auto",
+            }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest(),
+            "policy_hash": "graphrag-native-source-v1",
             "document_id": int(document["id"]),
             "project_id": int(project["id"]),
         }
@@ -2164,11 +2864,11 @@ class KnowledgeForgeService:
                 "effective_strategy": plan.effective_strategy,
             }
             self._assert_ingestion_active(job_id, document_id)
+            process_result = ProcessingResult(plan, parsed, [], [])
             self._write_process_payload(
-                payload_path, document["original_filename"],
-                ProcessingResult(plan, parsed, [], []),
+                payload_path, document["original_filename"], process_result,
             )
-            self.db.update_document(
+            document = self.db.update_document(
                 document_id, effective_parser=plan.effective_parser,
                 effective_chunk_strategy=plan.effective_strategy,
                 parser_version=parsed.parser_version, parse_quality=parsed.quality,
@@ -2295,16 +2995,191 @@ class KnowledgeForgeService:
             if revision_scope is not None:
                 revision_scope.__exit__(None, None, None)
 
+    def _prepare_native_source(
+        self, job_id: str, document_id: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Publish parser blocks without creating KF chunks, vectors, or Schema."""
+
+        document = self.db.get_document(document_id)
+        if not document:
+            raise IngestionCancelled("文档不存在或已删除")
+        project = self.db.get_project(int(document["project_id"]))
+        if not project:
+            raise LookupError("项目不存在")
+        self._assert_project_strategy(int(project["id"]), GRAPHRAG_NATIVE_STRATEGY)
+        manifest = self._native_source_revision_manifest(document, project)
+        if (
+            self._shared_content_is_current(document, manifest)
+            and bool(document.get("structure_ready_at"))
+        ):
+            preview = GraphRAGNativeInputBuilder(self).preview(
+                project_id=int(project["id"]), document_id=document_id,
+            )
+            self._job(
+                job_id, "running", 90,
+                f"GraphRAG Native 源结构已就绪，复用 {preview['total']} 个 Native Documents",
+                document_id=document_id, stage="source_ready",
+                structure_ready=True, chunks_ready=False, shared_content_reused=True,
+                subtasks={
+                    "structure": {
+                        "status": "completed", "progress": 100,
+                        "detail": "复用源结构",
+                    },
+                    "chunking": {"status": "waiting", "progress": 0, "detail": ""},
+                    "schema_base": {
+                        "status": "completed", "progress": 100,
+                        "detail": f"{preview['total']} 个 Native Documents",
+                    },
+                    "extraction": {"status": "waiting", "progress": 0, "detail": ""},
+                    "graph_sync": {"status": "waiting", "progress": 0, "detail": ""},
+                },
+            )
+            return document, project
+
+        revision: dict[str, Any] | None = None
+        try:
+            self._start_ingestion_job(job_id, document_id, mutate_graph=False)
+            self._mark_graphrag_native_source_changed(
+                int(project["id"]),
+                "源文档正在生成新的 active revision，native source snapshot 已失效",
+            )
+            self.db.update_document(
+                document_id, status="processing", error_message=None,
+                processing_stage="structure", structure_ready_at=None,
+                chunks_ready_at=None, graph_ready_at=None,
+            )
+            revision = self.db.begin_document_revision(document_id, job_id, manifest)
+            source_path = Path(document["local_path"])
+            plan, parsed = parse_document_structure(
+                source_path,
+                requested_parser=document.get("requested_parser") or "auto",
+                requested_strategy="auto",
+            )
+            media_dir = (
+                Config.media_root
+                / Config.project_storage_key(int(project["id"]), project["name"])
+                / str(document["doc_hash"][:16])
+            )
+
+            def media_progress(index: int, total: int, message: str) -> None:
+                self._assert_ingestion_active(job_id, document_id)
+                self._job_subtask(
+                    job_id, "structure", subtask_status="running",
+                    subtask_progress=20 + int(index / max(1, total) * 60),
+                    detail=f"图片内容 {index}/{total}", progress=10, log=message,
+                )
+
+            parsed = self.media.enrich(
+                source_path, parsed, project, media_dir, progress=media_progress,
+            )
+            process_root = (
+                Config.chunks_root
+                / Config.project_storage_key(int(project["id"]), project["name"])
+            )
+            process_root.mkdir(parents=True, exist_ok=True)
+            payload_path = process_root / f"{document['doc_hash'][:16]}.json"
+            current_metadata = (
+                document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+            )
+            process_metadata = {
+                **current_metadata,
+                "chunk_file": str(payload_path),
+                "media_dir": str(media_dir),
+                "effective_parser": plan.effective_parser,
+                "native_source_profile": "graphrag_native_source_v1",
+                "native_source_ready": True,
+            }
+            process_result = ProcessingResult(plan, parsed, [], [])
+            self._assert_ingestion_active(job_id, document_id)
+            self._write_process_payload(
+                payload_path, document["original_filename"],
+                process_result,
+            )
+            self.db.update_document(
+                document_id, effective_parser=plan.effective_parser,
+                effective_chunk_strategy=None, parser_version=parsed.parser_version,
+                parse_quality=parsed.quality, routing_reason=plan.routing_reason,
+                processing_stage="structure_ready",
+                structure_ready_at=datetime.now(timezone.utc), chunks_ready_at=None,
+                metadata=process_metadata,
+            )
+            self._job_subtask(
+                job_id, "structure", subtask_status="completed", subtask_progress=100,
+                detail=f"{parsed.quality.get('block_count', 0)} 个源结构块",
+                progress=70,
+                log=(
+                    f"源结构解析完成：{parsed.quality.get('text_chars', 0)} 字符、"
+                    f"{parsed.quality.get('block_count', 0)} 个结构块"
+                ),
+                stage="structure_ready", structure_ready=True, chunks_ready=False,
+            )
+            blocks = process_result.payload().get("blocks") or []
+            native_units = GraphRAGNativeInputBuilder(self)._units_for_document(
+                int(project["id"]), document, revision, blocks,
+            )
+            document, _ = self.db.activate_document_revision(
+                document_id, str(revision["revision_id"]), job_id,
+                str(revision["lease_token"]),
+                reason="GraphRAG Native 源文档 revision 已更新",
+                mutate_legacy_graph=False,
+                document_values={
+                    "status": "indexed",
+                    "indexed_at": datetime.now(timezone.utc),
+                    "error_message": None,
+                    "processing_stage": "source_ready",
+                    "chunks_ready_at": None,
+                    "metadata": process_metadata,
+                },
+            )
+            self._job_subtask(
+                job_id, "schema_base", subtask_status="completed",
+                subtask_progress=100,
+                detail=f"{len(native_units)} 个 Native Documents",
+                progress=95, log=f"Native Documents 预检完成：{len(native_units)} 个",
+            )
+            return document, project
+        except Exception as exc:
+            if revision:
+                self.db.fail_document_revision(
+                    str(revision["revision_id"]), job_id,
+                    str(revision["lease_token"]), str(exc),
+                )
+            current = self.db.get_document(document_id)
+            if current:
+                self.db.update_document(
+                    document_id,
+                    status="indexed" if current.get("active_revision_id") else "failed",
+                    processing_stage="failed", error_message=str(exc),
+                )
+            raise
+
     @recorded_job("content_preparation")
-    def _prepare_document_content(self, job_id: str, document_id: int) -> None:
-        """Build reusable structure, chunks, vectors and Schema for one document."""
+    def _prepare_document_content(
+        self,
+        job_id: str,
+        document_id: int,
+        strategy_key: str = ENHANCED_SHADOW_STRATEGY,
+    ) -> None:
+        """Prepare one document using the project's fixed strategy."""
 
         try:
-            self._prepare_shared_content(job_id, document_id, mutate_graph=False)
+            strategy_key = normalize_strategy(strategy_key)
+            document = self.db.get_document(document_id)
+            if not document:
+                raise IngestionCancelled("文档不存在或已删除")
+            self._assert_project_strategy(int(document["project_id"]), strategy_key)
+            if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
+                self._prepare_native_source(job_id, document_id)
+                message = "GraphRAG Native 源文档准备完成，可构建原生 bundle"
+                chunks_ready = False
+            else:
+                self._prepare_shared_content(job_id, document_id, mutate_graph=False)
+                message = "文档预处理完成，可构建 Knowledge Forge"
+                chunks_ready = True
             self._job(
-                job_id, "completed", 100, "文档预处理完成，可选择任一方案构建知识",
+                job_id, "completed", 100, message,
                 stage="completed", active_subtask="", structure_ready=True,
-                chunks_ready=True, graph_ready=False,
+                chunks_ready=chunks_ready, graph_ready=False,
             )
         except IngestionCancelled:
             self._fail_active_ingestion_subtask(
@@ -2339,6 +3214,9 @@ class KnowledgeForgeService:
             if not document: raise LookupError("文档不存在")
             project = self.db.get_project(int(document["project_id"]))
             if not project: raise LookupError("项目不存在")
+            self._mark_graphrag_native_source_changed(
+                int(project["id"]), "文档正在生成新的 active revision，native source snapshot 已失效",
+            )
             revision_manifest = {
                 "content_hash": document["doc_hash"],
                 "source_hash": document["doc_hash"],
@@ -2830,7 +3708,7 @@ class KnowledgeForgeService:
                 )
                 document, project, _ = self._prepare_shared_content(job_id, target_id)
             if project is None:
-                raise RuntimeError("增强实验没有可处理文档")
+                raise RuntimeError("Knowledge Forge 没有可处理文档")
             project_id = int(project["id"])
             self._assert_ingestion_active(job_id, document_id)
             eligible_documents = [
@@ -2839,29 +3717,44 @@ class KnowledgeForgeService:
                 and not item.get("is_deleted")
             ]
             if not eligible_documents:
-                raise RuntimeError("项目尚无可用于增强实验的预处理结果")
+                raise RuntimeError("项目尚无可用于 Knowledge Forge 的预处理结果")
             self._job_subtask(
                 job_id, "schema_base", subtask_status="completed", subtask_progress=100,
                 detail=f"{len(eligible_documents)} 个预处理结果", progress=50,
                 log=(
-                    "===== 增强实验：Shadow v2 关系 + P2 实体归一 =====\n"
+                    "===== Knowledge Forge：关系验证 + 实体归一 =====\n"
                     "已冻结文档预处理结果与逻辑 Schema，开始构建隔离实体关系快照"
                 ),
                 stage="graph", strategy_key=strategy_key, graph_ready=False,
             )
             self._job_subtask(
                 job_id, "extraction", subtask_status="running", subtask_progress=5,
-                detail="Shadow v2/P2 处理中", progress=52,
+                detail="实体归一与关系验证处理中", progress=52,
             )
 
+            last_shadow_progress = 5
+
             def shadow_progress(done: int, total: int, message: str) -> None:
+                nonlocal last_shadow_progress
                 self._assert_ingestion_active(job_id, document_id)
-                ratio = done / max(1, total)
+                mapped_progress, detail = (
+                    self._knowledge_forge_extraction_progress(
+                        done, total, message,
+                    )
+                )
+                # Defensive monotonicity protects the public progress bar if a
+                # future nested phase reports a fresh local counter.
+                last_shadow_progress = max(
+                    last_shadow_progress, mapped_progress,
+                )
+                overall_progress = 52 + int(
+                    (last_shadow_progress - 5) / 90 * 27
+                )
                 self._job_subtask(
                     job_id, "extraction", subtask_status="running",
-                    subtask_progress=max(5, min(95, 5 + int(ratio * 90))),
-                    detail=f"{done}/{total} 个知识块",
-                    progress=max(52, min(79, 52 + int(ratio * 27))),
+                    subtask_progress=last_shadow_progress,
+                    detail=detail,
+                    progress=max(52, min(79, overall_progress)),
                     log=message,
                 )
 
@@ -2870,7 +3763,7 @@ class KnowledgeForgeService:
             )
             namespace = shadow.get("namespace") or {}
             if namespace.get("status") != "ready" or not namespace.get("snapshot_complete"):
-                raise RuntimeError("增强实验快照未完整收敛")
+                raise RuntimeError("Knowledge Forge 快照未完整收敛")
             shadow["mentions"] = self.db.list_entity_shadow_mentions(shadow["namespace_id"])
             metrics = namespace.get("metrics") or {}
             self._job_subtask(
@@ -2881,7 +3774,7 @@ class KnowledgeForgeService:
                 ),
                 progress=80,
                 log=(
-                    f"增强实验快照完成：{len(shadow['mentions'])} 个实体提及，"
+                    f"Knowledge Forge 快照完成：{len(shadow['mentions'])} 个实体提及，"
                     f"{len(shadow.get('canonicals') or [])} 个规范实体，"
                     f"{len(shadow.get('relation_endpoints') or [])} 条 v2 可物化关系"
                 ),
@@ -2918,6 +3811,21 @@ class KnowledgeForgeService:
                 project, eligible_documents, chunks_by_document, shadow,
                 strategy_key=strategy_key, mutation=mutation,
             )
+            self._job_subtask(
+                job_id, "graph_sync", subtask_status="running", subtask_progress=70,
+                detail="正在识别图谱社区", progress=94,
+                log="Knowledge Forge 图谱写入完成，正在基于当前规范实体和已验证关系识别社区",
+            )
+            community_run = self.knowledge_forge_communities.detect(
+                project_id=project_id,
+                graph_generation=generation,
+                entity_namespace_id=str(shadow["namespace_id"]),
+                snapshot=shadow,
+                config=CommunityConfig(
+                    seed=42, max_cluster_size=10,
+                    use_lcc=False, timeout_seconds=300,
+                ),
+            )
             completed = self.db.complete_strategy_graph_rebuild(
                 project_id, strategy_key, generation,
                 stats=graph_stats,
@@ -2926,11 +3834,13 @@ class KnowledgeForgeService:
                     "policy_hash": policy_hash,
                     "entity_namespace_id": shadow["namespace_id"],
                     "entity_metrics": metrics,
+                    "community_run_id": str(community_run["run_id"]),
+                    "community_input_hash": str(community_run["input_hash"]),
                 },
                 empty=not graph_stats["documents"],
             )
             if not completed:
-                raise RuntimeError("增强实验图代次已过期，拒绝发布就绪状态")
+                raise RuntimeError("Knowledge Forge 图代次已过期，拒绝发布就绪状态")
             now = datetime.now(timezone.utc)
             for item in eligible_documents:
                 self.db.ensure_document_strategy_builds(int(item["id"]))
@@ -2961,12 +3871,13 @@ class KnowledgeForgeService:
                 detail=f"{graph_stats['entities']} 个实体，{graph_stats['relations']} 条关系",
                 progress=100,
                 log=(
-                    f"增强实验隔离图同步完成：{graph_stats['entities']} 个实体，"
-                    f"{graph_stats['relations']} 条关系"
+                    f"Knowledge Forge 图谱同步完成：{graph_stats['entities']} 个实体，"
+                    f"{graph_stats['relations']} 条关系，"
+                    f"{int(community_run.get('community_count') or 0)} 个社区"
                 ),
             )
             self._job(
-                job_id, "completed", 100, "增强实验构建完成（仍保持 shadow，不激活生产）",
+                job_id, "completed", 100, "Knowledge Forge 构建完成（隔离运行，未激活生产）",
                 stage="completed", graph_ready=True, strategy_key=strategy_key,
                 graph_stats=graph_stats, production_approved=False,
             )
@@ -2983,7 +3894,7 @@ class KnowledgeForgeService:
             error_message = str(exc)
             if "禁止回退旧流程" not in error_message:
                 error_message = (
-                    "Shadow relation v2 构建失败，enhanced_shadow 禁止回退旧流程："
+                    "Knowledge Forge 构建失败，禁止回退旧流程："
                     f"{error_message}"
                 )
             if state:
@@ -2999,7 +3910,7 @@ class KnowledgeForgeService:
             self._fail_active_ingestion_subtask(job_id, error_message)
             self.db.update_job(
                 job_id, status="failed", progress=100,
-                log=f"增强实验构建失败：{error_message}", error=error_message,
+                log=f"Knowledge Forge 构建失败：{error_message}", error=error_message,
                 metadata={"stage": "failed", "strategy_key": strategy_key},
             )
         finally:
@@ -3708,21 +4619,32 @@ class KnowledgeForgeService:
     def delete_document(self, document_id: int) -> str:
         document = self.db.get_document(document_id)
         if not document: raise LookupError("文档不存在或已删除")
+        strategy_key = self._assert_project_strategy(int(document["project_id"]))
         self.db.cancel_document_jobs(document_id)
-        self.db.cancel_project_jobs(
-            int(document["project_id"]), ["schema_reassessment"],
-            "项目文档已删除，本次 Schema 重新评估已取消，请按需重新执行",
-        )
+        if strategy_key == ENHANCED_SHADOW_STRATEGY:
+            self.db.cancel_project_jobs(
+                int(document["project_id"]), ["schema_reassessment"],
+                "项目文档已删除，本次 Schema 重新评估已取消，请按需重新执行",
+            )
         # Make the user-visible deletion immediate. The final cleanup runs after any
         # in-flight resolver call releases the per-document lock and reapplies the
         # soft-delete cascade to catch writes that were already in progress.
         self.db.soft_delete_document(document_id)
-        self.db.set_graph_state(
-            int(document["project_id"]), GRAPH_STALE,
-            error="项目文档已删除，图谱正在重新收敛",
-        )
+        if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
+            self._mark_graphrag_native_source_changed(
+                int(document["project_id"]), "文档删除，native source snapshot 已失效",
+            )
+        else:
+            self.db.set_graph_state(
+                int(document["project_id"]), GRAPH_STALE,
+                error="项目文档已删除，图谱正在重新收敛",
+            )
         document_name = str(document.get("original_filename") or f"文档 {document_id}")
-        job = self.db.create_job("document_cleanup", int(document["project_id"]), document_id)
+        job = self.db.create_job(
+            "document_cleanup", int(document["project_id"]), document_id,
+            metadata={"strategy_key": strategy_key},
+            strategy_key=strategy_key,
+        )
         self.db.update_job(
             str(job["id"]),
             status="queued",
@@ -3736,6 +4658,7 @@ class KnowledgeForgeService:
     def _cleanup_deleted_document(self, job_id: str, document: dict[str, Any]) -> None:
         document_id = int(document["id"])
         project_id = int(document["project_id"])
+        strategy_key = self._assert_project_strategy(project_id)
         try:
             self._job(
                 job_id,
@@ -3765,22 +4688,27 @@ class KnowledgeForgeService:
                     shutil.move(str(media_path), trash_dir / f"{stamp}_{media_path.name}_media")
                 self.db.soft_delete_document(document_id)
                 self._job(job_id, "running", 80, "源文件和解析过程文件已移入回收目录", stage="cleanup")
-                if self.db.count_documents(project_id) == 0:
+                if (
+                    strategy_key == ENHANCED_SHADOW_STRATEGY
+                    and self.db.count_documents(project_id) == 0
+                ):
                     self.schemas.activate_base(project_id)
 
-            report = self._rebuild_project_graph(project_id)
-            self._job(
-                job_id, "running", 92,
-                f"HugeGraph 已按剩余文档重建：{report['relations']} 条关系",
-                stage="cleanup",
-            )
+            if strategy_key == ENHANCED_SHADOW_STRATEGY:
+                report = self._rebuild_project_graph(project_id)
+                self._job(
+                    job_id, "running", 92,
+                    f"HugeGraph 已按剩余文档重建：{report['relations']} 条关系",
+                    stage="cleanup",
+                )
             self._job(job_id, "completed", 100, "文档及其派生数据清理完成", stage="completed")
         except Exception as exc:
             LOGGER.exception("Document cleanup failed: %s", document_id)
-            try:
-                self.db.set_graph_state(project_id, GRAPH_FAILED, error=str(exc))
-            except LookupError:
-                pass
+            if strategy_key == ENHANCED_SHADOW_STRATEGY:
+                try:
+                    self.db.set_graph_state(project_id, GRAPH_FAILED, error=str(exc))
+                except LookupError:
+                    pass
             self.db.update_job(
                 job_id,
                 status="failed",
@@ -3795,27 +4723,144 @@ class KnowledgeForgeService:
         if not project: raise LookupError("项目不存在")
         query = (query or "").strip()
         if not query: raise ValueError("请输入检索内容")
+        reference = self._current_knowledge_forge_snapshot_reference(project_id)
+        namespace_id = str(reference["entity_namespace_id"])
+        relation_run_id = str(reference["relation_run_id"])
+        namespace = reference["namespace"]
         limit = min(top_k or 20, 50)
-        lexical = self.db.search_graph_text(project_id, query, limit)
-        entity_hits = self.vectors.search_type(project, query, "entity", limit)
-        relation_hits = self.vectors.search_type(project, query, "relation", limit)
-        entity_scores = {int(item["object_key"]): item["score"] for item in entity_hits if str(item["object_key"]).isdigit()}
-        relation_scores = {int(item["object_key"]): item["score"] for item in relation_hits if str(item["object_key"]).isdigit()}
-        entities = {int(item["id"]): dict(item) for item in lexical["entities"]}
-        for item in self.db.get_entities_by_ids(project_id, list(entity_scores)):
-            value = entities.setdefault(int(item["id"]), dict(item)); value["score"] = entity_scores[int(item["id"])]
-        relation_ids = {
-            *(int(item["id"]) for item in lexical["relations"]),
-            *relation_scores,
+        dense_weight = max(
+            0.0, min(1.0, float(Config.retrieval_dense_weight)),
+        )
+        chunks = self.vectors.search(project, query, top_k)
+        chunk_scores = {
+            int(item["chunk_id"]): float(item.get("score") or 0.0)
+            for item in chunks if item.get("chunk_id") is not None
         }
-        relations = {}
-        for item in self.db.get_relations_by_ids(project_id, list(relation_ids)):
-            value = relations.setdefault(int(item["id"]), dict(item))
-            if int(item["id"]) in relation_scores:
-                value["score"] = relation_scores[int(item["id"])]
-        return {"query": query, "chunks": self.vectors.search(project, query, top_k),
-                "entities": sorted(entities.values(), key=lambda item: item.get("score", 0), reverse=True)[:limit],
-                "relations": sorted(relations.values(), key=lambda item: item.get("score", item.get("confidence", 0)), reverse=True)[:limit]}
+
+        embedding_model = str(
+            namespace.get("embedding_model")
+            or project.get("embedding_model")
+            or Config.default_embedding_model
+        )
+        query_vector = self.ollama.embed([query], embedding_model)[0]
+        lexical_entities = self.db.search_knowledge_forge_entities(
+            namespace_id, query, limit,
+        )
+        vector_entities = self.db.search_entity_shadow_vector_candidates(
+            namespace_id, embedding_model, query_vector, limit,
+        )
+        entities: dict[str, dict[str, Any]] = {}
+        for item in [*lexical_entities, *vector_entities]:
+            key = str(item.get("canonical_key") or "")
+            if not key:
+                continue
+            metadata = (
+                item.get("metadata")
+                if isinstance(item.get("metadata"), dict) else {}
+            )
+            description = str(metadata.get("description") or "")
+            content = " ".join([
+                str(item.get("name") or ""),
+                str(item.get("primary_type") or ""),
+                " ".join(str(value) for value in (item.get("aliases") or [])),
+                description,
+            ])
+            lexical_score = max(
+                float(item.get("lexical_score") or 0.0),
+                lexical_similarity(query, content),
+            )
+            vector_score = float(item.get("vector_score") or 0.0)
+            existing = entities.setdefault(key, {
+                "id": key,
+                "canonical_key": key,
+                "name": str(item.get("name") or key),
+                "entity_type": str(item.get("primary_type") or "GenericEntity"),
+                "description": description,
+                "aliases": list(item.get("aliases") or []),
+                "source_count": int(item.get("source_count") or 0),
+                "lexical_score": 0.0,
+                "dense_score": 0.0,
+                "score": 0.0,
+            })
+            existing["lexical_score"] = max(
+                float(existing["lexical_score"]), lexical_score,
+            )
+            existing["dense_score"] = max(
+                float(existing["dense_score"]), vector_score,
+            )
+            existing["score"] = (
+                dense_weight * float(existing["dense_score"])
+                + (1 - dense_weight)
+                * float(existing["lexical_score"])
+            )
+
+        relation_rows = self.db.search_knowledge_forge_relations(
+            namespace_id,
+            relation_run_id,
+            query,
+            chunk_ids=list(chunk_scores),
+            limit=max(limit, len(chunk_scores) * 4),
+        )
+        relations: list[dict[str, Any]] = []
+        for item in relation_rows:
+            metadata = (
+                item.get("metadata")
+                if isinstance(item.get("metadata"), dict) else {}
+            )
+            content = " ".join([
+                str(item.get("source_name") or ""),
+                str(item.get("relation_type") or ""),
+                str(item.get("target_name") or ""),
+                str(item.get("evidence_text") or ""),
+            ])
+            lexical_score = max(
+                float(item.get("lexical_score") or 0.0),
+                lexical_similarity(query, content),
+            )
+            evidence_score = float(
+                chunk_scores.get(int(item.get("chunk_id") or 0), 0.0)
+            )
+            score = (
+                dense_weight * evidence_score
+                + (1 - dense_weight) * lexical_score
+            )
+            relations.append({
+                **dict(item),
+                "description": str(item.get("evidence_text") or ""),
+                "confidence": float(metadata.get("confidence") or 1.0),
+                "verification_status": "SUPPORTED",
+                "dense_score": evidence_score,
+                "lexical_score": lexical_score,
+                "score": score,
+            })
+        return {
+            "query": query,
+            "strategy": ENHANCED_SHADOW_STRATEGY,
+            "graph_generation": int(
+                reference["graph"].get("ready_generation") or 0
+            ),
+            "entity_namespace_id": namespace_id,
+            "relation_run_id": relation_run_id,
+            "chunks": chunks,
+            "entities": sorted(
+                entities.values(),
+                key=lambda item: (
+                    float(item.get("score") or 0.0),
+                    int(item.get("source_count") or 0),
+                    str(item.get("name") or ""),
+                ),
+                reverse=True,
+            )[:limit],
+            "relations": sorted(
+                relations,
+                key=lambda item: (
+                    float(item.get("score") or 0.0),
+                    int(item.get("evidence_count") or 0),
+                    str(item.get("id") or ""),
+                ),
+                reverse=True,
+            )[:limit],
+        }
 
     def health(self) -> dict[str, Any]:
         self.db.list_projects()

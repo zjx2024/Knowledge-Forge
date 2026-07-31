@@ -16,7 +16,7 @@ from typing import Any, Mapping
 from . import relation_shadow_v2 as v2
 
 
-SHADOW_RELATION_SCHEMA_OVERLAY_VERSION = "shadow-relation-schema-overlay-v1"
+SHADOW_RELATION_SCHEMA_OVERLAY_VERSION = "shadow-relation-schema-overlay-v2"
 
 SHADOW_RELATION_SCHEMA_OVERLAY_REQUIRED_FIELDS = frozenset({
     "name",
@@ -33,6 +33,8 @@ SHADOW_RELATION_SCHEMA_OVERLAY_REQUIRED_FIELDS = frozenset({
     "reciprocal_allowed",
     "publish_mode",
     "allowed_context_kinds",
+    "allowed_source_roles",
+    "scope_policy",
     "required_evidence_roles",
     "positive_examples",
     "negative_examples",
@@ -65,6 +67,11 @@ _CONTEXT_KINDS = [
     "table_cell",
     "list_item",
 ]
+_FACT_SOURCE_ROLES = ["body", "list_item", "table_row", "table_cell"]
+_DEFAULT_SCOPE_POLICY = {
+    "require_same_atomic_scope": True,
+    "allow_cross_scope_with_explicit_evidence": False,
+}
 
 _RELATION_EVIDENCE_ROLES = ["subject", "predicate_cue", "object"]
 
@@ -94,6 +101,8 @@ def _policy(
     identity_qualifier_keys: list[str] | None = None,
     conflicts_with: list[str] | None = None,
     allowed_context_kinds: list[str] | None = None,
+    allowed_source_roles: list[str] | None = None,
+    scope_policy: dict[str, Any] | None = None,
     required_evidence_roles: list[str] | None = None,
     negation_policy: str = "reject_negated",
     modality_policy: str = "require_asserted",
@@ -119,6 +128,10 @@ def _policy(
         "reflexive": bool(reflexive),
         "reciprocal_allowed": bool(reciprocal_allowed),
         "allowed_context_kinds": list(allowed_context_kinds or _CONTEXT_KINDS),
+        "allowed_source_roles": list(
+            allowed_source_roles or _FACT_SOURCE_ROLES
+        ),
+        "scope_policy": dict(scope_policy or _DEFAULT_SCOPE_POLICY),
         "required_evidence_roles": list(
             required_evidence_roles or _RELATION_EVIDENCE_ROLES
         ),

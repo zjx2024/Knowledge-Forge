@@ -19,6 +19,8 @@ TYPE_UNRESOLVED = "TYPE_UNRESOLVED"
 TYPE_INCOMPATIBLE = "TYPE_INCOMPATIBLE"
 FILTERED_DISTANCE = "FILTERED_DISTANCE"
 FILTERED_STRUCTURE_PEER = "FILTERED_STRUCTURE_PEER"
+FILTERED_STRUCTURE_INELIGIBLE = "FILTERED_STRUCTURE_INELIGIBLE"
+FILTERED_SCOPE_BOUNDARY = "FILTERED_SCOPE_BOUNDARY"
 NO_RELATION = "NO_RELATION"
 OTHER_UNSUPPORTED = "OTHER_UNSUPPORTED"
 HYPOTHESES = "HYPOTHESES"
@@ -28,15 +30,15 @@ HYPOTHESES_EMITTED = "HYPOTHESES_EMITTED"
 CLASSIFICATION_PENDING = "CLASSIFICATION_PENDING"
 CLASSIFICATION_FAILED = "CLASSIFICATION_FAILED"
 
-SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION = "shadow-relation-classifier-prompt-v9"
-SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION = "shadow-relation-classifier-schema-v6"
-SHADOW_RELATION_CLASSIFIER_PARSER_VERSION = "shadow-relation-classifier-parser-v9"
+SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION = "shadow-relation-classifier-prompt-v10"
+SHADOW_RELATION_CLASSIFIER_SCHEMA_VERSION = "shadow-relation-classifier-schema-v7"
+SHADOW_RELATION_CLASSIFIER_PARSER_VERSION = "shadow-relation-classifier-parser-v10"
 SHADOW_RELATION_PROPOSER_PROMPT_VERSION = "shadow-relation-proposer-prompt-v2"
 SHADOW_RELATION_PROPOSER_SCHEMA_VERSION = "shadow-relation-proposer-schema-v2"
 SHADOW_RELATION_PROPOSER_PARSER_VERSION = "shadow-relation-proposer-parser-v2"
-SHADOW_RELATION_VERIFIER_PROMPT_VERSION = "shadow-relation-verifier-prompt-v5"
-SHADOW_RELATION_VERIFIER_SCHEMA_VERSION = "shadow-relation-verifier-schema-v4"
-SHADOW_RELATION_VERIFIER_PARSER_VERSION = "shadow-relation-verifier-parser-v4"
+SHADOW_RELATION_VERIFIER_PROMPT_VERSION = "shadow-relation-verifier-prompt-v6"
+SHADOW_RELATION_VERIFIER_SCHEMA_VERSION = "shadow-relation-verifier-schema-v5"
+SHADOW_RELATION_VERIFIER_PARSER_VERSION = "shadow-relation-verifier-parser-v6"
 
 PASS = "PASS"
 REVIEW_ONLY = "REVIEW_ONLY"
@@ -134,6 +136,20 @@ class ShadowClassificationError(ValueError):
     """A classifier batch cannot be aligned to its frozen pair universe."""
 
 
+class ShadowVerificationRejected(ShadowClassificationError):
+    """A verifier response is valid enough to reject, but cannot support a fact.
+
+    This is deliberately distinct from a transport or response-protocol failure:
+    a claimed ``SUPPORTED`` verdict without admissible evidence is a semantic
+    rejection of that hypothesis, not a reason to fail an otherwise independent
+    document build.
+    """
+
+    def __init__(self, reason_code: str, message: str):
+        super().__init__(message)
+        self.reason_code = str(reason_code)
+
+
 @dataclass(frozen=True)
 class PredicateSpec:
     name: str
@@ -150,6 +166,8 @@ class PredicateSpec:
     reflexive: bool
     reciprocal_allowed: bool
     allowed_context_kinds: tuple[str, ...]
+    allowed_source_roles: tuple[str, ...]
+    scope_policy: dict[str, bool]
     required_evidence_roles: tuple[str, ...]
     positive_examples: tuple[str, ...]
     negative_examples: tuple[str, ...]
@@ -420,6 +438,8 @@ def normalize_predicate_schema(
         "inverse_predicate",
         "canonical_orientation",
         "publish_mode",
+        "allowed_source_roles",
+        "scope_policy",
         "positive_examples",
         "negative_examples",
         "reflexive",
@@ -464,7 +484,7 @@ def normalize_predicate_schema(
             "positive_examples", "negative_examples", "optional_soft_cues",
             "positive_cues", "negative_cues", "anti_patterns",
             "allowed_context_kinds", "required_evidence_roles",
-            "identity_qualifier_keys", "conflicts_with",
+            "allowed_source_roles", "identity_qualifier_keys", "conflicts_with",
         ):
             value = raw.get(field_name, [])
             if (
@@ -474,6 +494,35 @@ def normalize_predicate_schema(
                 raise ValueError(
                     f"predicate {name} {field_name} must be a string array"
                 )
+        allowed_source_roles = [
+            str(item).strip() for item in raw.get("allowed_source_roles") or []
+        ]
+        if not allowed_source_roles or not all(allowed_source_roles):
+            raise ValueError(
+                f"predicate {name} requires allowed_source_roles"
+            )
+        scope_policy_raw = raw.get("scope_policy")
+        if not isinstance(scope_policy_raw, Mapping):
+            raise ValueError(f"predicate {name} scope_policy must be an object")
+        scope_policy = {
+            "require_same_atomic_scope": scope_policy_raw.get(
+                "require_same_atomic_scope"
+            ),
+            "allow_cross_scope_with_explicit_evidence": scope_policy_raw.get(
+                "allow_cross_scope_with_explicit_evidence"
+            ),
+        }
+        if not all(isinstance(value, bool) for value in scope_policy.values()):
+            raise ValueError(
+                f"predicate {name} scope_policy requires boolean boundary fields"
+            )
+        if (
+            scope_policy["require_same_atomic_scope"]
+            and scope_policy["allow_cross_scope_with_explicit_evidence"]
+        ):
+            raise ValueError(
+                f"predicate {name} scope_policy has conflicting boundary rules"
+            )
         if not isinstance(raw.get("symmetric"), bool):
             raise ValueError(f"predicate {name} symmetric must be boolean")
         if not isinstance(raw.get("reflexive"), bool):
@@ -539,6 +588,8 @@ def normalize_predicate_schema(
             allowed_context_kinds=tuple(
                 str(value) for value in raw.get("allowed_context_kinds") or []
             ),
+            allowed_source_roles=tuple(allowed_source_roles),
+            scope_policy=scope_policy,
             required_evidence_roles=tuple(
                 str(value) for value in raw.get("required_evidence_roles") or []
             ),
@@ -729,6 +780,13 @@ def classifier_prompt(
         "soft_cue_matches": list(
             item.provenance.get("soft_cue_matches") or []
         ),
+        "structural_evidence_contract": {
+            "source_roles": list(item.provenance.get("source_roles") or []),
+            "atomic_scopes": list(item.provenance.get("atomic_scopes") or []),
+            "required_atomic_scope": list(
+                item.provenance.get("required_atomic_scope") or []
+            ),
+        },
     } for item in opportunities]
     if len(opportunities) == 1:
         response_shape = (
@@ -761,6 +819,8 @@ def classifier_prompt(
         "optional_soft_cues 只是可配置提示，不能作为关系、方向或发布的证据。"
         "结构共现本身不等于关系；Schema 无法表示但文本明确表达关系时返回 "
         "OTHER_UNSUPPORTED；没有语义关系返回 NO_RELATION。"
+        "每个 pair 的 structural_evidence_contract 是硬边界；不得跨越 required_atomic_scope，"
+        "不得因表格、列表或版面相邻而假定关系。"
         "evidence_spans 必须是冻结 context 内的绝对半开区间。"
         f"{response_shape}"
         "pair_id 必须逐字复制输入。decision=HYPOTHESES 时，hypotheses 中每个元素"
@@ -1185,6 +1245,20 @@ def proposal_to_hypothesis(
     spec = normalize_predicate_schema(logical_schema).get(proposal.predicate)
     if spec is None:
         raise ShadowClassificationError("proposal predicate is no longer in schema")
+    allowed = {
+        str(item.get("name") or "")
+        for item in opportunity.allowed_predicate_metadata
+    }
+    if proposal.predicate not in allowed:
+        raise ShadowClassificationError(
+            "proposal predicate is not allowed by the frozen structure policy"
+        )
+    if not _spans_stay_within_required_atomic_scope(
+        proposal.evidence_spans, opportunity,
+    ):
+        raise ShadowClassificationError(
+            "proposal evidence crosses the required atomic scope"
+        )
     spans_material = json.dumps(
         [[span.start, span.end] for span in proposal.evidence_spans],
         separators=(",", ":"),
@@ -1239,6 +1313,22 @@ def _parse_spans(
             raise ShadowClassificationError("evidence span is outside frozen context")
         parsed.append(EvidenceSpan(start=start, end=end))
     return tuple(parsed)
+
+
+def _spans_stay_within_required_atomic_scope(
+    spans: Sequence[EvidenceSpan],
+    opportunity: PairOpportunity,
+) -> bool:
+    required = opportunity.provenance.get("required_atomic_scope") or []
+    if not required:
+        return True
+    if not isinstance(required, Sequence) or len(required) != 2:
+        return False
+    try:
+        start, end = int(required[0]), int(required[1])
+    except (TypeError, ValueError):
+        return False
+    return all(start <= span.start < span.end <= end for span in spans)
 
 
 def _normalize_occurrence(
@@ -1391,6 +1481,10 @@ def parse_classifier_response(
             )
             if not spans:
                 raise ShadowClassificationError("positive hypothesis requires evidence")
+            if not _spans_stay_within_required_atomic_scope(spans, pair):
+                raise ShadowClassificationError(
+                    "positive hypothesis evidence crosses the required atomic scope"
+                )
             try:
                 confidence = float(hypothesis.get("classifier_confidence"))
             except (TypeError, ValueError) as exc:
@@ -1535,6 +1629,16 @@ def validate_hypothesis(
         return result(REJECTED, "EVIDENCE_ENDPOINT_MISMATCH")
     if spec is None:
         return result(REJECTED, "UNKNOWN_PREDICATE")
+    allowed_predicates = {
+        str(item.get("name") or "")
+        for item in opportunity.allowed_predicate_metadata
+    }
+    if hypothesis.predicate not in allowed_predicates:
+        return result(REJECTED, "PREDICATE_NOT_ALLOWED_BY_STRUCTURE")
+    if not _spans_stay_within_required_atomic_scope(
+        hypothesis.evidence_spans, opportunity,
+    ):
+        return result(REJECTED, "EVIDENCE_CROSSES_ATOMIC_SCOPE")
     if (
         subject["canonical_id"]
         and subject["canonical_id"] == object_["canonical_id"]
@@ -1584,7 +1688,11 @@ def verifier_prompt(
                 "Use only the frozen source context. Verify the complete ordered "
                 "(subject,predicate,object) fact, including predicate meaning, roles, "
                 "direction, negation, modality, quotation and exact occurrence alignment. "
-                "Cooccurrence and external knowledge are insufficient. The caller binds "
+                "A supported result must establish the predicate semantic_definition and "
+                "the declared subject/object role mapping in this direction; cooccurrence, "
+                "table/list adjacency, headings and external knowledge are insufficient. "
+                "Evidence must stay inside the supplied atomic evidence scope when one is "
+                "required. The caller binds "
                 "this independent response to the supplied hypothesis_id; do not emit "
                 "or invent a correlation identifier. Return exactly one JSON object "
                 "with only verdict, reason_code, and supported_evidence_spans. verdict "
@@ -1607,6 +1715,19 @@ def verifier_prompt(
             "classifier_evidence_spans": [
                 asdict(value) for value in hypothesis.evidence_spans
             ],
+            "structural_evidence_contract": {
+                "source_roles": list(
+                    opportunity.provenance.get("source_roles") or []
+                ),
+                "atomic_scopes": list(
+                    opportunity.provenance.get("atomic_scopes") or []
+                ),
+                "required_atomic_scope": list(
+                    opportunity.provenance.get("required_atomic_scope") or []
+                ),
+                "schema_scope_policy": dict(spec.scope_policy),
+                "required_evidence_roles": list(spec.required_evidence_roles),
+            },
             "hypothesis_id": hypothesis.hypothesis_id,
         },
         ensure_ascii=False,
@@ -1712,7 +1833,10 @@ def _parse_verifier_response(
     )
     if verdict == SUPPORTED:
         if not spans:
-            raise ShadowClassificationError("SUPPORTED verdict requires evidence")
+            raise ShadowVerificationRejected(
+                "SUPPORTED_EVIDENCE_REQUIRED",
+                "SUPPORTED verdict requires evidence",
+            )
         subject = _occurrence_details(
             opportunity, hypothesis.subject_occurrence_key, content,
         )
@@ -1723,8 +1847,14 @@ def _parse_verifier_response(
             _spans_cover(spans, subject["span"])
             and _spans_cover(spans, object_["span"])
         ):
-            raise ShadowClassificationError(
-                "verifier evidence does not cover exact occurrences"
+            raise ShadowVerificationRejected(
+                "SUPPORTED_EVIDENCE_MISSING_ENDPOINT",
+                "verifier evidence does not cover exact occurrences",
+            )
+        if not _spans_stay_within_required_atomic_scope(spans, opportunity):
+            raise ShadowVerificationRejected(
+                "SUPPORTED_EVIDENCE_OUTSIDE_ATOMIC_SCOPE",
+                "verifier evidence crosses the required atomic scope",
             )
     return _attempt(
         hypothesis,
@@ -1777,6 +1907,17 @@ def verify_hypothesis(
             content=content,
             attempt_no=attempt_no,
             verifier_model_revision=verifier_model_revision,
+        )
+    except ShadowVerificationRejected as exc:
+        return _attempt(
+            hypothesis,
+            attempt_no=attempt_no,
+            verdict=REJECTED,
+            reason_code=exc.reason_code,
+            supported_spans=(),
+            independent_call=True,
+            verifier_model_revision=verifier_model_revision,
+            error_message=f"{type(exc).__name__}: {exc}"[:2000],
         )
     except Exception as exc:
         return _attempt(
@@ -2427,6 +2568,86 @@ def _validated_occurrences(
     return ordered, max(0, len(mentions) - len(ordered))
 
 
+def _occurrence_scope(
+    occurrence: Mapping[str, Any],
+    *,
+    content: str,
+    sentences: Sequence[tuple[int, int, str]],
+) -> dict[str, Any]:
+    """Read a runtime-provided atomic scope, with sentence-only legacy fallback."""
+
+    start = int(occurrence["mention_start"])
+    end = int(occurrence["mention_end"])
+    raw_start = occurrence.get("scope_start")
+    raw_end = occurrence.get("scope_end")
+    raw_id = str(occurrence.get("scope_id") or "").strip()
+    raw_kind = str(occurrence.get("scope_kind") or "").strip()
+    try:
+        scope_start = int(raw_start)
+        scope_end = int(raw_end)
+    except (TypeError, ValueError):
+        scope_start, scope_end = -1, -1
+    if (
+        raw_id
+        and raw_kind
+        and 0 <= scope_start <= start < end <= scope_end <= len(content)
+    ):
+        return {
+            "scope_id": raw_id,
+            "scope_kind": raw_kind,
+            "start": scope_start,
+            "end": scope_end,
+            "source": "structured",
+        }
+    sentence = sentence_index(sentences, start)
+    if sentence is not None:
+        sentence_start, sentence_end, _ = sentences[sentence]
+        if sentence_start <= start < end <= sentence_end:
+            return {
+                "scope_id": f"legacy-sentence:{sentence}:{sentence_start}:{sentence_end}",
+                "scope_kind": "sentence",
+                "start": int(sentence_start),
+                "end": int(sentence_end),
+                "source": "legacy_sentence",
+            }
+    return {
+        "scope_id": "invalid:occurrence-scope",
+        "scope_kind": "invalid",
+        "start": start,
+        "end": end,
+        "source": "invalid",
+    }
+
+
+def _source_role(occurrence: Mapping[str, Any]) -> str:
+    return str(occurrence.get("source_role") or "body").strip() or "body"
+
+
+def _relation_eligible(occurrence: Mapping[str, Any]) -> bool:
+    value = occurrence.get("relation_eligible")
+    return True if value is None else bool(value)
+
+
+def _metadata_allows_structure(
+    metadata: Mapping[str, Any],
+    *,
+    left_role: str,
+    right_role: str,
+    same_scope: bool,
+) -> bool:
+    allowed_roles = {
+        str(value) for value in metadata.get("allowed_source_roles") or []
+    }
+    if left_role not in allowed_roles or right_role not in allowed_roles:
+        return False
+    scope_policy = metadata.get("scope_policy") or {}
+    if not isinstance(scope_policy, Mapping):
+        return False
+    if same_scope:
+        return True
+    return bool(scope_policy.get("allow_cross_scope_with_explicit_evidence"))
+
+
 def plan_pair_opportunities(
     *,
     project_id: int,
@@ -2492,6 +2713,46 @@ def plan_pair_opportunities(
             str(right.get("type") or ""),
             logical_schema,
         )
+        left_scope = _occurrence_scope(
+            left, content=content, sentences=sentences,
+        )
+        right_scope = _occurrence_scope(
+            right, content=content, sentences=sentences,
+        )
+        same_scope = str(left_scope["scope_id"]) == str(right_scope["scope_id"])
+        left_role = _source_role(left)
+        right_role = _source_role(right)
+        source_eligible = _relation_eligible(left) and _relation_eligible(right)
+        source_role_allowed_metadata = tuple(
+            metadata for metadata in predicate_metadata
+            if left_role in {
+                str(value) for value in metadata.get("allowed_source_roles") or []
+            }
+            and right_role in {
+                str(value) for value in metadata.get("allowed_source_roles") or []
+            }
+        )
+        structurally_allowed_metadata = tuple(
+            metadata for metadata in source_role_allowed_metadata
+            if _metadata_allows_structure(
+                metadata,
+                left_role=left_role,
+                right_role=right_role,
+                same_scope=same_scope,
+            )
+        )
+        if same_scope:
+            context_start, context_end = (
+                int(left_scope["start"]), int(left_scope["end"]),
+            )
+        elif structurally_allowed_metadata:
+            context_start = min(
+                int(left_scope["start"]), int(right_scope["start"]),
+            )
+            context_end = max(
+                int(left_scope["end"]), int(right_scope["end"]),
+            )
+        context_text = content[context_start:context_end]
         left_table = str(left.get("table_id") or "")
         right_table = str(right.get("table_id") or "")
         left_row = str(left.get("row_id") or "")
@@ -2504,17 +2765,37 @@ def plan_pair_opportunities(
         different_table_peer_rows = bool(
             same_table and left_row and right_row and left_row != right_row
         )
+        same_scope_for_policy = same_scope or same_table_row
+        if same_scope_for_policy != same_scope:
+            structurally_allowed_metadata = tuple(
+                metadata for metadata in source_role_allowed_metadata
+                if _metadata_allows_structure(
+                    metadata,
+                    left_role=left_role,
+                    right_role=right_role,
+                    same_scope=True,
+                )
+            )
+            context_start, context_end = 0, len(content)
         same_sentence = sentence_distance == 0
-        same_paragraph_with_schema_cue = False
         structural_admission_reason = ""
-        if same_cell:
+        if not source_eligible:
+            structural_admission_reason = "ineligible_source_role"
+        elif not structurally_allowed_metadata:
+            structural_admission_reason = "predicate_structure_policy_denied"
+        elif same_cell:
             structural_admission_reason = "same_cell"
         elif same_table_row:
             structural_admission_reason = "same_table_row"
-        elif same_sentence:
-            structural_admission_reason = "same_sentence"
-        elif same_paragraph_with_schema_cue:
-            structural_admission_reason = "same_paragraph_with_schema_cue"
+        elif same_scope_for_policy:
+            structural_admission_reason = "same_atomic_scope"
+        elif any(
+            bool((metadata.get("scope_policy") or {}).get(
+                "allow_cross_scope_with_explicit_evidence"
+            ))
+            for metadata in structurally_allowed_metadata
+        ):
+            structural_admission_reason = "cross_atomic_scope_schema_policy"
         normalized_context = context_text.casefold()
         soft_cue_matches = sorted(
             (
@@ -2530,13 +2811,6 @@ def plan_pair_opportunities(
             key=lambda item: (item["predicate"], item["cue"]),
         )
         cue = str(soft_cue_matches[0]["cue"]) if soft_cue_matches else ""
-        if (
-            not structural_admission_reason
-            and sentence_distance <= sentence_window
-            and cue
-        ):
-            same_paragraph_with_schema_cue = True
-            structural_admission_reason = "same_paragraph_with_schema_cue"
         status = PENDING_CLASSIFICATION
         reason = structural_admission_reason or "local_pair_within_structural_window"
         if (
@@ -2547,9 +2821,24 @@ def plan_pair_opportunities(
         elif different_table_peer_rows:
             status, reason = FILTERED_STRUCTURE_PEER, "different_table_peer_rows"
         elif type_status == "incompatible":
+            # Preserve the most informative terminal ledger state.  The pair
+            # remains non-admissible either way, but a known schema type
+            # mismatch must not be reported as a generic source-role gate.
             status, reason = TYPE_INCOMPATIBLE, "known_schema_type_incompatibility"
         elif type_status == "unresolved":
             status, reason = TYPE_UNRESOLVED, "unknown_endpoint_type"
+        elif not source_eligible:
+            status, reason = (
+                FILTERED_STRUCTURE_INELIGIBLE,
+                "source_role_is_not_relation_eligible",
+            )
+        elif not source_role_allowed_metadata:
+            status, reason = (
+                FILTERED_STRUCTURE_INELIGIBLE,
+                "schema_disallows_source_role",
+            )
+        elif not structurally_allowed_metadata:
+            status, reason = FILTERED_SCOPE_BOUNDARY, "cross_atomic_scope"
         elif (
             not structural_admission_reason
             and (
@@ -2561,8 +2850,8 @@ def plan_pair_opportunities(
         structure_rank = {
             "same_cell": 0,
             "same_table_row": 1,
-            "same_sentence": 2,
-            "same_paragraph_with_schema_cue": 3,
+            "same_atomic_scope": 2,
+            "cross_atomic_scope_schema_policy": 3,
         }.get(structural_admission_reason, 9)
         type_rank = {
             "compatible": 0,
@@ -2605,7 +2894,7 @@ def plan_pair_opportunities(
                 document_revision_id, chunk_key, context_start, context_end,
             )),
             context_span=(context_start, context_end),
-            allowed_predicate_metadata=predicate_metadata,
+            allowed_predicate_metadata=structurally_allowed_metadata,
             planning_reason=reason,
             cue=cue,
             type_status=type_status,
@@ -2614,6 +2903,18 @@ def plan_pair_opportunities(
                 "sentence_distance": sentence_distance,
                 "character_distance": centre_distance,
                 "structure_admission": structural_admission_reason,
+                "source_roles": [left_role, right_role],
+                "source_relation_eligible": source_eligible,
+                "atomic_scopes": [left_scope, right_scope],
+                "same_atomic_scope": same_scope_for_policy,
+                "required_atomic_scope": (
+                    [int(left_scope["start"]), int(left_scope["end"])]
+                    if same_scope else ([0, len(content)] if same_table_row else [])
+                ),
+                "allowed_predicates_after_structure": [
+                    str(item.get("name") or "")
+                    for item in structurally_allowed_metadata
+                ],
                 "priority": list(priority),
                 "soft_cue_matches": soft_cue_matches,
             },

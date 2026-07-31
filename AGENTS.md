@@ -42,6 +42,30 @@ must not require a running RAGFlow service or call its API.
     self-checks. Prefer targeted regression tests plus the standard compile/test
     commands below; do not rely on the user to discover first-order failures
     through the UI.
+11. A change that affects a user-visible HTTP route, browser interaction,
+    background job, or model-backed workflow is not self-checked by unit tests
+    alone. Before reporting it complete, exercise the real public HTTP/job
+    entrypoint against isolated data, wait for its terminal state, and inspect
+    the persisted result or failure record. For Ollama-backed workflows this
+    must use the configured runtime model service, not only scripted fixtures.
+    A fail-closed error, stale lease, malformed model response, migration gap,
+    or missing UI state means the change is incomplete and must be fixed before
+    asking the user to test it.
+12. `graphrag_native` is an independent, project-wide GraphRAG 3.1.1 strategy.
+    Its algorithm facts stay in immutable per-run Parquet/LanceDB bundles and
+    its PostgreSQL tables are control-plane metadata only.  Never route it
+    through Stable/Enhanced extraction, canonical entities, pgvector or
+    HugeGraph, and never silently fall back to those paths.
+13. A native run may become queryable only after independent bundle validation
+    and current-source freshness checks.  Native active-run and project
+    selected-strategy pointers are separate CAS-controlled concepts; do not
+    auto-select, activate, delete, commit, push or deploy native work without
+    explicit user authority.
+14. Before restarting `knowledge-forge.service`, query every active
+    `graphrag_native_build`.  Do not restart while one is running: systemd
+    terminates its isolated GraphRAG child and recovery restarts the entire
+    run.  Finish it, cancel it with user authority, or use a non-disruptive
+    observation path instead.
 
 ## Module boundaries
 

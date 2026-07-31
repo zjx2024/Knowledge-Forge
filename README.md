@@ -171,10 +171,28 @@ python3.12 -m venv .venv
 VS Code 中使用“Python: Select Interpreter”并选择
 `<仓库根目录>/.venv/bin/python`。
 
-依赖中固定包含 `graphrag==3.1.1`。当前仅接入手动触发的 BYOG 社区检测 shadow，
-Knowledge Forge 仍使用自身的实体、关系和 HugeGraph 写入流程；社区报告和 Global
-Search 尚未接入。使用方式和数据边界见
-[GraphRAG 社区检测 Shadow](docs/graphrag-community-shadow.md)。
+依赖中固定包含 `graphrag==3.1.1`。除 Stable 与增强 Shadow 外，界面还提供
+`GraphRAG Native（原生语义图与社区）`：它从当前 active revision 的已持久化结构块
+生成隔离的 GraphRAG Standard 输入，产物保存在
+`KnowledgeFiles/graphrag_native/` 的不可变 run bundle 中。该策略只支持项目级全量
+构建，不写入旧实体、关系、pgvector 或 HugeGraph；其应用内查看器、社区报告和查询
+也不依赖 Hubble。文档新增、删除或重建 revision 会使 native run 过期，必须重新构建。
+native run 内部的 READY 指针不改变项目的 Stable/增强策略选择，也不会自动发布或部署。
+
+真实模型构建与查询会消耗本地 Ollama 资源，因此普通测试只运行离线 bundle、配置、
+迁移和路由门禁；需要人工授权后才运行真实 GraphRAG index/query。离线验证工具：
+
+```bash
+.venv/bin/python scripts/validate_graphrag_native_bundle.py --root '<RUN_DIR>'
+.venv/bin/python scripts/check_graphrag_native_freshness.py --project-id '<PROJECT_ID>' --run-id '<RUN_ID>'
+.venv/bin/python scripts/retention_graphrag_native.py --project-id '<PROJECT_ID>'
+```
+
+retention 命令默认只列出候选；即使显式执行清理，也会拒绝 active、最后一个 READY
+或仍持有 lease 的 run。
+
+完整的数据边界、状态机、API 与恢复说明见
+[GraphRAG Native 第三策略](docs/graphrag-native.md)。
 
 ### 依赖锁更新
 

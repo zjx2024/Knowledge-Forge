@@ -41,7 +41,14 @@ class FakeDatabase:
         self.soft_delete_calls += 1
         self.soft_deleted = True
 
-    def create_job(self, kind, project_id=None, document_id=None):
+    def assert_project_construction_strategy(self, project_id, expected_strategy=None):
+        assert project_id == 9
+        return "enhanced_shadow"
+
+    def create_job(
+        self, kind, project_id=None, document_id=None, *,
+        metadata=None, strategy_key="stable",
+    ):
         job = {
             "id": "cleanup-job",
             "kind": kind,
@@ -50,7 +57,7 @@ class FakeDatabase:
             "status": "queued",
             "progress": 0,
             "log": [],
-            "metadata": {},
+            "metadata": metadata or {},
         }
         self.jobs[job["id"]] = job
         return job

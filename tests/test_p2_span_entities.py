@@ -177,6 +177,36 @@ def test_scalar_temporal_contact_and_structural_noise_are_rejected():
     assert "non_referential_modifier" in reasons
 
 
+def test_parser_mapped_table_header_is_rejected_but_table_row_stays_available():
+    content = "Header Value\nBody Item"
+    extractor = SpanFirstEntityExtractor("entity-extraction-p2-structure-gate-v2")
+    result = extractor.normalize(
+        project_scope="p",
+        document_key="d",
+        chunk_key="c",
+        content=content,
+        raw_entities=[
+            {
+                "name": "Header", "type": "Concept",
+                "mention_start": 0, "mention_end": 6,
+            },
+            {
+                "name": "Body", "type": "Concept",
+                "mention_start": 13, "mention_end": 17,
+            },
+        ],
+        chunk_metadata={
+            "structural_spans": [
+                {"start": 0, "end": 12, "source_role": "table_header"},
+                {"start": 13, "end": len(content), "source_role": "table_row"},
+            ],
+        },
+    )
+
+    assert [item.surface for item in result.mentions] == ["Body"]
+    assert [item["reason"] for item in result.rejected] == ["structural_node"]
+
+
 def test_zero_confidence_is_preserved_for_mention_type_and_alias():
     content = "International Business Machines (IBM)"
     extractor = SpanFirstEntityExtractor("entity-extraction-p2-shadow-v1")

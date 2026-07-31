@@ -111,26 +111,27 @@ def test_old_nonempty_graphs_are_marked_stale_but_empty_projects_are_excluded():
     assert params[-3:] == ("empty", GRAPH_POLICY_VERSION, GRAPH_POLICY_HASH)
 
 
-def test_direct_graph_view_returns_409_for_noncurrent_graph(monkeypatch):
+def test_legacy_graph_view_routes_to_inline_workspace_without_hubble(monkeypatch):
     class NotReadyService:
         @staticmethod
-        def hubble_project_url(project_id):
-            raise GraphNotReadyError("图谱需要按当前验证策略重建")
+        def _assert_project_strategy(project_id, expected_strategy=None):
+            return expected_strategy
 
     monkeypatch.setattr(web, "SERVICE", NotReadyService())
     handler = object.__new__(web.AppHandler)
     handler.path = "/graph/view?project=7"
     response = {}
-    handler._respond = lambda status, body, content_type: response.update(
-        status=status, body=body, content_type=content_type,
+    handler._redirect = lambda target, project_id=None: response.update(
+        target=target, project_id=project_id,
     )
-    handler._redirect = lambda *_args, **_kwargs: pytest.fail("must not redirect")
     handler._project = lambda: 7
 
     handler.do_GET()
 
-    assert response["status"] == HTTPStatus.CONFLICT
-    assert "当前验证策略重建" in response["body"]
+    assert response == {
+        "target": "/projects/7/knowledge-forge#query",
+        "project_id": 7,
+    }
 
 
 class RebuildSubmissionConnection:

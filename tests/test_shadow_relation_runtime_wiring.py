@@ -629,7 +629,7 @@ def test_runtime_direct_proposer_enters_verifier_even_when_classifier_says_no_re
     assert len(database.endpoints) == 1
 
 
-def test_runtime_direct_proposer_creates_missing_pair_ledger(monkeypatch):
+def test_runtime_direct_proposer_cannot_create_a_pair_missing_from_planner(monkeypatch):
     monkeypatch.setattr(
         v2,
         "plan_pair_opportunities",
@@ -684,16 +684,12 @@ def test_runtime_direct_proposer_creates_missing_pair_ledger(monkeypatch):
         project_id=1,
     )
 
-    assert len(database.opportunities) == 1
-    opportunity = database.opportunities[0]
-    assert opportunity.planning_reason == "direct_proposer_pair_not_in_planner"
-    assert opportunity.status == "PENDING_CLASSIFICATION"
-    assert opportunity.provenance["candidate_sources"] == ["DIRECT_PROPOSER"]
-    assert result["metrics"]["pair_opportunities_classified"] == 1
-    assert gateway.classifier_calls == 1
-    assert result["metrics"]["proposer_hypotheses_persisted"] == 1
-    assert result["metrics"]["verifier_supported"] == 1
-    assert len(database.endpoints) == 1
+    assert database.opportunities == []
+    assert result["metrics"]["pair_opportunities_classified"] == 0
+    assert gateway.classifier_calls == 0
+    assert result["metrics"]["proposer_hypotheses_persisted"] == 0
+    assert result["metrics"]["verifier_supported"] == 0
+    assert database.endpoints == []
 
 
 def test_runtime_proposer_retry_then_relation_only_gleaning(monkeypatch):

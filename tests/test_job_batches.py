@@ -161,6 +161,29 @@ def test_preparation_batch_preserves_its_job_kind():
     assert batch["metadata"]["subtasks"]["chunking"]["status"] == "running"
 
 
+def test_single_project_wide_job_preserves_real_subtask_unit_detail():
+    started = datetime.now(timezone.utc)
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = ServiceBatchDatabase([
+        _job(
+            "project-build", "project.pdf", "running", started,
+            progress=64, log=["关系分类处理中"],
+            subtasks={
+                "extraction": {
+                    "status": "running", "progress": 72,
+                    "detail": "关系分类 9/15",
+                },
+            },
+        ),
+    ])
+
+    batch = service.get_ingestion_batch("batch-1")
+
+    assert batch["metadata"]["subtasks"]["extraction"]["detail"] == (
+        "关系分类 9/15"
+    )
+
+
 def test_batch_does_not_finish_while_any_document_is_queued():
     started = datetime.now(timezone.utc) - timedelta(seconds=10)
     rows = [

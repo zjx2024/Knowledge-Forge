@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from knowledge_forge import relation_shadow_v2 as v2
+from knowledge_forge import entity_shadow, shadow_context, span_entities
 from knowledge_forge.relation_shadow_runtime import ShadowRelationV2Runtime
 from knowledge_forge.schema_evolution import BASE_SCHEMA
+from knowledge_forge.shadow_schema_overlay import apply_shadow_relation_schema_overlay
 from knowledge_forge.service import KnowledgeForgeService
 from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
@@ -311,6 +313,8 @@ def test_unknown_predicate_and_missing_critical_metadata_fail_closed():
         "inverse_predicate",
         "canonical_orientation",
         "publish_mode",
+        "allowed_source_roles",
+        "scope_policy",
         "positive_examples",
         "negative_examples",
     ):
@@ -386,18 +390,21 @@ def test_every_versioned_predicate_policy_field_enters_fingerprint_payload():
     }
 
 
-def test_base_schema_stores_complete_policy_as_data():
-    for definition in BASE_SCHEMA["relation_types"]:
-        v2.normalize_predicate_schema({
-            "version": BASE_SCHEMA["version"],
-            "relation_types": [definition],
-        })
+def test_enhanced_schema_overlay_supplies_complete_policy_as_data():
+    enhanced = apply_shadow_relation_schema_overlay(BASE_SCHEMA)
+    normalized = v2.normalize_predicate_schema(enhanced)
+    assert set(normalized) == {
+        item["name"] for item in enhanced["relation_types"]
+    }
 
 
 def test_enhanced_v2_production_control_flow_has_no_concrete_predicate_or_cue():
     modules = (
         Path(v2.__file__),
         Path(inspect.getfile(ShadowRelationV2Runtime)),
+        Path(shadow_context.__file__),
+        Path(entity_shadow.__file__),
+        Path(span_entities.__file__),
     )
     forbidden = {
         "produces", "produce", "uses", "depends_on", "depends on",

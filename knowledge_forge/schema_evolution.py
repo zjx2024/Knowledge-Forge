@@ -634,7 +634,9 @@ class SchemaEvolutionService:
             "semantic definition, domain/range types, direction, symmetry, inverse predicate or null, "
             "canonical orientation, publish mode, reflexivity, positive/negative examples, and optional "
             "soft cues. Soft cues are non-binding model hints, never deterministic rules. "
-            "Use short English identifiers. Every candidate must cite evidence_chunks using the exact bracketed "
+            "Use short English identifiers, but write summary, description, semantic_definition, "
+            "direction_description, examples and explanatory text in clear Simplified Chinese. "
+            "Every candidate must cite evidence_chunks using the exact bracketed "
             "chunk keys supplied. Return empty candidate arrays when the general schema is sufficient."
         )
         current_json = json.dumps(current, ensure_ascii=False)
@@ -673,7 +675,8 @@ class SchemaEvolutionService:
                     "You consolidate candidate additions to an existing logical knowledge graph schema. "
                     "Merge synonyms, reject instance names and overly narrow types, preserve all valid evidence chunk keys, "
                     "and keep only additive reusable types supported by the supplied candidates. Preserve every explicit "
-                    "relation policy field; never infer behavior from a predicate name. Use short English identifiers."
+                    "relation policy field; never infer behavior from a predicate name. Use short English identifiers, "
+                    "but keep every user-facing description and explanation in clear Simplified Chinese."
                 ),
                 prompt=(
                     f"Current schema:\n{json.dumps(current, ensure_ascii=False)}\n\n"
