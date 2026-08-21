@@ -66,6 +66,11 @@ must not require a running RAGFlow service or call its API.
     terminates its isolated GraphRAG child and recovery restarts the entire
     run.  Finish it, cancel it with user authority, or use a non-disruptive
     observation path instead.
+15. After every `git push`, inspect the remote CI/check runs for the pushed
+    commit and wait until all required checks reach a terminal state.  Do not
+    report the push as complete while checks are pending.  If a check fails,
+    inspect its remote logs, fix the failure, push again, and repeat until all
+    required checks pass or a genuine external blocker is reported.
 
 ## Module boundaries
 
