@@ -1,0 +1,16 @@
+{
+  "dataset": "knowledge-forge-long-document-stress",
+  "version": "v1",
+  "purpose": "deterministic_processing_and_scheduled_call_scaling_only",
+  "quality_gold": false,
+  "source_corpora": [
+    "../knowledge_forge_cross_domain_v1",
+    "../knowledge_forge_cross_domain_zh_v1"
+  ],
+  "scales": [1, 10],
+  "acceptance": {
+    "minimum_large_document_bytes": 50000,
+    "maximum_graph_chunk_growth_vs_source_growth": 1.5,
+    "maximum_scheduled_base_call_growth_vs_source_growth": 1.5
+  }
+}

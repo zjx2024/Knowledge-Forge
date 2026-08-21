@@ -1,0 +1,9 @@
+# 第 39 页
+DOI: 10.1234/example.2026.001
+https://doi.org/10.1234/example.2026.001
+
+Atlas Control System consists of Scheduler Module and Storage Module.
+Scheduler Module dispatches periodic tasks.
+Storage Module stores configuration records.
+
+图片描述: The image displays a mostly blank white page with a single horizontal line near the top.

@@ -1,0 +1,16 @@
+1 Overview
+
+The UTM TCL 2 software implements the software requirements described in this document. It is a cloud-ready research platform, not an operational system. The platform supports beyond-visual-line-of-sight operations and tracking operations.
+
+Service map
+
+| Service | Responsibility | Requirement |
+| Strategic Deconfliction Service | checks flight intent | SR-01 |
+| USS | submits operation intent | SR-02 |
+
+Requirements
+
+SR-01 The Strategic Deconfliction Service shall check a flight intent before approval.
+SR-02 The USS shall submit an operation intent to the service.
+
+The service map links a service to a requirement; the service name and the requirement identifier are not the same entity.

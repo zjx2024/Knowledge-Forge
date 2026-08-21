@@ -1,0 +1,62 @@
+[
+  {
+    "id": "software-python-reference",
+    "title": "The Python Language Reference",
+    "domain": "software",
+    "url": "https://docs.python.org/3/reference/index.html",
+    "license_url": "https://docs.python.org/3/license.html",
+    "usage_note": "Python documentation is under the PSF License Version 2; documentation examples have an additional Zero-Clause BSD option. This snapshot is a short excerpt.",
+    "structure": ["numbered_heading", "prose", "code_block"],
+    "accessed_at": "2026-08-07"
+  },
+  {
+    "id": "network-rfc9110-excerpt",
+    "title": "HTTP Semantics (RFC 9110)",
+    "domain": "network_protocol",
+    "url": "https://www.rfc-editor.org/rfc/rfc9110.html",
+    "license_url": "https://trustee.ietf.org/documents/ietf-trust-legal-provisions/",
+    "usage_note": "IETF standards text; retain the RFC copyright and legal notices when expanding the snapshot. This repository keeps a short benchmark excerpt only.",
+    "structure": ["numbered_sections", "normative_prose"],
+    "accessed_at": "2026-08-07"
+  },
+  {
+    "id": "legal-ecfr-grants-excerpt",
+    "title": "eCFR Title 2, § 26.200 General requirements",
+    "domain": "regulation",
+    "url": "https://www.ecfr.gov/current/title-32/subtitle-A/chapter-I/subchapter-C/part-26/subpart-B",
+    "license_url": "https://www.ecfr.gov/reader-aids/government-policy-and-ofr-procedures/copyright",
+    "usage_note": "Official U.S. Government regulatory text. Freeze the retrieval date and content hash because the current eCFR can change.",
+    "structure": ["subsection", "numbered_clauses", "normative_obligation"],
+    "accessed_at": "2026-08-07"
+  },
+  {
+    "id": "knowledge-usgs-aquifer-report-excerpt",
+    "title": "Digital data sets for principal aquifers, surficial geology, and ground-water regions",
+    "domain": "earth_science",
+    "url": "https://pubs.usgs.gov/of/1999/ofr99-77/",
+    "license_url": "https://www.usgs.gov/information-policies-and-instructions/copyrights-and-credits",
+    "usage_note": "USGS public-domain report/data description. The snapshot preserves a small narrative/table-shaped calibration excerpt.",
+    "structure": ["report_narrative", "pipe_table", "data_provenance"],
+    "accessed_at": "2026-08-07"
+  },
+  {
+    "id": "engineering-nasa-utm-requirements-excerpt",
+    "title": "UTM TCL2 Software Requirements",
+    "domain": "aerospace_engineering",
+    "url": "https://ntrs.nasa.gov/citations/20170006027",
+    "download_url": "https://ntrs.nasa.gov/api/citations/20170006027/downloads/20170006027.pdf",
+    "usage_note": "NASA NTRS marks the report Public Use Permitted. The local snapshot is a short excerpt/structure fixture; preserve the NASA report citation when expanding it.",
+    "structure": ["overview", "service_map", "requirement_ids", "shall_statements"],
+    "accessed_at": "2026-08-07"
+  },
+  {
+    "id": "narrative-alice-excerpt",
+    "title": "Alice's Adventures in Wonderland",
+    "domain": "fiction",
+    "url": "https://www.gutenberg.org/ebooks/11",
+    "license_url": "https://www.gutenberg.org/policy/license",
+    "usage_note": "Project Gutenberg identifies this U.S. edition as public domain. The local snapshot is a short excerpt and should not include Project Gutenberg trademark/license boilerplate.",
+    "structure": ["narrative_prose", "coreference", "event_sequence"],
+    "accessed_at": "2026-08-07"
+  }
+]

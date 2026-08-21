@@ -1,2 +1,2 @@
-# Local cross-encoder inference for conservative entity identity review.
+# Dedicated HTTP service cross-encoder inference for entity identity review.
 transformers>=5.0,<6

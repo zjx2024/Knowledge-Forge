@@ -85,3 +85,16 @@ def test_mention_occurrence_migration_replaces_payload_uniqueness_idempotently()
     assert "WHERE mention_key<>'' AND is_deleted=FALSE" in migration.sql
     assert "md5(" in migration.sql
     assert "digest(" not in migration.sql
+
+
+def test_project_language_migration_preserves_legacy_auto_then_defaults_new_to_chinese():
+    migration = next(
+        item for item in MIGRATIONS
+        if item.version == "0034_project_knowledge_language"
+    )
+
+    assert "ADD COLUMN IF NOT EXISTS knowledge_language" in migration.sql
+    assert "DEFAULT 'auto'" in migration.sql
+    assert "ALTER COLUMN knowledge_language SET DEFAULT 'zh'" in migration.sql
+    assert "knowledge_language IN ('auto','zh','en')" in migration.sql
+    assert "knowledge_language TEXT NOT NULL DEFAULT 'zh'" in SCHEMA_SQL

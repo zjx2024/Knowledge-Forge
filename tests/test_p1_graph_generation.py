@@ -2,7 +2,12 @@ import threading
 from contextlib import contextmanager
 import uuid
 
-from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.database import (
+    Database,
+    SCHEMA_SQL,
+    SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS,
+    SHADOW_RELATION_SOURCE_MODEL_COMPONENTS,
+)
 from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import (
     GRAPH_POLICY_HASH,
@@ -19,6 +24,25 @@ def test_generation_schema_and_active_rebuild_uniqueness_are_additive():
     assert "target_generation BIGINT" in SCHEMA_SQL
     assert "uq_jobs_active_graph_sync" in SCHEMA_SQL
     assert "next_attempt_at TIMESTAMPTZ" in SCHEMA_SQL
+
+
+def test_relation_source_model_component_registry_covers_runtime_audits():
+    assert {
+        "source_inventory",
+        "source_reference",
+        "source_binding",
+        "source_conflict",
+        "batch_verifier",
+        "source_structure_binding_audit",
+        "source_projection_role_audit",
+        "atomic_publication_audit",
+    } <= SHADOW_RELATION_SOURCE_MODEL_COMPONENTS
+    assert SHADOW_RELATION_SOURCE_MODEL_COMPONENTS <= (
+        SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS
+    )
+    assert {"proposer", "classifier"} <= (
+        SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS
+    )
 
 
 def test_graph_readiness_requires_matching_generation_and_policy_hash():
@@ -292,3 +316,23 @@ def test_document_embedding_query_qualifies_joined_columns():
     assert "SELECT v.id,v.project_id,v.document_id,v.chunk_id" in statement
     assert "ORDER BY v.chunk_id,v.id" in statement
     assert params == (8, "chunk", "embed")
+
+
+def test_document_embedding_query_can_read_explicit_staged_revision():
+    class EmbeddingConnection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params=None):
+            self.calls.append((str(statement), tuple(params or ())))
+            return Row(rows=[])
+
+    connection = EmbeddingConnection()
+    database_for(connection).list_document_embeddings(
+        8, "chunk", "embed", revision_id="revision-new",
+    )
+
+    statement, params = connection.calls[0]
+    assert "v.revision_id=%s" in statement
+    assert "d.active_revision_id=v.revision_id" not in statement
+    assert params == (8, "chunk", "embed", "revision-new")

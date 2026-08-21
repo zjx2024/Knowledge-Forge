@@ -1,0 +1,1368 @@
+{
+  "documents": {
+    "zh-software-hierarchy": [
+      {
+        "mention_id": "zh-software-hierarchy:m001",
+        "surface": "核心操作系统",
+        "span": [
+          2,
+          8
+        ],
+        "canonical_id": "zh-os:platform",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m002",
+        "surface": "ACore平台",
+        "span": [
+          10,
+          17
+        ],
+        "canonical_id": "zh-os:platform",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m003",
+        "surface": "分区管理",
+        "span": [
+          19,
+          23
+        ],
+        "canonical_id": "zh-os:partition_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m004",
+        "surface": "任务管理",
+        "span": [
+          24,
+          28
+        ],
+        "canonical_id": "zh-os:task_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m005",
+        "surface": "时间管理",
+        "span": [
+          29,
+          33
+        ],
+        "canonical_id": "zh-os:time_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m006",
+        "surface": "任务间通信管理",
+        "span": [
+          34,
+          41
+        ],
+        "canonical_id": "zh-os:intertask_communication",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m007",
+        "surface": "健康监控",
+        "span": [
+          42,
+          46
+        ],
+        "canonical_id": "zh-os:health_monitoring",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m008",
+        "surface": "虚中断管理",
+        "span": [
+          47,
+          52
+        ],
+        "canonical_id": "zh-os:virtual_interrupt_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m009",
+        "surface": "分区管理",
+        "span": [
+          57,
+          61
+        ],
+        "canonical_id": "zh-os:partition_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m010",
+        "surface": "空间隔离",
+        "span": [
+          66,
+          70
+        ],
+        "canonical_id": "zh-os:space_isolation",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m011",
+        "surface": "分区间通信",
+        "span": [
+          75,
+          80
+        ],
+        "canonical_id": "zh-os:interpartition_communication",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m012",
+        "surface": "任务管理",
+        "span": [
+          83,
+          87
+        ],
+        "canonical_id": "zh-os:task_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m013",
+        "surface": "调度表管理",
+        "span": [
+          92,
+          97
+        ],
+        "canonical_id": "zh-os:schedule_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m014",
+        "surface": "定时器管理",
+        "span": [
+          102,
+          107
+        ],
+        "canonical_id": "zh-os:timer_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m015",
+        "surface": "任务间通信管理",
+        "span": [
+          110,
+          117
+        ],
+        "canonical_id": "zh-os:intertask_communication",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m016",
+        "surface": "消息队列",
+        "span": [
+          122,
+          126
+        ],
+        "canonical_id": "zh-os:message_queue",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m017",
+        "surface": "互斥信号量",
+        "span": [
+          131,
+          136
+        ],
+        "canonical_id": "zh-os:mutex_semaphore",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m018",
+        "surface": "事件",
+        "span": [
+          141,
+          143
+        ],
+        "canonical_id": "zh-os:event",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m019",
+        "surface": "健康监控",
+        "span": [
+          145,
+          149
+        ],
+        "canonical_id": "zh-os:health_monitoring",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m020",
+        "surface": "核心级",
+        "span": [
+          151,
+          154
+        ],
+        "canonical_id": "zh-os:core_level",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m021",
+        "surface": "多分区级",
+        "span": [
+          155,
+          159
+        ],
+        "canonical_id": "zh-os:multi_partition_level",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m022",
+        "surface": "分区级",
+        "span": [
+          160,
+          163
+        ],
+        "canonical_id": "zh-os:partition_level",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m023",
+        "surface": "日志模块",
+        "span": [
+          164,
+          168
+        ],
+        "canonical_id": "zh-os:log_module",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m024",
+        "surface": "故障记录",
+        "span": [
+          170,
+          174
+        ],
+        "canonical_id": "zh-os:fault_record",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m025",
+        "surface": "调度任务",
+        "span": [
+          179,
+          183
+        ],
+        "canonical_id": "zh-os:scheduling_task",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m026",
+        "surface": "配置数据库",
+        "span": [
+          185,
+          190
+        ],
+        "canonical_id": "zh-os:configuration_database",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m027",
+        "surface": "调度表",
+        "span": [
+          192,
+          195
+        ],
+        "canonical_id": "zh-os:schedule_table",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m028",
+        "surface": "分区参数",
+        "span": [
+          196,
+          200
+        ],
+        "canonical_id": "zh-os:partition_parameter",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m029",
+        "surface": "虚中断管理",
+        "span": [
+          201,
+          206
+        ],
+        "canonical_id": "zh-os:virtual_interrupt_management",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-software-hierarchy:m030",
+        "surface": "核心操作系统",
+        "span": [
+          207,
+          213
+        ],
+        "canonical_id": "zh-os:platform",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      }
+    ],
+    "zh-manufacturing-table": [
+      {
+        "mention_id": "zh-manufacturing-table:m001",
+        "surface": "华宁材料厂",
+        "span": [
+          12,
+          17
+        ],
+        "canonical_id": "zh-mfg:factory",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m002",
+        "surface": "江苏",
+        "span": [
+          19,
+          21
+        ],
+        "canonical_id": "zh-mfg:jiangsu",
+        "type": "Location",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m003",
+        "surface": "电池隔膜",
+        "span": [
+          24,
+          28
+        ],
+        "canonical_id": "zh-mfg:separator",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m004",
+        "surface": "复合涂层",
+        "span": [
+          29,
+          33
+        ],
+        "canonical_id": "zh-mfg:coating",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m005",
+        "surface": "远航物流公司",
+        "span": [
+          34,
+          40
+        ],
+        "canonical_id": "zh-mfg:logistics",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m006",
+        "surface": "华宁材料厂",
+        "span": [
+          41,
+          46
+        ],
+        "canonical_id": "zh-mfg:factory",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m007",
+        "surface": "包装材料",
+        "span": [
+          48,
+          52
+        ],
+        "canonical_id": "zh-mfg:packaging",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m008",
+        "surface": "电池隔膜",
+        "span": [
+          53,
+          57
+        ],
+        "canonical_id": "zh-mfg:separator",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m009",
+        "surface": "储能电池装配线",
+        "span": [
+          60,
+          67
+        ],
+        "canonical_id": "zh-mfg:assembly_line",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m010",
+        "surface": "产品",
+        "span": [
+          72,
+          74
+        ],
+        "canonical_id": "zh-mfg:product",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m011",
+        "surface": "检测方法",
+        "span": [
+          84,
+          88
+        ],
+        "canonical_id": "zh-mfg:inspection_method",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m012",
+        "surface": "电池隔膜",
+        "span": [
+          98,
+          102
+        ],
+        "canonical_id": "zh-mfg:separator",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m013",
+        "surface": "聚乙烯树脂",
+        "span": [
+          105,
+          110
+        ],
+        "canonical_id": "zh-mfg:resin",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m014",
+        "surface": "厚度测量",
+        "span": [
+          113,
+          117
+        ],
+        "canonical_id": "zh-mfg:thickness_measurement",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m015",
+        "surface": "储能电池装配线",
+        "span": [
+          120,
+          127
+        ],
+        "canonical_id": "zh-mfg:assembly_line",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m016",
+        "surface": "复合涂层",
+        "span": [
+          132,
+          136
+        ],
+        "canonical_id": "zh-mfg:coating",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m017",
+        "surface": "陶瓷粉体",
+        "span": [
+          139,
+          143
+        ],
+        "canonical_id": "zh-mfg:ceramic_powder",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m018",
+        "surface": "附着力试验",
+        "span": [
+          146,
+          151
+        ],
+        "canonical_id": "zh-mfg:adhesion_test",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m019",
+        "surface": "耐热保护",
+        "span": [
+          154,
+          158
+        ],
+        "canonical_id": "zh-mfg:heat_protection",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m020",
+        "surface": "批次A-17",
+        "span": [
+          162,
+          168
+        ],
+        "canonical_id": "zh-mfg:batch_a17",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m021",
+        "surface": "质量实验室",
+        "span": [
+          169,
+          174
+        ],
+        "canonical_id": "zh-mfg:quality_lab",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m022",
+        "surface": "合格",
+        "span": [
+          180,
+          182
+        ],
+        "canonical_id": "zh-mfg:qualified",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m023",
+        "surface": "仓库",
+        "span": [
+          183,
+          185
+        ],
+        "canonical_id": "zh-mfg:warehouse",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m024",
+        "surface": "批次A-17",
+        "span": [
+          187,
+          193
+        ],
+        "canonical_id": "zh-mfg:batch_a17",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m025",
+        "surface": "江苏",
+        "span": [
+          195,
+          197
+        ],
+        "canonical_id": "zh-mfg:jiangsu",
+        "type": "Location",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m026",
+        "surface": "供应商",
+        "span": [
+          199,
+          202
+        ],
+        "canonical_id": "zh-mfg:supplier",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m027",
+        "surface": "检测方法",
+        "span": [
+          203,
+          207
+        ],
+        "canonical_id": "zh-mfg:inspection_method",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-manufacturing-table:m028",
+        "surface": "产品",
+        "span": [
+          210,
+          212
+        ],
+        "canonical_id": "zh-mfg:product",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      }
+    ],
+    "zh-regulation-clauses": [
+      {
+        "mention_id": "zh-regulation-clauses:m001",
+        "surface": "第十二条",
+        "span": [
+          0,
+          4
+        ],
+        "canonical_id": "zh-law:article_12",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m002",
+        "surface": "申请与审查",
+        "span": [
+          5,
+          10
+        ],
+        "canonical_id": "zh-law:article_12",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m003",
+        "surface": "（一）",
+        "span": [
+          12,
+          15
+        ],
+        "canonical_id": "zh-law:clause_1",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m004",
+        "surface": "申请人",
+        "span": [
+          15,
+          18
+        ],
+        "canonical_id": "zh-law:applicant",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m005",
+        "surface": "受理机构",
+        "span": [
+          21,
+          25
+        ],
+        "canonical_id": "zh-law:receiving_authority",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m006",
+        "surface": "申请材料",
+        "span": [
+          27,
+          31
+        ],
+        "canonical_id": "zh-law:application_materials",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m007",
+        "surface": "安全报告",
+        "span": [
+          32,
+          36
+        ],
+        "canonical_id": "zh-law:safety_report",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m008",
+        "surface": "（二）",
+        "span": [
+          38,
+          41
+        ],
+        "canonical_id": "zh-law:clause_2",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m009",
+        "surface": "受理机构",
+        "span": [
+          41,
+          45
+        ],
+        "canonical_id": "zh-law:receiving_authority",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m010",
+        "surface": "五个工作日",
+        "span": [
+          47,
+          52
+        ],
+        "canonical_id": "zh-law:five_workdays",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m011",
+        "surface": "审查",
+        "span": [
+          53,
+          55
+        ],
+        "canonical_id": "zh-law:review",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m012",
+        "surface": "申请材料",
+        "span": [
+          55,
+          59
+        ],
+        "canonical_id": "zh-law:application_materials",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m013",
+        "surface": "审查结果",
+        "span": [
+          62,
+          66
+        ],
+        "canonical_id": "zh-law:review_result",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m014",
+        "surface": "申请人",
+        "span": [
+          68,
+          71
+        ],
+        "canonical_id": "zh-law:applicant",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m015",
+        "surface": "（三）",
+        "span": [
+          73,
+          76
+        ],
+        "canonical_id": "zh-law:clause_3",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m016",
+        "surface": "申请材料",
+        "span": [
+          76,
+          80
+        ],
+        "canonical_id": "zh-law:application_materials",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m017",
+        "surface": "受理机构",
+        "span": [
+          84,
+          88
+        ],
+        "canonical_id": "zh-law:receiving_authority",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m018",
+        "surface": "申请人",
+        "span": [
+          91,
+          94
+        ],
+        "canonical_id": "zh-law:applicant",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m019",
+        "surface": "补正",
+        "span": [
+          94,
+          96
+        ],
+        "canonical_id": "zh-law:supplement",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m020",
+        "surface": "补正通知",
+        "span": [
+          97,
+          101
+        ],
+        "canonical_id": "zh-law:supplement_notice",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m021",
+        "surface": "缺失项目",
+        "span": [
+          104,
+          108
+        ],
+        "canonical_id": "zh-law:missing_items",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m022",
+        "surface": "安全报告",
+        "span": [
+          111,
+          115
+        ],
+        "canonical_id": "zh-law:safety_report",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m023",
+        "surface": "审批决定",
+        "span": [
+          116,
+          120
+        ],
+        "canonical_id": "zh-law:approval_decision",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m024",
+        "surface": "申请人",
+        "span": [
+          124,
+          127
+        ],
+        "canonical_id": "zh-law:applicant",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m025",
+        "surface": "提交材料",
+        "span": [
+          130,
+          134
+        ],
+        "canonical_id": "zh-law:application_materials",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m026",
+        "surface": "许可持有人",
+        "span": [
+          139,
+          144
+        ],
+        "canonical_id": "zh-law:permit_holder",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m027",
+        "surface": "第（一）项",
+        "span": [
+          146,
+          151
+        ],
+        "canonical_id": "zh-law:clause_1",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m028",
+        "surface": "第（二）项",
+        "span": [
+          152,
+          157
+        ],
+        "canonical_id": "zh-law:clause_2",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-regulation-clauses:m029",
+        "surface": "并列义务",
+        "span": [
+          158,
+          162
+        ],
+        "canonical_id": "zh-law:parallel_obligations",
+        "type": "GenericEntity",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      }
+    ],
+    "zh-narrative-coreference": [
+      {
+        "mention_id": "zh-narrative-coreference:m001",
+        "surface": "林岚",
+        "span": [
+          3,
+          5
+        ],
+        "canonical_id": "zh-story:lin_lan",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m002",
+        "surface": "测温仪",
+        "span": [
+          7,
+          10
+        ],
+        "canonical_id": "zh-story:thermometer",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m003",
+        "surface": "北站",
+        "span": [
+          12,
+          14
+        ],
+        "canonical_id": "zh-story:north_station",
+        "type": "Location",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m004",
+        "surface": "仪器",
+        "span": [
+          17,
+          19
+        ],
+        "canonical_id": "zh-story:thermometer",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m005",
+        "surface": "周启",
+        "span": [
+          24,
+          26
+        ],
+        "canonical_id": "zh-story:zhou_qi",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m006",
+        "surface": "周启",
+        "span": [
+          27,
+          29
+        ],
+        "canonical_id": "zh-story:zhou_qi",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m007",
+        "surface": "检查",
+        "span": [
+          31,
+          33
+        ],
+        "canonical_id": "zh-story:inspection",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m008",
+        "surface": "冷却泵",
+        "span": [
+          33,
+          36
+        ],
+        "canonical_id": "zh-story:cooling_pump",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m009",
+        "surface": "检查",
+        "span": [
+          38,
+          40
+        ],
+        "canonical_id": "zh-story:inspection",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m010",
+        "surface": "测温仪",
+        "span": [
+          46,
+          49
+        ],
+        "canonical_id": "zh-story:thermometer",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m011",
+        "surface": "蓝色工具箱",
+        "span": [
+          51,
+          56
+        ],
+        "canonical_id": "zh-story:blue_toolbox",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m012",
+        "surface": "检测报告",
+        "span": [
+          59,
+          63
+        ],
+        "canonical_id": "zh-story:inspection_report",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m013",
+        "surface": "林岚",
+        "span": [
+          66,
+          68
+        ],
+        "canonical_id": "zh-story:lin_lan",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m014",
+        "surface": "警报响起",
+        "span": [
+          72,
+          76
+        ],
+        "canonical_id": "zh-story:alarm",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m015",
+        "surface": "冷却泵",
+        "span": [
+          78,
+          81
+        ],
+        "canonical_id": "zh-story:cooling_pump",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m016",
+        "surface": "停机",
+        "span": [
+          83,
+          85
+        ],
+        "canonical_id": "zh-story:shutdown",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m017",
+        "surface": "林岚",
+        "span": [
+          86,
+          88
+        ],
+        "canonical_id": "zh-story:lin_lan",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m018",
+        "surface": "报告",
+        "span": [
+          90,
+          92
+        ],
+        "canonical_id": "zh-story:inspection_report",
+        "type": "Product",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m019",
+        "surface": "维修组",
+        "span": [
+          95,
+          98
+        ],
+        "canonical_id": "zh-story:maintenance_team",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m020",
+        "surface": "维修组",
+        "span": [
+          100,
+          103
+        ],
+        "canonical_id": "zh-story:maintenance_team",
+        "type": "Organization",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m021",
+        "surface": "北站",
+        "span": [
+          105,
+          107
+        ],
+        "canonical_id": "zh-story:north_station",
+        "type": "Location",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m022",
+        "surface": "传感器",
+        "span": [
+          111,
+          114
+        ],
+        "canonical_id": "zh-story:sensor",
+        "type": "Technology",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m023",
+        "surface": "周启",
+        "span": [
+          115,
+          117
+        ],
+        "canonical_id": "zh-story:zhou_qi",
+        "type": "Person",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m024",
+        "surface": "北站",
+        "span": [
+          121,
+          123
+        ],
+        "canonical_id": "zh-story:north_station",
+        "type": "Location",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m025",
+        "surface": "警报响起",
+        "span": [
+          125,
+          129
+        ],
+        "canonical_id": "zh-story:alarm",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      },
+      {
+        "mention_id": "zh-narrative-coreference:m026",
+        "surface": "冷却泵停机",
+        "span": [
+          135,
+          140
+        ],
+        "canonical_id": "zh-story:shutdown",
+        "type": "Event",
+        "label_source": "assistant_expert_annotator",
+        "review_status": "single_expert_reviewed"
+      }
+    ]
+  }
+}

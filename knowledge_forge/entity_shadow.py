@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
+import unicodedata
 from copy import deepcopy
 from typing import Any, Iterable
 
@@ -14,6 +16,7 @@ from .entity_identity import (
     normalize_name,
     types_are_compatible,
 )
+from .sentence_spans import split_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +32,61 @@ _HARD_INCOMPATIBLE_TYPE_PAIRS = {
 }
 
 
+def bounded_identity_evidence(
+    content: str,
+    start: int,
+    end: int,
+    *,
+    sentence_radius: int = 1,
+    max_chars: int = 1200,
+) -> str:
+    """Return exact neighboring source sentences for identity/coreference review."""
+
+    source = str(content or "")
+    if not source:
+        return ""
+    left = max(0, min(len(source), int(start)))
+    right = max(left, min(len(source), int(end)))
+    # Newlines immediately following terminal punctuation may be emitted as
+    # their own exact span by the shared splitter.  They carry no identity
+    # evidence and must not consume the bounded neighboring-sentence radius.
+    sentences = [item for item in split_sentences(source) if item[2].strip()]
+    overlapping = [
+        index for index, (sentence_start, sentence_end, _text) in enumerate(sentences)
+        if sentence_start < max(right, left + 1) and sentence_end > left
+    ]
+    if overlapping:
+        first = max(0, overlapping[0] - max(0, int(sentence_radius)))
+        last = min(
+            len(sentences) - 1,
+            overlapping[-1] + max(0, int(sentence_radius)),
+        )
+        window_start = sentences[first][0]
+        window_end = sentences[last][1]
+    else:
+        window_start = max(0, left - max_chars // 2)
+        window_end = min(len(source), max(right, left + 1) + max_chars // 2)
+    if window_end - window_start > max_chars:
+        half = max(1, max_chars // 2)
+        center = (left + right) // 2
+        window_start = max(window_start, center - half)
+        window_end = min(window_end, window_start + max_chars)
+        window_start = max(0, window_end - max_chars)
+    return source[window_start:window_end].strip()
+
+
 def shadow_types_are_compatible(left: str, right: str) -> bool:
     """Enhanced-only hard type gate for shadow canonical assignment."""
 
     left_type = str(left or "GenericEntity")
     right_type = str(right or "GenericEntity")
     if left_type in _UNRESOLVED_TYPES or right_type in _UNRESOLVED_TYPES:
-        return left_type == right_type
+        # An unresolved extraction label is missing information, not negative
+        # identity evidence.  Treating it as a hard contradiction permanently
+        # split exact names such as ``Service``/``service`` and prevented the
+        # bounded context-review path from seeing plausible aliases.  Explicit
+        # resolved-type contradictions remain fail-closed below.
+        return True
     if frozenset((left_type, right_type)) in _HARD_INCOMPATIBLE_TYPE_PAIRS:
         return False
     return left_type == right_type
@@ -51,9 +102,21 @@ class DatabaseShadowStore:
         return self.database.find_exact_entity_shadow_candidates(namespace, normalized, limit)
 
     def search_lexical(
-        self, namespace: str, normalized: str, limit: int,
+        self,
+        namespace: str,
+        normalized: str,
+        limit: int,
+        *,
+        document_id: int | None = None,
+        chunk_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        return self.database.search_entity_shadow_name_candidates(namespace, normalized, limit)
+        return self.database.search_entity_shadow_name_candidates(
+            namespace,
+            normalized,
+            limit,
+            preferred_document_id=document_id,
+            preferred_chunk_id=chunk_id,
+        )
 
     def search_vector(
         self,
@@ -61,9 +124,17 @@ class DatabaseShadowStore:
         model_name: str,
         vector: list[float],
         limit: int,
+        *,
+        document_id: int | None = None,
+        chunk_id: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.database.search_entity_shadow_vector_candidates(
-            namespace, model_name, vector, limit,
+            namespace,
+            model_name,
+            vector,
+            limit,
+            preferred_document_id=document_id,
+            preferred_chunk_id=chunk_id,
         )
 
     def persist_candidates(self, rows: list[dict[str, Any]]) -> None:
@@ -105,19 +176,67 @@ class ShadowModelGateway:
                 "canonical_key": {"type": "string"},
                 "reason": {"type": "string"},
             },
-            "required": ["decision", "canonical_key", "reason"],
+            # ``canonical_key`` and ``reason`` are optional at the transport
+            # boundary because small schema-capable models frequently emit the
+            # correct terminal singleton decision without them.  A merge is
+            # repaired only for one bounded candidate below; a missing key
+            # with multiple candidates remains fail-closed.
+            "required": ["decision"],
         }
         payload = {
             "mention": {
                 "surface": mention["surface"],
+                "normalized_surface": normalize_name(str(mention["surface"])),
                 "type_assertion": mention.get("entity_type") or "GenericEntity",
                 "evidence": str(mention.get("evidence") or "")[:1200],
+                "source": {
+                    "document_id": mention.get("document_id"),
+                    "chunk_id": mention.get("chunk_id"),
+                    "start": mention.get("start"),
+                    "end": mention.get("end"),
+                },
             },
             "candidates": [{
                 "canonical_key": item["canonical_key"],
                 "name": item["name"],
+                "normalized_name": str(
+                    item.get("normalized_name")
+                    or normalize_name(str(item["name"]))
+                ),
+                "exact_normalized_name_match": (
+                    normalize_name(str(mention["surface"]))
+                    == str(
+                        item.get("normalized_name")
+                        or normalize_name(str(item["name"]))
+                    )
+                ),
                 "type_assertion": item.get("primary_type") or "GenericEntity",
                 "aliases": item.get("aliases") or [],
+                "evidence": str(item.get("mention_evidence") or "")[:1200],
+                "source": {
+                    "document_id": item.get("mention_document_id"),
+                    "chunk_id": item.get("mention_chunk_id"),
+                    "start": item.get("mention_evidence_start"),
+                    "end": item.get("mention_evidence_end"),
+                },
+                "same_document": bool(
+                    mention.get("document_id") is not None
+                    and item.get("mention_document_id") is not None
+                    and int(mention["document_id"])
+                    == int(item["mention_document_id"])
+                ),
+                "same_chunk": bool(
+                    mention.get("chunk_id") is not None
+                    and item.get("mention_chunk_id") is not None
+                    and int(mention["chunk_id"])
+                    == int(item["mention_chunk_id"])
+                ),
+                "contained_name_form": bool(
+                    normalize_name(str(mention["surface"]))
+                    in normalize_name(str(item.get("name") or ""))
+                    or normalize_name(str(item.get("name") or ""))
+                    in normalize_name(str(mention["surface"]))
+                ),
                 "scores": item.get("resolution_scores") or {},
             } for item in candidates],
         }
@@ -125,10 +244,30 @@ class ShadowModelGateway:
             result = self.ollama.json_chat(
                 model=self.llm_model,
                 system=(
-                    "Conservatively decide whether an exact source mention and one bounded "
-                    "candidate refer to the same real-world entity. Related entities, "
-                    "conflicting identifiers, versions and homonyms must remain separate. "
-                    "Return only schema-valid JSON."
+                    "Conservatively decide whether a source mention and one bounded candidate "
+                    "refer to the same real-world entity. Entity type assertions may be noisy, "
+                    "so compare both names and the exact source contexts. Related entities, "
+                    "conflicting identifiers, versions, namesakes and homonyms must remain "
+                    "separate. An entity-type label difference alone is never evidence that two "
+                    "exactly identical normalized names are distinct. For an exact normalized "
+                    "name, merge when the contexts are compatible continuations of the same "
+                    "entity and there is no explicit distinguishing identifier, version, locale, "
+                    "namesake or contradictory identity evidence; choose separate only when such "
+                    "source evidence exists. For different names, merge only when the contexts "
+                    "support identity, not merely a semantic relationship. In one source chunk, "
+                    "an introduced full name followed by a shorter definite name, a person's "
+                    "role/title plus the same personal name followed by the bare personal name, "
+                    "or a product name followed by the same name plus a generic designator can "
+                    "be positive identity evidence when their discourse roles are continuous. "
+                    "In particular, within one chunk, an indefinite introduced modified noun "
+                    "phrase followed later by the definite shorter head is ordinary local "
+                    "coreference: choose merge unless the source explicitly introduces, "
+                    "contrasts, counts or assigns different roles to two entities. Do not "
+                    "choose separate merely because the shorter wording could be generic in "
+                    "isolation. Containment by itself is still insufficient, and a generic head "
+                    "that the source identifies as a part, category, host or related object must "
+                    "stay separate. Return only "
+                    "schema-valid JSON."
                 ),
                 prompt=json.dumps(payload, ensure_ascii=False),
                 schema=schema,
@@ -142,8 +281,25 @@ class ShadowModelGateway:
             # abort an otherwise complete entity snapshot.
             logger.warning("entity shadow LLM review skipped: %s", exc)
             return None
-        if result.get("decision") != "merge":
+        raw_decision = str(
+            result.get("decision")
+            or result.get("result")
+            or result.get("status") or ""
+        ).strip().lower()
+        if raw_decision != "merge":
             return None
+        if result.get("decision") != "merge":
+            result = {**result, "decision": "merge"}
+        # Some schema-capable local models return the correct terminal decision
+        # but omit the candidate key.  It is safe to repair only the singleton
+        # case because there is no candidate choice to infer; multiple bounded
+        # candidates remain fail-closed.
+        if not str(result.get("canonical_key") or "") and len(candidates) == 1:
+            result = {
+                **result,
+                "canonical_key": str(candidates[0]["canonical_key"]),
+                "reason": str(result.get("reason") or "唯一候选的同一实体证据成立"),
+            }
         return result
 
 
@@ -169,6 +325,7 @@ class ShadowEntityResolver:
         lexical_cap: int = 20,
         vector_cap: int = 30,
         reranker_cap: int = 10,
+        reviewer_cap: int = 5,
         auto_merge_threshold: float = 0.94,
         review_threshold: float = 0.72,
         identity_profile: str = "bounded_similarity",
@@ -183,6 +340,7 @@ class ShadowEntityResolver:
         self.lexical_cap = max(1, min(50, int(lexical_cap)))
         self.vector_cap = max(1, min(100, int(vector_cap)))
         self.reranker_cap = max(1, min(30, int(reranker_cap)))
+        self.reviewer_cap = max(1, min(10, int(reviewer_cap)))
         self.auto_merge_threshold = float(auto_merge_threshold)
         self.review_threshold = float(review_threshold)
         self.identity_profile = str(identity_profile or "").strip()
@@ -206,12 +364,166 @@ class ShadowEntityResolver:
             reasons.append("cannot_link")
         if identifiers_conflict(str(mention["surface"]), str(candidate["name"])):
             reasons.append("identifier_conflict")
+        if self._cjk_near_edit_identity_ambiguous(
+            str(mention["surface"]), str(candidate["name"]),
+        ):
+            reasons.append("cjk_near_edit_ambiguous")
         if not shadow_types_are_compatible(
             str(mention.get("entity_type") or "GenericEntity"),
             str(candidate.get("primary_type") or "GenericEntity"),
         ):
             reasons.append("type_incompatible")
         return ",".join(reasons)
+
+    @staticmethod
+    def _cjk_near_edit_identity_ambiguous(left: str, right: str) -> bool:
+        """Keep short CJK near-neighbours separate without explicit alias proof.
+
+        One-character contrasts often carry the entire domain distinction
+        (for example intra- versus inter-partition), while embeddings and a
+        reranker score the surrounding shared phrase almost identically.  A
+        small edit distance is therefore evidence of ambiguity, not identity.
+        Exact and contained names remain on their existing exact/nested-review
+        paths; this guard covers only non-contained near edits and never tries
+        to infer the meaning of the changed characters.
+        """
+
+        left_name = normalize_name(str(left or ""))
+        right_name = normalize_name(str(right or ""))
+        if (
+            not left_name
+            or not right_name
+            or left_name == right_name
+            or left_name in right_name
+            or right_name in left_name
+            or min(len(left_name), len(right_name)) < 3
+            or max(len(left_name), len(right_name)) > 48
+            or not any("\u3400" <= value <= "\u9fff" for value in left_name)
+            or not any("\u3400" <= value <= "\u9fff" for value in right_name)
+        ):
+            return False
+        maximum_distance = 1 if max(len(left_name), len(right_name)) <= 5 else 2
+        previous = list(range(len(right_name) + 1))
+        for left_index, left_character in enumerate(left_name, start=1):
+            current = [left_index]
+            for right_index, right_character in enumerate(right_name, start=1):
+                current.append(min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1]
+                    + (left_character != right_character),
+                ))
+            if min(current) > maximum_distance:
+                return False
+            previous = current
+        return previous[-1] <= maximum_distance
+
+    @staticmethod
+    def _nested_surface_identity_ambiguous(
+        mention_surface: str, candidate_name: str, *, strict: bool = False,
+    ) -> bool:
+        """Route strict nested source spans through explicit identity review."""
+
+        mention = re.sub(r"\s+", " ", str(mention_surface or "")).strip().casefold()
+        candidate = re.sub(r"\s+", " ", str(candidate_name or "")).strip().casefold()
+        if not mention or not candidate or mention == candidate:
+            return False
+        shorter, longer = (
+            (mention, candidate)
+            if len(mention) < len(candidate)
+            else (candidate, mention)
+        )
+        if any("\u3400" <= value <= "\u9fff" for value in shorter + longer):
+            return shorter in longer
+        # Ordinary short-name resolution still needs the reranker/LLM review
+        # path (for example ``Acme`` versus ``Acme Holdings``).  Compound or
+        # structurally marked source spans are different: their inner token is
+        # often a generic head, not an identity continuation.  The explicit
+        # strict flag is supplied by endpoint/span recovery; punctuation is a
+        # conservative fallback for callers that do not carry that metadata.
+        if not strict and not any(mark in shorter + longer for mark in ("-", "/")):
+            return False
+        pattern = rf"(?<![\w]){re.escape(shorter)}(?![\w])"
+        return re.search(pattern, longer, flags=re.IGNORECASE) is not None
+
+    @staticmethod
+    def _nested_identity_review_allowed(
+        mention: dict[str, Any], candidate: dict[str, Any],
+    ) -> bool:
+        """Allow model identity review only for bounded alias-shaped nests.
+
+        A shared common-noun head is normally a class/component relation, not
+        an alias (``管理`` versus ``设备管理`` or ``platform`` versus
+        ``research platform``).  Local models over-merge these singleton
+        candidates even when both contexts are shown.  Person names with a
+        title/role and parser-numbered section labels are the two generic,
+        syntax-supported nested forms retained for review.  Everything else
+        stays separate unless an exact alias, must-link or inflectional rule
+        already established identity.
+        """
+
+        mention_type = str(mention.get("entity_type") or "GenericEntity")
+        candidate_type = str(candidate.get("primary_type") or "GenericEntity")
+        if "Person" in {mention_type, candidate_type}:
+            return True
+        mention_surface = re.sub(
+            r"\s+", " ", str(mention.get("surface") or ""),
+        ).strip()
+        candidate_surface = re.sub(
+            r"\s+", " ", str(candidate.get("name") or ""),
+        ).strip()
+        shorter, longer = (
+            (mention_surface, candidate_surface)
+            if len(mention_surface) <= len(candidate_surface)
+            else (candidate_surface, mention_surface)
+        )
+        if not shorter or not longer.casefold().endswith(shorter.casefold()):
+            return False
+        prefix = longer[: len(longer) - len(shorter)].strip()
+        return re.fullmatch(
+            r"(?:§\s*)?\d+(?:\.\d+){1,5}[.):：]?",
+            prefix,
+        ) is not None
+
+    @staticmethod
+    def _inflectional_surface_equivalent(left: str, right: str) -> bool:
+        """Recognize conservative Latin singular/plural name variants.
+
+        This is intentionally narrower than stemming: token count and every
+        non-inflected token must match, and only ordinary terminal plural
+        forms are considered.  It recovers headings such as ``Compound
+        statements`` versus a singular occurrence without equating merely
+        related nested names.
+        """
+
+        def tokens(value: str) -> list[str]:
+            normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+            return re.findall(r"[a-z0-9]+", normalized)
+
+        def forms(token: str) -> set[str]:
+            values = {token}
+            if len(token) <= 3:
+                return values
+            if token.endswith("ies") and len(token) > 4:
+                values.add(token[:-3] + "y")
+            if token.endswith("es") and len(token) > 4:
+                values.add(token[:-1])
+                values.add(token[:-2])
+            if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+                values.add(token[:-1])
+            return values
+
+        left_tokens, right_tokens = tokens(left), tokens(right)
+        if (
+            not left_tokens
+            or len(left_tokens) != len(right_tokens)
+            or left_tokens == right_tokens
+        ):
+            return False
+        return all(
+            bool(forms(left_token) & forms(right_token))
+            for left_token, right_token in zip(left_tokens, right_tokens)
+        )
 
     @staticmethod
     def _scores(mention: dict[str, Any], candidate: dict[str, Any]) -> dict[str, float]:
@@ -259,6 +571,14 @@ class ShadowEntityResolver:
                 "scores": candidate.get("resolution_scores") or {},
                 "filter_reason": candidate.get("filter_reason") or "",
                 "policy_version": self.policy_version,
+                "metadata": {
+                    "identity_review_required": str(
+                        candidate.get("identity_review_required") or ""
+                    ),
+                    "inflectional_identity_equivalent": bool(
+                        candidate.get("inflectional_identity_equivalent")
+                    ),
+                },
             })
         if rows:
             self.store.persist_candidates(rows)
@@ -309,7 +629,10 @@ class ShadowEntityResolver:
                 "scores": candidate["resolution_scores"],
                 "embedding": None, "candidates": [candidate],
             }
-        exact = list(self.store.find_exact(self.namespace, normalized, 10))[:10]
+        exact_rows = list(self.store.find_exact(self.namespace, normalized, 10))[:10]
+        exact = list({
+            str(item["canonical_key"]): item for item in exact_rows
+        }.values())
         exact.sort(key=lambda item: str(item["canonical_key"]))
         allowed_exact = []
         audited_exact = []
@@ -341,6 +664,33 @@ class ShadowEntityResolver:
                 "candidates": exact,
             }
         if len(allowed_exact) > 1:
+            # Duplicate canonicals can be created by earlier parallel or
+            # interrupted runs.  If every candidate's canonical name exactly
+            # matches this occurrence and every candidate has the same hard
+            # type, they represent the same name/type identity under this
+            # policy.  Deterministically converge on one key without a model.
+            # Alias-only homonyms (whose canonical names differ) remain
+            # quarantined, as do type disagreements and explicit cannot-links.
+            signatures = {
+                (
+                    str(item.get("normalized_name") or ""),
+                    str(item.get("primary_type") or "GenericEntity"),
+                )
+                for item in allowed_exact
+            }
+            if signatures == {(
+                normalized,
+                str(mention.get("entity_type") or "GenericEntity"),
+            )}:
+                selected = allowed_exact[0]
+                return {
+                    "canonical_key": str(selected["canonical_key"]),
+                    "decision": "exact_name_type_convergence",
+                    "reason": "相同规范名称和硬类型的重复 canonical 已确定性收敛",
+                    "scores": selected["resolution_scores"],
+                    "embedding": None,
+                    "candidates": exact,
+                }
             return {
                 "canonical_key": self._new_key(mention),
                 "decision": "quarantined_ambiguous_exact",
@@ -350,6 +700,44 @@ class ShadowEntityResolver:
                 "candidates": exact,
                 "quarantined": True,
             }
+        # Extraction type labels are assertions rather than identity keys.  An
+        # exact canonical name can therefore be blocked solely because the two
+        # occurrences received different type labels.  Resolve that narrow
+        # case from both exact contexts instead of either splitting forever or
+        # weakening the type gate for every similarity candidate.
+        cross_type_exact = [
+            item for item in exact
+            if str(item.get("normalized_name") or "") == normalized
+            and str(item.get("filter_reason") or "") == "type_incompatible"
+        ]
+        if cross_type_exact:
+            try:
+                reviewed = self.models.review(
+                    mention, cross_type_exact[: self.reviewer_cap],
+                )
+            except Exception as exc:
+                logger.warning("entity shadow exact-name type review skipped: %s", exc)
+                reviewed = None
+            reviewed_key = str((reviewed or {}).get("canonical_key") or "")
+            reviewed_candidate = next(
+                (
+                    item for item in cross_type_exact
+                    if str(item["canonical_key"]) == reviewed_key
+                ),
+                None,
+            )
+            if reviewed_candidate:
+                return {
+                    "canonical_key": reviewed_key,
+                    "decision": "exact_name_cross_type_review",
+                    "reason": str(
+                        (reviewed or {}).get("reason")
+                        or "双方精确原文支持同一实体，类型标签冲突保留在审计记录中"
+                    ),
+                    "scores": reviewed_candidate["resolution_scores"],
+                    "embedding": None,
+                    "candidates": exact,
+                }
         return None
 
     def resolve_with_embedding(
@@ -379,10 +767,19 @@ class ShadowEntityResolver:
             }
 
         lexical = list(self.store.search_lexical(
-            self.namespace, normalized, self.lexical_cap,
+            self.namespace,
+            normalized,
+            self.lexical_cap,
+            document_id=mention.get("document_id"),
+            chunk_id=mention.get("chunk_id"),
         ))[: self.lexical_cap]
         vector = list(self.store.search_vector(
-            self.namespace, embedding_model, embedding, self.vector_cap,
+            self.namespace,
+            embedding_model,
+            embedding,
+            self.vector_cap,
+            document_id=mention.get("document_id"),
+            chunk_id=mention.get("chunk_id"),
         ))[: self.vector_cap]
         combined: dict[str, dict[str, Any]] = {}
         for candidate in [*lexical, *vector]:
@@ -400,7 +797,51 @@ class ShadowEntityResolver:
         for candidate in combined.values():
             candidate["resolution_scores"] = self._scores(mention, candidate)
             candidate["filter_reason"] = self._blocked_reason(mention, candidate)
+            candidate["inflectional_identity_equivalent"] = bool(
+                not candidate["filter_reason"]
+                and self._inflectional_surface_equivalent(
+                    str(mention.get("surface") or ""),
+                    str(candidate.get("name") or ""),
+                )
+            )
+            if (
+                not candidate["filter_reason"]
+                and not candidate["inflectional_identity_equivalent"]
+                and self._nested_surface_identity_ambiguous(
+                    str(mention.get("surface") or ""),
+                    str(candidate.get("name") or ""),
+                    strict=bool(
+                        mention.get("endpoint_candidate")
+                        or candidate.get("endpoint_candidate")
+                    ),
+                )
+            ):
+                # A contained surface can be either a true short-name alias
+                # (a qualified role -> its short role / a titled person ->
+                # the personal name) or a distinct part/head.  Similarity
+                # alone must never merge it, but a
+                # hard filter also makes genuine aliases unrecoverable.  Keep
+                # it eligible for the bounded context review and record that
+                # the automatic path is forbidden.
+                if self._nested_identity_review_allowed(mention, candidate):
+                    candidate["identity_review_required"] = (
+                        "nested_surface_identity_ambiguity"
+                    )
+                else:
+                    candidate["filter_reason"] = ",".join(filter(None, (
+                        str(candidate.get("filter_reason") or ""),
+                        "nested_identity_ambiguous",
+                    )))
             ranked.append(candidate)
+        inflectional_candidates = [
+            item for item in ranked
+            if item.get("inflectional_identity_equivalent")
+        ]
+        if len(inflectional_candidates) > 1:
+            for candidate in inflectional_candidates:
+                candidate["identity_review_required"] = (
+                    "ambiguous_inflectional_alias"
+                )
         ranked.sort(
             key=lambda item: (
                 -float(item["resolution_scores"]["combined"]),
@@ -429,30 +870,69 @@ class ShadowEntityResolver:
         )
         self._audit(mention, selected, stage="reranker")
         best = selected[0] if selected else None
-        if best and float(best["resolution_scores"]["combined"]) >= self.auto_merge_threshold:
+        selected_inflectional = [
+            item for item in selected
+            if item.get("inflectional_identity_equivalent")
+        ]
+        if len(selected_inflectional) == 1 and len(inflectional_candidates) == 1:
+            equivalent = selected_inflectional[0]
             return {
-                "canonical_key": str(best["canonical_key"]),
-                "decision": "bounded_similarity_merge",
-                "reason": "有界检索与 reranker 达到 shadow 自动归一阈值",
-                "scores": best["resolution_scores"],
+                "canonical_key": str(equivalent["canonical_key"]),
+                "decision": "bounded_inflectional_alias",
+                "reason": "名称仅存在保守的单复数词形差异，确定性归一",
+                "scores": equivalent["resolution_scores"],
                 "embedding": embedding,
                 "candidates": ranked,
             }
+        if (
+            best
+            and not best.get("identity_review_required")
+            and float(best["resolution_scores"]["combined"])
+            >= self.auto_merge_threshold
+        ):
+            # Similarity is candidate-retrieval evidence, not identity proof.
+            # Even a very high embedding/reranker score can collapse nearby
+            # concepts.  Keep the high-scoring pair eligible for one bounded
+            # context review, but never merge it automatically.
+            best["identity_review_required"] = (
+                "non_exact_similarity_requires_review"
+            )
         if best and float(best["resolution_scores"]["combined"]) >= self.review_threshold:
+            # Nested/contained names pose one explicit pairwise coreference
+            # question.  Passing unrelated lower-ranked entities into that
+            # review makes local models compare categories instead of judging
+            # the best pair.  Ordinary ambiguity can still inspect a small,
+            # configured shortlist.
+            review_candidates = (
+                [best]
+                if best.get("identity_review_required")
+                else selected[: self.reviewer_cap]
+            )
             try:
-                reviewed = self.models.review(mention, selected)
+                reviewed = self.models.review(mention, review_candidates)
             except Exception as exc:
                 logger.warning("entity shadow candidate review skipped: %s", exc)
                 reviewed = None
             reviewed_key = str((reviewed or {}).get("canonical_key") or "")
             reviewed_candidate = next(
-                (item for item in selected if str(item["canonical_key"]) == reviewed_key),
+                (
+                    item for item in review_candidates
+                    if str(item["canonical_key"]) == reviewed_key
+                ),
                 None,
             )
             if reviewed_candidate and not reviewed_candidate["filter_reason"]:
                 return {
                     "canonical_key": reviewed_key,
-                    "decision": "bounded_llm_merge",
+                    "decision": (
+                        "bounded_nested_identity_review_merge"
+                        if reviewed_candidate.get("identity_review_required")
+                        in {
+                            "nested_surface_identity_ambiguity",
+                            "ambiguous_inflectional_alias",
+                        }
+                        else "bounded_llm_merge"
+                    ),
                     "reason": str((reviewed or {}).get("reason") or "LLM shadow 裁决"),
                     "scores": reviewed_candidate["resolution_scores"],
                     "embedding": embedding,

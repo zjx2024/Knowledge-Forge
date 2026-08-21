@@ -14,47 +14,31 @@ from knowledge_forge.shadow_schema_overlay import (
 from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
-def test_industry_overlay_contains_complete_versioned_policy_fields():
-    by_name = {item["name"]: item for item in SHADOW_RELATION_SCHEMA_OVERLAY}
-
-    for predicate in (
-        "is_a",
-        "used_in",
-        "used_as",
-        "has_production",
-        "has_reserve",
-        "has_resource",
-        "funded_by",
-        "published_by",
-        "substitutes_for",
-        "related_to",
-    ):
-        assert predicate in by_name
-        assert SHADOW_RELATION_SCHEMA_OVERLAY_REQUIRED_FIELDS <= set(by_name[predicate])
-        assert by_name[predicate]["semantic_definition"]
-        assert by_name[predicate]["direction_description"]
-        assert by_name[predicate]["publish_mode"] in {"auto", "review_only", "disabled"}
-
-
-def test_overlay_fills_known_base_schema_without_mutating_stable_schema():
+def test_policy_completion_injects_no_hidden_predicates():
     original = deepcopy(BASE_SCHEMA)
 
     enhanced = apply_shadow_relation_schema_overlay(BASE_SCHEMA)
 
+    assert SHADOW_RELATION_SCHEMA_OVERLAY == ()
     assert BASE_SCHEMA == original
-    assert enhanced is not BASE_SCHEMA
     assert enhanced["shadow_relation_schema_overlay_version"] == (
         SHADOW_RELATION_SCHEMA_OVERLAY_VERSION
     )
-    by_name = {item["name"]: item for item in enhanced["relation_types"]}
-    assert SHADOW_RELATION_SCHEMA_OVERLAY_REQUIRED_FIELDS <= set(by_name["produces"])
-    assert by_name["produces"]["domain_types"] == ["*"]
-    assert by_name["has_production"]["qualifier_schema"]["amount"] == "number"
-    assert by_name["related_to"]["publish_mode"] == "review_only"
+    assert [item["name"] for item in enhanced["relation_types"]] == [
+        item["name"] for item in BASE_SCHEMA["relation_types"]
+    ]
+    for item in enhanced["relation_types"]:
+        assert SHADOW_RELATION_SCHEMA_OVERLAY_REQUIRED_FIELDS <= set(item)
+        # Generic production completion keeps cross-scope candidates visible
+        # to the classifier/verifier instead of deleting them at planning.
+        assert item["scope_policy"] == {
+            "require_same_atomic_scope": False,
+            "allow_cross_scope_with_explicit_evidence": True,
+        }
 
 
-def test_unknown_custom_predicate_missing_overlay_fields_fails_closed():
-    with pytest.raises(ValueError, match="missing Shadow overlay fields"):
+def test_unknown_custom_predicate_missing_behavior_fields_fails_closed():
+    with pytest.raises(ValueError, match="missing behavior metadata"):
         apply_shadow_relation_schema_overlay({
             "version": "custom-schema-v1",
             "relation_types": [{
@@ -74,7 +58,7 @@ def test_unknown_custom_predicate_missing_overlay_fields_fails_closed():
         })
 
 
-def test_unknown_custom_predicate_with_complete_metadata_is_preserved():
+def test_complete_arbitrary_predicate_is_preserved_without_name_lookup():
     custom = predicate_policy(
         "alpha_rel",
         domain=["SourceType"],
@@ -86,18 +70,16 @@ def test_unknown_custom_predicate_with_complete_metadata_is_preserved():
         custom, version="custom-complete-v1",
     ))
 
-    by_name = {item["name"]: item for item in enhanced["relation_types"]}
-    assert by_name["alpha_rel"]["positive_cues"] == ["alpha cue"]
-    assert by_name["alpha_rel"]["domain_types"] == ["SourceType"]
-    assert "has_production" in by_name
+    assert len(enhanced["relation_types"]) == 1
+    result = enhanced["relation_types"][0]
+    assert result["name"] == "alpha_rel"
+    assert result["positive_cues"] == ["alpha cue"]
+    assert result["domain_types"] == ["SourceType"]
 
 
-def test_known_predicate_structural_policy_conflict_fails_closed():
-    broken = deepcopy(BASE_SCHEMA)
-    for item in broken["relation_types"]:
-        if item["name"] == "produces":
-            item["publish_mode"] = "disabled"
-            break
+def test_schema_metadata_controls_publication_without_name_special_case():
+    custom = predicate_policy("beta_rel", publish_mode="disabled")
 
-    with pytest.raises(ValueError, match="conflicts with Shadow overlay"):
-        apply_shadow_relation_schema_overlay(broken)
+    enhanced = apply_shadow_relation_schema_overlay(logical_schema(custom))
+
+    assert enhanced["relation_types"][0]["publish_mode"] == "disabled"

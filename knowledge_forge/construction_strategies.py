@@ -6,7 +6,15 @@ from dataclasses import dataclass
 
 
 STABLE_STRATEGY = "stable"
-ENHANCED_SHADOW_STRATEGY = "enhanced_shadow"
+KNOWLEDGE_FORGE_STRATEGY = "knowledge_forge"
+# This was the original persisted key while the strategy was still being
+# prototyped.  It remains an input-only compatibility alias so old bookmarks,
+# queued HTTP requests and historical API clients resolve to the same product.
+LEGACY_ENHANCED_SHADOW_STRATEGY = "enhanced_shadow"
+# Deprecated Python import compatibility.  New application code must use
+# KNOWLEDGE_FORGE_STRATEGY; retaining this alias does not preserve the old
+# strategy key in newly persisted records.
+ENHANCED_SHADOW_STRATEGY = KNOWLEDGE_FORGE_STRATEGY
 GRAPHRAG_NATIVE_STRATEGY = "graphrag_native"
 
 
@@ -28,17 +36,17 @@ STRATEGIES = {
         production_approved=True,
         user_selectable=False,
     ),
-    ENHANCED_SHADOW_STRATEGY: ConstructionStrategy(
-        key=ENHANCED_SHADOW_STRATEGY,
+    KNOWLEDGE_FORGE_STRATEGY: ConstructionStrategy(
+        key=KNOWLEDGE_FORGE_STRATEGY,
         label="Knowledge Forge",
-        description="基于文档预处理结果执行实体归一、关系验证与隔离知识图谱构建",
+        description="基于冻结的文档证据执行实体归一、关系验证与可审计知识图谱构建",
         production_approved=False,
         build_scope="project",
     ),
     GRAPHRAG_NATIVE_STRATEGY: ConstructionStrategy(
         key=GRAPHRAG_NATIVE_STRATEGY,
         label="GraphRAG Native",
-        description="从冻结源文档构建原生语义图、社区、报告与 LanceDB 查询包",
+        description="从已准备的源文档构建实体、关系、主题社区、摘要与知识问答索引",
         production_approved=False,
         build_scope="project",
     ),
@@ -47,6 +55,9 @@ STRATEGIES = {
 
 def normalize_strategy(value: str | None) -> str:
     key = str(value or STABLE_STRATEGY).strip().lower()
+    key = {
+        LEGACY_ENHANCED_SHADOW_STRATEGY: KNOWLEDGE_FORGE_STRATEGY,
+    }.get(key, key)
     if key not in STRATEGIES:
         raise ValueError(f"未知知识构建方案: {value}")
     return key

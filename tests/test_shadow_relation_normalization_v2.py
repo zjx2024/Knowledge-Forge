@@ -191,6 +191,35 @@ def test_inverse_predicates_collapse_to_declared_canonical_forward_fact() -> Non
 
 
 def test_verified_non_symmetric_reciprocal_facts_are_both_preserved() -> None:
+    schema, _, pair, hypotheses = _classified(
+        schema=logical_schema(_predicate("links", reciprocal_allowed=True)),
+        hypotheses=[
+        {
+            "subject_occurrence_id": "occ-alpha",
+            "predicate": "links",
+            "object_occurrence_id": "occ-beta",
+            "evidence_spans": [{"start": 0, "end": 17}],
+            "classifier_confidence": 0.9,
+        },
+        {
+            "subject_occurrence_id": "occ-beta",
+            "predicate": "links",
+            "object_occurrence_id": "occ-alpha",
+            "evidence_spans": [{"start": 0, "end": 17}],
+            "classifier_confidence": 0.9,
+        },
+        ],
+    )
+    result = _normalize(
+        schema, [pair], hypotheses, [_attempt(item) for item in hypotheses],
+    )
+
+    assert len(result.facts) == 2
+    assert result.metrics["verified_reciprocal_facts"] == 2
+    assert result.metrics["unsupported_reverse_conflicts"] == 0
+
+
+def test_non_reciprocal_reverse_facts_are_quarantined_fail_closed() -> None:
     schema, _, pair, hypotheses = _classified(hypotheses=[
         {
             "subject_occurrence_id": "occ-alpha",
@@ -211,12 +240,20 @@ def test_verified_non_symmetric_reciprocal_facts_are_both_preserved() -> None:
         schema, [pair], hypotheses, [_attempt(item) for item in hypotheses],
     )
 
-    assert len(result.facts) == 2
-    assert result.metrics["verified_reciprocal_facts"] == 2
-    assert result.metrics["unsupported_reverse_conflicts"] == 0
+    assert result.facts == ()
+    assert result.evidence == ()
+    assert len(result.conflicts) == 2
+    assert {
+        item.reason_code for item in result.conflicts
+    } == {"RECIPROCAL_DIRECTION_CONFLICT"}
+    assert result.metrics["verified_reciprocal_facts"] == 0
+    assert result.metrics["unsupported_reverse_conflicts"] == 2
+    assert {
+        item["fact_id"] for item in result.collapse_audit
+    }.issubset({item.fact_id for item in result.facts})
 
 
-def test_unsupported_reverse_hypothesis_never_creates_a_second_fact() -> None:
+def test_rejected_reverse_does_not_create_fact_or_veto_supported_forward() -> None:
     schema, _, pair, hypotheses = _classified(hypotheses=[
         {
             "subject_occurrence_id": "occ-alpha",
@@ -241,8 +278,9 @@ def test_unsupported_reverse_hypothesis_never_creates_a_second_fact() -> None:
     )
 
     assert len(result.facts) == 1
-    assert result.metrics["unsupported_reverse_conflicts"] == 1
-    assert all(item.reason_code != "UNSUPPORTED_REVERSE_CONFLICT" for item in result.facts)
+    assert result.facts[0].normalization_eligible is True
+    assert result.metrics["unsupported_reverse_conflicts"] == 0
+    assert not result.conflicts
 
 
 def test_multiple_occurrence_evidence_bind_to_one_semantic_fact() -> None:

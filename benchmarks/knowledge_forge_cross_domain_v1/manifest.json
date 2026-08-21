@@ -1,0 +1,47 @@
+{
+  "dataset": "knowledge-forge-cross-domain",
+  "version": "v1",
+  "level": "calibration",
+  "status": "expert_annotated_calibration",
+  "label_source": "assistant_expert_annotator",
+  "frozen_at": "2026-08-07T00:00:00Z",
+  "adjudication_revision": "2026-08-10-polarity-and-attachment-audit-v3",
+  "holdout_content_hash": "590ef2693e697d5faaaf763c0cd0567303d13a4eec5205c11598c38151233a56",
+  "recall_universe_complete": true,
+  "precision_adjudication_universe": "single expert annotation; no independent inter-annotator adjudication",
+  "production_gate_eligible": false,
+  "trusted_approval": null,
+  "ontology_path": "ontology.json",
+  "sources_path": "SOURCES.json",
+  "annotations": {
+    "entities": "annotations/entities.json",
+    "coreference_links": "annotations/coreference_links.json",
+    "assertions": "annotations/assertions.json",
+    "ambiguous_claims": "annotations/ambiguous_claims.json",
+    "pairs": "annotations/pairs.json",
+    "facts": "annotations/facts.json",
+    "unsupported_facts": "annotations/unsupported_facts.json"
+  },
+  "documents": [
+    {"id":"software-python-reference","path":"documents/software_python_reference.txt","split":"dev","content_sha256":"d1e31e790fc603c74b3d686ff80a9a775bd0d35eb4d9fe6914776e52857304ba","domain":"software","structure":["numbered_heading","prose","code_block"]},
+    {"id":"network-rfc9110-excerpt","path":"documents/network_rfc9110_excerpt.txt","split":"dev","content_sha256":"d1aaaa9ae02e356862998c19912318742379a716c1ebceed66e660fdbeaa557e","domain":"network_protocol","structure":["numbered_sections","normative_prose"]},
+    {"id":"legal-ecfr-grants-excerpt","path":"documents/legal_ecfr_grants_excerpt.txt","split":"holdout","content_sha256":"2e0a9579670cb033569f67d8d5452dd774bba30bc84537c37a480b760c849d40","domain":"regulation","structure":["subsection","numbered_clauses","normative_obligation"]},
+    {"id":"knowledge-usgs-aquifer-report-excerpt","path":"documents/knowledge_usgs_aquifer_report_excerpt.txt","split":"dev","content_sha256":"95cabc1826da7f2608acf256ae973c8bbb638eafcf56725f9856904578376275","domain":"earth_science","structure":["report_narrative","pipe_table","data_provenance"]},
+    {"id":"engineering-nasa-utm-requirements-excerpt","path":"documents/engineering_nasa_utm_requirements_excerpt.txt","split":"dev","content_sha256":"6d28f14c955b164bb335a3c8193503e60e8036525ecdaf61f58423ea597d2f0c","domain":"aerospace_engineering","structure":["overview","service_map","requirement_ids","shall_statements"]},
+    {"id":"narrative-alice-excerpt","path":"documents/narrative_alice_excerpt.txt","split":"holdout","content_sha256":"2a6419bddbce55b7c108ed5054a713e9273ce8cb88237103f428c824b370b7c0","domain":"fiction","structure":["narrative_prose","coreference","event_sequence"]}
+  ],
+  "expected_counts": {
+    "documents": 6,
+    "pair_decisions": 43,
+    "has_relation_pairs": 8,
+    "no_relation_pairs": 12,
+    "other_unsupported_pairs": 23,
+    "current_schema_facts": 8,
+    "extension_facts": 23,
+    "entity_mentions": 144,
+    "coreference_links": 11,
+    "complete_positive_assertions": 80,
+    "predicate_specific_negative_claims": 16,
+    "ambiguous_claims": 1
+  }
+}

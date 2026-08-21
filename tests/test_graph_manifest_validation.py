@@ -147,14 +147,33 @@ def test_disposable_postgres_graph_lease_is_exclusive_recoverable_and_generation
 
     strategy_graph = next(
         item for item in database.ensure_project_strategy_graphs(project["id"])
-        if item["strategy_key"] == "enhanced_shadow"
+        if item["strategy_key"] == "knowledge_forge"
     )
     strategy_graph = database.start_strategy_graph_rebuild(
-        project["id"], "enhanced_shadow",
+        project["id"], "knowledge_forge",
     )
     strategy_lease = database.acquire_graph_lease(
         project["id"], strategy_graph["namespace_id"], strategy_graph["generation"],
-        "strategy-worker", ttl_seconds=30,
+        "strategy:knowledge_forge:job-recovery", ttl_seconds=30,
     )
     assert strategy_lease["namespace_id"] == strategy_graph["namespace_id"]
-    database.release_graph_lease(strategy_lease["id"], strategy_lease["lease_token"])
+    assert database.release_job_graph_leases("unrelated-job") == 0
+    assert database.assert_graph_lease(
+        project["id"], strategy_graph["namespace_id"],
+        strategy_graph["generation"], strategy_lease["lease_token"],
+    )
+    assert database.release_job_graph_leases("job-recovery") == 1
+    assert not database.assert_graph_lease(
+        project["id"], strategy_graph["namespace_id"],
+        strategy_graph["generation"], strategy_lease["lease_token"],
+    )
+
+    rebuild_lease = database.acquire_graph_lease(
+        project["id"], project["graph_namespace_id"], 0,
+        "graph-rebuild:stable-job-recovery", ttl_seconds=30,
+    )
+    assert database.release_job_graph_leases("stable-job-recovery") == 1
+    assert not database.assert_graph_lease(
+        project["id"], project["graph_namespace_id"], 0,
+        rebuild_lease["lease_token"],
+    )

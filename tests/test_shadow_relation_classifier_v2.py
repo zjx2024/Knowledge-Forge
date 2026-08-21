@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
 
 from knowledge_forge.relation_shadow_v2 import (
+    CLASSIFICATION_FAILED,
+    EvidenceSpan,
     HYPOTHESES,
     NO_RELATION,
     OTHER_UNSUPPORTED,
+    PairClassificationDecision,
     ShadowClassificationError,
     classifier_prompt,
     classifier_response_schema,
@@ -159,6 +163,303 @@ def test_no_relation_defaults_missing_reason_and_evidence() -> None:
     ]
 
 
+def test_no_relation_lexical_recovery_requires_pair_local_cue() -> None:
+    content = "Platform supports Alpha and Beta."
+    schema = logical_schema(predicate_policy(
+        "supports",
+        optional_soft_cues=["supports"],
+        semantic_definition="The subject supports the object.",
+    ))
+    mentions = []
+    for surface in ("Platform", "Alpha", "Beta"):
+        start = content.index(surface)
+        mentions.append({
+            "mention_id": surface.lower(),
+            "occurrence_key": surface.lower(),
+            "surface": surface,
+            "mention_start": start,
+            "mention_end": start + len(surface),
+            "canonical_id": "entity-" + surface.lower(),
+            "assignment_version": "assign-v1",
+            "type": "GenericEntity",
+        })
+    plan = plan_pair_opportunities(
+        project_id=12,
+        document_revision_id="revision-pair-local-recovery",
+        chunk_key="chunk-pair-local-recovery",
+        content=content,
+        mentions=mentions,
+        logical_schema=schema,
+        run_id="run-pair-local-recovery",
+        candidate_policy_version="candidate-pair-local-recovery-v1",
+    )
+    by_pair = {
+        frozenset((item.left_occurrence_key, item.right_occurrence_key)): item
+        for item in plan.opportunities
+    }
+
+    platform_alpha = by_pair[frozenset(("platform", "alpha"))]
+    alpha_beta = by_pair[frozenset(("alpha", "beta"))]
+    assert platform_alpha.provenance["pair_local_soft_cue_matches"]
+    assert not alpha_beta.provenance["pair_local_soft_cue_matches"]
+
+    recovered = parse_classifier_response(
+        [platform_alpha],
+        {"decisions": [_decision(
+            platform_alpha.pair_identity,
+            decision=NO_RELATION,
+        )]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+    sibling = parse_classifier_response(
+        [alpha_beta],
+        {"decisions": [_decision(
+            alpha_beta.pair_identity,
+            decision=NO_RELATION,
+        )]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+
+    assert recovered.decision == HYPOTHESES
+    assert len(recovered.hypotheses) == 2
+    assert all(
+        item.predicate_metadata["candidate_source"]
+        == "LEXICAL_CUE_RECOVERY"
+        for item in recovered.hypotheses
+    )
+    assert sibling.decision == NO_RELATION
+    assert sibling.hypotheses == ()
+
+
+def test_no_relation_lexical_recovery_does_not_cross_later_comma_clause() -> None:
+    content = (
+        "标注准确性差异导致模型语义理解出现偏差，"
+        "学者从噪声处理方面提出方法。"
+    )
+    schema = logical_schema(predicate_policy(
+        "causes",
+        optional_soft_cues=["导致"],
+        semantic_definition="主体直接导致客体。",
+    ))
+
+    def mention(key: str, surface: str) -> dict:
+        start = content.index(surface)
+        return {
+            "mention_id": key,
+            "occurrence_key": key,
+            "surface": surface,
+            "mention_start": start,
+            "mention_end": start + len(surface),
+            "canonical_id": "entity-" + key,
+            "assignment_version": "assign-v1",
+            "type": "GenericEntity",
+        }
+
+    pair = plan_pair_opportunities(
+        project_id=12,
+        document_revision_id="revision-clause-local-recovery",
+        chunk_key="chunk-clause-local-recovery",
+        content=content,
+        mentions=[
+            mention("label-difference", "标注准确性差异"),
+            mention("noise-handling", "噪声处理"),
+        ],
+        logical_schema=schema,
+        run_id="run-clause-local-recovery",
+        candidate_policy_version="candidate-clause-local-recovery-v1",
+    ).opportunities[0]
+    assert pair.provenance["pair_local_soft_cue_matches"]
+
+    decision = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(pair.pair_identity, decision=NO_RELATION)]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+
+    assert decision.decision == NO_RELATION
+    assert decision.hypotheses == ()
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "标注差异导致语义偏差。",
+        "在复杂场景中，标注差异导致语义偏差。",
+    ),
+)
+def test_no_relation_lexical_recovery_keeps_direct_clause_cue(
+    content: str,
+) -> None:
+    schema = logical_schema(predicate_policy(
+        "causes",
+        optional_soft_cues=["导致"],
+        semantic_definition="主体直接导致客体。",
+    ))
+    mentions = []
+    for key, surface in (("difference", "标注差异"), ("deviation", "语义偏差")):
+        start = content.index(surface)
+        mentions.append({
+            "mention_id": key,
+            "occurrence_key": key,
+            "surface": surface,
+            "mention_start": start,
+            "mention_end": start + len(surface),
+            "canonical_id": "entity-" + key,
+            "assignment_version": "assign-v1",
+            "type": "GenericEntity",
+        })
+    pair = plan_pair_opportunities(
+        project_id=12,
+        document_revision_id="revision-direct-recovery",
+        chunk_key="chunk-direct-recovery",
+        content=content,
+        mentions=mentions,
+        logical_schema=schema,
+        run_id="run-direct-recovery",
+        candidate_policy_version="candidate-direct-recovery-v1",
+    ).opportunities[0]
+
+    decision = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(pair.pair_identity, decision=NO_RELATION)]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+
+    assert decision.decision == HYPOTHESES
+    assert {item.predicate for item in decision.hypotheses} == {"causes"}
+
+
+def test_legacy_opportunity_recomputes_lexical_recovery_between_endpoints_only() -> None:
+    content = "Platform supports Alpha and Beta."
+    schema = logical_schema(predicate_policy(
+        "supports",
+        optional_soft_cues=["supports"],
+        semantic_definition="The subject supports the object.",
+    ))
+    mentions = []
+    for surface in ("Platform", "Alpha", "Beta"):
+        start = content.index(surface)
+        mentions.append({
+            "mention_id": surface.lower(),
+            "occurrence_key": surface.lower(),
+            "surface": surface,
+            "mention_start": start,
+            "mention_end": start + len(surface),
+            "canonical_id": "entity-" + surface.lower(),
+            "assignment_version": "assign-v1",
+            "type": "GenericEntity",
+        })
+    plan = plan_pair_opportunities(
+        project_id=12,
+        document_revision_id="revision-legacy-local-recovery",
+        chunk_key="chunk-legacy-local-recovery",
+        content=content,
+        mentions=mentions,
+        logical_schema=schema,
+        run_id="run-legacy-local-recovery",
+        candidate_policy_version="candidate-legacy-local-recovery-v1",
+    )
+    by_pair = {
+        frozenset((item.left_occurrence_key, item.right_occurrence_key)): item
+        for item in plan.opportunities
+    }
+    platform_alpha = by_pair[frozenset(("platform", "alpha"))]
+    alpha_beta = by_pair[frozenset(("alpha", "beta"))]
+    # Simulate a persisted opportunity from before pair-local cue provenance
+    # was introduced. Immutable offsets still permit a safe local recompute.
+    platform_alpha = replace(
+        platform_alpha,
+        provenance={
+            **platform_alpha.provenance,
+            "pair_local_soft_cue_matches": [],
+        },
+    )
+    alpha_beta = replace(
+        alpha_beta,
+        provenance={
+            **alpha_beta.provenance,
+            "pair_local_soft_cue_matches": [],
+        },
+    )
+
+    recovered = parse_classifier_response(
+        [platform_alpha],
+        {"decisions": [_decision(
+            platform_alpha.pair_identity,
+            decision=NO_RELATION,
+        )]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+    sibling = parse_classifier_response(
+        [alpha_beta],
+        {"decisions": [_decision(
+            alpha_beta.pair_identity,
+            decision=NO_RELATION,
+        )]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+
+    assert recovered.decision == HYPOTHESES
+    assert sibling.decision == NO_RELATION
+
+
+def test_no_relation_lexical_recovery_never_crosses_atomic_scopes() -> None:
+    content = "Platform\nsupports\nAlpha"
+    schema = logical_schema(predicate_policy(
+        "supports",
+        optional_soft_cues=["supports"],
+        semantic_definition="The subject supports the object.",
+        scope_policy={
+            "require_same_atomic_scope": False,
+            "allow_cross_scope_with_explicit_evidence": True,
+        },
+    ))
+    mentions = []
+    for surface in ("Platform", "Alpha"):
+        start = content.index(surface)
+        mentions.append({
+            "mention_id": surface.lower(),
+            "occurrence_key": surface.lower(),
+            "surface": surface,
+            "mention_start": start,
+            "mention_end": start + len(surface),
+            "canonical_id": "entity-" + surface.lower(),
+            "assignment_version": "assign-v1",
+            "type": "GenericEntity",
+        })
+    pair = plan_pair_opportunities(
+        project_id=12,
+        document_revision_id="revision-cross-scope-recovery",
+        chunk_key="chunk-cross-scope-recovery",
+        content=content,
+        mentions=mentions,
+        logical_schema=schema,
+        run_id="run-cross-scope-recovery",
+        candidate_policy_version="candidate-cross-scope-recovery-v1",
+    ).opportunities[0]
+    assert pair.provenance["same_atomic_scope"] is False
+    assert pair.provenance["pair_local_soft_cue_matches"]
+
+    parsed = parse_classifier_response(
+        [pair],
+        {"decisions": [_decision(
+            pair.pair_identity,
+            decision=NO_RELATION,
+        )]},
+        content=content,
+        logical_schema=schema,
+    )[0]
+
+    assert parsed.decision == NO_RELATION
+    assert parsed.hypotheses == ()
+
+
 def test_clear_schema_gap_is_other_unsupported_not_related_to() -> None:
     pair = _opportunity()
     parsed = parse_classifier_response(
@@ -196,6 +497,18 @@ def test_other_unsupported_reason_is_normalized_to_schema_gap() -> None:
     assert [(span.start, span.end) for span in parsed[0].evidence_spans] == [
         pair.context_span,
     ]
+
+
+def test_terminal_fail_closed_decision_is_not_mislabeled_as_schema_gap() -> None:
+    decision = PairClassificationDecision(
+        pair_identity="pair-1",
+        decision=OTHER_UNSUPPORTED,
+        hypotheses=(),
+        evidence_spans=(EvidenceSpan(start=0, end=1),),
+        reason_code="CLASSIFIER_TERMINAL_PROTOCOL_FAILURE",
+    )
+
+    assert decision.decision_status == CLASSIFICATION_FAILED
 
 
 def test_batch_schema_outside_predicate_fails_closed() -> None:
@@ -248,27 +561,61 @@ def test_batch_schema_outside_predicate_fails_closed() -> None:
     ][:2]
     assert len(pairs) == 2
 
+    response = {"decisions": [
+        _decision(
+            pairs[0].pair_identity,
+            decision=NO_RELATION,
+            reason_code="CO_OCCURRENCE_ONLY",
+        ),
+        _decision(
+            pairs[1].pair_identity,
+            hypotheses=[_hypothesis(
+                subject="occ-acme",
+                predicate="schema_outside_predicate",
+                object_="occ-bolt",
+            )],
+        ),
+    ]}
     with pytest.raises(ShadowClassificationError, match="predicate"):
         parse_classifier_response(
             pairs,
-            {"decisions": [
-                _decision(
-                    pairs[0].pair_identity,
-                    decision=NO_RELATION,
-                    reason_code="CO_OCCURRENCE_ONLY",
-                ),
-                _decision(
-                    pairs[1].pair_identity,
-                    hypotheses=[_hypothesis(
-                        subject="occ-acme",
-                        predicate="schema_outside_predicate",
-                        object_="occ-bolt",
-                    )],
-                ),
-            ]},
+            response,
             content=content,
             logical_schema=_schema(),
         )
+
+    recovered = parse_classifier_response(
+        pairs,
+        response,
+        content=content,
+        logical_schema=_schema(),
+        allow_partial=True,
+    )
+
+    assert [item.pair_identity for item in recovered] == [
+        pairs[0].pair_identity,
+    ]
+    assert recovered[0].decision == NO_RELATION
+
+
+def test_partial_classifier_recovery_withholds_duplicate_and_unknown_members() -> None:
+    pair = _opportunity()
+    valid = _decision(pair.pair_identity, decision=NO_RELATION)
+
+    assert parse_classifier_response(
+        [pair],
+        {"decisions": [valid, valid]},
+        content=CONTENT,
+        logical_schema=_schema(),
+        allow_partial=True,
+    ) == ()
+    assert parse_classifier_response(
+        [pair],
+        {"decisions": [_decision("unknown", decision=NO_RELATION)]},
+        content=CONTENT,
+        logical_schema=_schema(),
+        allow_partial=True,
+    ) == ()
 
 
 def test_one_pair_can_propose_two_concrete_hypotheses() -> None:
@@ -334,7 +681,7 @@ def test_structural_left_right_roles_bind_to_exact_frozen_occurrences() -> None:
     assert parsed.object_occurrence_key == pair.left_occurrence_key
 
 
-def test_type_incompatible_orientation_is_classified_then_rejected_by_validation() -> None:
+def test_reverse_type_compatible_orientation_reaches_independent_role_verification() -> None:
     pair = _opportunity()
     parsed = parse_classifier_response(
         [pair],
@@ -352,8 +699,11 @@ def test_type_incompatible_orientation_is_classified_then_rejected_by_validation
         logical_schema=_schema(),
     )
 
-    assert validation.status == "REJECTED"
-    assert validation.reason_code == "TYPE_INCOMPATIBLE"
+    assert validation.status == "PASS"
+    assert validation.reason_code == (
+        "REVERSE_TYPE_COMPATIBLE_REQUIRES_ROLE_VERIFICATION"
+    )
+    assert validation.type_orientation == "reverse"
 
 
 def test_legacy_direction_must_agree_with_endpoint_roles() -> None:
@@ -538,9 +888,8 @@ def test_prompt_and_json_schema_version_the_generic_contract() -> None:
         metadata["name"] for metadata in pair.allowed_predicate_metadata
     }
     assert set(pair_payload["allowed_predicates"]) == allowed_predicates
-    assert {
-        metadata["name"] for metadata in pair_payload["allowed_predicate_metadata"]
-    } == allowed_predicates
+    assert set(payload["predicate_catalog"]) == allowed_predicates
+    assert "allowed_predicate_metadata" not in pair_payload
     endpoint_schema = (
         schema["properties"]["hypotheses"]["items"]["properties"]
     )
@@ -582,6 +931,32 @@ def test_classifier_prompt_omits_pair_ineligible_global_predicates() -> None:
     assert "beta_rel" not in prompt
     assert "beta_rel" not in predicate_schema["enum"]
     assert "predicates" not in payload
+
+
+def test_classifier_prompt_deduplicates_predicate_catalog_across_pairs() -> None:
+    pair = _opportunity()
+    second = _opportunity(content=CONTENT, mentions=[
+        {**_mentions()[0], "occurrence_key": "occ-acme-2"},
+        {**_mentions()[1], "occurrence_key": "occ-alloy-2"},
+    ])
+
+    payload = json.loads(classifier_prompt(
+        [pair, second], content=CONTENT, logical_schema=_schema(),
+    ))
+
+    assert len(payload["pairs"]) == 2
+    assert set(payload["predicate_catalog"]) == {
+        metadata["name"] for metadata in pair.allowed_predicate_metadata
+    }
+    assert all(
+        "allowed_predicate_metadata" not in item
+        for item in payload["pairs"]
+    )
+    assert len(payload["context_catalog"]) == 1
+    assert {
+        item["context_ref"] for item in payload["pairs"]
+    } == {"CTX-1"}
+    assert all("context" not in item for item in payload["pairs"])
 
 
 def test_multi_pair_schema_uses_decisions_array_wrapper() -> None:

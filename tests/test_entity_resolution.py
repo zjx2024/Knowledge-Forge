@@ -20,6 +20,19 @@ def test_normalize_name_unifies_spacing_case_and_punctuation():
     assert normalize_name("Straße") == normalize_name("STRASSE") == "strasse"
 
 
+def test_symbolic_expressions_preserve_operator_identity_without_affecting_names():
+    assert normalize_name("U-Net") == normalize_name("U Net") == "unet"
+    assert normalize_name("θ j") == "θj"
+    assert normalize_name("θ j") != normalize_name("j")
+    assert normalize_name("Сервер") == "сервер"
+    assert normalize_name("サーバー") == "サーバー"
+    assert normalize_name("서버") == "서버"
+    assert normalize_name("A ∩ B") != normalize_name("‖a-b‖")
+    assert normalize_name("c = 1") != normalize_name("C1")
+    assert identifiers_conflict("A ∩ B", "‖a-b‖")
+    assert identifiers_conflict("c = 1", "C1")
+
+
 def test_name_compatibility_is_conservative():
     assert names_are_compatible("星河机器人公司", "星河机器人")
     assert names_are_compatible("Knowledge Forge", "knowledge-forge")
@@ -50,18 +63,22 @@ def test_lexical_score_and_identifier_conflicts_are_conservative():
     assert not identifiers_conflict("控制器 V2", "二代控制器 V2")
 
 
-def test_reranker_diagnostics_expose_runtime_fallback_reason(monkeypatch, tmp_path):
+def test_reranker_diagnostics_expose_http_fallback_reason(monkeypatch):
     monkeypatch.setattr(Config, "entity_reranker_enabled", True)
-    monkeypatch.setattr(Config, "entity_reranker_model_path", str(tmp_path))
-    reranker = EntityReranker()
+    reranker = EntityReranker(
+        base_url="http://127.0.0.1:8012",
+        model="fixture-reranker",
+    )
     reranker._last_fallback_reason = "simulated batch failure"
 
     diagnostics = reranker.diagnostics()
 
     assert diagnostics["reranker_enabled"] is True
+    assert diagnostics["reranker_transport"] == "http"
+    assert diagnostics["reranker_endpoint"] == "http://127.0.0.1:8012"
     assert diagnostics["reranker_loaded"] is False
     assert diagnostics["last_score_used_model"] is False
-    assert diagnostics["reranker_device"] == "cpu"
+    assert diagnostics["reranker_device"] == "remote"
     assert diagnostics["fallback_reason"] == "simulated batch failure"
 
 

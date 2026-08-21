@@ -24,6 +24,17 @@ from knowledge_forge.relation_shadow_v2 import (
 from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
+def _role_probe(*_args):
+    return {
+        "subject_role": "source endpoint role",
+        "object_role": "target endpoint role",
+    }
+
+
+def _role_alignment_probe(*_args):
+    return {"subject_role": "ALIGNED", "object_role": "ALIGNED"}
+
+
 def _database(dsn: str) -> Database:
     params = conninfo_to_dict(dsn)
 
@@ -42,6 +53,106 @@ def _schema() -> dict:
             range_=["Product"],
         ),
         version="schema-v1",
+    )
+
+
+@pytest.mark.integration
+def test_shadow_model_cache_is_component_scoped_across_code_tree_changes() -> None:
+    dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
+    database = _database(dsn)
+    database.bootstrap()
+    suffix = uuid.uuid4().hex[:12]
+    project_id = int(database.create_project(
+        f"Shadow component cache {suffix}", "", "test-model", "test-embed",
+    )["id"])
+    prior_run_id = f"shadow-cache-prior-{suffix}"
+    current_run_id = f"shadow-cache-current-{suffix}"
+    prior_fingerprint = f"prior-fingerprint-{suffix}"
+    current_fingerprint = f"current-fingerprint-{suffix}"
+    database.start_shadow_relation_v2_run({
+        "id": prior_run_id,
+        "project_id": project_id,
+        "input_fingerprint": prior_fingerprint,
+        "fingerprint_components": {
+            "materialization_root": {"code_tree": "old-tree"},
+        },
+        "source_generation": 1,
+    })
+    persisted = database.record_shadow_relation_v2_source_model_call(
+        prior_run_id,
+        {
+            "component": "source_inventory",
+            "model_name": "test-model",
+            "model_digest": "model-digest",
+            "prompt_version": "prompt-v1",
+            "schema_version": "schema-v1",
+            "parser_version": "parser-v1",
+            "idempotency_key": "inventory:one",
+            "attempt_no": 1,
+            "status": "COMPLETED",
+            "request_hash": "exact-request-hash",
+            "response_hash": "exact-response-hash",
+            "request_payload": {"prompt": "exact rendered request"},
+            "raw_response_text": '{"facts":[]}',
+            "parsed_response": {"facts": []},
+            "token_usage": {},
+            "terminal_status": "COMPLETED",
+        },
+    )
+    database.finish_shadow_relation_v2_run(
+        prior_run_id,
+        status="ready",
+        metrics={},
+        input_fingerprint=prior_fingerprint,
+    )
+    database.start_shadow_relation_v2_run({
+        "id": current_run_id,
+        "project_id": project_id,
+        "input_fingerprint": current_fingerprint,
+        "fingerprint_components": {
+            "materialization_root": {"code_tree": "new-unrelated-tree"},
+        },
+        "source_generation": 1,
+    })
+
+    reused = database.find_reusable_shadow_model_call(
+        run_id=current_run_id,
+        component="source_inventory",
+        model_digest="model-digest",
+        prompt_version="prompt-v1",
+        schema_version="schema-v1",
+        parser_version="parser-v1",
+        request_hash="exact-request-hash",
+    )
+    assert reused is not None
+    assert reused["id"] == persisted["id"]
+    reparsed = database.find_reusable_shadow_model_call(
+        run_id=current_run_id,
+        component="source_inventory",
+        model_digest="model-digest",
+        prompt_version="prompt-v1",
+        schema_version="schema-v1",
+        parser_version="parser-v2-stricter-local-parser",
+        request_hash="exact-request-hash",
+    )
+    assert reparsed is not None
+    assert reparsed["id"] == persisted["id"]
+    assert database.find_reusable_shadow_model_call(
+        run_id=current_run_id,
+        component="source_inventory",
+        model_digest="model-digest",
+        prompt_version="prompt-v2",
+        schema_version="schema-v1",
+        parser_version="parser-v1",
+        request_hash="exact-request-hash",
+    ) is None
+    database.finish_shadow_relation_v2_run(
+        current_run_id,
+        status="cancelled",
+        metrics={},
+        input_fingerprint=current_fingerprint,
     )
 
 
@@ -137,10 +248,16 @@ def test_shadow_relation_v2_persistence_is_idempotent_and_product_isolated() -> 
         pair,
         content=content,
         logical_schema=_schema(),
+        role_probe=_role_probe,
+        role_alignment_probe=_role_alignment_probe,
         verifier=lambda _prompt, _schema: {
             "hypothesis_id": hypothesis.hypothesis_id,
             "verdict": SUPPORTED,
             "reason_code": "EXACT_TRIPLE_SUPPORTED",
+            "forward_entailment": "ENTAILED",
+            "reverse_entailment": "NOT_ENTAILED",
+            "subject_role_supported": True,
+            "object_role_supported": True,
             "supported_evidence_spans": [{"start": 0, "end": len(content)}],
         },
         verifier_model_revision="verifier-r1",

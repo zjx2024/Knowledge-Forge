@@ -1,4 +1,4 @@
-"""Small offline smoke benchmark for the optional entity reranker."""
+"""Small smoke benchmark for the configured entity reranker service."""
 
 from __future__ import annotations
 
@@ -23,6 +23,11 @@ PAIRS = [
 
 def main() -> None:
     reranker = EntityReranker()
+    readiness = reranker.probe()
+    if not readiness.get("ready"):
+        raise SystemExit(
+            f"reranker service is unavailable: {readiness.get('error') or readiness}"
+        )
     results = []
     for left, right, entity_type, expected_same in PAIRS:
         score = reranker.score(

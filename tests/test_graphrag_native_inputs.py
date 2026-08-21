@@ -13,7 +13,10 @@ from knowledge_forge.graphrag_native_inputs import (
     GraphRAGNativeInputBuilder,
     NativeInputError,
 )
-from knowledge_forge.graphrag_native_config import GraphRAGNativeSettingsBuilder
+from knowledge_forge.graphrag_native_config import (
+    GraphRAGNativePromptProfileBuilder,
+    GraphRAGNativeSettingsBuilder,
+)
 from knowledge_forge.graphrag_native_runner import GraphRAGNativeRunner
 
 
@@ -133,12 +136,20 @@ def test_real_graphrag_311_init_then_native_input_and_config_contract(tmp_path):
     (tmp_path / "kf-manifest").mkdir(parents=True, exist_ok=True)
     (tmp_path / "kf-manifest" / "candidate-identity.json").write_text("{}", encoding="utf-8")
     build = GraphRAGNativeInputBuilder(_Service(_blocks())).build(project_id=3, run_root=tmp_path)
+    prompt_profile = GraphRAGNativePromptProfileBuilder.apply(
+        run_root=tmp_path,
+        texts=tuple(item.text for item in build.input_documents),
+    )
     original_cwd = Path.cwd()
     settings = GraphRAGNativeSettingsBuilder().write_and_validate(
         run_root=tmp_path, completion_model="test-completion", embedding_model="test-embedding",
         embedding_dimension=2, api_base="http://127.0.0.1:11434/v1",
     )
+    runner.config_dry_run(
+        root=tmp_path, environment={"GRAPHRAG_API_KEY": "placeholder"},
+    )
     assert build.documents_path.is_file()
+    assert prompt_profile["language"]["language_code"] == "zh"
     assert settings["settings_path"].is_file()
     assert Path.cwd() == original_cwd
 

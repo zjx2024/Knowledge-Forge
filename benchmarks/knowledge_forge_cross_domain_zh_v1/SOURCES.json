@@ -1,0 +1,29 @@
+{
+  "notes": "These Chinese documents are expert-authored synthetic calibration fixtures. They contain no uploaded or proprietary source text.",
+  "documents": [
+    {
+      "id": "zh-software-hierarchy",
+      "origin": "expert-authored synthetic calibration fixture",
+      "license_note": "repository test fixture",
+      "content_sha256": "f07dc66cd66e28c4fb7ed1a0fb0542eec50bf73860c79019f1243df0fc7bc3d3"
+    },
+    {
+      "id": "zh-manufacturing-table",
+      "origin": "expert-authored synthetic calibration fixture",
+      "license_note": "repository test fixture",
+      "content_sha256": "a317e0ee7715c09fa0d324ce5eaef244208dbf982b3ddf2367c11e2b45cbf4fc"
+    },
+    {
+      "id": "zh-regulation-clauses",
+      "origin": "expert-authored synthetic calibration fixture",
+      "license_note": "repository test fixture",
+      "content_sha256": "966a45ba840de979445bd8773f9d2900b4668f39235afe8c913a305257bd6320"
+    },
+    {
+      "id": "zh-narrative-coreference",
+      "origin": "expert-authored synthetic calibration fixture",
+      "license_note": "repository test fixture",
+      "content_sha256": "2c6edad83911fc0e428aa9c6ae5348162be9c15e5b2a6ce2f56224031a02173b"
+    }
+  ]
+}

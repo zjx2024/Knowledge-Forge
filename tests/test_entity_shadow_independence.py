@@ -1,11 +1,59 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 
 from knowledge_forge.database import Database
-from knowledge_forge.entity_shadow import ShadowEntityResolver
+from knowledge_forge.entity_shadow import (
+    ShadowEntityResolver,
+    ShadowModelGateway,
+    bounded_identity_evidence,
+)
 from knowledge_forge.migrations import MIGRATIONS
 from knowledge_forge.service import KnowledgeForgeService
+
+
+def test_exact_shadow_candidate_query_reads_persisted_evidence_text_column():
+    statements = []
+
+    class Result:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def execute(self, statement, params):
+            statements.append((statement, params))
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    database = object.__new__(Database)
+    database.connection = connection
+
+    assert database.find_exact_entity_shadow_candidates("ns", "甲", 3) == []
+    statement, params = statements[0]
+    assert "mention.evidence_text" in statement
+    assert "mention.evidence\n" not in statement
+    assert params == ("ns", "甲", 3)
+
+
+def test_shadow_canonical_aliases_preserve_display_surfaces():
+    aliases = Database._entity_shadow_display_aliases(
+        {
+            "name": "Compound statements",
+            "aliases": ["Compound statements"],
+        },
+        {"surface": "compound statement"},
+        [{"surface": "compound-statement construct"}],
+    )
+
+    assert aliases == [
+        "Compound statements",
+        "compound statement",
+        "compound-statement construct",
+    ]
 
 
 class _CountingModels:
@@ -20,6 +68,30 @@ class _CountingModels:
     def review(self, *_args, **_kwargs):
         self.review_calls += 1
         return None
+
+
+class _MergingModels(_CountingModels):
+    def __init__(self, canonical_key):
+        super().__init__()
+        self.canonical_key = canonical_key
+
+    def review(self, *_args, **_kwargs):
+        self.review_calls += 1
+        return {
+            "decision": "merge",
+            "canonical_key": self.canonical_key,
+            "reason": "two exact contexts identify the same entity",
+        }
+
+
+class _CapturingMergingModels(_MergingModels):
+    def __init__(self, canonical_key):
+        super().__init__(canonical_key)
+        self.reviewed_candidates = []
+
+    def review(self, _mention, candidates):
+        self.reviewed_candidates.append(list(candidates))
+        return super().review(_mention, candidates)
 
 
 class _FailingReviewModels(_CountingModels):
@@ -38,10 +110,10 @@ class _ShadowCandidates:
     def find_exact(self, *_args):
         return list(self.exact)
 
-    def search_lexical(self, *_args):
+    def search_lexical(self, *_args, **_kwargs):
         return list(self.lexical)
 
-    def search_vector(self, *_args):
+    def search_vector(self, *_args, **_kwargs):
         return list(self.vector)
 
     def persist_candidates(self, rows):
@@ -53,6 +125,68 @@ class _ShadowCandidates:
              if row["canonical_key"] == canonical_key),
             None,
         )
+
+
+def test_singleton_exact_identity_review_repairs_omitted_candidate_key():
+    class Ollama:
+        def json_chat(self, **_kwargs):
+            return {"decision": "merge"}
+
+    gateway = ShadowModelGateway(
+        Ollama(), llm_model="fixture", context_budget_tokens=8192,
+    )
+    result = gateway.review(
+        {"surface": "共享实验室", "entity_type": "Organization", "evidence": ""},
+        [{
+            "canonical_key": "canonical-lab",
+            "name": "共享实验室",
+            "normalized_name": "共享实验室",
+            "primary_type": "Product",
+            "aliases": ["共享实验室"],
+            "mention_evidence": "",
+        }],
+    )
+
+    assert result["canonical_key"] == "canonical-lab"
+
+
+def test_singleton_exact_identity_review_accepts_bounded_result_alias():
+    class Ollama:
+        def json_chat(self, **_kwargs):
+            return {"result": "merge"}
+
+    gateway = ShadowModelGateway(
+        Ollama(), llm_model="fixture", context_budget_tokens=8192,
+    )
+    result = gateway.review(
+        {"surface": "共享实验室", "entity_type": "Organization", "evidence": ""},
+        [{
+            "canonical_key": "canonical-lab",
+            "name": "共享实验室",
+            "normalized_name": "共享实验室",
+            "primary_type": "Product",
+            "aliases": ["共享实验室"],
+            "mention_evidence": "",
+        }],
+    )
+
+    assert result["decision"] == "merge"
+    assert result["canonical_key"] == "canonical-lab"
+
+
+def test_identity_evidence_includes_neighboring_source_sentences_without_leaving_source():
+    content = (
+        "An extended client establishes a connection.\n"
+        "The client sends requests.\n"
+        "A different server handles responses."
+    )
+    start = content.index("client", content.index("The client"))
+
+    evidence = bounded_identity_evidence(content, start, start + len("client"))
+
+    assert evidence == content
+    assert "extended client" in evidence
+    assert "different server" in evidence
 
 
 def _mention(**overrides):
@@ -73,17 +207,86 @@ def _mention(**overrides):
 
 
 def test_entity_shadow_pipeline_reads_active_chunks_not_formal_mentions():
-    source = inspect.getsource(KnowledgeForgeService.build_entity_shadow_namespace)
+    source = inspect.getsource(KnowledgeForgeService.build_grounded_entity_namespace)
     assert "list_document_chunks" in source
-    assert "build_shadow_context_manifest" in source
+    assert "build_grounded_context_manifest" in source
     assert "SpanFirstEntityExtractor" in source
+    assert "structured_relation_endpoint_candidates" in source
     assert "schemas.extract_entities_only" in source
     assert "schemas.extract_chunk" not in source
     assert "list_document_mentions" not in source
+    assert '"relation_policy_set"' not in source
+    assert '"ollama_seed": Config.ollama_seed' in source
+    assert 'snapshot_metrics.get("relation_endpoints")' in source
+    assert '"relation_endpoints": relation_endpoint_count' in source
+
+
+def test_ready_entity_namespace_reaudits_publishability_after_relation_refresh():
+    source = inspect.getsource(KnowledgeForgeService.build_grounded_entity_namespace)
+    refresh = source[
+        source.index("if relation_refresh_required:"):
+        source.index("# A relation-only refresh reuses the immutable entity namespace.")
+    ]
+
+    assert refresh.index("_run_grounded_relation_namespace") < refresh.index(
+        "_audit_grounded_entity_publishability"
+    )
+    assert 'persisted.get("relation_endpoints")' in refresh
+    assert '"after_relations": publishability_after_relations' in refresh
+    assert refresh.count("load_entity_shadow_snapshot") >= 2
+
+
+def test_ready_entity_namespace_repairs_interrupted_projection_by_endpoint_hash():
+    source = inspect.getsource(KnowledgeForgeService.build_grounded_entity_namespace)
+
+    assert "current_endpoint_fingerprint" in source
+    assert "relation_endpoint_fingerprint" in source
+    assert "publishability_metrics_changed" in source
+
+
+def test_relation_endpoint_projection_fingerprint_is_order_independent_but_directed():
+    first = [
+        {
+            "relation_key": "r2",
+            "source_canonical_key": "b",
+            "target_canonical_key": "c",
+        },
+        {
+            "relation_key": "r1",
+            "source_canonical_key": "a",
+            "target_canonical_key": "b",
+        },
+    ]
+    reordered = list(reversed(first))
+    reversed_edge = [
+        first[0],
+        {
+            **first[1],
+            "source_canonical_key": "b",
+            "target_canonical_key": "a",
+        },
+    ]
+
+    fingerprint = KnowledgeForgeService._grounded_relation_endpoint_fingerprint
+    assert fingerprint(first) == fingerprint(reordered)
+    assert fingerprint(first) != fingerprint(reversed_edge)
+
+
+def test_entity_shadow_honors_retrieval_only_chunk_metadata():
+    chunks = [
+        {"id": 1, "metadata": {}},
+        {"id": 2, "metadata": {"graph_extraction_enabled": True}},
+        {"id": 3, "metadata": {"graph_extraction_enabled": False}},
+        {"id": 4, "metadata": '{"graph_extraction_enabled": false}'},
+    ]
+
+    selected = KnowledgeForgeService._graph_extraction_chunks(chunks)
+
+    assert [item["id"] for item in selected] == [1, 2]
 
 
 def test_entity_shadow_pipeline_requeues_terminal_work_on_explicit_retry():
-    source = inspect.getsource(KnowledgeForgeService.build_entity_shadow_namespace)
+    source = inspect.getsource(KnowledgeForgeService.build_grounded_entity_namespace)
 
     assert "requeue_terminal_entity_shadow_work" in source
     assert source.index("requeue_terminal_entity_shadow_work") < source.index("while True")
@@ -116,6 +319,60 @@ def test_entity_shadow_migration_persists_independent_audit_and_work_state():
     assert "gin(normalized_alias gin_trgm_ops)" in sql
     assert "input_fingerprint" in sql
     assert "snapshot_complete" in sql
+
+
+def test_grounded_entity_extraction_cache_is_exact_input_and_provenance_bound():
+    migration = next(
+        item for item in MIGRATIONS
+        if item.version == "0032_knowledge_forge_entity_extraction_cache"
+    )
+
+    assert "knowledge_forge_entity_extraction_cache" in migration.sql
+    assert "project_id BIGINT NOT NULL" in migration.sql
+    assert "document_id BIGINT NOT NULL" in migration.sql
+    assert "revision_id TEXT NOT NULL" in migration.sql
+    assert "chunk_id BIGINT NOT NULL" in migration.sql
+    assert "model_digest TEXT NOT NULL" in migration.sql
+    assert "request_fingerprint TEXT NOT NULL" in migration.sql
+    assert "output_hash TEXT NOT NULL" in migration.sql
+    assert migration.startup_safe is True
+
+    source = inspect.getsource(
+        KnowledgeForgeService.build_grounded_entity_namespace
+    )
+    for required in (
+        "schema_fingerprint",
+        "model_digest",
+        "effective_context_tokens",
+        "context_budget_tokens",
+        "max_output_tokens",
+        "seed",
+        "segment_max_chars",
+        "max_sentences_per_segment",
+        "max_items_per_segment",
+        "gleaning_rounds",
+        "entity_extraction_policy_version",
+        "code_version",
+    ):
+        assert f'"{required}"' in source
+    assert source.index(
+        "get_knowledge_forge_entity_extraction_cache"
+    ) < source.index("schemas.extract_grounded_mentions")
+    assert "delete_knowledge_forge_entity_extraction_cache" in source
+
+
+def test_project_activity_repair_is_bounded_to_maintenance_batches():
+    migration = next(
+        item for item in MIGRATIONS
+        if item.version == "0033_project_activity_timestamp_repair"
+    )
+
+    assert migration.startup_safe is True
+    assert "HAVING COUNT(*)>1" in migration.sql
+    assert "graph_error='图谱需要按当前策略集合和代次重建'" in migration.sql
+    assert "MAX(j.updated_at)" in migration.sql
+    assert "MAX(d.updated_at)" in migration.sql
+    assert "MAX(s.updated_at)" in migration.sql
 
 
 def test_exact_alias_hit_skips_embedding_reranker_and_llm():
@@ -206,6 +463,91 @@ def test_multilingual_exact_alias_and_ambiguous_homonym_stay_model_free():
     assert models.embedding_calls == models.review_calls == 0
 
 
+def test_duplicate_exact_name_and_type_converge_deterministically():
+    rows = [{
+        "canonical_key": key,
+        "name": "Shared Component",
+        "normalized_name": "shared component",
+        "primary_type": "Technology",
+        "aliases": ["shared component"],
+    } for key in ("canonical-b", "canonical-a")]
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns",
+        policy_version="p2-name-type",
+        store=_ShadowCandidates(exact=rows),
+        models=models,
+        reranker=lambda *_args: [],
+        identity_profile="exact_canonical_name_only",
+    )
+
+    result = resolver.resolve(_mention(
+        surface="Shared Component",
+        normalized_surface="shared component",
+        entity_type="Technology",
+    ))
+
+    assert result["canonical_key"] == "canonical-a"
+    assert result["decision"] == "exact_name_type_convergence"
+    assert models.embedding_calls == models.review_calls == 0
+
+
+def test_exact_name_cross_type_conflict_requires_context_review():
+    candidate = {
+        "canonical_key": "c-platform",
+        "name": "星云平台",
+        "normalized_name": "星云平台",
+        "primary_type": "Technology",
+        "aliases": ["星云平台"],
+        "mention_evidence": "机器人通过星云平台完成巡检。",
+    }
+    models = _MergingModels("c-platform")
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2",
+        store=_ShadowCandidates(exact=[candidate]), models=models,
+        reranker=lambda *_args: [],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="星云平台",
+        normalized_surface="星云平台",
+        entity_type="Product",
+        evidence="星云平台为机器人提供视觉识别能力。",
+    ))
+
+    assert result["canonical_key"] == "c-platform"
+    assert result["decision"] == "exact_name_cross_type_review"
+    assert models.review_calls == 1
+    assert models.embedding_calls == 0
+
+
+def test_exact_name_cross_type_review_failure_keeps_entities_separate():
+    candidate = {
+        "canonical_key": "c-apple-company",
+        "name": "苹果",
+        "normalized_name": "苹果",
+        "primary_type": "Organization",
+        "aliases": ["苹果"],
+        "mention_evidence": "苹果公司发布了年度报告。",
+    }
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2",
+        store=_ShadowCandidates(exact=[candidate]), models=models,
+        reranker=lambda *_args: [],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="苹果",
+        normalized_surface="苹果",
+        entity_type="Product",
+        evidence="果农采摘苹果并装箱运输。",
+    ))
+
+    assert result["canonical_key"] != "c-apple-company"
+    assert result["decision"] == "new_canonical"
+    assert models.review_calls == 1
+
 def test_hard_identifier_and_cannot_link_win_over_similarity():
     candidates = [{
         "canonical_key": "model-2",
@@ -229,6 +571,68 @@ def test_hard_identifier_and_cannot_link_win_over_similarity():
 
     assert result["decision"] == "new_canonical"
     assert result["canonical_key"] != "model-2"
+    assert any(
+        "identifier_conflict" in item["filter_reason"]
+        for item in store.candidate_rows
+    )
+
+
+def test_cjk_near_edit_names_remain_separate_despite_maximum_similarity():
+    candidate = {
+        "canonical_key": "c-intra-partition",
+        "name": "分区内通信管理",
+        "normalized_name": "分区内通信管理",
+        "primary_type": "GenericEntity",
+        "aliases": [],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+    }
+    store = _ShadowCandidates(lexical=[candidate], vector=[candidate])
+    models = _MergingModels("c-intra-partition")
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=store, models=models,
+        reranker=lambda _mention, rows: [1.0 for _ in rows],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="分区间通信管理",
+        normalized_surface="分区间通信管理",
+        entity_type="GenericEntity",
+    ))
+
+    assert result["decision"] == "new_canonical"
+    assert result["canonical_key"] != "c-intra-partition"
+    assert models.review_calls == 0
+    assert any(
+        "cjk_near_edit_ambiguous" in item["filter_reason"]
+        for item in store.candidate_rows
+    )
+
+
+def test_numeric_identifier_extension_is_not_a_similarity_alias():
+    candidate = {
+        "canonical_key": "c-mips-family",
+        "name": "MIPS",
+        "normalized_name": "mips",
+        "primary_type": "Technology",
+        "aliases": [],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+    }
+    store = _ShadowCandidates(lexical=[candidate], vector=[candidate])
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=store,
+        models=_MergingModels("c-mips-family"),
+        reranker=lambda _mention, rows: [1.0 for _ in rows],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="mips64", normalized_surface="mips64",
+        entity_type="Technology",
+    ))
+
+    assert result["decision"] == "new_canonical"
+    assert result["canonical_key"] != "c-mips-family"
     assert any(
         "identifier_conflict" in item["filter_reason"]
         for item in store.candidate_rows
@@ -267,6 +671,202 @@ def test_shadow_type_gate_blocks_material_product_embedding_merge():
     )
 
 
+def test_unresolved_type_is_missing_information_not_a_hard_type_conflict():
+    candidate = {
+        "canonical_key": "c-service",
+        "name": "Service",
+        "normalized_name": "service",
+        "primary_type": "Organization",
+        "aliases": ["service"],
+    }
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=_ShadowCandidates(exact=[candidate]),
+        models=models, reranker=lambda *_args: [],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="service",
+        normalized_surface="service",
+        entity_type="GenericEntity",
+    ))
+
+    assert result["canonical_key"] == "c-service"
+    assert result["decision"] == "exact_alias"
+    assert models.embedding_calls == models.review_calls == 0
+
+
+def test_singular_plural_name_variant_merges_without_identity_model_guessing():
+    candidate = {
+        "canonical_key": "c-compound",
+        "name": "Compound statements",
+        "normalized_name": "compoundstatements",
+        "primary_type": "GenericEntity",
+        "aliases": [],
+        "lexical_score": 0.97,
+        "vector_score": 0.65,
+    }
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2",
+        store=_ShadowCandidates(lexical=[candidate], vector=[candidate]),
+        models=models,
+        reranker=lambda _mention, rows: [0.0 for _ in rows],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="compound statement",
+        normalized_surface="compoundstatement",
+        entity_type="Technology",
+    ))
+
+    assert result["canonical_key"] == "c-compound"
+    assert result["decision"] == "bounded_inflectional_alias"
+    assert models.review_calls == 0
+
+
+def test_generic_nested_source_spans_remain_separate_without_identity_review():
+    candidate = {
+        "canonical_key": "c-platform",
+        "name": "platform",
+        "normalized_name": "platform",
+        "primary_type": "Product",
+        "aliases": [],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+    }
+    store = _ShadowCandidates(lexical=[candidate], vector=[candidate])
+    models = _CountingModels()
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=store,
+        models=models,
+        reranker=lambda _mention, rows: [1.0 for _ in rows],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="cloud-ready research platform",
+        normalized_surface="cloud-ready research platform",
+        entity_type="Product",
+    ))
+
+    assert result["decision"] == "new_canonical"
+    assert result["canonical_key"] != "c-platform"
+    assert all(
+        "nested_identity_ambiguous" in item["filter_reason"]
+        for item in store.candidate_rows
+    )
+    assert models.review_calls == 0
+
+
+def test_nested_short_name_can_merge_only_after_explicit_context_review():
+    candidate = {
+        "canonical_key": "c-operator",
+        "name": "值班员周启",
+        "normalized_name": "值班员周启",
+        "primary_type": "Person",
+        "aliases": [],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+        "mention_evidence": "值班员周启将温度计交给巡检员。",
+    }
+    store = _ShadowCandidates(lexical=[candidate], vector=[candidate])
+    models = _MergingModels("c-operator")
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=store, models=models,
+        reranker=lambda _mention, rows: [1.0 for _ in rows],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="周启",
+        normalized_surface="周启",
+        entity_type="Person",
+        evidence="周启随后填写异常报告。",
+    ))
+
+    assert result["canonical_key"] == "c-operator"
+    assert result["decision"] == "bounded_nested_identity_review_merge"
+    assert models.review_calls == 1
+
+
+def test_nested_identity_review_is_pairwise_even_with_high_scoring_distractors():
+    target = {
+        "canonical_key": "c-inspector-alice",
+        "name": "Inspector Alice",
+        "normalized_name": "inspectoralice",
+        "primary_type": "Person",
+        "aliases": [],
+        "lexical_score": 0.75,
+        "vector_score": 0.99,
+    }
+    distractors = [{
+        "canonical_key": f"c-distractor-{index}",
+        "name": f"related object {index}",
+        "normalized_name": f"relatedobject{index}",
+        "primary_type": "GenericEntity",
+        "aliases": [],
+        "lexical_score": 0.70 - index / 100,
+        "vector_score": 0.95 - index / 100,
+    } for index in range(8)]
+    rows = [target, *distractors]
+    models = _CapturingMergingModels("c-inspector-alice")
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2",
+        store=_ShadowCandidates(lexical=rows, vector=rows),
+        models=models,
+        reranker=lambda _mention, candidates: [
+            1.0 if item["canonical_key"] == "c-http-client" else 0.8
+            for item in candidates
+        ],
+        reranker_cap=9,
+        reviewer_cap=5,
+    )
+
+    result = resolver.resolve(_mention(
+        surface="Alice",
+        normalized_surface="alice",
+        entity_type="Person",
+        endpoint_candidate=True,
+    ))
+
+    assert result["canonical_key"] == "c-inspector-alice"
+    assert result["decision"] == "bounded_nested_identity_review_merge"
+    assert len(models.reviewed_candidates) == 1
+    assert [item["canonical_key"] for item in models.reviewed_candidates[0]] == [
+        "c-inspector-alice",
+    ]
+
+
+def test_generic_nested_capability_names_do_not_merge_after_model_review():
+    candidate = {
+        "canonical_key": "c-partition-service",
+        "name": "分区管理服务",
+        "normalized_name": "分区管理服务",
+        "primary_type": "GenericEntity",
+        "aliases": [],
+        "lexical_score": 1.0,
+        "vector_score": 1.0,
+    }
+    store = _ShadowCandidates(lexical=[candidate], vector=[candidate])
+    models = _MergingModels("c-partition-service")
+    resolver = ShadowEntityResolver(
+        namespace="ns", policy_version="p2", store=store, models=models,
+        reranker=lambda _mention, rows: [1.0 for _ in rows],
+    )
+
+    result = resolver.resolve(_mention(
+        surface="分区管理", normalized_surface="分区管理",
+        entity_type="GenericEntity",
+    ))
+
+    assert result["decision"] == "new_canonical"
+    assert result["canonical_key"] != "c-partition-service"
+    assert models.review_calls == 0
+    assert any(
+        "nested_identity_ambiguous" in item["filter_reason"]
+        for item in store.candidate_rows
+    )
+
+
 def test_hard_must_link_is_audited_but_cannot_override_identifier_conflict():
     candidate = {
         "canonical_key": "model-2", "name": "Model 2",
@@ -289,8 +889,8 @@ def test_hard_must_link_is_audited_but_cannot_override_identifier_conflict():
 def test_shadow_candidate_reranking_is_hard_bounded():
     rows = [{
         "canonical_key": f"c{index}",
-        "name": f"Acme {index}",
-        "normalized_name": f"acme {index}",
+        "name": f"Acme Variant {chr(65 + index)}",
+        "normalized_name": f"acme variant {chr(65 + index)}",
         "primary_type": "Organization",
         "aliases": [],
         "lexical_score": 0.7,

@@ -129,7 +129,7 @@ def test_expected_manifest_is_strategy_scoped():
 
     stable = store.expected_manifest(project, [document], mutation=mutation)
     enhanced = store.expected_manifest(
-        {**project, "_strategy_key": "enhanced_shadow"},
+        {**project, "_strategy_key": "knowledge_forge"},
         [document],
         mutation=mutation,
     )

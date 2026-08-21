@@ -16,6 +16,7 @@ import requests
 
 from .config import Config
 from .observability import current_metrics, increment
+from .unicode_safety import sanitize_unicode_data, sanitize_unicode_text
 
 
 LOGGER = logging.getLogger(__name__)
@@ -79,9 +80,13 @@ class OllamaClient:
         base_url: str = "",
         timeout: int | None = None,
         *,
+        embedding_base_url: str = "",
         token_estimator: TokenEstimator | None = None,
     ):
         self.base_url = (base_url or Config.ollama_base_url).rstrip("/")
+        self.embedding_base_url = (
+            embedding_base_url or Config.ollama_embedding_base_url
+        ).rstrip("/")
         self.timeout = timeout or Config.ollama_timeout
         self.token_estimator = token_estimator or ConservativeTokenEstimator()
         self.last_call_diagnostics: OllamaCallDiagnostics | None = None
@@ -164,14 +169,14 @@ class OllamaClient:
         return result
 
     def embed(self, texts: Iterable[str], model: str) -> list[list[float]]:
-        values = [str(item) for item in texts]
+        values = [sanitize_unicode_text(str(item)) for item in texts]
         if not values:
             return []
         increment("ollama_logical_calls")
         increment("embedding_input_count", len(values))
         response = self._request(
             "post",
-            f"{self.base_url}/api/embed",
+            f"{self.embedding_base_url}/api/embed",
             json={"model": model, "input": values, "keep_alive": Config.ollama_keep_alive},
             timeout=self.timeout,
         )
@@ -186,7 +191,7 @@ class OllamaClient:
     def _legacy_embedding(self, text: str, model: str) -> list[float]:
         response = self._request(
             "post",
-            f"{self.base_url}/api/embeddings",
+            f"{self.embedding_base_url}/api/embeddings",
             json={"model": model, "prompt": text, "keep_alive": Config.ollama_keep_alive},
             timeout=self.timeout,
         )
@@ -222,11 +227,15 @@ class OllamaClient:
             raise OllamaBudgetError("Ollama token budgets must be positive")
         runtime = self.effective_model_context(model)
         verified_context = min(context_budget, runtime.effective_context_tokens)
-        user_message: dict[str, Any] = {"role": "user", "content": prompt}
+        user_message: dict[str, Any] = {
+            "role": "user", "content": sanitize_unicode_text(prompt),
+        }
         encoded_images = [base64.b64encode(value).decode("ascii") for value in (images or [])]
         if encoded_images:
             user_message["images"] = encoded_images
-        messages = [{"role": "system", "content": system}, user_message]
+        messages = [{
+            "role": "system", "content": sanitize_unicode_text(system),
+        }, user_message]
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -236,10 +245,12 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": output_budget,
+                "seed": Config.ollama_seed,
             },
             "format": schema or "json",
         }
         parse_error: Exception | None = None
+        last_parsed_candidate: dict[str, Any] | None = None
         for attempt in range(2):
             if attempt:
                 increment("http_retry_count")
@@ -275,10 +286,14 @@ class OllamaClient:
             LOGGER.info("Ollama request diagnostics: %s", json.dumps(
                 asdict(self.last_call_diagnostics), ensure_ascii=True, sort_keys=True,
             ))
-            content = str((payload.get("message") or {}).get("content") or "").strip()
+            content = sanitize_unicode_text(
+                str((payload.get("message") or {}).get("content") or "")
+            ).strip()
             self.last_raw_response_text = content
             try:
-                parsed = self._parse_json(content)
+                parsed = self._parse_json(content, schema=schema)
+                last_parsed_candidate = parsed
+                self._validate_schema_shape(parsed, schema)
                 self.last_parsed_json_response = parsed
                 return parsed
             except (RuntimeError, json.JSONDecodeError) as exc:
@@ -290,12 +305,31 @@ class OllamaClient:
                     messages.append({"role": "assistant", "content": content[:12000]})
                 messages.append({
                     "role": "user",
-                    "content": "The previous response was not one valid JSON value. Return only the JSON object required by the schema, without analysis, markdown, or a second object.",
+                    "content": (
+                        "The previous response did not satisfy the required JSON "
+                        "object contract. Return only one JSON object containing "
+                        "every required schema field, with no analysis, markdown, "
+                        "YAML, or second object."
+                    ),
                 })
                 body["options"] = {
                     "temperature": 0,
                     "num_predict": output_budget,
+                    "seed": Config.ollama_seed,
                 }
+        if (
+            last_parsed_candidate is not None
+            and self._schema_has_known_property(
+                last_parsed_candidate, schema,
+            )
+        ):
+            # Keep a schema-compatible legacy object available to the
+            # component parser.  This is deliberately narrower than accepting
+            # an arbitrary extracted fragment: a response must contain at
+            # least one declared property, while aliases and semantic gates
+            # remain the responsibility of the caller.
+            self.last_parsed_json_response = last_parsed_candidate
+            return last_parsed_candidate
         raise RuntimeError(f"Ollama JSON response invalid after retry: {parse_error}")
 
     @staticmethod
@@ -374,26 +408,254 @@ class OllamaClient:
         return canonical(requested) == canonical(runner)
 
     @staticmethod
-    def _parse_json(content: str) -> dict[str, Any]:
+    def _parse_json(
+        content: str,
+        *,
+        schema: dict[str, Any] | str | None = None,
+    ) -> dict[str, Any]:
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", content, flags=re.IGNORECASE).strip()
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
         try:
             value = json.loads(cleaned)
         except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            value = None
-            for match in re.finditer(r"[\[{]", cleaned):
-                try:
-                    candidate, _ = decoder.raw_decode(cleaned[match.start():])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, (dict, list)):
-                    value = candidate
-                    break
-            if value is None:
-                raise RuntimeError("Ollama did not return a JSON object")
+            repaired = (
+                OllamaClient._repair_missing_schema_property_separators(
+                    cleaned, schema=schema,
+                )
+            )
+            repaired = OllamaClient._repair_unescaped_json_string_quotes(
+                repaired
+            )
+            try:
+                value = json.loads(repaired)
+            except json.JSONDecodeError:
+                yaml_like = OllamaClient._parse_key_value_object(cleaned)
+                if yaml_like is not None:
+                    return sanitize_unicode_data(yaml_like)
+                decoder = json.JSONDecoder()
+                value = None
+                for match in re.finditer(r"[\[{]", cleaned):
+                    try:
+                        candidate, _ = decoder.raw_decode(cleaned[match.start():])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(candidate, (dict, list)):
+                        value = candidate
+                        break
+                if value is None:
+                    raise RuntimeError("Ollama did not return a JSON object")
         if isinstance(value, list):
             value = {"items": value}
         if not isinstance(value, dict):
             raise RuntimeError("Ollama JSON response must be an object or array")
-        return value
+        return sanitize_unicode_data(value)
+
+    @staticmethod
+    def _repair_missing_schema_property_separators(
+        content: str,
+        *,
+        schema: dict[str, Any] | str | None,
+    ) -> str:
+        """Close a malformed scalar before a known top-level Schema key.
+
+        A schema-constrained local model can finish a long string value and
+        start the next requested property on a new line without emitting the
+        closing quote and comma.  Generic JSON substring recovery then finds
+        an inner span object and loses the otherwise complete response.  This
+        repair is deliberately Schema-guided: it considers only a line that
+        starts with an exact top-level property declared by the request, and
+        only while the JSON scanner is still inside the preceding string.
+        The reconstructed object must subsequently pass ordinary JSON parsing
+        and the complete top-level Schema check.
+        """
+
+        if not isinstance(schema, dict):
+            return content
+        properties = schema.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            return content
+        known = {str(key) for key in properties}
+        if not known or "\n" not in content:
+            return content
+
+        result: list[str] = []
+        in_string = False
+        escaped = False
+        index = 0
+        length = len(content)
+        while index < length:
+            char = content[index]
+            if char == "\n" and in_string and not escaped:
+                match = re.match(
+                    r'\n([ \t]*)"([^"\\\r\n]+)"[ \t]*:',
+                    content[index:],
+                )
+                if match is not None and match.group(2) in known:
+                    result.extend(('"', ',', '\n'))
+                    in_string = False
+                    index += 1
+                    continue
+            result.append(char)
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            index += 1
+        return "".join(result)
+
+    @staticmethod
+    def _repair_unescaped_json_string_quotes(content: str) -> str:
+        """Escape only quotes that are unambiguously inside a JSON string.
+
+        Schema-constrained local models occasionally place a quoted phrase in
+        a long rationale without escaping its double quotes.  The surrounding
+        object and every typed audit field can otherwise be valid.  A quote is
+        treated as a legitimate string terminator only when the next
+        non-whitespace character is a JSON delimiter (colon for an object key,
+        comma, closing bracket/brace, or end of input).  The repaired object is
+        still parsed normally and then checked against the complete requested
+        Schema; this helper never fabricates a field or accepts a fragment.
+        """
+
+        result: list[str] = []
+        in_string = False
+        escaped = False
+        length = len(content)
+        for index, char in enumerate(content):
+            if not in_string:
+                result.append(char)
+                if char == '"':
+                    in_string = True
+                continue
+            if escaped:
+                result.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                result.append(char)
+                escaped = True
+                continue
+            if char != '"':
+                result.append(char)
+                continue
+            next_index = index + 1
+            while (
+                next_index < length
+                and content[next_index] in " \t\r\n"
+            ):
+                next_index += 1
+            next_char = (
+                content[next_index] if next_index < length else ""
+            )
+            if not next_char or next_char in ":,}]":
+                result.append(char)
+                in_string = False
+            else:
+                result.append('\\"')
+        return "".join(result)
+
+    @staticmethod
+    def _parse_key_value_object(content: str) -> dict[str, Any] | None:
+        """Recover a small line-oriented object emitted instead of JSON.
+
+        This intentionally handles only ``key: scalar`` and JSON-array values.
+        It is a transport compatibility layer for schema-constrained models
+        that occasionally emit YAML-like lines; semantic aliases and type
+        rules remain in the component parsers.
+        """
+
+        result: dict[str, Any] = {}
+        for line in content.splitlines():
+            match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$", line)
+            if not match:
+                continue
+            key, raw_value = match.groups()
+            if not raw_value:
+                result[key] = ""
+                continue
+            try:
+                result[key] = json.loads(raw_value)
+            except json.JSONDecodeError:
+                normalized = raw_value.strip().lower()
+                if normalized == "true":
+                    result[key] = True
+                elif normalized == "false":
+                    result[key] = False
+                elif normalized in {"null", "none"}:
+                    result[key] = None
+                else:
+                    result[key] = raw_value.strip().strip('"').strip("'")
+        return result if len(result) >= 2 else None
+
+    @staticmethod
+    def _validate_schema_shape(
+        value: dict[str, Any], schema: dict[str, Any] | str | None,
+    ) -> None:
+        """Reject a JSON-shaped fragment that is not the requested object.
+
+        Some local models wrap a YAML-like answer in prose.  The permissive
+        substring recovery in ``_parse_json`` can otherwise mistake an inner
+        list (for example a span) for the whole response.  Checking only the
+        schema's top-level required keys keeps this transport-layer guard
+        generic; component parsers remain responsible for semantic validation.
+        """
+
+        if not isinstance(schema, dict):
+            return
+        required = schema.get("required")
+        if not isinstance(required, list):
+            return
+        if OllamaClient._schema_accepts_items_array(value, schema):
+            return
+        missing = [
+            str(key) for key in required
+            if str(key) not in value
+        ]
+        if missing:
+            raise RuntimeError(
+                "Ollama JSON response omitted required fields: "
+                + ", ".join(missing[:12])
+            )
+
+    @staticmethod
+    def _schema_has_known_property(
+        value: dict[str, Any], schema: dict[str, Any] | str | None,
+    ) -> bool:
+        if not isinstance(schema, dict):
+            return True
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return True
+        if OllamaClient._schema_accepts_items_array(value, schema):
+            return True
+        if any(str(key) in properties for key in value):
+            return True
+        # A line-oriented compatibility object may use parser-level aliases
+        # rather than the exact schema spellings.  Require several fields so
+        # an extracted inner list/object such as ``{"items": [...]}`` is not
+        # mistaken for the response root.
+        return len(value) >= 3 and "items" not in value
+
+    @staticmethod
+    def _schema_accepts_items_array(
+        value: dict[str, Any], schema: dict[str, Any] | str | None,
+    ) -> bool:
+        """Allow the historical object wrapper for a top-level JSON array."""
+
+        if not isinstance(schema, dict) or value.keys() != {"items"}:
+            return False
+        required = schema.get("required")
+        properties = schema.get("properties")
+        if not isinstance(required, list) or not isinstance(properties, dict):
+            return False
+        array_fields = [
+            key for key in required
+            if isinstance(properties.get(key), dict)
+            and properties[key].get("type") == "array"
+        ]
+        return len(array_fields) == 1

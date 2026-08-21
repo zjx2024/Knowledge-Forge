@@ -35,10 +35,22 @@ P1_RELATION_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
 
 P2_ENTITY_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
     **P1_RELATION_SHADOW_POLICY_SET,
-    "entity_extraction_policy_version": "entity-extraction-p2-structure-gate-v2",
-    "entity_resolution_policy_version": "entity-resolution-p2-evidence-identity-v2",
-    "entity_identity_policy_version": "entity-identity-exact-canonical-name-v1",
-    "entity_identity_profile": "exact_canonical_name_only",
+    "entity_extraction_policy_version": "entity-extraction-p2-proposition-arguments-v15-reference-placeholders",
+    "entity_resolution_policy_version": "entity-resolution-p2-symbol-safe-v10",
+    "entity_identity_policy_version": "entity-identity-symbol-safe-v9",
+    "entity_identity_profile": "bounded_similarity",
+})
+
+# The entity snapshot is reused by relation-policy experiments.  Keep the
+# required policy axes present for audit compatibility, but make relation axes
+# explicitly non-semantic here; the relation runtime owns and fingerprints its
+# own policy set.  Otherwise a verifier/predicate change needlessly re-runs the
+# expensive, model-backed entity extraction.
+ENTITY_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **P2_ENTITY_SHADOW_POLICY_SET,
+    "relation_candidate_policy_version": "entity-shadow-relation-independent-v1",
+    "relation_classifier_policy_version": "entity-shadow-relation-independent-v1",
+    "verification_policy_version": "entity-shadow-relation-independent-v1",
 })
 
 PUBLISH_PREDICATE_VERSION = "publish-predicate-p0-v1"

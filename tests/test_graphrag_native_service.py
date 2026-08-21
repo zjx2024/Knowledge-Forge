@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from knowledge_forge.graphrag_native_artifacts import NativeArtifact
+from knowledge_forge.graphrag_native_config import GraphRAGNativePromptProfileBuilder
 from knowledge_forge.graphrag_native_executor import GraphRAGNativeExecutor, NativeNoGraphUnsupported
 from knowledge_forge.graphrag_native_inputs import NativeInputBuild, NativeInputPreflight
 from knowledge_forge.graphrag_native_runner import NativeProcessProgress
@@ -20,13 +22,19 @@ class _Tripwire:
 class _Database:
     def __init__(self):
         self.calls: list[tuple[str, object]] = []
-        self.job = {"id": "job-1", "status": "queued"}
+        self.job = {"id": "job-1", "status": "queued", "metadata": {}}
         self.fail_renewal = False
 
     def assert_graphrag_native_ready(self): self.calls.append(("ready", None)); return {}
     def get_project(self, project_id): return {"id": project_id, "llm_model": "llm", "embedding_model": "embed"}
     def latest_active_job(self, *_args): return None
-    def update_job(self, _job_id, **values): self.calls.append(("job", values)); self.job.update(values); return self.job
+    def update_job(self, _job_id, **values):
+        self.calls.append(("job", values))
+        metadata = values.pop("metadata", None)
+        if metadata is not None:
+            self.job["metadata"] = {**self.job.get("metadata", {}), **metadata}
+        self.job.update(values)
+        return self.job
     def get_job(self, _job_id): return dict(self.job)
     def create_graphrag_native_run(self, values): self.calls.append(("create", values)); return {"run_id": values["run_id"]}
     def acquire_graphrag_native_run_lease(self, run_id, _owner, **_kwargs): self.calls.append(("lease", run_id)); return {"run_id": run_id}
@@ -38,13 +46,25 @@ class _Database:
     def replace_graphrag_native_run_documents(self, run_id, docs, **_values): self.calls.append(("documents", (run_id, docs)))
     def update_graphrag_native_run(self, run_id, **values): self.calls.append(("run", (run_id, values))); return {"run_id": run_id}
     def replace_graphrag_native_artifacts(self, run_id, artifacts, **_values): self.calls.append(("artifacts", (run_id, artifacts)))
-    def activate_graphrag_native_run(self, run_id, **_values): self.calls.append(("activate", run_id)); return {"run_id": run_id, "state": "READY"}
+    def activate_graphrag_native_run(self, run_id, **values):
+        self.calls.append(("activate", (run_id, values)))
+        self.job["metadata"] = {
+            **self.job.get("metadata", {}),
+            "publication_committed": True,
+        }
+        return {"run_id": run_id, "state": "READY"}
 
 
 class _Runner:
     def initialize(self, *, root, **_kwargs):
         (root / "prompts").mkdir(parents=True, exist_ok=True)
-        (root / "prompts" / "extract_graph.txt").write_text("native", encoding="utf-8")
+        for name in GraphRAGNativePromptProfileBuilder.required_prompt_names:
+            content = (
+                "Return output in English with {input_text}."
+                if name in {"extract_graph.txt", "extract_claims.txt"}
+                else "native prompt"
+            )
+            (root / "prompts" / name).write_text(content, encoding="utf-8")
         return SimpleNamespace(returncode=0)
     def config_dry_run(self, **_kwargs): return SimpleNamespace(returncode=0)
     def connectivity_dry_run(self, **_kwargs): return SimpleNamespace(returncode=0)
@@ -116,6 +136,10 @@ def test_native_executor_runs_only_native_chain_and_persists_control_plane(monke
         for name, value in database.calls if name == "job"
     )
     assert "renew" in names
+    _run_id, activation_values = next(
+        value for name, value in database.calls if name == "activate"
+    )
+    assert activation_values["job_id"] == "job-1"
 
 
 def test_native_executor_lease_renewal_failure_stops_before_publication(monkeypatch, tmp_path):
@@ -144,11 +168,39 @@ def test_native_executor_failure_never_falls_back_to_a_legacy_chain(monkeypatch,
     assert "activate" not in [name for name, _value in database.calls]
 
 
+def test_native_executor_cancellation_stops_before_publication_and_cleans_bundle(
+    monkeypatch, tmp_path,
+):
+    executor, database = _executor(monkeypatch, tmp_path)
+
+    def cancelled_index(**_kwargs):
+        database.job.setdefault("metadata", {})["cancel_requested"] = True
+        raise RuntimeError("isolated child stopped")
+
+    monkeypatch.setattr(executor.runner, "index", cancelled_index)
+
+    executor.run(job_id="job-1", project_id=7)
+
+    names = [name for name, _value in database.calls]
+    assert database.job["status"] == "cancelled"
+    assert database.job["metadata"]["stage"] == "cancelled"
+    assert database.job["metadata"]["cancel_acknowledged_at"]
+    assert "activate" not in names
+    assert "artifacts" not in names
+    assert not list((tmp_path / "graphrag_native" / ".staging").glob("*"))
+
+
 def test_candidate_evidence_is_secret_free_and_contains_reproducible_sources(monkeypatch, tmp_path):
     executor, _database = _executor(monkeypatch, tmp_path)
     root = tmp_path / "evidence"; (root / "kf-manifest").mkdir(parents=True)
     monkeypatch.setattr(executor, "_write_candidate_evidence", GraphRAGNativeExecutor._write_candidate_evidence.__get__(executor, GraphRAGNativeExecutor))
-    monkeypatch.setattr(executor, "_git_output", lambda *_args: "")
+    monkeypatch.setattr(
+        executor,
+        "_git_output",
+        lambda *_args: (
+            '+fixture = "Authorization: Bearer secret-token-value-123456"\n'
+        ),
+    )
 
     executor._write_candidate_evidence(root, identity={"base_sha": "0" * 40, "head": "1" * 40, "worktree_diff_hash": "2" * 64, "code_tree_hash": "3" * 64}, prompt_hash="4" * 64)
 
@@ -156,6 +208,57 @@ def test_candidate_evidence_is_secret_free_and_contains_reproducible_sources(mon
     assert (manifest / "candidate-source-archive.tar.zst").is_file()
     assert (manifest / "candidate-source-manifest.json").is_file()
     assert "api_key" not in (manifest / "runtime-environment.json").read_text(encoding="utf-8").lower()
+    assert "secret-token-value" not in (
+        manifest / "candidate-worktree.patch"
+    ).read_text(encoding="utf-8")
+    redaction = json.loads(
+        (manifest / "candidate-worktree-redaction.json").read_text(encoding="utf-8")
+    )
+    assert redaction["redacted_line_count"] == 1
+
+
+def test_native_executor_reuses_only_compatible_completed_failed_call_cache(
+    monkeypatch, tmp_path,
+):
+    executor, database = _executor(monkeypatch, tmp_path)
+    source = tmp_path / "graphrag_native" / ".staging" / "failed-attempt"
+    (source / "cache" / "nested").mkdir(parents=True)
+    (source / "cache" / "nested" / "entry.json").write_text(
+        '{"cached": true}', encoding="utf-8",
+    )
+    current = {
+        "run_id": "current",
+        "source_snapshot_hash": "a" * 64,
+        "settings_hash": "b" * 64,
+        "prompt_profile_hash": "c" * 64,
+        "completion_model_id": "llm",
+        "completion_model_digest": "d" * 64,
+        "embedding_model_id": "embed",
+        "embedding_model_digest": "e" * 64,
+        "embedding_dimension": 1024,
+        "graphrag_version": "3.1.1",
+    }
+    database.list_graphrag_native_runs = lambda _project_id: [{
+        **current,
+        "run_id": "failed",
+        "state": "FAILED",
+        "failure_class": "GraphRAGNativeBundleError",
+        "execution_completed_at": "2026-08-21T00:00:00Z",
+        "staging_relative_path": ".staging/failed-attempt",
+    }]
+    destination = tmp_path / "graphrag_native" / ".staging" / "current-attempt"
+    destination.mkdir(parents=True)
+
+    result = executor._seed_compatible_graph_cache(
+        destination, project_id=7, current_run=current,
+    )
+
+    assert result and result["source_run_id"] == "failed"
+    assert result["file_count"] == 1
+    assert (destination / "cache" / "nested" / "entry.json").read_text(
+        encoding="utf-8",
+    ) == '{"cached": true}'
+    assert (destination / "kf-manifest" / "cache-reuse.json").is_file()
 
 
 def test_source_provenance_marker_in_graph_output_is_rejected(tmp_path):

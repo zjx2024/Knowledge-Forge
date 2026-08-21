@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from copy import deepcopy
 from pathlib import Path
 
@@ -39,6 +40,23 @@ MENTIONS = [
         "type": "TargetType",
     },
 ]
+
+
+def _role_probe(*_args):
+    return {
+        "subject_role": "source endpoint role",
+        "object_role": "target endpoint role",
+    }
+
+
+def _role_alignment_probe(prompt, *_args):
+    payload = json.loads(prompt)
+    symmetric = bool(payload.get("symmetric"))
+    return {
+        "forward_alignment": "ALIGNED",
+        "reverse_alignment": "ALIGNED" if symmetric else "MISALIGNED",
+        "exact_argument_orientation": "SYMMETRIC" if symmetric else "FORWARD",
+    }
 
 
 def _plan(schema: dict, *, content: str = CONTENT):
@@ -88,12 +106,22 @@ def _run_supported(schema: dict, predicate: str):
         pair,
         content=CONTENT,
         logical_schema=schema,
+        role_probe=_role_probe,
+        role_alignment_probe=_role_alignment_probe,
         verifier=lambda _prompt, _contract: (
             calls.append(hypothesis.hypothesis_id)
             or {
                 "hypothesis_id": hypothesis.hypothesis_id,
                 "verdict": v2.SUPPORTED,
                 "reason_code": "FIXTURE_SUPPORTED",
+                "forward_entailment": "ENTAILED",
+                "reverse_entailment": (
+                    "ENTAILED"
+                    if v2.normalize_predicate_schema(schema)[predicate].symmetric
+                    else "NOT_ENTAILED"
+                ),
+                "subject_role_supported": True,
+                "object_role_supported": True,
                 "supported_evidence_spans": [
                     {"start": 0, "end": len(CONTENT)}
                 ],
@@ -162,6 +190,8 @@ def test_same_name_publish_mode_metadata_changes_verifier_and_publish_behavior()
         pair,
         content=CONTENT,
         logical_schema=review_schema,
+        role_probe=_role_probe,
+        role_alignment_probe=_role_alignment_probe,
         verifier=lambda *_args: pytest.fail("review-only called verifier"),
         verifier_model_revision="fixture-verifier",
     )
@@ -261,10 +291,16 @@ def test_fictional_predicates_support_multi_relation_without_known_names():
             pair,
             content=CONTENT,
             logical_schema=schema,
+            role_probe=_role_probe,
+            role_alignment_probe=_role_alignment_probe,
             verifier=lambda _prompt, _contract, item=hypothesis: {
                 "hypothesis_id": item.hypothesis_id,
                 "verdict": v2.SUPPORTED,
                 "reason_code": "FIXTURE_SUPPORTED",
+                "forward_entailment": "ENTAILED",
+                "reverse_entailment": "NOT_ENTAILED",
+                "subject_role_supported": True,
+                "object_role_supported": True,
                 "supported_evidence_spans": [
                     {"start": 0, "end": len(CONTENT)}
                 ],
@@ -440,10 +476,10 @@ def test_enhanced_v2_production_control_flow_has_no_concrete_predicate_or_cue():
     assert violations == []
 
     enhanced_source = inspect.getsource(
-        KnowledgeForgeService._ingest_enhanced_strategy
+        KnowledgeForgeService._ingest_knowledge_forge_strategy
     )
     entity_source = inspect.getsource(
-        KnowledgeForgeService.build_entity_shadow_namespace
+        KnowledgeForgeService.build_grounded_entity_namespace
     )
     runtime_source = inspect.getsource(ShadowRelationV2Runtime)
     combined = "\n".join((enhanced_source, entity_source, runtime_source))

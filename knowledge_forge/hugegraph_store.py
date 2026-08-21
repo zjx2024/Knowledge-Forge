@@ -8,7 +8,7 @@ import io
 import logging
 from datetime import datetime, timezone
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from pyhugegraph.client import PyHugeClient
@@ -17,6 +17,7 @@ from .config import Config
 from .database import Database
 from .graph_manifest import GraphManifestAccumulator, build_graph_manifest
 from .graph_safety import GraphMutationContext, GraphSafetyError
+from .knowledge_forge_descriptions import relation_display_label
 
 
 # A missing customized vertex is the normal first-write path. The SDK logs that
@@ -166,9 +167,17 @@ class HugeGraphStore:
         return f"kf:entity:{namespace_id}:{entity_id}"
 
     @staticmethod
-    def shadow_entity_vertex_id(namespace_id: str, canonical_key: str) -> str:
+    def grounded_entity_vertex_id(namespace_id: str, canonical_key: str) -> str:
+        """Return the stable vertex identity for a grounded canonical entity.
+
+        The ``shadow-entity`` prefix is retained in persisted HugeGraph IDs so
+        published manifests and existing evidence links remain addressable.
+        """
         digest = hashlib.sha256(str(canonical_key).encode("utf-8")).hexdigest()
         return f"kf:shadow-entity:{namespace_id}:{digest}"
+
+    # Compatibility for callers that still import the historical storage term.
+    shadow_entity_vertex_id = grounded_entity_vertex_id
 
     @staticmethod
     def _stable_int(value: str) -> int:
@@ -302,12 +311,14 @@ class HugeGraphStore:
         document: dict[str, Any],
         chunks: list[dict[str, Any]],
         *, mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, int]:
         """Write into an already-purged full rebuild without schema/purge repetition."""
 
         self._validate_mutation(project, mutation)
         return self._write_document_snapshot(
             self.client().graph(), project, document, chunks, mutation,
+            checkpoint=checkpoint,
         )
 
     def _write_document_snapshot(
@@ -317,7 +328,13 @@ class HugeGraphStore:
         document: dict[str, Any],
         chunks: list[dict[str, Any]],
         mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, int]:
+        def check() -> None:
+            if checkpoint is not None:
+                checkpoint()
+
+        check()
         project_id, document_id = int(project["id"]), int(document["id"])
         namespace = mutation.namespace_id
         common = {
@@ -334,6 +351,7 @@ class HugeGraphStore:
         self._record_writer(mutation, {"kind": "vertex", "label": "KFDocument",
             "logical_id": doc_vertex_id, "properties": self._manifest_properties(doc_properties)})
         for chunk in chunks:
+            check()
             chunk_id = int(chunk["id"]); vertex_id = self.chunk_vertex_id(namespace, chunk_id)
             chunk_properties = {**common, "kf_doc_id": document_id,
                 "kf_chunk_id": chunk_id, "kf_name": str(chunk.get("chunk_key") or ""),
@@ -348,12 +366,19 @@ class HugeGraphStore:
                 "logical_id": f"contains:{doc_vertex_id}:{vertex_id}", "source": doc_vertex_id,
                 "target": vertex_id, "direction": "out-in",
                 "properties": self._manifest_properties(edge_properties)})
+        check()
         return {"documents": 1, "chunks": len(chunks)}
 
     def sync_document_assertions(
         self, project: dict[str, Any], document: dict[str, Any],
         *, mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, int]:
+        def check() -> None:
+            if checkpoint is not None:
+                checkpoint()
+
+        check()
         self._validate_mutation(project, mutation)
         graph = self.client().graph(); project_id, document_id = int(project["id"]), int(document["id"])
         namespace = mutation.namespace_id
@@ -366,6 +391,7 @@ class HugeGraphStore:
         relations = self.db.list_document_relations(document_id)
         entities = {int(item["canonical_entity_id"]): item for item in mentions}
         for entity_id, mention in entities.items():
+            check()
             vertex_id = self.entity_vertex_id(namespace, entity_id)
             entity_properties = {"kf_namespace_id": namespace,
                 "kf_graph_generation": mutation.generation, "kf_policy_hash": mutation.policy_hash,
@@ -379,6 +405,7 @@ class HugeGraphStore:
                 "logical_id": vertex_id, "properties": self._manifest_properties(entity_properties)})
             self.db.set_entity_graph_id(entity_id, vertex_id)
         for mention in mentions:
+            check()
             source = self.chunk_vertex_id(namespace, int(mention["chunk_id"]))
             target = self.entity_vertex_id(namespace, int(mention["canonical_entity_id"]))
             properties = {**common,
@@ -390,6 +417,7 @@ class HugeGraphStore:
                 "direction": "out-in", "properties": self._manifest_properties(properties)})
             if edge: self.db.set_mention_graph_id(int(mention["id"]), str(edge.id))
         for relation in relations:
+            check()
             source = self.entity_vertex_id(namespace, int(relation["source_entity_id"]))
             target = self.entity_vertex_id(namespace, int(relation["target_entity_id"]))
             properties = {**common,
@@ -402,6 +430,7 @@ class HugeGraphStore:
                 "logical_id": f"relation:{relation['id']}", "source": source, "target": target,
                 "direction": "out-in", "properties": self._manifest_properties(properties)})
             if edge: self.db.set_relation_graph_id(int(relation["id"]), str(edge.id))
+        check()
         return {"entities": len(entities), "mentions": len(mentions), "relations": len(relations)}
 
     def delete_document(
@@ -413,20 +442,30 @@ class HugeGraphStore:
         )
 
     def prune_project_entities(
-        self, project: dict[str, Any], *, mutation: GraphMutationContext,
+        self,
+        project: dict[str, Any],
+        *,
+        mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> int:
         self._validate_mutation(project, mutation)
         project_id = int(project["id"])
         active_ids = {int(item["id"]) for item in self.db.list_canonical_entities(project_id)}
         graph = self.client().graph(); removed = 0
         for vertex in self._iter_vertices(graph, "KFEntity", {"kf_namespace_id": mutation.namespace_id}):
+            if checkpoint is not None:
+                checkpoint()
             entity_id = int(vertex.properties.get("kf_entity_id") or 0)
             if entity_id not in active_ids:
                 graph.removeVertexById(vertex.id); removed += 1
         return removed
 
     def delete_project(
-        self, project: dict[str, Any], *, mutation: GraphMutationContext | None,
+        self,
+        project: dict[str, Any],
+        *,
+        mutation: GraphMutationContext | None,
+        checkpoint: Callable[[], None] | None = None,
     ) -> None:
         mutation = self._validate_mutation(project, mutation)
         graph = self.client().graph()
@@ -441,22 +480,40 @@ class HugeGraphStore:
         )
         for label in ("kf_related", "kf_mentions", "kf_contains"):
             for edge in self._iter_edges(graph, label=label, properties={"kf_namespace_id": namespace}):
+                if checkpoint is not None:
+                    checkpoint()
                 graph.removeEdgeById(edge.id)
         for label in ("KFChunk", "KFDocument", "KFEntity"):
             for vertex in self._iter_vertices(graph, label, {"kf_namespace_id": namespace}):
+                if checkpoint is not None:
+                    checkpoint()
                 graph.removeVertexById(vertex.id)
+
+    def discard_writer_manifest(self, mutation: GraphMutationContext) -> None:
+        """Close an unfinished generation's local manifest accumulator."""
+
+        accumulator = self._writer_records.pop(
+            (mutation.namespace_id, mutation.generation), None,
+        )
+        if accumulator is not None:
+            accumulator.close()
 
     def replace_strategy_snapshot(
         self,
         project: dict[str, Any],
         documents: list[dict[str, Any]],
         chunks_by_document: dict[int, list[dict[str, Any]]],
-        shadow_snapshot: dict[str, Any],
+        grounded_snapshot: dict[str, Any],
         *,
         strategy_key: str,
         mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, int]:
-        """Replace one isolated strategy graph from a complete shadow snapshot."""
+        """Replace one isolated strategy graph from a complete grounded snapshot."""
+
+        def check() -> None:
+            if checkpoint is not None:
+                checkpoint()
 
         scoped_project = {
             **project,
@@ -465,17 +522,22 @@ class HugeGraphStore:
             "_strategy_key": strategy_key,
         }
         self._validate_mutation(scoped_project, mutation)
+        check()
         self.ensure_schema()
+        check()
         self.delete_project(scoped_project, mutation=mutation)
+        check()
         graph = self.client().graph()
         counts = {
             "documents": 0, "chunks": 0, "entities": 0,
             "mentions": 0, "relations": 0,
         }
         for document in documents:
+            check()
             written = self._write_document_snapshot(
                 graph, scoped_project, document,
                 chunks_by_document.get(int(document["id"]), []), mutation,
+                checkpoint=checkpoint,
             )
             counts["documents"] += int(written["documents"])
             counts["chunks"] += int(written["chunks"])
@@ -490,14 +552,15 @@ class HugeGraphStore:
             "kf_strategy_key": strategy_key,
             "kf_updated_at": self._now(),
         }
-        canonicals = shadow_snapshot.get("canonicals") or []
+        canonicals = grounded_snapshot.get("canonicals") or []
         assignments = {
             str(item["mention_key"]): str(item["canonical_key"])
-            for item in shadow_snapshot.get("assignments") or []
+            for item in grounded_snapshot.get("assignments") or []
         }
         for canonical in canonicals:
+            check()
             canonical_key = str(canonical["canonical_key"])
-            vertex_id = self.shadow_entity_vertex_id(namespace, canonical_key)
+            vertex_id = self.grounded_entity_vertex_id(namespace, canonical_key)
             metadata = canonical.get("metadata") or {}
             properties = {
                 **common,
@@ -515,13 +578,14 @@ class HugeGraphStore:
             })
             counts["entities"] += 1
 
-        for mention in shadow_snapshot.get("mentions") or []:
+        for mention in grounded_snapshot.get("mentions") or []:
+            check()
             mention_key = str(mention["mention_key"])
             canonical_key = assignments.get(mention_key)
             if not canonical_key:
-                raise RuntimeError(f"shadow mention 缺少 canonical assignment: {mention_key}")
+                raise RuntimeError(f"grounded mention 缺少 canonical assignment: {mention_key}")
             source = self.chunk_vertex_id(namespace, int(mention["chunk_id"]))
-            target = self.shadow_entity_vertex_id(namespace, canonical_key)
+            target = self.grounded_entity_vertex_id(namespace, canonical_key)
             properties = {
                 **common,
                 "kf_doc_id": int(mention["document_id"]),
@@ -533,28 +597,42 @@ class HugeGraphStore:
             graph.addEdge("kf_mentions", source, target, properties)
             self._record_writer(mutation, {
                 "kind": "edge", "label": "kf_mentions",
-                "logical_id": f"shadow-mention:{mention_key}",
+                "logical_id": f"grounded-mention:{mention_key}",
                 "source": source, "target": target, "direction": "out-in",
                 "properties": self._manifest_properties(properties),
             })
             counts["mentions"] += 1
 
-        for relation in shadow_snapshot.get("relation_endpoints") or []:
+        for relation in grounded_snapshot.get("relation_endpoints") or []:
+            check()
             relation_key = str(relation["relation_key"])
-            source = self.shadow_entity_vertex_id(
+            source = self.grounded_entity_vertex_id(
                 namespace, str(relation["source_canonical_key"]),
             )
-            target = self.shadow_entity_vertex_id(
+            target = self.grounded_entity_vertex_id(
                 namespace, str(relation["target_canonical_key"]),
             )
             metadata = relation.get("metadata") or {}
+            display_relation = relation_display_label(
+                relation.get("relation_type"), metadata,
+            )
+            evidence_description = str(
+                relation.get("evidence_text") or ""
+            )
             properties = {
                 **common,
                 "kf_doc_id": int(relation["document_id"]),
                 "kf_chunk_id": int(relation["chunk_id"]),
                 "kf_assertion_id": self._stable_int(relation_key),
                 "kf_relation_type": str(relation.get("relation_type") or "related_to"),
-                "kf_description": str(relation.get("evidence_text") or ""),
+                "kf_description": (
+                    f"{display_relation}：{evidence_description}"
+                    if display_relation else evidence_description
+                ),
+                # The existing physical KF schema requires this compatibility
+                # field.  Product views deliberately do not expose it as a
+                # calibrated probability when the extraction run supplied no
+                # score; publication status and evidence count are authoritative.
                 "kf_confidence": float(metadata.get("confidence") or 1.0),
                 "kf_schema_version": int(project.get("active_schema_version") or 1),
             }
@@ -566,6 +644,7 @@ class HugeGraphStore:
                 "properties": self._manifest_properties(properties),
             })
             counts["relations"] += 1
+        check()
         return counts
 
     def _purge_document_graph(
@@ -586,20 +665,38 @@ class HugeGraphStore:
             }):
                 graph.removeVertexById(vertex.id)
 
-    def statistics(self, project: dict[str, Any]) -> dict[str, int]:
+    def statistics(
+        self,
+        project: dict[str, Any],
+        *,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> dict[str, int]:
         graph = self.client().graph()
         namespace = str(project["graph_namespace_id"])
         result = {}
         for key, label in (("documents", "KFDocument"), ("chunks", "KFChunk"), ("entities", "KFEntity")):
-            result[key] = sum(1 for _ in self._iter_vertices(graph, label, {"kf_namespace_id": namespace}))
-        result["relations"] = sum(
-            1 for _ in self._iter_edges(graph, label="kf_related", properties={"kf_namespace_id": namespace})
-        )
+            count = 0
+            for _ in self._iter_vertices(
+                graph, label, {"kf_namespace_id": namespace},
+            ):
+                if checkpoint is not None:
+                    checkpoint()
+                count += 1
+            result[key] = count
+        relations = 0
+        for _ in self._iter_edges(
+            graph, label="kf_related", properties={"kf_namespace_id": namespace},
+        ):
+            if checkpoint is not None:
+                checkpoint()
+            relations += 1
+        result["relations"] = relations
         return result
 
     def expected_manifest(
         self, project: dict[str, Any], documents: list[dict[str, Any]],
         *, mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Derive the exact generation manifest from current PostgreSQL facts."""
 
@@ -614,6 +711,8 @@ class HugeGraphStore:
             ))] = record
 
         for document in documents:
+            if checkpoint is not None:
+                checkpoint()
             document_id = int(document["id"])
             common = {
                 "kf_namespace_id": namespace, "kf_graph_generation": mutation.generation,
@@ -628,6 +727,8 @@ class HugeGraphStore:
                     "kf_source_url": document["storage_path"],
                     "kf_schema_version": int(project.get("active_schema_version") or 1)}})
             for chunk in self.db.list_document_chunks(document_id):
+                if checkpoint is not None:
+                    checkpoint()
                 chunk_id = int(chunk["id"])
                 chunk_vertex = self.chunk_vertex_id(namespace, chunk_id)
                 add({"kind": "vertex", "label": "KFChunk", "logical_id": chunk_vertex,
@@ -641,6 +742,8 @@ class HugeGraphStore:
                     "properties": {**common, "kf_doc_id": document_id}})
             mentions = self.db.list_document_mentions(document_id)
             for mention in mentions:
+                if checkpoint is not None:
+                    checkpoint()
                 entity_id = int(mention["canonical_entity_id"])
                 entity_vertex = self.entity_vertex_id(namespace, entity_id)
                 add({"kind": "vertex", "label": "KFEntity", "logical_id": entity_vertex,
@@ -660,6 +763,8 @@ class HugeGraphStore:
                     "logical_id": f"mention:{mention['id']}", "source": source,
                     "target": entity_vertex, "direction": "out-in", "properties": properties})
             for relation in self.db.list_document_relations(document_id):
+                if checkpoint is not None:
+                    checkpoint()
                 source = self.entity_vertex_id(namespace, int(relation["source_entity_id"]))
                 target = self.entity_vertex_id(namespace, int(relation["target_entity_id"]))
                 add({"kind": "edge", "label": "kf_related",
@@ -692,7 +797,11 @@ class HugeGraphStore:
             self._writer_records.pop(key, None)
 
     def actual_manifest(
-        self, project: dict[str, Any], *, mutation: GraphMutationContext,
+        self,
+        project: dict[str, Any],
+        *,
+        mutation: GraphMutationContext,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Read the namespace through bounded cursor pages and hash exact graph facts."""
 
@@ -702,6 +811,8 @@ class HugeGraphStore:
         def records():
             for label in ("KFDocument", "KFChunk", "KFEntity"):
                 for vertex in self._iter_vertices(graph, label, {"kf_namespace_id": namespace}):
+                    if checkpoint is not None:
+                        checkpoint()
                     yield {
                         "kind": "vertex", "label": label, "logical_id": str(vertex.id),
                         "properties": self._manifest_properties(dict(vertex.properties or {})),
@@ -710,6 +821,8 @@ class HugeGraphStore:
                 for edge in self._iter_edges(
                     graph, label=label, properties={"kf_namespace_id": namespace},
                 ):
+                    if checkpoint is not None:
+                        checkpoint()
                     properties = dict(edge.properties or {})
                     if label == "kf_contains":
                         logical_id = f"contains:{edge.outV}:{edge.inV}"

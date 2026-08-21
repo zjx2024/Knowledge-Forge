@@ -162,7 +162,12 @@ def test_persisted_gateway_replays_exact_sequence_and_never_calls_model():
             "raw_response_text": '{"verdict":"SUPPORTED"}',
             "parsed_response": {
                 "hypothesis_id": "h1", "verdict": "SUPPORTED",
-                "reason_code": "SUPPORTED", "supported_evidence_spans": [
+                "reason_code": "SUPPORTED",
+                "forward_entailment": "ENTAILED",
+                "reverse_entailment": "NOT_ENTAILED",
+                "subject_role_supported": True,
+                "object_role_supported": True,
+                "supported_evidence_spans": [
                     {"start": 0, "end": 4},
                 ],
             },
@@ -186,6 +191,10 @@ def test_persisted_gateway_replays_exact_sequence_and_never_calls_model():
     assert verifier == {
         "verdict": "SUPPORTED",
         "reason_code": "SUPPORTED",
+        "forward_entailment": "ENTAILED",
+        "reverse_entailment": "NOT_ENTAILED",
+        "subject_role_supported": True,
+        "object_role_supported": True,
         "supported_evidence_spans": [{"start": 0, "end": 4}],
     }
     gateway.assert_replay_complete()

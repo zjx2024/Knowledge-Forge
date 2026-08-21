@@ -1,0 +1,10 @@
+4. Compound statements
+
+A compound statement contains one or more clauses. The `if` statement is used for conditional execution. The `for` statement iterates over the items of an iterable. A `try` statement specifies exception handlers. A suite is a group of statements that forms the body of a clause.
+
+The following example places a suite inside an `if` statement:
+
+    if ready:
+        start()
+
+The `for` statement and the `if` statement are both compound statements, but they have different execution rules.

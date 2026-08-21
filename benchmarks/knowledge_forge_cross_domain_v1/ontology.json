@@ -1,0 +1,57 @@
+{
+  "version": "kf-cross-domain-predicates-v1",
+  "current_schema_predicates": [
+    "part_of",
+    "belongs_to",
+    "located_in",
+    "uses",
+    "depends_on",
+    "causes",
+    "supports"
+  ],
+  "extension_predicates": [
+    "identified_by",
+    "used_for",
+    "iterates_over",
+    "establishes",
+    "sends",
+    "applies_to",
+    "makes_effort_for",
+    "agrees_with",
+    "condition_for",
+    "derived_from",
+    "checks",
+    "submits",
+    "mapped_to",
+    "pursues",
+    "carries",
+    "enters",
+    "about",
+    "provides"
+  ],
+  "notes": {
+    "part_of": "Direction is component or member to containing structure.",
+    "supports": "Only use when the source says that one entity enables, backs, or provides a framework for another.",
+    "located_in": "Use for an explicit spatial containment/state, not merely an action that mentions a location.",
+    "extension_predicates": "These are source-asserted relations retained for schema-coverage analysis. They are not silently collapsed to related_to."
+  },
+  "relation_policies": {
+    "about": {"source_role_pairs":["action_theme->role_complement"]},
+    "applies_to": {"source_role_pairs":["grammatical_subject->role_complement"]},
+    "derived_from": {"source_role_pairs":["grammatical_subject->direct_argument"]},
+    "extracted_from": {"source_role_pairs":["action_theme->role_complement"]},
+    "lacks_content": {"negation_policy":"allow_explicit_negative_relation"},
+    "links_to": {"source_role_pairs":["grammatical_subject->action_theme","grammatical_subject->role_complement"]},
+    "listed_in": {"source_role_pairs":["direct_argument->grammatical_subject"]},
+    "located_in": {"source_role_pairs":["action_theme->role_complement","grammatical_subject->role_complement"]},
+    "mapped_to": {"source_role_pairs":["action_theme->role_complement"]},
+    "part_of": {"source_role_pairs":["action_theme->grammatical_subject","grammatical_subject->direct_argument"]},
+    "possesses": {"source_role_pairs":["possessor->possessed"]},
+    "provides": {"source_role_pairs":["grammatical_subject->action_theme","grammatical_subject->direct_argument"]},
+    "sends": {"source_role_pairs":["grammatical_subject->action_theme"]},
+    "submits": {"source_role_pairs":["grammatical_subject->action_theme"]},
+    "submitted_to": {"source_role_pairs":["action_theme->role_complement"]},
+    "supports": {"source_role_pairs":["grammatical_subject->action_theme","grammatical_subject->role_complement","grammatical_subject->direct_argument"]},
+    "used_for": {"source_role_pairs":["action_theme->role_complement","grammatical_subject->direct_argument"]}
+  }
+}

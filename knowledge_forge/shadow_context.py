@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 from .quality import canonical_json
-from .sentence_spans import split_sentences
+from .sentence_spans import split_relation_scopes
 
 
-SHADOW_CONTEXT_POLICY_VERSION = "shadow-context-source-map-v2"
-SHADOW_CONTEXT_SOURCE_MAP_POLICY = "block-or-legacy-chunk-local-v2"
-KNOWLEDGE_FORGE_STRUCTURE_POLICY_VERSION = "knowledge-forge-structure-gate-v1"
+SHADOW_CONTEXT_POLICY_VERSION = "shadow-context-source-map-v8-cross-block-lists"
+SHADOW_CONTEXT_SOURCE_MAP_POLICY = (
+    "block-sentence-list-or-legacy-local-v8-cross-block-lists"
+)
+KNOWLEDGE_FORGE_STRUCTURE_POLICY_VERSION = "knowledge-forge-structure-gate-v5"
 
 # These are parser roles, rather than business concepts.  They deliberately
 # decide only whether a source is suitable for factual extraction; relation
@@ -23,6 +26,8 @@ _SOURCE_ROLE_ALIASES = {
     "body": "body",
     "text": "body",
     "sentence": "body",
+    "structured_chunk": "body",
+    "legacy_chunk": "body",
     "clause": "body",
     "apposition": "body",
     "list": "list_item",
@@ -49,14 +54,221 @@ _SOURCE_ROLE_ALIASES = {
     "table-header": "table_header",
     "caption": "caption",
     "footnote": "footnote",
+    "image": "media_description",
+    "figure": "media_description",
+    "media_description": "media_description",
     "reference_heading": "reference_heading",
     "table_of_contents": "table_of_contents",
     "index_entry": "index_entry",
 }
 _RELATION_ELIGIBLE_SOURCE_ROLES = frozenset({
-    "body", "list_item", "table_row", "table_cell",
+    "body", "list_item", "table_row", "table_cell", "media_description",
 })
-_LIST_ITEM_LINE = re.compile(r"^\s*(?:[-*+]|\d+[.)]|[A-Za-z][.)])\s+\S")
+_LIST_MARKER_EXCLUDED = frozenset("#.,;:!?，。；：！？()[]{}<>《》【】\"'“”‘’")
+_PAGE_NAVIGATION_HEADING = re.compile(
+    r"^\s{0,3}#{1,6}\s*(?:"
+    r"第\s*\d{1,6}\s*页|"
+    r"pages?\s*[-:#.]?\s*\d{1,6}|"
+    r"p(?:age)?\.?\s*[-:#.]?\s*\d{1,6}"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_STANDALONE_PAGE_NUMBER = re.compile(
+    r"^\s*(?:page|页码)?\s*[-:#.]?\s*\d{1,6}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _list_marker(line: str) -> tuple[str, int] | None:
+    """Return a syntax-only list marker and its indentation width.
+
+    PDF text extraction commonly turns bullets into private-use glyphs or
+    em-dashes.  Treating only ASCII ``-``/``*`` markers as lists makes an
+    otherwise explicit hierarchy look like unrelated prose.  This parser
+    recognizes punctuation/symbol markers (including private-use glyphs) only
+    when followed by whitespace and excludes ordinary sentence punctuation.
+    No text content or domain vocabulary is inspected.
+    """
+
+    leading = len(line) - len(line.lstrip())
+    value = line[leading:]
+    if not value:
+        return None
+    if value[0].isdigit():
+        index = 0
+        while index < len(value) and value[index].isdigit():
+            index += 1
+        if index < len(value) and value[index] in ".)" and index + 1 < len(value):
+            if value[index + 1].isspace() and value[index + 2:].strip():
+                return value[: index + 1], leading
+        return None
+    if len(value) >= 2 and value[0].isascii() and value[0].isalpha():
+        if value[1] in ".)" and len(value) > 2 and value[2].isspace() and value[3:].strip():
+            return value[:2], leading
+        return None
+    index = 0
+    while index < len(value):
+        char = value[index]
+        category = unicodedata.category(char)
+        if char in _LIST_MARKER_EXCLUDED or category[0] not in {"P", "S", "C"}:
+            break
+        index += 1
+    if index == 0 or index >= len(value) or not value[index].isspace():
+        return None
+    if not value[index + 1:].strip():
+        return None
+    return value[:index], leading
+
+
+def _list_marker_style(marker: str) -> str:
+    if marker and marker[0].isdigit():
+        return "decimal"
+    if len(marker) == 2 and marker[0].isascii() and marker[0].isalpha():
+        return "alpha"
+    return marker
+
+
+def _page_navigation_gap(lines: Iterable[str]) -> bool:
+    """Return true only for parser-inserted page navigation scaffolding.
+
+    Coalesced PDF chunks can place a Markdown page marker and a standalone
+    printed page number between two source list items.  Those lines are
+    provenance/navigation, not a semantic section boundary, so they may be
+    transparent to list depth.  A normal heading, prose line, caption or bare
+    number without a page heading still terminates the list.
+    """
+
+    values = [str(line).strip() for line in lines if str(line).strip()]
+    return bool(
+        values
+        and _PAGE_NAVIGATION_HEADING.fullmatch(values[0])
+        and all(
+            _STANDALONE_PAGE_NUMBER.fullmatch(value)
+            for value in values[1:]
+        )
+    )
+
+
+def _list_item_scopes(
+    lines: Iterable[tuple[int, int, int, str]],
+    *,
+    block_key: str,
+) -> list[dict[str, Any]]:
+    """Build auditable list-item scopes and syntax-derived parent links."""
+
+    source_lines = list(lines)
+    line_text_by_index = {
+        int(line_index): str(line)
+        for line_index, _start, _end, line in source_lines
+    }
+    marked: list[tuple[int, int, int, str, str, int]] = []
+    for line_index, start, end, line in source_lines:
+        marker = _list_marker(line)
+        if marker is None:
+            continue
+        marker_text, indent = marker
+        marked.append((line_index, start, end, line, marker_text, indent))
+    groups: list[list[tuple[int, int, int, str, str, int]]] = []
+    styles = [_list_marker_style(item[4]) for item in marked]
+    for index, item in enumerate(marked):
+        previous_line_index = marked[index - 1][0] if index else -1
+        page_continuation = bool(
+            index > 0
+            and item[0] > previous_line_index + 1
+            and _page_navigation_gap(
+                line_text_by_index.get(line_index, "")
+                for line_index in range(previous_line_index + 1, item[0])
+            )
+        )
+        starts_new_root = bool(
+            index > 0 and index + 2 < len(marked)
+            and item[0] == marked[index - 1][0] + 1
+            and styles[index] != styles[index - 1]
+            and styles[index + 1] == styles[index - 1]
+            and styles[index + 2] == styles[index - 1]
+        )
+        if (
+            not groups
+            or (
+                item[0] != groups[-1][-1][0] + 1
+                and not page_continuation
+            )
+            or starts_new_root
+        ):
+            groups.append([])
+        groups[-1].append(item)
+
+    scopes: list[dict[str, Any]] = []
+    for group_index, group in enumerate(groups):
+        last_by_depth: dict[int, str] = {}
+        style_depth: dict[str, int] = {}
+        indent_depth: dict[int, int] = {}
+        previous_depth = 0
+        previous_indent = 0
+        previous_style = ""
+        for item_index, (_line_index, start, end, _line, marker, indent) in enumerate(group):
+            style = _list_marker_style(marker)
+            if not last_by_depth:
+                depth = 0
+            elif indent > previous_indent:
+                depth = previous_depth + 1
+            elif indent < previous_indent:
+                # Explicit source indentation is stronger evidence than a
+                # reused marker glyph.  PDF extraction commonly renders every
+                # level with the same em dash; looking up that glyph in
+                # ``style_depth`` made only the first indented child a child
+                # and incorrectly promoted all of its siblings back to the
+                # root.  Prefer the exact indentation level, with a
+                # conservative nearest-shallower fallback for irregular
+                # whitespace.
+                if indent in indent_depth:
+                    depth = indent_depth[indent]
+                else:
+                    shallower = [
+                        (known_indent, known_depth)
+                        for known_indent, known_depth in indent_depth.items()
+                        if known_indent < indent
+                    ]
+                    depth = (
+                        max(shallower, key=lambda item: item[0])[1] + 1
+                        if shallower else 0
+                    )
+            elif style == previous_style:
+                # Same indentation and marker means a sibling, including when
+                # the marker is also used by a shallower level.
+                depth = previous_depth
+            elif style in style_depth:
+                # With no indentation signal, a recurring marker style can
+                # still close a nested PDF-symbol list back to its prior level.
+                depth = style_depth[style]
+            else:
+                depth = previous_depth + 1
+            depth = max(0, min(depth, len(last_by_depth) + 1))
+            scope_id = f"{block_key}:list-item:{group_index}:{item_index}"
+            parent_scope_id = last_by_depth.get(depth - 1, "") if depth else ""
+            scopes.append({
+                "start": start,
+                "end": end,
+                "source_role": "list_item",
+                "scope_id": scope_id,
+                "scope_kind": "list_item",
+                "list_group_id": f"{block_key}:list-group:{group_index}",
+                "list_depth": depth,
+                "list_marker": marker,
+                "list_parent_scope_id": parent_scope_id,
+            })
+            last_by_depth[depth] = scope_id
+            for stale_depth in [value for value in last_by_depth if value > depth]:
+                del last_by_depth[stale_depth]
+            # Indentation is allowed to refine a marker style's depth.  Keep
+            # the first style depth only for unindented symbol hierarchies;
+            # equal-style siblings above use ``previous_depth`` directly.
+            indent_depth[indent] = depth
+            style_depth.setdefault(style, depth)
+            previous_depth = depth
+            previous_indent = indent
+            previous_style = style
+    return scopes
 
 
 def _first_text(*values: Any) -> str:
@@ -119,10 +331,18 @@ def structural_profile(
     )
     scopes: list[dict[str, Any]] = []
     if atomic_kind == "sentence":
-        for index, (start, end, _text) in enumerate(split_sentences(content)):
+        for index, (start, end, _text) in enumerate(
+            split_relation_scopes(content)
+        ):
+            scope_kind = (
+                "clause"
+                if content[end - 1:end] in {";", "；"}
+                or content[start - 1:start] in {";", "；"}
+                else "sentence"
+            )
             scopes.append({
-                "scope_id": f"sentence:{index}:{start}:{end}",
-                "scope_kind": "sentence",
+                "scope_id": f"relation_scope:{index}:{start}:{end}",
+                "scope_kind": scope_kind,
                 "start": int(start),
                 "end": int(end),
             })
@@ -189,6 +409,12 @@ def occurrence_scope(
                     "scope_kind": str(raw_scope.get("scope_kind") or role),
                     "start": scope_start,
                     "end": scope_end,
+                    "list_group_id": str(raw_scope.get("list_group_id") or ""),
+                    "list_depth": int(raw_scope.get("list_depth") or 0),
+                    "list_marker": str(raw_scope.get("list_marker") or ""),
+                    "list_parent_scope_id": str(
+                        raw_scope.get("list_parent_scope_id") or ""
+                    ),
                 },
             }
     if any(
@@ -252,8 +478,28 @@ def _table_or_list_scopes(
     spans: list[dict[str, Any]] = []
     lines = list(_line_spans(text, block_start))
     if role == "table_container":
-        for index, (start, end, _line) in enumerate(lines):
-            row_role = "table_header" if index < 2 else "table_row"
+        for index, (start, end, line) in enumerate(lines):
+            # The first row carries column labels.  A second structural row is
+            # a header only when it is an actual Markdown alignment delimiter
+            # (``| --- | :---: |``).  Some parser inputs use pipe-delimited
+            # tables without that optional delimiter; treating their first
+            # data row as a header removed every endpoint unique to that row.
+            delimiter_cells = [
+                value.strip()
+                for value in line.strip().strip("|").split("|")
+            ]
+            markdown_delimiter = bool(
+                delimiter_cells
+                and all(
+                    re.fullmatch(r":?-{3,}:?", value) is not None
+                    for value in delimiter_cells
+                )
+            )
+            row_role = (
+                "table_header"
+                if index == 0 or markdown_delimiter
+                else "table_row"
+            )
             spans.append({
                 "start": start,
                 "end": end,
@@ -262,17 +508,33 @@ def _table_or_list_scopes(
                 "scope_kind": row_role,
             })
         return spans
-    list_lines = [line for line in lines if _LIST_ITEM_LINE.match(line[2])]
-    if list_lines:
-        for index, (start, end, _line) in enumerate(list_lines):
+    list_scopes = _list_item_scopes(
+        [(index, start, end, line) for index, (start, end, line) in enumerate(lines)],
+        block_key=block_key,
+    )
+    if list_scopes:
+        return list_scopes
+    if role == "body":
+        for index, (start, end, _sentence) in enumerate(
+            split_relation_scopes(text)
+        ):
+            if start == end:
+                continue
+            scope_kind = (
+                "clause"
+                if text[end - 1:end] in {";", "；"}
+                or text[start - 1:start] in {";", "；"}
+                else "sentence"
+            )
             spans.append({
-                "start": start,
-                "end": end,
-                "source_role": "list_item",
-                "scope_id": f"{block_key}:list-item:{index}",
-                "scope_kind": "list_item",
+                "start": block_start + start,
+                "end": block_start + end,
+                "source_role": "body",
+                "scope_id": f"{block_key}:relation-scope:{index}",
+                "scope_kind": scope_kind,
             })
-        return spans
+        if spans:
+            return spans
     spans.append({
         "start": block_start,
         "end": block_end,
@@ -325,6 +587,43 @@ def structural_spans_for_chunk(
             block_end=match_start + len(text),
             block_key=block_key,
         ))
+    # List hierarchy belongs to the rendered chunk, not to an arbitrary parser
+    # block boundary.  A coalesced PDF chunk can contain the tail of one page
+    # as locally recovered text and the next page as an exactly mapped block.
+    # Parsing those regions independently loses the active parent across a
+    # transparent page marker.  Reparse all non-table lines as one immutable
+    # syntax stream and replace block-local list scopes with that global view.
+    # This remains syntax-only: ordinary prose is a group boundary and no
+    # relation meaning or domain vocabulary is consulted.
+    #
+    # Table rows are excluded because a pipe followed by whitespace can look
+    # like a symbol list marker.  Their parser-owned row/header scopes remain
+    # authoritative.
+    table_ranges = [
+        (int(item["start"]), int(item["end"]))
+        for item in spans
+        if str(item.get("source_role") or "") in {
+            "table_header", "table_row", "table_cell",
+        }
+    ]
+    chunk_list_lines = [
+        (index, start, end, line)
+        for index, (start, end, line) in enumerate(_line_spans(content, 0))
+        if not any(
+            start < reserved_end and end > reserved_start
+            for reserved_start, reserved_end in table_ranges
+        )
+    ]
+    chunk_list_scopes = _list_item_scopes(
+        chunk_list_lines,
+        block_key="chunk",
+    )
+    if chunk_list_scopes:
+        spans = [
+            item for item in spans
+            if str(item.get("scope_kind") or "") != "list_item"
+        ]
+        spans.extend(chunk_list_scopes)
     return sorted(
         spans,
         key=lambda item: (int(item["start"]), int(item["end"]), str(item["scope_id"])),
@@ -477,8 +776,12 @@ def _unit(
     structure_quality: str,
 ) -> ContextUnit:
     rendered_hash = _digest(rendered_text)
+    # ``context_id`` identifies the frozen physical source context.  It must
+    # stay identical when the entity and relation stages independently rebuild
+    # the same manifest under different runtime namespace labels.  Isolation
+    # is carried by ContextUnit.namespace_id and the owning run/namespace rows,
+    # not by changing the physical context identity.
     context_id = "shadowctx_" + _digest({
-        "namespace_id": namespace_id,
         "revision_id": revision_id,
         "context_kind": context_kind,
         "rendered_hash": rendered_hash,
@@ -695,6 +998,7 @@ def build_shadow_context_manifest(
             "structure_policy_version": str(
                 unit.structure.get("structure_policy_version") or ""
             ),
+            "structure_hash": _digest(unit.structure),
         } for unit in units_tuple],
     }
     summary = {

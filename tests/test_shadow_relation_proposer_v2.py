@@ -71,6 +71,9 @@ def test_proposer_prompt_uses_occurrence_universe_and_predicate_metadata():
 
     assert prompt["occurrences"][0]["occurrence_id"] == "occ-acme"
     assert prompt["predicates"]["alpha_rel"]["semantic_definition"]
+    assert "positive_examples" not in prompt["predicates"]["alpha_rel"]
+    assert "negative_examples" not in prompt["predicates"]["alpha_rel"]
+    assert "conflicts_with" not in prompt["predicates"]["alpha_rel"]
     assert prompt["protocol_feedback"] == ""
     assert prompt["required_evidence_span"] == {"start": 0, "end": len(CONTENT)}
     assert "Do not invent endpoints" in prompt["instruction"]
@@ -87,6 +90,64 @@ def test_proposer_prompt_carries_retry_protocol_feedback():
     ))
 
     assert prompt["protocol_feedback"] == "coverage must be an object"
+
+
+def test_proposer_prompt_focuses_one_atomic_scope_with_absolute_offsets():
+    content = "Ignore this. Acme uses Alloy. Ignore that."
+    start = content.index("Acme")
+    end = content.index(" Ignore that")
+    mentions = [
+        {**MENTIONS[0], "mention_start": start, "mention_end": start + 4},
+        {
+            **MENTIONS[1],
+            "mention_start": content.index("Alloy"),
+            "mention_end": content.index("Alloy") + 5,
+        },
+    ]
+
+    prompt = json.loads(v2.proposer_prompt(
+        context_id="ctx-atomic",
+        content=content,
+        mentions=mentions,
+        logical_schema=_schema(),
+        required_evidence_span=(start, end),
+    ))
+    schema = v2.proposer_response_schema(
+        mentions=mentions,
+        logical_schema=_schema(),
+        content_length=len(content),
+        required_evidence_span=(start, end),
+    )
+
+    assert prompt["context"] == {
+        "context_id": "ctx-atomic",
+        "text": content[start:end],
+        "start": start,
+        "end": end,
+    }
+    assert prompt["required_evidence_span"] == {
+        "start": start, "end": end,
+    }
+    span_schema = schema["properties"]["proposals"]["items"][
+        "properties"
+    ]["evidence_spans"]["items"]["properties"]
+    assert span_schema["start"]["minimum"] == start
+    assert span_schema["end"]["maximum"] == end
+
+
+def test_proposer_prompt_expands_coordinated_arguments_without_peer_edges():
+    content = "系统连接模块甲、模块乙和模块丙。"
+    prompt = json.loads(v2.proposer_prompt(
+        context_id="ctx-list",
+        content=content,
+        mentions=[],
+        logical_schema=_schema(),
+    ))
+
+    instruction = prompt["instruction"]
+    assert "分别展开到每个并列成员" in instruction
+    assert "不得把并列成员彼此连接" in instruction
+    assert "事件、状态、条件端点" in instruction
 
 
 def test_proposer_response_schema_constrains_runtime_universe():
@@ -148,6 +209,82 @@ def test_proposer_response_becomes_candidate_hypothesis_for_same_verifier_path()
         content=CONTENT,
         logical_schema=_schema(),
     ).status == v2.PASS
+
+
+def test_legacy_nested_proposer_envelope_is_strictly_normalized():
+    batch = v2.parse_proposer_response(
+        context_id="ctx-legacy",
+        content=CONTENT,
+        mentions=MENTIONS,
+        logical_schema=_schema(),
+        raw={
+            "proposals": [{
+                "subject_endpoint": {
+                    "occurrence_id": "occ-acme",
+                    "canonical_id": "entity-acme",
+                    "surface": "Acme",
+                },
+                "predicate": "alpha_rel",
+                "object_endpoint": {
+                    "occurrence_id": "occ-alloy",
+                    "canonical_id": "entity-alloy",
+                    "surface": "Alloy",
+                },
+                "evidence_span": {"start": 0, "end": len(CONTENT)},
+            }],
+        },
+        proposer_model_revision="legacy-fixture",
+    )
+
+    assert len(batch.proposals) == 1
+    assert batch.proposals[0].subject_occurrence_key == "occ-acme"
+    assert batch.proposals[0].object_occurrence_key == "occ-alloy"
+    assert batch.proposals[0].predicate == "alpha_rel"
+    assert batch.proposals[0].evidence_spans == (
+        v2.EvidenceSpan(0, len(CONTENT)),
+    )
+    assert "legacy_nested_endpoint_proposals_normalized" in (
+        batch.coverage["_parser_repairs"]
+    )
+
+
+def test_broad_proposer_evidence_is_narrowed_to_shared_atomic_scope() -> None:
+    content = "Acme uses Alloy. Gamma observes Delta."
+    mentions = [dict(item) for item in MENTIONS]
+    batch = v2.parse_proposer_response(
+        context_id="ctx-atomic",
+        content=content,
+        mentions=mentions,
+        logical_schema=_schema(),
+        raw={
+            "proposals": [{
+                **_response()["proposals"][0],
+                "evidence_spans": [{"start": 0, "end": len(content)}],
+            }],
+            "missing_endpoint_mentions": [],
+            "coverage": {"complete": True, "uncovered_cues": []},
+        },
+    )
+    plan = v2.plan_pair_opportunities(
+        project_id=1,
+        document_revision_id="revision-atomic",
+        chunk_key="chunk-atomic",
+        content=content,
+        mentions=mentions,
+        logical_schema=_schema(),
+        run_id="run-atomic",
+        candidate_policy_version="candidate-v1",
+    )
+
+    hypothesis = v2.proposal_to_hypothesis(
+        batch.proposals[0], plan.opportunities[0], _schema(),
+    )
+
+    assert hypothesis.evidence_spans == (
+        v2.EvidenceSpan(
+            *plan.opportunities[0].provenance["required_atomic_scope"],
+        ),
+    )
 
 
 @pytest.mark.parametrize(

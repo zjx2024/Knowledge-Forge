@@ -7,7 +7,7 @@ from concurrent.futures import Future
 import pytest
 
 from knowledge_forge.construction_strategies import (
-    ENHANCED_SHADOW_STRATEGY,
+    KNOWLEDGE_FORGE_STRATEGY,
     GRAPHRAG_NATIVE_STRATEGY,
     STABLE_STRATEGY,
     normalize_strategy,
@@ -28,7 +28,7 @@ class _Recorder:
 
 class _NativeDatabase:
     def __init__(self) -> None:
-        self.project = {"id": 7}
+        self.project = {"id": 7, "knowledge_language": "en"}
         self.documents = [
             {
                 "id": 11,
@@ -119,6 +119,7 @@ def test_native_project_build_queues_only_native_executor_and_no_document_build_
             "strategy_key": GRAPHRAG_NATIVE_STRATEGY,
             "scope": "project_full_snapshot",
             "document_ids": [11, 12],
+            "knowledge_language": "en",
         },
         "strategy_key": GRAPHRAG_NATIVE_STRATEGY,
     }]
@@ -143,9 +144,9 @@ def test_strategy_executor_registry_has_no_non_native_fallback(monkeypatch):
     enhanced = object()
     native = object()
     monkeypatch.setattr(service, "_ingest_document", stable)
-    monkeypatch.setattr(service, "_ingest_enhanced_strategy", enhanced)
+    monkeypatch.setattr(service, "_ingest_knowledge_forge_strategy", enhanced)
     monkeypatch.setattr(service, "_ingest_graphrag_native", native)
 
     assert service._strategy_executor(STABLE_STRATEGY) is stable
-    assert service._strategy_executor(ENHANCED_SHADOW_STRATEGY) is enhanced
+    assert service._strategy_executor(KNOWLEDGE_FORGE_STRATEGY) is enhanced
     assert service._strategy_executor(GRAPHRAG_NATIVE_STRATEGY) is native

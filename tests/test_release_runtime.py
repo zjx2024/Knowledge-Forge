@@ -90,6 +90,10 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
     assert '"127.0.0.1:5433:5432"' in compose
     assert '"8011:8011"' in compose
     assert '"8010:8010"' in compose
+    assert '"8012:8012"' in compose
+    assert "knowledge-forge-reranker:" in compose
+    assert 'command: ["python", "reranker_server.py"]' in compose
+    assert 'ENTITY_RERANKER_URL: "http://knowledge-forge-reranker:8012"' in compose
     assert "CONSTRAINTS_FILE: constraints-gpu.txt" in compose
     assert "DOCLING_REQUIREMENTS: requirements-docling-gpu.txt" in compose
     assert "knowledge-forge-init:" in compose
@@ -98,6 +102,8 @@ def test_docker_context_compose_image_and_ci_are_release_safe():
     assert "condition: service_completed_successfully" in compose
 
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY server.py reranker_server.py ./" in dockerfile
+    assert "EXPOSE 8010 8011 8012" in dockerfile
     assert (
         "FROM python:3.12.13-slim-bookworm@sha256:"
         "d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"

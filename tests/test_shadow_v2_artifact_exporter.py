@@ -26,6 +26,17 @@ from scripts.export_shadow_v2_evaluation_bundle import export_shadow_v2_bundle
 from tests.shadow_v2_fixtures import logical_schema, predicate_policy
 
 
+def _role_probe(*_args):
+    return {
+        "subject_role": "source endpoint role",
+        "object_role": "target endpoint role",
+    }
+
+
+def _role_alignment_probe(*_args):
+    return {"subject_role": "ALIGNED", "object_role": "ALIGNED"}
+
+
 def _database(dsn: str) -> Database:
     params = conninfo_to_dict(dsn)
 
@@ -124,10 +135,16 @@ def test_shadow_v2_artifact_exporter_exports_and_audits_ready_run(tmp_path):
         pair,
         content=content,
         logical_schema=_schema(),
+        role_probe=_role_probe,
+        role_alignment_probe=_role_alignment_probe,
         verifier=lambda _prompt, _schema: {
             "hypothesis_id": hypothesis.hypothesis_id,
             "verdict": SUPPORTED,
             "reason_code": "EXACT_TRIPLE_SUPPORTED",
+            "forward_entailment": "ENTAILED",
+            "reverse_entailment": "NOT_ENTAILED",
+            "subject_role_supported": True,
+            "object_role_supported": True,
             "supported_evidence_spans": [{"start": 0, "end": len(content)}],
         },
         verifier_model_revision="verifier-r1",

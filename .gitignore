@@ -22,3 +22,12 @@ KnowledgeFiles/graphrag_native/*
 logs/*
 !logs/.gitkeep
 external/
+
+# Local Codex work logs and recovery artifacts.
+.codex/
+
+# Operator-created database and runtime backups.
+backups/
+
+# Front-end dependencies are restored from webui/package-lock.json.
+webui/node_modules/

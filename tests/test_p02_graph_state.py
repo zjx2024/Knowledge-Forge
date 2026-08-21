@@ -107,6 +107,7 @@ def test_old_nonempty_graphs_are_marked_stale_but_empty_projects_are_excluded():
     statement, params = connection.calls[0]
     assert "graph_status<>%s" in statement
     assert "graph_policy_version<>%s" in statement
+    assert "updated_at" not in statement
     assert params[0] == GRAPH_STALE
     assert params[-3:] == ("empty", GRAPH_POLICY_VERSION, GRAPH_POLICY_HASH)
 

@@ -1,7 +1,9 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-from knowledge_forge.database import Database
+import pytest
+
+from knowledge_forge.database import Database, JobPublicationCommitted
 from knowledge_forge.service import KnowledgeForgeService
 
 
@@ -89,8 +91,17 @@ class ServiceBatchDatabase:
         assert batch_id == "batch-1"
         return self.rows
 
+    def get_project(self, project_id):
+        return {"id": project_id} if project_id == 7 else None
 
-def _job(job_id, name, status, created_at, *, completed_at=None, progress=0, log=None, subtasks=None, kind="ingestion"):
+    def get_job(self, job_id):
+        return next((row for row in self.rows if row["id"] == job_id), None)
+
+
+def _job(
+    job_id, name, status, created_at, *, completed_at=None, progress=0,
+    log=None, subtasks=None, kind="ingestion", metadata=None,
+):
     return {
         "id": job_id,
         "kind": kind,
@@ -100,7 +111,10 @@ def _job(job_id, name, status, created_at, *, completed_at=None, progress=0, log
         "completed_at": completed_at,
         "document_name": name,
         "log": log or [],
-        "metadata": {"batch_id": "batch-1", "subtasks": subtasks or {}},
+        "metadata": {
+            "batch_id": "batch-1", "subtasks": subtasks or {},
+            **(metadata or {}),
+        },
     }
 
 
@@ -159,6 +173,196 @@ def test_preparation_batch_preserves_its_job_kind():
 
     assert batch["kind"] == "content_preparation"
     assert batch["metadata"]["subtasks"]["chunking"]["status"] == "running"
+
+
+def test_batch_propagates_cancellation_request_and_terminal_partial_cancel():
+    started = datetime.now(timezone.utc)
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = ServiceBatchDatabase([
+        _job(
+            "running", "first.pdf", "running", started, progress=42,
+            kind="content_preparation",
+            subtasks={
+                "structure": {"status": "completed", "progress": 100},
+                "chunking": {"status": "running", "progress": 50},
+            },
+            metadata={"cancel_requested": True},
+        ),
+        _job(
+            "queued", "second.pdf", "cancelled", started, progress=100,
+            kind="content_preparation",
+        ),
+    ])
+
+    stopping = service.get_ingestion_batch("batch-1")
+
+    assert stopping["status"] == "running"
+    assert stopping["metadata"]["cancel_requested"] is True
+    assert stopping["metadata"]["subtasks"]["chunking"]["status"] == "running"
+
+    service.db.rows[0]["status"] = "cancelled"
+    service.db.rows[0]["metadata"]["subtasks"]["chunking"]["status"] = "cancelled"
+    stopped = service.get_ingestion_batch("batch-1")
+
+    assert stopped["status"] == "cancelled"
+    assert stopped["metadata"]["cancel_requested"] is False
+    assert stopped["metadata"]["subtasks"]["chunking"]["status"] == "cancelled"
+
+
+def test_batch_cancellation_accepts_completed_lead_job_id_and_stops_active_siblings():
+    started = datetime.now(timezone.utc)
+    rows = [
+        {
+            **_job(
+                "first", "first.pdf", "completed", started,
+                completed_at=started, progress=100,
+                kind="content_preparation",
+            ),
+            "project_id": 7,
+        },
+        {
+            **_job(
+                "second", "second.pdf", "running", started, progress=35,
+                kind="content_preparation",
+            ),
+            "project_id": 7,
+        },
+        {
+            **_job(
+                "third", "third.pdf", "queued", started,
+                kind="content_preparation",
+            ),
+            "project_id": 7,
+        },
+    ]
+
+    class CancellationDatabase(ServiceBatchDatabase):
+        def __init__(self, values):
+            super().__init__(values)
+            self.cancelled = []
+
+        def assert_project_construction_strategy(self, project_id, expected=None):
+            assert project_id == 7
+            return "knowledge_forge"
+
+        def request_job_cancellation(
+            self, job_id, *, project_id, allowed_kinds, reason,
+        ):
+            row = self.get_job(job_id)
+            self.cancelled.append(job_id)
+            return {**row, "metadata": {**row["metadata"], "cancel_requested": True}}
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = CancellationDatabase(rows)
+
+    result = service.request_project_job_cancellation(
+        7,
+        job_id="first",
+        batch_id="batch-1",
+        expected_kind="content_preparation",
+    )
+
+    assert service.db.cancelled == ["second", "third"]
+    assert result["requested_count"] == 2
+
+
+def test_batch_cancellation_skips_published_tail_and_stops_other_siblings():
+    started = datetime.now(timezone.utc)
+    rows = [
+        {
+            **_job(
+                "published", "first.pdf", "running", started, progress=99,
+                kind="content_preparation",
+            ),
+            "project_id": 7,
+        },
+        {
+            **_job(
+                "queued", "second.pdf", "queued", started,
+                kind="content_preparation",
+            ),
+            "project_id": 7,
+        },
+    ]
+
+    class PublicationRaceDatabase(ServiceBatchDatabase):
+        def __init__(self, values):
+            super().__init__(values)
+            self.cancelled = []
+
+        def assert_project_construction_strategy(self, project_id, expected=None):
+            assert project_id == 7
+            return "knowledge_forge"
+
+        def request_job_cancellation(
+            self, job_id, *, project_id, allowed_kinds, reason,
+        ):
+            if job_id == "published":
+                raise JobPublicationCommitted("任务成果已经发布")
+            self.cancelled.append(job_id)
+            row = self.get_job(job_id)
+            return {**row, "metadata": {**row["metadata"], "cancel_requested": True}}
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = PublicationRaceDatabase(rows)
+
+    result = service.request_project_job_cancellation(
+        7,
+        job_id="published",
+        batch_id="batch-1",
+        expected_kind="content_preparation",
+    )
+
+    assert service.db.cancelled == ["queued"]
+    assert result["requested_count"] == 1
+    assert result["skipped_count"] == 1
+    assert result["skipped_jobs"] == [
+        {"job_id": "published", "reason": "publication_committed"},
+    ]
+
+
+def test_single_job_cancellation_rejects_post_publication_tail():
+    started = datetime.now(timezone.utc)
+    rows = [{
+        **_job(
+            "published", "only.pdf", "running", started, progress=99,
+            kind="content_preparation",
+        ),
+        "project_id": 7,
+    }]
+
+    class PublicationRaceDatabase(ServiceBatchDatabase):
+        def assert_project_construction_strategy(self, project_id, expected=None):
+            return "knowledge_forge"
+
+        def request_job_cancellation(self, *args, **kwargs):
+            raise JobPublicationCommitted("任务成果已经发布")
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = PublicationRaceDatabase(rows)
+
+    with pytest.raises(JobPublicationCommitted, match="成果已经发布"):
+        service.request_project_job_cancellation(
+            7,
+            job_id="published",
+            expected_kind="content_preparation",
+        )
+
+
+def test_cancellation_without_any_target_is_rejected_instead_of_guessing():
+    class CancellationDatabase(ServiceBatchDatabase):
+        def assert_project_construction_strategy(self, project_id, expected=None):
+            assert project_id == 7
+            return "knowledge_forge"
+
+        def latest_active_job(self, *_args, **_kwargs):
+            raise AssertionError("an unscoped request must not select an arbitrary job")
+
+    service = KnowledgeForgeService.__new__(KnowledgeForgeService)
+    service.db = CancellationDatabase([])
+
+    with pytest.raises(ValueError, match="请指定要终止的任务"):
+        service.request_project_job_cancellation(7)
 
 
 def test_single_project_wide_job_preserves_real_subtask_unit_detail():

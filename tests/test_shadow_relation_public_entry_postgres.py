@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 
 from knowledge_forge import relation_shadow_v2 as v2
 from knowledge_forge import relation_shadow_runtime as relation_runtime
-from knowledge_forge.construction_strategies import ENHANCED_SHADOW_STRATEGY
+from knowledge_forge.construction_strategies import KNOWLEDGE_FORGE_STRATEGY
 from knowledge_forge.database import Database
 from knowledge_forge.relation_shadow_runtime import ShadowRelationV2Runtime
 from knowledge_forge.service import KnowledgeForgeService
@@ -43,6 +43,10 @@ class _ScriptedV2Gateway:
     def __init__(self, *, fail_classifier: bool = False):
         self.fail_classifier = fail_classifier
         self.classifier_calls = 0
+        self.role_probe_calls = 0
+        self.role_alignment_calls = 0
+        self.semantic_contrast_calls = 0
+        self.exact_argument_calls = 0
         self.verifier_calls = 0
 
     @staticmethod
@@ -77,11 +81,58 @@ class _ScriptedV2Gateway:
                     }],
                 } for pair in payload["pairs"]]
             }
+        if "semantic contrast judge" in str(kwargs["system"]):
+            self.semantic_contrast_calls += 1
+            return {"semantic_contrast": "DEFINITION"}
+        if "directional textual-entailment verifier" in str(kwargs["system"]):
+            self.exact_argument_calls += 1
+            entailed = self.exact_argument_calls % 2 == 1
+            return {
+                "source_role": entailed,
+                "target_role": entailed,
+                "direct_relation": entailed,
+            }
+        if "role alignment judge" in str(kwargs["system"]):
+            self.role_alignment_calls += 1
+            return {
+                "subject_role": "ALIGNED",
+                "object_role": "ALIGNED",
+            }
+        if "role analyst" in str(kwargs["system"]):
+            self.role_probe_calls += 1
+            return {
+                "endpoint_a_complete_argument": True,
+                "endpoint_b_complete_argument": True,
+                "direct_relation_present": True,
+                "subject_role": "scripted source endpoint role",
+                "object_role": "scripted target endpoint role",
+                "expressed_relation": "Alpha directly acts on Beta.",
+            }
+        if isinstance(payload.get("claims"), list):
+            self.verifier_calls += 1
+            return {
+                "decisions": [{
+                    "hypothesis_id": claim["hypothesis_id"],
+                    "verdict": v2.SUPPORTED,
+                    "reason_code": "SCRIPTED_EXACT_EVIDENCE",
+                    "forward_entailment": "ENTAILED",
+                    "reverse_entailment": "NOT_ENTAILED",
+                    "subject_role_supported": True,
+                    "object_role_supported": True,
+                    "supported_evidence_spans": claim[
+                        "classifier_evidence_spans"
+                    ],
+                } for claim in payload["claims"]],
+            }
         self.verifier_calls += 1
         return {
             "hypothesis_id": payload["hypothesis_id"],
             "verdict": v2.SUPPORTED,
             "reason_code": "SCRIPTED_EXACT_EVIDENCE",
+            "forward_entailment": "ENTAILED",
+            "reverse_entailment": "NOT_ENTAILED",
+            "subject_role_supported": True,
+            "object_role_supported": True,
             "supported_evidence_spans": payload["classifier_evidence_spans"],
         }
 
@@ -100,7 +151,7 @@ class _NoopStrategyGraph:
         strategy_key,
         mutation,
     ):
-        assert strategy_key == ENHANCED_SHADOW_STRATEGY
+        assert strategy_key == KNOWLEDGE_FORGE_STRATEGY
         assert mutation.namespace_id
         self.calls += 1
         return {
@@ -372,6 +423,9 @@ def _wire_public_service(
         database.get_project(int(seeded["project_id"])),
         database.list_document_chunks(document_id),
     )
+    service.schemas.evaluate_corpus = lambda _project, _documents: (
+        database.get_active_schema(int(seeded["project_id"]))
+    )
 
     def build_runtime(project_id, *, progress=None, **_kwargs):
         result = ShadowRelationV2Runtime(database, gateway).run_namespace(
@@ -399,12 +453,12 @@ def _wire_public_service(
         )
         return {"namespace_id": seeded["namespace_id"], **snapshot}
 
-    service.build_entity_shadow_namespace = build_runtime
+    service.build_grounded_entity_namespace = build_runtime
     return service, graph, legacy_calls
 
 
 @pytest.mark.integration
-def test_public_enhanced_shadow_entry_executes_v2_with_zero_legacy_calls(
+def test_public_knowledge_forge_entry_executes_v2_with_zero_legacy_calls(
     monkeypatch,
 ):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
@@ -427,7 +481,7 @@ def test_public_enhanced_shadow_entry_executes_v2_with_zero_legacy_calls(
     for function_name, counter_name in (
         ("plan_pair_opportunities", "planner"),
         ("parse_classifier_response", "classifier_parser"),
-        ("verify_hypothesis", "verifier"),
+        ("verify_hypothesis_lean", "verifier"),
         ("normalize_verified_hypotheses", "normalizer"),
     ):
         original = getattr(v2, function_name)
@@ -441,7 +495,7 @@ def test_public_enhanced_shadow_entry_executes_v2_with_zero_legacy_calls(
     before = _formal_state(database, int(seeded["project_id"]))
     job_id = service.submit_ingestion(
         int(seeded["document_id"]),
-        strategy_key=ENHANCED_SHADOW_STRATEGY,
+        strategy_key=KNOWLEDGE_FORGE_STRATEGY,
         target_document_ids=[int(seeded["document_id"])],
     )
     after = _formal_state(database, int(seeded["project_id"]))
@@ -455,6 +509,9 @@ def test_public_enhanced_shadow_entry_executes_v2_with_zero_legacy_calls(
         "normalizer": 1,
     }
     assert gateway.classifier_calls == 1
+    assert gateway.role_probe_calls == 0
+    assert gateway.role_alignment_calls == 0
+    assert gateway.exact_argument_calls == 0
     assert gateway.verifier_calls == 1
     assert graph.calls == 1
     assert after == before
@@ -534,7 +591,7 @@ def test_public_enhanced_shadow_entry_executes_v2_with_zero_legacy_calls(
     )
     retry_job_id = service.submit_ingestion(
         int(seeded["document_id"]),
-        strategy_key=ENHANCED_SHADOW_STRATEGY,
+        strategy_key=KNOWLEDGE_FORGE_STRATEGY,
         target_document_ids=[int(seeded["document_id"])],
     )
     assert database.get_job(retry_job_id)["status"] == "completed"
@@ -580,7 +637,7 @@ def test_public_enhanced_shadow_entry_executes_v2_with_zero_legacy_calls(
 
 
 @pytest.mark.integration
-def test_public_enhanced_shadow_v2_failure_never_falls_back_or_materializes():
+def test_public_knowledge_forge_v2_failure_never_falls_back_or_materializes():
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
@@ -596,7 +653,7 @@ def test_public_enhanced_shadow_v2_failure_never_falls_back_or_materializes():
 
     job_id = service.submit_ingestion(
         int(seeded["document_id"]),
-        strategy_key=ENHANCED_SHADOW_STRATEGY,
+        strategy_key=KNOWLEDGE_FORGE_STRATEGY,
     )
 
     job = database.get_job(job_id)
@@ -621,7 +678,7 @@ def test_public_enhanced_shadow_v2_failure_never_falls_back_or_materializes():
 
 
 @pytest.mark.integration
-def test_public_enhanced_shadow_stale_fingerprint_never_materializes_or_falls_back():
+def test_public_knowledge_forge_stale_fingerprint_never_materializes_or_falls_back():
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
@@ -633,7 +690,7 @@ def test_public_enhanced_shadow_stale_fingerprint_never_materializes_or_falls_ba
     service, graph, legacy_calls = _wire_public_service(
         database, seeded, gateway,
     )
-    normal_build = service.build_entity_shadow_namespace
+    normal_build = service.build_grounded_entity_namespace
 
     def stale_build(project_id, **kwargs):
         original_get_project = database.get_project
@@ -657,12 +714,12 @@ def test_public_enhanced_shadow_stale_fingerprint_never_materializes_or_falls_ba
         finally:
             database.get_project = original_get_project
 
-    service.build_entity_shadow_namespace = stale_build
+    service.build_grounded_entity_namespace = stale_build
     before = _formal_state(database, int(seeded["project_id"]))
 
     job_id = service.submit_ingestion(
         int(seeded["document_id"]),
-        strategy_key=ENHANCED_SHADOW_STRATEGY,
+        strategy_key=KNOWLEDGE_FORGE_STRATEGY,
     )
 
     job = database.get_job(job_id)

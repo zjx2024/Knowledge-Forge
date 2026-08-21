@@ -8,6 +8,7 @@ import pytest
 
 from knowledge_forge.graphrag_native_config import (
     GraphRAGNativeConfigError,
+    GraphRAGNativePromptProfileBuilder,
     GraphRAGNativeSettingsBuilder,
 )
 
@@ -57,3 +58,76 @@ def test_native_settings_refuse_assumed_embedding_dimension(tmp_path):
             run_root=tmp_path, completion_model="model", embedding_model="embed",
             embedding_dimension=0, api_base="http://127.0.0.1:11434/v1",
         )
+
+
+def test_native_prompt_profile_follows_project_language_across_all_workflows(tmp_path):
+    _prompts(tmp_path)
+    (tmp_path / "prompts" / "extract_graph.txt").write_text(
+        "Return output in English with {entity_types} and {input_text}.",
+        encoding="utf-8",
+    )
+    (tmp_path / "prompts" / "extract_claims.txt").write_text(
+        "Return output in English with {input_text}.", encoding="utf-8",
+    )
+
+    result = GraphRAGNativePromptProfileBuilder.apply(
+        run_root=tmp_path,
+        texts=("这是项目中文正文。" * 300, "English abstract only. " * 20),
+    )
+
+    assert result["language"]["language_code"] == "zh"
+    assert result["language"]["input_unit_count"] == 2
+    extract = (tmp_path / "prompts" / "extract_graph.txt").read_text(
+        encoding="utf-8",
+    )
+    assert "Return output in English" not in extract
+    assert "Return output in Chinese" in extract
+    assert "{entity_types}" in extract and "{input_text}" in extract
+    assert "Do not translate entity names" in extract
+    assert "KF_SOURCE_ID" in extract
+    for name in GraphRAGNativePromptProfileBuilder.required_prompt_names:
+        prompt = (tmp_path / "prompts" / name).read_text(encoding="utf-8")
+        assert prompt.count("KF_PROJECT_LANGUAGE_POLICY_START") == 1
+    query = (tmp_path / "prompts" / "local_search_system_prompt.txt").read_text(
+        encoding="utf-8",
+    )
+    assert "language used by the user's query" in query
+    assert result["profile_path"].is_file()
+
+    # Applying the same frozen project profile is deterministic and does not
+    # stack another instruction block.
+    repeated = GraphRAGNativePromptProfileBuilder.apply(
+        run_root=tmp_path,
+        texts=("这是项目中文正文。" * 300, "English abstract only. " * 20),
+    )
+    assert repeated["prompt_profile_hash"] == result["prompt_profile_hash"]
+
+
+def test_native_prompt_profile_distinguishes_english_project(tmp_path):
+    _prompts(tmp_path)
+    result = GraphRAGNativePromptProfileBuilder.apply(
+        run_root=tmp_path,
+        texts=("This project contains an English technical manual. " * 200,),
+    )
+
+    assert result["language"]["language_code"] == "en"
+    assert result["language"]["prompt_language"] == "English"
+
+
+def test_native_prompt_profile_honours_explicit_project_language(tmp_path):
+    _prompts(tmp_path)
+    result = GraphRAGNativePromptProfileBuilder.apply(
+        run_root=tmp_path,
+        texts=("This source document is written in English. " * 100,),
+        requested_language="zh",
+    )
+
+    assert result["language"]["language_code"] == "zh"
+    assert result["language"]["detected_language_code"] == "en"
+    assert result["language"]["selection_mode"] == "explicit"
+    assert "Return output in Chinese" not in (
+        tmp_path / "prompts" / "extract_graph.txt"
+    ).read_text(encoding="utf-8")
+    assert "Write every generated natural-language value in Chinese" in (
+        tmp_path / "prompts" / "extract_graph.txt"
+    ).read_text(encoding="utf-8")

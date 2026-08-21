@@ -17,12 +17,12 @@ RUN pip install --no-cache-dir -c "${CONSTRAINTS_FILE}" \
         -r requirements-entity-resolution.txt \
     && pip check
 COPY knowledge_forge ./knowledge_forge
-COPY server.py ./
+COPY server.py reranker_server.py ./
 RUN groupadd --system --gid 10001 knowledgeforge \
     && useradd --system --uid 10001 --gid knowledgeforge --home-dir /home/knowledgeforge --create-home knowledgeforge \
     && mkdir -p /app/KnowledgeFiles/docs /app/KnowledgeFiles/chunks /app/KnowledgeFiles/media /app/KnowledgeFiles/.trash /home/knowledgeforge/.cache \
     && chown -R knowledgeforge:knowledgeforge /app /home/knowledgeforge
 
-EXPOSE 8010 8011
+EXPOSE 8010 8011 8012
 USER knowledgeforge
 CMD ["python", "server.py"]

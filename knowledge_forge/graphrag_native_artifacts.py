@@ -38,6 +38,20 @@ STANDARD_WORKFLOWS = (
 )
 
 
+PLAINTEXT_CREDENTIAL_PATTERNS = (
+    re.compile(
+        r"(?i)authorization\s*[:=]\s*bearer\s+"
+        r"(?!\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})(?:\s|['\"]|$))"
+        r"(?!\$\{REDACTED\})\S+"
+    ),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(
+        r"(?i)(api[_-]?key|password)\s*[:=]\s*['\"]"
+        r"(?!\$\{)(?:sk-|[A-Za-z0-9_./-]{16,})"
+    ),
+)
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -64,11 +78,6 @@ def safe_bundle_path(root: Path, relative_path: str) -> Path:
 def assert_bundle_has_no_plaintext_credentials(root: Path) -> None:
     """Reject recognizable credentials while allowing `${VAR}` configuration."""
 
-    patterns = (
-        re.compile(r"(?i)authorization\s*[:=]\s*bearer\s+(?!\$\{REDACTED\})\S+"),
-        re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
-        re.compile(r"(?i)(api[_-]?key|password)\s*[:=]\s*['\"](?!\$\{)(?:sk-|[A-Za-z0-9_./-]{16,})"),
-    )
     root = Path(root).resolve()
     for path in root.rglob("*"):
         if not path.is_file() or path.is_symlink() or path.stat().st_size > 4 * 1024 * 1024:
@@ -76,8 +85,30 @@ def assert_bundle_has_no_plaintext_credentials(root: Path) -> None:
         if path.suffix.lower() in {".parquet", ".lance", ".zst", ".tar"}:
             continue
         content = path.read_text(encoding="utf-8", errors="ignore")
-        if any(pattern.search(content) for pattern in patterns):
+        if any(pattern.search(content) for pattern in PLAINTEXT_CREDENTIAL_PATTERNS):
             raise GraphRAGNativeBundleError(f"bundle 检测到疑似明文凭据: {path.relative_to(root)}")
+
+
+def redact_plaintext_credential_lines(content: str) -> tuple[str, int]:
+    """Redact credential-like patch lines while preserving their diff marker.
+
+    Reproducibility patches can legitimately include security-test fixtures or
+    an accidental local secret.  The raw patch hash remains part of the run
+    identity, but the bundle must never retain such line contents.
+    """
+
+    redacted: list[str] = []
+    count = 0
+    for line in str(content).splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        if any(pattern.search(body) for pattern in PLAINTEXT_CREDENTIAL_PATTERNS):
+            marker = body[:1] if body[:1] in {"+", "-", " "} else ""
+            redacted.append(marker + "[KF_REDACTED_CREDENTIAL_LIKE_LINE]" + ending)
+            count += 1
+        else:
+            redacted.append(line)
+    return "".join(redacted), count
 
 
 def _list_value(value: Any) -> list[Any]:
@@ -127,6 +158,76 @@ class GraphRAGNativeBundleValidator:
     validator_version = "graphrag-native-validator-v1"
 
     @staticmethod
+    def _validate_prompt_profile(
+        root: Path,
+        manifest: dict[str, Any],
+        artifact_by_path: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Validate the frozen project-language profile for new bundles.
+
+        Historical 3.1.1 bundles predate project-language profiles and remain
+        readable.  Once a run identity declares ``prompt_profile_hash``, every
+        configured prompt and the settings file must be immutable manifest
+        artifacts and the profile becomes fail-closed.
+        """
+
+        identity = manifest.get("identity") if isinstance(manifest.get("identity"), dict) else {}
+        expected_hash = str(identity.get("prompt_profile_hash") or "")
+        if not expected_hash:
+            return {"status": "legacy_unprofiled", "language_code": ""}
+        profile_relative = "kf-manifest/prompt-profile.json"
+        profile_artifact = artifact_by_path.get(profile_relative)
+        if profile_artifact is None:
+            raise GraphRAGNativeBundleError("项目语言提示配置未写入 immutable artifact manifest")
+        profile_path = GraphRAGNativeBundleValidator._validate_manifest_artifact(
+            root, profile_artifact,
+        )
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise GraphRAGNativeBundleError("项目语言提示配置不是合法 JSON") from exc
+        if not isinstance(profile, dict) or profile.get("schema_version") != "graphrag-native-prompt-profile-v2":
+            raise GraphRAGNativeBundleError("项目语言提示配置版本不受支持")
+        embedded_hash = str(profile.pop("prompt_profile_hash", "") or "")
+        actual_hash = hashlib.sha256(canonical_json(profile).encode("utf-8")).hexdigest()
+        if not embedded_hash or embedded_hash != expected_hash or actual_hash != expected_hash:
+            raise GraphRAGNativeBundleError("项目语言提示配置哈希不一致")
+        language = profile.get("language")
+        if not isinstance(language, dict) or str(language.get("language_code") or "") not in {"zh", "en", "ja", "ko"}:
+            raise GraphRAGNativeBundleError("项目语言提示配置缺少受支持的冻结语言")
+        prompts = profile.get("prompts")
+        if not isinstance(prompts, list) or not prompts:
+            raise GraphRAGNativeBundleError("项目语言提示配置没有 prompts")
+        seen: set[str] = set()
+        for item in prompts:
+            if not isinstance(item, dict):
+                raise GraphRAGNativeBundleError("项目语言 prompt 记录必须为对象")
+            relative = str(item.get("relative_path") or "")
+            if (
+                not relative.startswith("prompts/")
+                or relative.count("/") != 1
+                or relative in seen
+            ):
+                raise GraphRAGNativeBundleError("项目语言 prompt 路径非法或重复")
+            seen.add(relative)
+            artifact = artifact_by_path.get(relative)
+            if artifact is None:
+                raise GraphRAGNativeBundleError(f"项目语言 prompt 未冻结为 artifact: {relative}")
+            path = GraphRAGNativeBundleValidator._validate_manifest_artifact(root, artifact)
+            if str(item.get("sha256") or "") != sha256_file(path):
+                raise GraphRAGNativeBundleError(f"项目语言 prompt 哈希不一致: {relative}")
+        settings_artifact = artifact_by_path.get("settings.yaml")
+        if settings_artifact is None:
+            raise GraphRAGNativeBundleError("项目语言运行缺少冻结的 settings.yaml")
+        GraphRAGNativeBundleValidator._validate_manifest_artifact(root, settings_artifact)
+        return {
+            "status": "validated",
+            "language_code": str(language["language_code"]),
+            "prompt_count": len(prompts),
+            "prompt_profile_hash": expected_hash,
+        }
+
+    @staticmethod
     def _validate_manifest_artifact(root: Path, artifact: dict[str, Any]) -> Path:
         """Check one immutable artifact without broadening a query's inputs."""
 
@@ -164,6 +265,7 @@ class GraphRAGNativeBundleValidator:
             if not relative or relative in by_path:
                 raise GraphRAGNativeBundleError("artifact manifest path 必须唯一")
             by_path[relative] = artifact
+        prompt_profile = self._validate_prompt_profile(root, manifest, by_path)
         table_names = ("entities.parquet", "communities.parquet", "community_reports.parquet")
         tables: dict[str, list[dict[str, Any]]] = {}
         for name in table_names:
@@ -192,6 +294,7 @@ class GraphRAGNativeBundleValidator:
             "communities": len(tables["communities.parquet"]),
             "community_reports": len(tables["community_reports.parquet"]),
             "lancedb": {"status": "not_opened_for_global_query"},
+            "prompt_profile": prompt_profile,
         }
 
     def _read_manifest(self, root: Path) -> dict[str, Any]:
@@ -353,6 +456,9 @@ class GraphRAGNativeBundleValidator:
                 if expected_rows >= 0 and expected_rows != table.num_rows:
                     raise GraphRAGNativeBundleError(f"artifact Parquet row count 不一致: {relative}")
             artifact_by_path[relative] = artifact
+        prompt_profile = self._validate_prompt_profile(
+            root, manifest, artifact_by_path,
+        )
         required_paths = {
             "input/documents.parquet", "kf-manifest/source-map.parquet",
             "kf-manifest/input-documents-manifest.jsonl",
@@ -471,7 +577,7 @@ class GraphRAGNativeBundleValidator:
             "input_documents": len(input_rows), "text_units": len(tables["text_units.parquet"]),
             "entities": len(tables["entities.parquet"]), "relationships": len(tables["relationships.parquet"]),
             "communities": len(tables["communities.parquet"]), "community_reports": len(tables["community_reports.parquet"]),
-            "lancedb": lance_report,
+            "lancedb": lance_report, "prompt_profile": prompt_profile,
         }
 
 

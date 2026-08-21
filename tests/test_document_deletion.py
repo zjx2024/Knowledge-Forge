@@ -43,7 +43,7 @@ class FakeDatabase:
 
     def assert_project_construction_strategy(self, project_id, expected_strategy=None):
         assert project_id == 9
-        return "enhanced_shadow"
+        return "knowledge_forge"
 
     def create_job(
         self, kind, project_id=None, document_id=None, *,
@@ -213,7 +213,9 @@ def test_delete_document_cancels_work_and_moves_source_and_process_files(tmp_pat
 
     assert database.cancelled is True
     assert database.soft_deleted is True
-    assert database.cancelled_project_jobs[0][0:2] == (9, ["schema_reassessment"])
+    assert database.cancelled_project_jobs[0][0:2] == (
+        9, ["schema_reassessment", "community_report_build"],
+    )
     assert job_id == "cleanup-job"
     assert service.graph.deleted == []
     service.cleanup_executor.run_all()

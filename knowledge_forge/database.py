@@ -9,7 +9,7 @@ import math
 import re
 import uuid
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -21,11 +21,12 @@ from psycopg.rows import dict_row
 
 from .config import Config
 from .construction_strategies import (
-    ENHANCED_SHADOW_STRATEGY,
+    KNOWLEDGE_FORGE_STRATEGY,
     GRAPHRAG_NATIVE_STRATEGY,
     STABLE_STRATEGY,
     normalize_strategy,
 )
+from .knowledge_language import CHINESE, normalize_knowledge_language
 from .entity_identity import normalize_name
 from .graph_manifest import GRAPH_MANIFEST_PROTOCOL
 from .graph_policy import (
@@ -52,6 +53,7 @@ from .observability import InstrumentedConnection, current_metrics, increment
 from .policy import POLICY_AXES, normalize_policy_set
 from .migrations import MigrationRunner
 from .audit import redact_audit_payload
+from .unicode_safety import sanitize_unicode_data
 
 
 LOGGER = logging.getLogger(__name__)
@@ -73,6 +75,14 @@ class RevisionLeaseLost(StaleContentRevision):
     """The worker no longer owns the revision lease."""
 
 
+class JobCancellationRequested(RuntimeError):
+    """A publication CAS observed a durable user cancellation request."""
+
+
+class JobPublicationCommitted(RuntimeError):
+    """A cancellation arrived after the task's atomic publication boundary."""
+
+
 SHADOW_RELATION_V2_REQUIRED_MIGRATIONS = (
     "0014_shadow_relation_v2_ledger",
     "0015_shadow_relation_v2_verification",
@@ -82,6 +92,13 @@ SHADOW_RELATION_V2_REQUIRED_MIGRATIONS = (
     "0019_shadow_relation_v2_execution",
     "0020_shadow_relation_v2_model_audit",
     "0021_shadow_relation_v2_artifact_audit",
+    "0027_shadow_relation_secondary_review",
+    "0028_shadow_relation_secondary_idempotency",
+    "0029_shadow_relation_secondary_idempotency_cleanup",
+)
+
+KNOWLEDGE_FORGE_NAMING_REQUIRED_MIGRATIONS = (
+    "0030_knowledge_forge_strategy_naming",
 )
 
 GRAPHRAG_NATIVE_REQUIRED_MIGRATIONS = (
@@ -220,6 +237,14 @@ SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS = {
         "context_id", "source_kind", "source_record_id", "evidence_hash",
         "qualifiers",
     },
+    "shadow_relation_secondary_passes": {
+        "id", "parent_run_id", "project_id", "pass_version",
+        "input_fingerprint", "status", "route_counts", "metrics",
+    },
+    "shadow_relation_secondary_candidates": {
+        "id", "secondary_pass_id", "pair_opportunity_id", "route",
+        "source_reason_code", "predicate_after", "status", "reason_code",
+    },
 }
 
 
@@ -245,6 +270,8 @@ CREATE TABLE IF NOT EXISTS models (
 CREATE TABLE IF NOT EXISTS projects (
     id BIGSERIAL PRIMARY KEY, project_key TEXT NOT NULL UNIQUE, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
     llm_model TEXT, embedding_model TEXT,
+    knowledge_language TEXT NOT NULL DEFAULT 'zh'
+        CHECK (knowledge_language IN ('auto','zh','en')),
     model_max_tokens INTEGER NOT NULL DEFAULT 32768 CHECK (model_max_tokens BETWEEN 1024 AND 1048576),
     chunk_max_tokens INTEGER NOT NULL DEFAULT 512 CHECK (chunk_max_tokens BETWEEN 64 AND 262144),
     graph_generation BIGINT NOT NULL DEFAULT 0,
@@ -811,6 +838,25 @@ WHERE d.processing_stage='uploaded' OR d.processing_stage IS NULL;
 """
 
 
+SHADOW_RELATION_SOURCE_MODEL_COMPONENTS = frozenset({
+    "source_inventory",
+    "source_reference",
+    "source_binding",
+    "source_conflict",
+    "batch_verifier",
+    "source_structure_binding_audit",
+    "source_projection_role_audit",
+    "source_projection_group_audit",
+    "source_projection_group_anchor_audit",
+    "atomic_publication_audit",
+})
+SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS = frozenset({
+    *SHADOW_RELATION_SOURCE_MODEL_COMPONENTS,
+    "proposer",
+    "classifier",
+})
+
+
 class Database:
     _hnsw_cache: OrderedDict[tuple[str, str, str, int], None] = OrderedDict()
     _hnsw_cache_lock = threading.RLock()
@@ -848,6 +894,15 @@ class Database:
                 raise RuntimeError(
                     "检测到待执行的重迁移；请先运行 "
                     "`.venv/bin/python scripts/manage_migrations.py apply`，再启动服务"
+                )
+            missing_naming = [
+                version for version in KNOWLEDGE_FORGE_NAMING_REQUIRED_MIGRATIONS
+                if not migrations.is_applied(conn, version)
+            ]
+            if missing_naming:
+                raise RuntimeError(
+                    "Knowledge Forge 命名迁移尚未完成；请先运行 "
+                    "`.venv/bin/python scripts/manage_migrations.py apply`"
                 )
             conn.execute(
                 "ALTER TABLE IF EXISTS canonical_entities "
@@ -903,6 +958,11 @@ class Database:
                 "migrations": list(SHADOW_RELATION_V2_REQUIRED_MIGRATIONS),
                 "tables": sorted(SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS),
             }
+
+    def assert_grounded_relation_ready(self) -> dict[str, Any]:
+        """Validate the grounded relation runtime's immutable storage contract."""
+
+        return self.assert_shadow_relation_v2_ready()
 
     def assert_graphrag_native_ready(self) -> dict[str, Any]:
         """Fail closed if the isolated native control-plane migration is incomplete."""
@@ -1129,19 +1189,22 @@ class Database:
 
     @staticmethod
     def _json(value: Any) -> str:
-        return json.dumps({} if value is None else value, ensure_ascii=False)
+        return json.dumps(
+            sanitize_unicode_data({} if value is None else value),
+            ensure_ascii=False,
+        )
 
     @staticmethod
     def _audit_json(value: Any) -> str:
         payload = {} if value is None else value
         if Config.audit_redaction_enabled:
             payload = redact_audit_payload(payload)
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(sanitize_unicode_data(payload), ensure_ascii=False)
 
     @staticmethod
     def _canonical_json(value: Any) -> str:
         return json.dumps(
-            {} if value is None else value,
+            sanitize_unicode_data({} if value is None else value),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -1227,7 +1290,7 @@ class Database:
         result = conn.execute(
             """UPDATE projects
                SET graph_status=%s,graph_policy_version='',graph_policy_hash='',
-                   graph_error=%s,updated_at=NOW()
+                   graph_error=%s
                WHERE is_deleted=FALSE AND graph_status<>%s
                  AND (graph_policy_version<>%s
                       OR graph_policy_hash<>COALESCE(NULLIF(active_policy_hash,''),%s)
@@ -1291,25 +1354,52 @@ class Database:
         embedding_model: str | None,
         *,
         strategy_key: str | None = None,
+        knowledge_language: str = "zh",
     ) -> dict[str, Any]:
         selected_strategy = (
             normalize_strategy(strategy_key) if strategy_key is not None else STABLE_STRATEGY
         )
         if strategy_key is not None and selected_strategy not in {
-            ENHANCED_SHADOW_STRATEGY,
+            KNOWLEDGE_FORGE_STRATEGY,
             GRAPHRAG_NATIVE_STRATEGY,
         }:
             raise ValueError("新项目只能绑定 Knowledge Forge 或 GraphRAG Native")
+        knowledge_language = normalize_knowledge_language(
+            knowledge_language, default=CHINESE,
+        )
         with self.connection() as conn:
-            row = conn.execute(
-                """INSERT INTO projects(
-                   project_key,name,description,llm_model,embedding_model,graph_namespace_id)
-                VALUES(%s,%s,%s,%s,%s,%s) RETURNING *""",
-                (
-                    f"pending-{uuid.uuid4().hex}", name, description, llm_model,
-                    embedding_model, str(uuid.uuid4()),
-                ),
+            language_column = conn.execute(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_schema=current_schema()
+                     AND table_name='projects'
+                     AND column_name='knowledge_language'""",
             ).fetchone()
+            if language_column:
+                row = conn.execute(
+                    """INSERT INTO projects(
+                       project_key,name,description,llm_model,embedding_model,
+                       knowledge_language,graph_namespace_id)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+                    (
+                        f"pending-{uuid.uuid4().hex}", name, description,
+                        llm_model, embedding_model, knowledge_language,
+                        str(uuid.uuid4()),
+                    ),
+                ).fetchone()
+            else:
+                # Migration and upgrade tests intentionally exercise historic
+                # schemas.  Keep project creation usable until migration 0034
+                # adds the forward-only language preference.
+                row = conn.execute(
+                    """INSERT INTO projects(
+                       project_key,name,description,llm_model,embedding_model,
+                       graph_namespace_id)
+                    VALUES(%s,%s,%s,%s,%s,%s) RETURNING *""",
+                    (
+                        f"pending-{uuid.uuid4().hex}", name, description,
+                        llm_model, embedding_model, str(uuid.uuid4()),
+                    ),
+                ).fetchone()
             key = self.project_key(int(row["id"]), name)
             result = conn.execute(
                 "UPDATE projects SET project_key=%s,updated_at=NOW() WHERE id=%s RETURNING *",
@@ -1356,6 +1446,7 @@ class Database:
 
     def update_project(self, project_id: int, **values: Any) -> dict[str, Any]:
         allowed = {"llm_model", "embedding_model", "model_max_tokens", "chunk_max_tokens",
+                   "knowledge_language",
                    "schema_status", "active_schema_version", "graph_status",
                    "graph_policy_version", "graph_policy_hash", "graph_error", "metadata", "status"}
         fields = [key for key in values if key in allowed]
@@ -1419,11 +1510,30 @@ class Database:
         manifest_digest: str,
         empty: bool = False,
         stats: dict[str, int] | None = None,
+        job_id: str = "",
     ) -> dict[str, Any] | None:
         """Publish a rebuild only if its immutable generation is still current."""
 
         status = GRAPH_EMPTY if empty else GRAPH_READY
         with self.connection() as conn:
+            if job_id:
+                job = conn.execute(
+                    "SELECT status,metadata FROM jobs WHERE id=%s FOR UPDATE",
+                    (str(job_id),),
+                ).fetchone()
+                metadata = (
+                    job.get("metadata")
+                    if job and isinstance(job.get("metadata"), dict)
+                    else {}
+                )
+                if (
+                    not job
+                    or str(job.get("status") or "") not in {"queued", "running"}
+                    or bool(metadata.get("cancel_requested"))
+                ):
+                    raise JobCancellationRequested(
+                        "任务已终止，拒绝发布项目图谱"
+                    )
             lease = conn.execute(
                 """SELECT id FROM graph_leases
                    WHERE project_id=%s AND namespace_id=%s AND graph_generation=%s
@@ -1497,6 +1607,19 @@ class Database:
                    WHERE project_id=%s AND status='indexed' AND is_deleted=FALSE""",
                 (project_id,),
             )
+            if job_id:
+                conn.execute(
+                    """UPDATE jobs SET metadata=metadata || %s::jsonb,updated_at=NOW()
+                       WHERE id=%s""",
+                    (
+                        self._json({
+                            "publication_committed": True,
+                            "publication_kind": "project_graph",
+                            "published_generation": int(target_generation),
+                        }),
+                        str(job_id),
+                    ),
+                )
             return project
 
     def acquire_graph_lease(
@@ -1593,6 +1716,27 @@ class Database:
                    WHERE id=%s AND lease_token=%s AND status='active' RETURNING id""",
                 (lease_id, lease_token),
             ).fetchone())
+
+    def release_job_graph_leases(self, job_id: str) -> int:
+        """Release graph leases owned by one interrupted durable job.
+
+        Strategy writers and ordinary project graph rebuilds include the job
+        id in their owner token.  After a process restart no old worker can
+        still be using those leases, so cancellation recovery may release only
+        those exact owners instead of waiting for the normal TTL.
+        """
+
+        owners = [
+            f"strategy:{KNOWLEDGE_FORGE_STRATEGY}:{str(job_id)}",
+            f"graph-rebuild:{str(job_id)}",
+        ]
+        with self.connection() as conn:
+            result = conn.execute(
+                """UPDATE graph_leases SET status='released',released_at=NOW()
+                   WHERE owner=ANY(%s) AND status='active'""",
+                (owners,),
+            )
+            return max(0, int(result.rowcount or 0))
 
     def persist_graph_manifest(
         self, project_id: int, namespace_id: str, graph_generation: int,
@@ -1726,6 +1870,10 @@ class Database:
                     COALESCE(build.status,'uploaded') AS strategy_status,
                     COALESCE(build.error_message,'') AS strategy_error_message,
                     COALESCE(build.stats,'{{}}'::jsonb) AS strategy_stats,
+                    active_revision.status AS active_revision_status,
+                    active_revision.content_hash AS active_revision_content_hash,
+                    active_revision.source_hash AS active_revision_source_hash,
+                    active_revision.config_hash AS active_revision_config_hash,
                     (
                         SELECT COUNT(*) FROM chunks prepared_chunk
                         WHERE prepared_chunk.document_id=d.id
@@ -1743,6 +1891,8 @@ class Database:
                 FROM documents d JOIN projects p ON p.id=d.project_id
                 LEFT JOIN document_strategy_builds build
                   ON build.document_id=d.id AND build.strategy_key=%s
+                LEFT JOIN document_content_revisions active_revision
+                  ON active_revision.revision_id=d.active_revision_id
                 WHERE {condition} ORDER BY d.updated_at DESC,d.id DESC""", params
             ).fetchall()
 
@@ -1780,15 +1930,16 @@ class Database:
             conn.execute(
                 """INSERT INTO project_strategy_graphs(
                        project_id,strategy_key,namespace_id,status,policy_summary)
-                   VALUES(%s,'enhanced_shadow',%s,'empty',%s::jsonb)
+                   VALUES(%s,%s,%s,'empty',%s::jsonb)
                    ON CONFLICT(project_id,strategy_key) DO NOTHING""",
                 (
                     project_id,
+                    KNOWLEDGE_FORGE_STRATEGY,
                     str(uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        f"knowledge-forge:{project['graph_namespace_id']}:enhanced-shadow",
+                        f"knowledge-forge:{project['graph_namespace_id']}:grounded",
                     )),
-                    self._json({"mode": "shadow", "production_approved": False}),
+                    self._json({"mode": "grounded", "production_approved": False}),
                 ),
             )
             conn.execute(
@@ -1820,7 +1971,7 @@ class Database:
             ).fetchone()
             if not document:
                 raise LookupError("文档不存在")
-            for strategy in ("stable", "enhanced_shadow"):
+            for strategy in (STABLE_STRATEGY, KNOWLEDGE_FORGE_STRATEGY):
                 conn.execute(
                     """INSERT INTO document_strategy_builds(
                            project_id,document_id,strategy_key,status,error_message,stats)
@@ -1892,6 +2043,25 @@ class Database:
             return conn.execute(
                 "SELECT * FROM graphrag_native_runs WHERE run_id=%s", (run_id,),
             ).fetchone()
+
+    def cancel_unpublished_graphrag_native_runs(
+        self, project_id: int, *, reason: str,
+    ) -> list[dict[str, Any]]:
+        """Close restart-orphaned native attempts without touching READY runs."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE graphrag_native_runs
+                   SET state='CANCELLED',failure_class='service_restart_cancel',
+                       failure_message=%s,failed_at=COALESCE(failed_at,NOW()),
+                       heartbeat_at=NOW(),lease_owner='',lease_expires_at=NULL
+                   WHERE project_id=%s
+                     AND state IN (
+                       'PENDING','PREPARING','RUNNING','EXECUTION_COMPLETE','VALIDATING'
+                     )
+                   RETURNING *""",
+                (str(reason or "服务恢复时确认构建已终止")[:4000], int(project_id)),
+            ).fetchall()
 
     def list_graphrag_native_runs(self, project_id: int) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -2201,13 +2371,30 @@ class Database:
 
     def activate_graphrag_native_run(
         self, run_id: str, *, owner: str, validation_report_hash: str,
-        expected_source_snapshot_hash: str,
+        expected_source_snapshot_hash: str, job_id: str = "",
     ) -> dict[str, Any]:
         """CAS the native pointer only after validation and unchanged source fingerprint."""
 
         if not re.fullmatch(r"[0-9a-f]{64}", str(validation_report_hash)):
             raise ValueError("validation_report_hash 必须是 SHA-256")
         with self.connection() as conn:
+            if job_id:
+                job = conn.execute(
+                    "SELECT status,metadata FROM jobs WHERE id=%s FOR UPDATE",
+                    (str(job_id),),
+                ).fetchone()
+                metadata = (
+                    job.get("metadata") if job and isinstance(job.get("metadata"), dict)
+                    else {}
+                )
+                if (
+                    not job
+                    or str(job.get("status") or "") not in {"queued", "running"}
+                    or bool(metadata.get("cancel_requested"))
+                ):
+                    raise JobCancellationRequested(
+                        "任务已终止，拒绝发布 GraphRAG Native 成果"
+                    )
             run = conn.execute(
                 "SELECT * FROM graphrag_native_runs WHERE run_id=%s FOR UPDATE", (run_id,),
             ).fetchone()
@@ -2236,6 +2423,26 @@ class Database:
                    WHERE project_id=%s""",
                 (run_id, run["project_id"]),
             )
+            # Publishing a user-requested build is project activity. Keep the
+            # recent-project order aligned with the Knowledge Forge path while
+            # the Native graph storage itself remains completely independent.
+            conn.execute(
+                "UPDATE projects SET updated_at=NOW() WHERE id=%s AND is_deleted=FALSE",
+                (run["project_id"],),
+            )
+            if job_id:
+                conn.execute(
+                    """UPDATE jobs SET metadata=metadata || %s::jsonb,updated_at=NOW()
+                       WHERE id=%s""",
+                    (
+                        self._json({
+                            "publication_committed": True,
+                            "publication_kind": "graphrag_native_bundle",
+                            "published_run_id": str(run_id),
+                        }),
+                        str(job_id),
+                    ),
+                )
             return ready
 
     @staticmethod
@@ -2315,7 +2522,7 @@ class Database:
         """Bind an unassigned project exactly once using a generation CAS."""
 
         strategy_key = normalize_strategy(strategy_key)
-        if strategy_key not in {ENHANCED_SHADOW_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
+        if strategy_key not in {KNOWLEDGE_FORGE_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
             raise ValueError("项目只能绑定 Knowledge Forge 或 GraphRAG Native")
         with self.connection() as conn:
             row = conn.execute(
@@ -2343,7 +2550,7 @@ class Database:
         if str(selection.get("association_status") or "") != "bound":
             raise ValueError("项目尚未绑定知识图谱策略，请先在项目首页完成一次性选择")
         strategy_key = normalize_strategy(str(selection.get("selected_strategy") or ""))
-        if strategy_key not in {ENHANCED_SHADOW_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
+        if strategy_key not in {KNOWLEDGE_FORGE_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
             raise RuntimeError("项目绑定了不可用于当前界面的知识图谱策略")
         if expected_strategy is not None and strategy_key != normalize_strategy(expected_strategy):
             raise ValueError("请求的知识图谱策略与项目绑定策略不一致")
@@ -2501,6 +2708,195 @@ class Database:
                 (project_id, strategy_key),
             ).fetchone()
 
+    def reconcile_knowledge_forge_schema_freshness(
+        self, project_id: int,
+    ) -> dict[str, Any] | None:
+        """Fail closed when a ready Knowledge Forge snapshot predates its active Schema.
+
+        Older graph rows did not persist the logical Schema version used by the
+        extraction run.  Such a row cannot prove that its normalized facts are
+        compatible with the currently active Schema, so it must be rebuilt.
+        The transition is idempotent: only a graph still advertised as ready
+        advances its CAS generation.
+        """
+
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE project_strategy_graphs graph
+                   SET generation=graph.generation+1,status='stale',
+                       error_message='逻辑 Schema 已变化，Knowledge Forge 需要重新构建',
+                       lease_token='',lease_expires_at=NULL,
+                       policy_summary=graph.policy_summary || jsonb_build_object(
+                           'invalidated_by','logical_schema',
+                           'invalidated_schema_version',project.active_schema_version
+                       ),
+                       updated_at=NOW()
+                   FROM projects project
+                   WHERE graph.project_id=project.id
+                     AND graph.project_id=%s
+                     AND graph.strategy_key=%s
+                     AND graph.status='ready'
+                     AND CASE
+                         WHEN COALESCE(
+                             graph.policy_summary->>'schema_version',''
+                         ) ~ '^[0-9]+$'
+                         THEN (graph.policy_summary->>'schema_version')::BIGINT
+                             <> project.active_schema_version
+                         ELSE TRUE
+                     END
+                   RETURNING graph.*""",
+                (project_id, KNOWLEDGE_FORGE_STRATEGY),
+            ).fetchone()
+
+    def reconcile_knowledge_forge_entity_freshness(
+        self,
+        project_id: int,
+        *,
+        code_version: str,
+        policy_set: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Invalidate a ready graph backed by an older entity treatment.
+
+        Document strategy rows describe source preparation, so they remain
+        ``indexed`` when only extraction or identity-resolution code changes.
+        The project graph must nevertheless be rebuilt unless its referenced,
+        complete entity namespace proves both the loaded code version and all
+        required policy axes. Missing legacy metadata deliberately fails
+        closed once.
+        """
+
+        expected_code = str(code_version or "").strip()
+        expected_policy = {
+            str(key): str(value)
+            for key, value in dict(policy_set or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
+        if not expected_code or not expected_policy:
+            raise ValueError(
+                "entity freshness requires a code version and policy set"
+            )
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE project_strategy_graphs graph
+                   SET generation=graph.generation+1,status='stale',
+                       error_message=(
+                         '实体抽取或归一策略已升级，Knowledge Forge 需要重新构建'
+                       ),
+                       lease_token='',lease_expires_at=NULL,
+                       policy_summary=graph.policy_summary || jsonb_build_object(
+                           'invalidated_by','entity_treatment',
+                           'expected_entity_code_version',%s::text,
+                           'expected_entity_policy_set',%s::jsonb
+                       ),
+                       updated_at=NOW()
+                   WHERE graph.project_id=%s
+                     AND graph.strategy_key=%s
+                     AND graph.status='ready'
+                     AND COALESCE(
+                       graph.policy_summary #>>
+                         '{relation_artifact_preservation,mode}',
+                       ''
+                     )<>'frozen_artifact_reprojection_v1'
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM entity_shadow_namespaces namespace
+                       WHERE namespace.id=(
+                           graph.policy_summary->>'entity_namespace_id'
+                       )
+                         AND namespace.project_id=graph.project_id
+                         AND namespace.status='ready'
+                         AND namespace.snapshot_complete=TRUE
+                         AND namespace.code_version=%s
+                         AND namespace.policy_set @> %s::jsonb
+                     )
+                   RETURNING graph.*""",
+                (
+                    expected_code,
+                    self._json(expected_policy),
+                    int(project_id),
+                    KNOWLEDGE_FORGE_STRATEGY,
+                    expected_code,
+                    self._json(expected_policy),
+                ),
+            ).fetchone()
+
+    def reconcile_knowledge_forge_relation_freshness(
+        self,
+        project_id: int,
+        *,
+        code_digest: str,
+        treatment_digest: str,
+    ) -> dict[str, Any] | None:
+        """Invalidate a ready graph whose relation treatment is not loaded.
+
+        Source bytes and entity assignments can remain reusable while relation
+        candidate, verifier, normalization or deployment-threshold policy has
+        changed. A ready strategy graph must therefore prove that its exact
+        referenced relation run used both the currently loaded code tree and
+        runtime treatment digest. Missing legacy metadata fails closed once.
+        """
+
+        expected_code = str(code_digest or "").strip()
+        expected_treatment = str(treatment_digest or "").strip()
+        if not expected_code or not expected_treatment:
+            raise ValueError(
+                "relation freshness requires code and treatment digests"
+            )
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE project_strategy_graphs graph
+                   SET generation=graph.generation+1,status='stale',
+                       error_message=(
+                         '关系抽取策略已升级，Knowledge Forge 需要重新构建'
+                       ),
+                       lease_token='',lease_expires_at=NULL,
+                       policy_summary=graph.policy_summary || jsonb_build_object(
+                           'invalidated_by','relation_treatment',
+                           'expected_relation_code_tree',%s::text,
+                           'expected_relation_treatment',%s::text
+                       ),
+                       updated_at=NOW()
+                   WHERE graph.project_id=%s
+                     AND graph.strategy_key=%s
+                     AND graph.status='ready'
+                     -- A recovered graph may intentionally retain a frozen,
+                     -- audited relation run after an implementation-only
+                     -- deployment.  Its public read path independently
+                     -- proves the published endpoint set still equals that
+                     -- run's eligible fact set before exposing it.  Do not
+                     -- invalidate it here merely because the current runtime
+                     -- treatment digest differs; source/schema changes still
+                     -- advance the normal graph generation elsewhere.
+                     AND COALESCE(
+                       graph.policy_summary #>>
+                         '{relation_artifact_preservation,mode}',
+                       ''
+                     )<>'frozen_artifact_reprojection_v1'
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM shadow_relation_v2_runs run
+                       WHERE run.id=(
+                           graph.policy_summary #>>
+                           '{entity_metrics,relation_v2_run_id}'
+                       )
+                         AND run.project_id=graph.project_id
+                         AND run.status='ready'
+                         AND run.fingerprint_components #>>
+                               '{materialization_root,code_tree}'=%s
+                         AND run.fingerprint_components #>>
+                               '{materialization_root,treatment}'=%s
+                     )
+                   RETURNING graph.*""",
+                (
+                    expected_code,
+                    expected_treatment,
+                    int(project_id),
+                    KNOWLEDGE_FORGE_STRATEGY,
+                    expected_code,
+                    expected_treatment,
+                ),
+            ).fetchone()
+
     def mark_strategy_graph_stale(
         self, project_id: int, strategy_key: str, reason: str,
     ) -> dict[str, Any]:
@@ -2517,12 +2913,12 @@ class Database:
                 raise LookupError("项目策略图状态不存在")
             return row
 
-    def invalidate_enhanced_strategy_for_document(
+    def invalidate_knowledge_forge_for_document(
         self, document_id: int, *, reason: str,
     ) -> None:
-        """Invalidate derived shadow results for an explicit source mutation.
+        """Invalidate derived Knowledge Forge results for an explicit source mutation.
 
-        The enhanced strategy is a project-wide snapshot.  Callers use this at
+        The Knowledge Forge strategy is a project-wide snapshot.  Callers use this at
         document/source mutation boundaries, not merely because a stable
         strategy rebuild starts.  Empty graphs stay empty so a first baseline
         build is not presented as a failed or stale experiment.
@@ -2541,7 +2937,7 @@ class Database:
                        stats='{}'::jsonb,error_message='',started_at=NULL,
                        completed_at=NULL,updated_at=NOW()
                    WHERE project_id=%s AND strategy_key=%s AND status<>'deleted'""",
-                (document["project_id"], ENHANCED_SHADOW_STRATEGY),
+                (document["project_id"], KNOWLEDGE_FORGE_STRATEGY),
             )
             conn.execute(
                 """UPDATE project_strategy_graphs
@@ -2550,7 +2946,7 @@ class Database:
                    WHERE project_id=%s AND strategy_key=%s AND status<>'empty'""",
                 (
                     reason or "稳定基线已更新，Knowledge Forge 需要重新构建",
-                    document["project_id"], ENHANCED_SHADOW_STRATEGY,
+                    document["project_id"], KNOWLEDGE_FORGE_STRATEGY,
                 ),
             )
 
@@ -2572,10 +2968,28 @@ class Database:
     def complete_strategy_graph_rebuild(
         self, project_id: int, strategy_key: str, generation: int,
         *, stats: dict[str, Any], policy_summary: dict[str, Any], empty: bool = False,
+        job_id: str = "",
     ) -> dict[str, Any] | None:
         strategy_key = normalize_strategy(strategy_key)
         with self.connection() as conn:
-            return conn.execute(
+            if job_id:
+                job = conn.execute(
+                    "SELECT status,metadata FROM jobs WHERE id=%s FOR UPDATE",
+                    (str(job_id),),
+                ).fetchone()
+                metadata = (
+                    job.get("metadata") if job and isinstance(job.get("metadata"), dict)
+                    else {}
+                )
+                if (
+                    not job
+                    or str(job.get("status") or "") not in {"queued", "running"}
+                    or bool(metadata.get("cancel_requested"))
+                ):
+                    raise JobCancellationRequested(
+                        "任务已终止，拒绝发布策略图谱"
+                    )
+            row = conn.execute(
                 """UPDATE project_strategy_graphs SET status=%s,ready_generation=%s,
                        error_message='',stats=%s::jsonb,policy_summary=%s::jsonb,
                        updated_at=NOW()
@@ -2586,6 +3000,20 @@ class Database:
                     self._json(policy_summary), project_id, strategy_key, generation,
                 ),
             ).fetchone()
+            if row and job_id:
+                conn.execute(
+                    """UPDATE jobs SET metadata=metadata || %s::jsonb,updated_at=NOW()
+                       WHERE id=%s""",
+                    (
+                        self._json({
+                            "publication_committed": True,
+                            "publication_kind": "strategy_graph",
+                            "published_generation": int(generation),
+                        }),
+                        str(job_id),
+                    ),
+                )
+            return row
 
     def fail_strategy_graph_rebuild(
         self, project_id: int, strategy_key: str, generation: int, error: str,
@@ -2598,6 +3026,32 @@ class Database:
                    WHERE project_id=%s AND strategy_key=%s AND generation=%s
                    RETURNING *""",
                 (error[:2000], project_id, strategy_key, generation),
+            ).fetchone()
+
+    def cancel_strategy_graph_rebuild(
+        self, project_id: int, strategy_key: str, generation: int, reason: str,
+    ) -> dict[str, Any] | None:
+        """Close an unpublished strategy generation after cooperative cancel.
+
+        A previous ready generation remains a valid historical artifact, but
+        the current generation must not be advertised as ready.  First builds
+        return to ``empty``; rebuilds remain ``stale`` and can be retried.
+        """
+
+        strategy_key = normalize_strategy(strategy_key)
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE project_strategy_graphs
+                   SET status=CASE WHEN ready_generation>0 THEN 'stale' ELSE 'empty' END,
+                       error_message=%s,lease_token='',lease_expires_at=NULL,
+                       updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s AND generation=%s
+                     AND status='rebuilding'
+                   RETURNING *""",
+                (
+                    str(reason or "构建已安全终止，未发布未完成图谱")[:2000],
+                    project_id, strategy_key, generation,
+                ),
             ).fetchone()
 
     def count_documents(self, project_id: int) -> int:
@@ -2703,6 +3157,21 @@ class Database:
                 (revision_id,),
             ).fetchone()
 
+    def abandon_job_document_revision(
+        self, ingestion_run_id: str, *, reason: str,
+    ) -> dict[str, Any] | None:
+        """Close only an unpublished revision owned by an interrupted job."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE document_content_revisions
+                   SET status='failed',failure=%s,failed_at=NOW(),lease_token=NULL,
+                       lease_expires_at=NULL,updated_at=NOW()
+                   WHERE ingestion_run_id=%s AND status='building'
+                   RETURNING *""",
+                (str(reason or "任务已安全终止")[:2000], str(ingestion_run_id)),
+            ).fetchone()
+
     def list_document_revisions(self, document_id: int) -> list[dict[str, Any]]:
         with self.connection() as conn:
             return conn.execute(
@@ -2763,6 +3232,21 @@ class Database:
         json_fields = {"metadata", "chunk_config", "parse_quality"}
         with self.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (document_id,))
+            job = conn.execute(
+                "SELECT kind,status,metadata FROM jobs WHERE id=%s FOR UPDATE",
+                (str(ingestion_run_id),),
+            ).fetchone()
+            job_metadata = (
+                job.get("metadata") if job and isinstance(job.get("metadata"), dict)
+                else {}
+            )
+            if job and (
+                str(job.get("status") or "") not in {"queued", "running"}
+                or bool(job_metadata.get("cancel_requested"))
+            ):
+                raise JobCancellationRequested(
+                    "任务已终止，拒绝发布文档预处理结果"
+                )
             document = conn.execute(
                 "SELECT * FROM documents WHERE id=%s AND is_deleted=FALSE FOR UPDATE",
                 (document_id,),
@@ -2842,6 +3326,24 @@ class Database:
                 ).fetchone()
             if not project:
                 raise LookupError("项目不存在")
+            # A content-preparation job owns exactly one document revision.
+            # Mark its publication in the same transaction so a cancellation
+            # cannot be accepted in the tiny tail before the worker writes its
+            # terminal job status.  Ingestion jobs continue into graph
+            # construction and therefore must remain cancellable here.
+            if job and str(job.get("kind") or "") == "content_preparation":
+                conn.execute(
+                    """UPDATE jobs SET metadata=metadata || %s::jsonb,updated_at=NOW()
+                       WHERE id=%s""",
+                    (
+                        self._json({
+                            "publication_committed": True,
+                            "publication_kind": "document_revision",
+                            "published_revision_id": str(revision_id),
+                        }),
+                        str(ingestion_run_id),
+                    ),
+                )
             return document, project
 
     def finalize_document_graph_facts(
@@ -2963,6 +3465,14 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Write one immutable content revision without deleting prior audit history."""
 
+        sections = sanitize_unicode_data(sections)
+        chunks = sanitize_unicode_data(chunks)
+        for item in [*sections, *chunks]:
+            if "content" in item:
+                item["content_hash"] = hashlib.sha256(
+                    str(item.get("content") or "").encode("utf-8")
+                ).hexdigest()
+
         implicit_revision = revision_id is None
         if implicit_revision:
             ingestion_run_id = ingestion_run_id or f"compat:{uuid.uuid4().hex}"
@@ -3051,6 +3561,30 @@ class Database:
                 )
                 ORDER BY c.chunk_index,c.id""", (document_id,)
             ).fetchall()
+
+    def get_chunk_provenance(
+        self, project_id: int, chunk_ids: list[int],
+    ) -> dict[int, dict[str, Any]]:
+        """Load source presentation metadata for exact current chunks."""
+
+        ids = sorted({int(value) for value in chunk_ids if int(value) > 0})
+        if not ids:
+            return {}
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT chunk.id,chunk.document_id,chunk.content,chunk.metadata,
+                          section.title AS section_title,
+                          document.original_filename,document.storage_path,
+                          document.mime_type
+                   FROM chunks chunk
+                   JOIN documents document ON document.id=chunk.document_id
+                   LEFT JOIN sections section ON section.id=chunk.section_id
+                   WHERE chunk.project_id=%s AND chunk.id=ANY(%s)
+                     AND chunk.is_deleted=FALSE AND document.is_deleted=FALSE
+                     AND document.active_revision_id=chunk.revision_id""",
+                (int(project_id), ids),
+            ).fetchall()
+            return {int(item["id"]): item for item in rows}
 
     def replace_document_embeddings(self, document_id: int, records: list[dict[str, Any]]) -> None:
         with self.connection() as conn:
@@ -3347,19 +3881,97 @@ class Database:
                 (project_id,object_type,model_name)
             ).fetchall()
 
-    def list_document_embeddings(
-        self, document_id: int, object_type: str, model_name: str
+    def list_active_embeddings_for_runtime_reindex(
+        self,
+        runtime_profile: str,
+        *,
+        project_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Return only current, rebuildable vectors from another runtime."""
+
+        project_filter = "AND v.project_id=%s" if project_id is not None else ""
+        params: list[Any] = [str(runtime_profile)]
+        if project_id is not None:
+            params.append(int(project_id))
         with self.connection() as conn:
             return conn.execute(
-                """SELECT v.id,v.project_id,v.document_id,v.chunk_id,v.object_type,
-                          v.object_key,v.content,v.model_name,v.embedding,v.dimension,v.metadata
-                   FROM vector_embeddings v JOIN documents d
-                     ON d.id=v.document_id AND d.active_revision_id=v.revision_id
+                f"""SELECT v.id,v.project_id,v.object_type,v.object_key,v.content,
+                           v.model_name,v.dimension
+                    FROM vector_embeddings v
+                    JOIN projects p ON p.id=v.project_id
+                    LEFT JOIN documents d ON d.id=v.document_id
+                    WHERE v.is_deleted=FALSE AND p.is_deleted=FALSE
+                      AND COALESCE(v.metadata->>'embedding_runtime_profile','')<>%s
+                      AND (v.document_id IS NULL OR (
+                        d.is_deleted=FALSE AND d.active_revision_id=v.revision_id
+                      ))
+                      {project_filter}
+                    ORDER BY v.model_name,v.project_id,v.object_type,v.id""",
+                tuple(params),
+            ).fetchall()
+
+    def replace_embedding_runtime_batch(
+        self,
+        records: list[dict[str, Any]],
+        runtime_profile: str,
+    ) -> int:
+        """Atomically replace a bounded vector batch and stamp its backend."""
+
+        if not records:
+            return 0
+        updated = 0
+        with self.connection() as conn:
+            for record in records:
+                vector = [float(value) for value in record.get("embedding") or []]
+                if not vector or not all(math.isfinite(value) for value in vector):
+                    raise ValueError("Embedding 重建返回了空向量或非有限数值")
+                model_name = str(record["model_name"])
+                self._ensure_hnsw_index(conn, model_name, len(vector))
+                result = conn.execute(
+                    """UPDATE vector_embeddings
+                       SET embedding=%s,embedding_vector=%s::vector,dimension=%s,
+                           metadata=metadata||%s::jsonb,updated_at=NOW()
+                       WHERE id=%s AND is_deleted=FALSE AND model_name=%s""",
+                    (
+                        vector, self._vector_literal(vector), len(vector),
+                        self._json({
+                            "embedding_runtime_profile": str(runtime_profile),
+                        }),
+                        int(record["id"]), model_name,
+                    ),
+                )
+                updated += max(0, int(result.rowcount or 0))
+        return updated
+
+    def list_document_embeddings(
+        self,
+        document_id: int,
+        object_type: str,
+        model_name: str,
+        *,
+        revision_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        revision_filter = (
+            "v.revision_id=%s"
+            if revision_id
+            else "d.active_revision_id=v.revision_id"
+        )
+        params: tuple[Any, ...] = (
+            (document_id, object_type, model_name, revision_id)
+            if revision_id
+            else (document_id, object_type, model_name)
+        )
+        with self.connection() as conn:
+            return conn.execute(
+                f"""SELECT v.id,v.project_id,v.document_id,v.chunk_id,v.revision_id,v.object_type,
+                          v.object_key,v.content,v.content_hash,v.model_name,
+                          v.embedding,v.dimension,v.metadata
+                   FROM vector_embeddings v JOIN documents d ON d.id=v.document_id
                    WHERE v.document_id=%s AND v.object_type=%s AND v.model_name=%s
                      AND v.is_deleted=FALSE AND d.is_deleted=FALSE
+                     AND {revision_filter}
                    ORDER BY v.chunk_id,v.id""",
-                (document_id, object_type, model_name),
+                params,
             ).fetchall()
 
     def count_prior_indexed_documents(self, project_id: int, document_id: int) -> int:
@@ -3425,11 +4037,21 @@ class Database:
         strategy_key = normalize_strategy(strategy_key)
         job_id = uuid.uuid4().hex
         with self.connection() as conn:
-            return conn.execute(
+            job = conn.execute(
                 """INSERT INTO jobs(id,kind,project_id,document_id,metadata,strategy_key)
                    VALUES(%s,%s,%s,%s,%s::jsonb,%s) RETURNING *""",
                 (job_id, kind, project_id, document_id, self._json(metadata), strategy_key),
             ).fetchone()
+            # The project chooser is ordered by project activity. Creating a
+            # durable project job is user-visible activity even when the job
+            # itself does not mutate project metadata, so keep the project in
+            # the recent-project list while work is queued or resumed.
+            if project_id is not None:
+                conn.execute(
+                    "UPDATE projects SET updated_at=NOW() WHERE id=%s AND is_deleted=FALSE",
+                    (project_id,),
+                )
+            return job
 
     def create_graph_rebuild_job(self, project_id: int) -> dict[str, Any]:
         """Queue or coalesce one rebuild at the project's current generation."""
@@ -3484,6 +4106,12 @@ class Database:
             job = conn.execute("SELECT * FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
             if not job:
                 raise LookupError("任务不存在")
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            if (
+                str(job.get("status") or "") not in {"queued", "running"}
+                or bool(metadata.get("cancel_requested"))
+            ):
+                raise RuntimeError("任务已取消或结束，拒绝开始图谱写入")
             if not job.get("project_id"):
                 raise ValueError("图谱写任务缺少项目")
             conn.execute(
@@ -3515,11 +4143,69 @@ class Database:
         with self.connection() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
             if not row: raise LookupError("任务不存在")
-            logs = list(row.get("log") or [])
-            if log: logs.append(log)
             next_status = status or row["status"]
             existing_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
             merged_metadata = {**existing_metadata, **metadata} if metadata is not None else existing_metadata
+            terminal = {"completed", "failed", "cancelled"}
+            # A late worker update must never revive a terminal job.  While a
+            # running job is cooperatively stopping, suppress ordinary progress
+            # writes so the durable cancellation request remains authoritative;
+            # the worker may still publish an explicit terminal result.
+            if str(row.get("status") or "") in terminal and next_status != row["status"]:
+                return row
+            if (
+                bool(existing_metadata.get("cancel_requested"))
+                and next_status == "completed"
+                and not bool(existing_metadata.get("publication_committed"))
+            ):
+                raise JobCancellationRequested(
+                    "任务已请求终止，拒绝记录未发布的完成状态"
+                )
+            if (
+                bool(existing_metadata.get("cancel_requested"))
+                and next_status not in terminal
+            ):
+                return row
+            # Cancellation acknowledgement is a terminal worker write, not an
+            # ordinary progress update.  It may close the currently active UI
+            # subtask, but it must not be able to alter any other durable
+            # metadata that was frozen when the cancellation was requested.
+            if (
+                bool(existing_metadata.get("cancel_requested"))
+                and next_status == "cancelled"
+                and metadata is not None
+            ):
+                safe_metadata: dict[str, Any] = {}
+                if metadata.get("stage") == "cancelled":
+                    safe_metadata["stage"] = "cancelled"
+                if metadata.get("cancel_acknowledged_at"):
+                    safe_metadata["cancel_acknowledged_at"] = str(
+                        metadata["cancel_acknowledged_at"]
+                    )
+                candidate_subtasks = metadata.get("subtasks")
+                if isinstance(candidate_subtasks, dict):
+                    existing_subtasks = (
+                        existing_metadata.get("subtasks")
+                        if isinstance(existing_metadata.get("subtasks"), dict)
+                        else {}
+                    )
+                    closed_subtasks = {
+                        key: value
+                        for key, value in candidate_subtasks.items()
+                        if (
+                            key in existing_subtasks
+                            and isinstance(value, dict)
+                            and str(value.get("status") or "") == "cancelled"
+                        )
+                    }
+                    if closed_subtasks:
+                        safe_metadata["subtasks"] = {
+                            **existing_subtasks,
+                            **closed_subtasks,
+                        }
+                merged_metadata = {**existing_metadata, **safe_metadata}
+            logs = list(row.get("log") or [])
+            if log: logs.append(log)
             return conn.execute(
                 """UPDATE jobs SET status=%s,progress=%s,log=%s::jsonb,error_message=NULLIF(%s,''),
                 metadata=%s::jsonb,updated_at=NOW(),completed_at=CASE WHEN %s IN ('completed','failed','cancelled') THEN NOW() ELSE completed_at END
@@ -3529,6 +4215,131 @@ class Database:
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self.connection() as conn: return conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
+
+    def request_job_cancellation(
+        self,
+        job_id: str,
+        *,
+        project_id: int,
+        allowed_kinds: list[str],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Persist a cooperative cancellation without lying about worker exit.
+
+        Queued work has not entered a side-effecting worker and can become
+        terminal immediately.  Running work remains active until its worker
+        reaches a checkpoint, rolls back or abandons staging output, and
+        acknowledges cancellation.
+        """
+
+        if not allowed_kinds:
+            raise ValueError("未指定可取消的任务类型")
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id=%s FOR UPDATE", (str(job_id),),
+            ).fetchone()
+            if not row or int(row.get("project_id") or 0) != int(project_id):
+                raise LookupError("任务不存在或不属于当前项目")
+            if str(row.get("kind") or "") not in set(allowed_kinds):
+                raise ValueError("该任务不支持从当前页面终止")
+            if str(row.get("status") or "") not in {"queued", "running"}:
+                raise ValueError("任务已经结束，无需终止")
+            existing_metadata = (
+                row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            )
+            if existing_metadata.get("publication_committed"):
+                raise JobPublicationCommitted(
+                    "任务成果已经发布，正在完成收尾，无需终止"
+                )
+            already_requested = bool(existing_metadata.get("cancel_requested"))
+            requested_at = str(
+                existing_metadata.get("cancel_requested_at")
+                or datetime.now(timezone.utc).isoformat()
+            )
+            cancellation_reason = str(reason or "用户请求安全终止任务")
+            next_status = (
+                "cancelled" if str(row.get("status") or "") == "queued"
+                else "running"
+            )
+            next_metadata = {
+                **existing_metadata,
+                "cancel_requested": True,
+                "cancel_requested_at": requested_at,
+                "cancel_reason": cancellation_reason,
+                "stage": (
+                    "cancelled" if next_status == "cancelled"
+                    else "cancelling"
+                ),
+            }
+            if next_status == "cancelled":
+                next_metadata["cancel_acknowledged_at"] = datetime.now(
+                    timezone.utc,
+                ).isoformat()
+            logs = list(row.get("log") or [])
+            if not already_requested:
+                logs.append(
+                    cancellation_reason
+                    + (
+                        "；排队任务已取消"
+                        if next_status == "cancelled"
+                        else "；正在等待当前安全步骤结束"
+                    )
+                )
+            updated = conn.execute(
+                """UPDATE jobs SET status=%s,progress=%s,log=%s::jsonb,
+                       metadata=%s::jsonb,error_message=NULL,updated_at=NOW(),
+                       completed_at=CASE WHEN %s='cancelled' THEN NOW() ELSE completed_at END
+                   WHERE id=%s RETURNING *""",
+                (
+                    next_status,
+                    100 if next_status == "cancelled" else row.get("progress"),
+                    self._json(logs), self._json(next_metadata), next_status,
+                    str(job_id),
+                ),
+            ).fetchone()
+            if next_status == "cancelled" and str(row.get("kind") or "") == "graph_sync":
+                conn.execute(
+                    """UPDATE projects SET graph_status=%s,graph_policy_version='',
+                       graph_policy_hash='',graph_error=%s,updated_at=NOW()
+                       WHERE id=%s AND graph_status=%s""",
+                    (
+                        GRAPH_STALE,
+                        "图谱构建已终止，未完成结果未发布",
+                        project_id,
+                        GRAPH_REBUILDING,
+                    ),
+                )
+            if next_status == "cancelled" and str(row.get("kind") or "") == "ingestion":
+                # Submission marks every target strategy row queued before
+                # handing the job to the executor.  A queued cancellation has
+                # no worker cleanup path, so close those exact rows here.  The
+                # latest-job guard prevents an old request from touching a
+                # later retry.
+                target_ids = [
+                    int(value)
+                    for value in (
+                        existing_metadata.get("target_document_ids")
+                        or [row.get("document_id")]
+                    )
+                    if value is not None
+                ]
+                if target_ids:
+                    conn.execute(
+                        """UPDATE document_strategy_builds
+                           SET status='cancelled',error_message=%s,
+                               completed_at=NOW(),updated_at=NOW()
+                           WHERE project_id=%s AND strategy_key=%s
+                             AND document_id=ANY(%s) AND latest_job_id=%s
+                             AND status='queued'""",
+                        (
+                            cancellation_reason,
+                            int(project_id),
+                            str(row.get("strategy_key") or STABLE_STRATEGY),
+                            target_ids,
+                            str(job_id),
+                        ),
+                    )
+            return updated
 
     def list_ingestion_batch_jobs(
         self, batch_id: str, strategy_key: str = "",
@@ -3570,6 +4381,26 @@ class Database:
                     """UPDATE jobs SET status='cancelled',log=%s::jsonb,metadata=%s::jsonb,
                     error_message=NULL,updated_at=NOW(),completed_at=NOW() WHERE id=%s""",
                     (self._json(logs), self._json(metadata), row["id"]),
+                )
+            report_job_ids = [
+                str(row["id"]) for row in rows
+                if str((row.get("metadata") or {}).get("report_run_id") or "")
+            ]
+            if report_job_ids:
+                conn.execute(
+                    """UPDATE knowledge_forge_community_reports report
+                       SET status='cancelled',error_message=%s,updated_at=NOW(),
+                           completed_at=NOW()
+                       FROM knowledge_forge_community_report_runs run
+                       WHERE report.run_id=run.run_id AND run.job_id=ANY(%s)
+                         AND report.status IN ('pending','running')""",
+                    (str(reason)[-4000:], report_job_ids),
+                )
+                conn.execute(
+                    """UPDATE knowledge_forge_community_report_runs
+                       SET status='cancelled',error_message=%s,completed_at=NOW()
+                       WHERE job_id=ANY(%s) AND status IN ('queued','running')""",
+                    (str(reason)[-4000:], report_job_ids),
                 )
             return len(rows)
 
@@ -3702,6 +4533,19 @@ class Database:
         with self.connection() as conn:
             return conn.execute(query, params).fetchone()
 
+    def latest_active_mutating_job(self, project_id: int) -> dict[str, Any] | None:
+        """Return active project work other than read-only enhancement jobs."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM jobs
+                   WHERE project_id=%s AND status IN ('queued','running')
+                     AND kind<>'community_report_build'
+                   ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END,
+                            updated_at DESC LIMIT 1""",
+                (int(project_id),),
+            ).fetchone()
+
     def ensure_base_schema(self, project_id: int, schema_json: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as conn:
             row = conn.execute("SELECT * FROM graph_schemas WHERE project_id=%s AND status='active'", (project_id,)).fetchone()
@@ -3749,6 +4593,35 @@ class Database:
                 (project_id,version,self._json(schema_json),self._json(report),document_ids,created_by),
             ).fetchone()
             conn.execute("UPDATE projects SET active_schema_version=%s,schema_status='adapted',updated_at=NOW() WHERE id=%s", (version,project_id))
+            # Logical Schema is an optional normalization layer, but a graph
+            # that claims to be ready must still identify the exact version it
+            # used.  Invalidate the Knowledge Forge snapshot atomically with Schema
+            # publication so no request can observe a new Schema paired with
+            # an old ready graph.  A graph already stale is not advanced again;
+            # an empty graph has no derived facts to invalidate.
+            conn.execute(
+                """UPDATE project_strategy_graphs
+                   SET generation=CASE
+                           WHEN status IN ('ready','rebuilding') THEN generation+1
+                           ELSE generation
+                       END,
+                       status=CASE WHEN status='empty' THEN 'empty' ELSE 'stale' END,
+                       error_message=CASE
+                           WHEN status='empty' THEN error_message
+                           ELSE '逻辑 Schema 已变化，Knowledge Forge 需要重新构建'
+                       END,
+                       lease_token=CASE WHEN status='empty' THEN lease_token ELSE '' END,
+                       lease_expires_at=CASE
+                           WHEN status='empty' THEN lease_expires_at ELSE NULL
+                       END,
+                       policy_summary=policy_summary || jsonb_build_object(
+                           'invalidated_by','logical_schema',
+                           'invalidated_schema_version',%s::BIGINT
+                       ),
+                       updated_at=NOW()
+                   WHERE project_id=%s AND strategy_key=%s""",
+                (version, project_id, KNOWLEDGE_FORGE_STRATEGY),
+            )
             return row
 
     def activate_base_schema(self, project_id: int, schema_json: dict[str, Any]) -> dict[str, Any]:
@@ -3779,6 +4652,41 @@ class Database:
 
     def list_schema_versions(self, project_id: int) -> list[dict[str, Any]]:
         with self.connection() as conn: return conn.execute("SELECT * FROM graph_schemas WHERE project_id=%s ORDER BY version DESC", (project_id,)).fetchall()
+
+    def record_schema_evaluation(
+        self,
+        project_id: int,
+        document_id: int,
+        *,
+        prior_schema_version: int,
+        resulting_schema_version: int,
+        outcome: str,
+        evaluation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one adaptive-schema decision even when it creates no version."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO schema_evaluation_runs(
+                   project_id,document_id,prior_schema_version,
+                   resulting_schema_version,outcome,evaluation)
+                   VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    project_id, document_id, prior_schema_version,
+                    resulting_schema_version, outcome, self._json(evaluation),
+                ),
+            ).fetchone()
+
+    def list_schema_evaluations(
+        self, project_id: int, *, document_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM schema_evaluation_runs WHERE project_id=%s"
+        params: list[Any] = [project_id]
+        if document_id is not None:
+            query += " AND document_id=%s"
+            params.append(document_id)
+        with self.connection() as conn:
+            return conn.execute(query + " ORDER BY created_at DESC,id DESC", params).fetchall()
 
     def list_canonical_entities(self, project_id: int, entity_type: str = "") -> list[dict[str, Any]]:
         query, params = "SELECT * FROM canonical_entities WHERE project_id=%s AND is_deleted=FALSE", [project_id]
@@ -5000,8 +5908,8 @@ class Database:
             conn.execute(
                 """INSERT INTO shadow_relation_v2_runs(
                    id,project_id,snapshot_id,input_fingerprint,fingerprint_components,
-                   source_generation,status)
-                   VALUES(%s,%s,%s,%s,%s::jsonb,%s,'planning')
+                   source_generation,status,audit_quality)
+                   VALUES(%s,%s,%s,%s,%s::jsonb,%s,'planning','complete')
                    ON CONFLICT(id) DO NOTHING""",
                 (
                     run_id,
@@ -5266,8 +6174,24 @@ class Database:
         self,
         run_id: str,
         opportunities: Any,
+        *,
+        mark_classifying: bool = True,
+        include_persisted_rows: bool = True,
     ) -> list[dict[str, Any]]:
-        """Persist the complete unordered opportunity ledger before model I/O."""
+        """Persist an immutable opportunity ledger batch before model I/O.
+
+        The first version of this ledger performed five or more client/server
+        round trips for every candidate.  Dense documents can legitimately
+        have thousands of candidates, turning provenance persistence into a
+        much longer step than relation inference.  Build each independent
+        table payload in memory, insert it set-wise, then retain the same
+        immutable pair-payload audit in one bounded read.
+
+        ``mark_classifying`` is deliberately controlled by the caller when a
+        full ledger is submitted in several batches.  A partly written ledger
+        is never a publishable run and must not appear classified merely
+        because its first batch committed.
+        """
 
         values = list(opportunities)
         with self.connection() as conn:
@@ -5278,6 +6202,29 @@ class Database:
             ).fetchone()
             if not run:
                 raise LookupError("Shadow relation v2 run does not exist")
+            source_context_identities = sorted({
+                str(item.provenance.get("source_context_id") or "")
+                for item in values
+                if (
+                    isinstance(item.provenance, dict)
+                    and str(item.provenance.get("source_context_id") or "")
+                )
+            })
+            context_id_by_identity: dict[str, str] = {}
+            if source_context_identities:
+                source_context_rows = conn.execute(
+                    """SELECT id,context_identity FROM shadow_source_contexts
+                       WHERE run_id=%s AND context_identity=ANY(%s)""",
+                    (run_id, source_context_identities),
+                ).fetchall()
+                context_id_by_identity = {
+                    str(row["context_identity"]): str(row["id"])
+                    for row in source_context_rows
+                }
+            pair_rows: list[dict[str, Any]] = []
+            pair_context_rows: list[dict[str, Any]] = []
+            candidate_source_rows: list[dict[str, Any]] = []
+            expected_by_id: dict[str, tuple[Any, ...]] = {}
             for item in values:
                 if str(item.run_id) != run_id:
                     raise ValueError("pair opportunity belongs to another run")
@@ -5293,60 +6240,12 @@ class Database:
                     provenance.get("source_record_id")
                     or item.context_identity
                 )
-                conn.execute(
-                    """INSERT INTO shadow_relation_pair_opportunities(
-                       id,run_id,project_id,document_revision_id,document_id,chunk_id,
-                       chunk_key,pair_identity,candidate_policy_version,
-                       left_occurrence_key,right_occurrence_key,left_mention_id,right_mention_id,
-                       left_start,left_end,right_start,right_end,left_canonical_id,
-                       right_canonical_id,left_assignment_version,right_assignment_version,
-                       context_identity,context_start,context_end,allowed_predicate_metadata,
-                       planning_reason,cue,type_status,status,provenance,
-                       source_kind,source_record_id)
-                       VALUES(
-                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,%s,%s)
-                       ON CONFLICT(id) DO NOTHING""",
-                    (
-                        item.opportunity_identity,
-                        run_id,
-                        int(item.project_id),
-                        item.document_revision_id,
-                        item.provenance.get("document_id"),
-                        item.provenance.get("chunk_id"),
-                        item.chunk_key,
-                        item.pair_identity,
-                        item.candidate_policy_version,
-                        item.left_occurrence_key,
-                        item.right_occurrence_key,
-                        item.left_mention_id,
-                        item.right_mention_id,
-                        int(item.left_span[0]),
-                        int(item.left_span[1]),
-                        int(item.right_span[0]),
-                        int(item.right_span[1]),
-                        item.left_canonical_id,
-                        item.right_canonical_id,
-                        item.left_assignment_version,
-                        item.right_assignment_version,
-                        item.context_identity,
-                        int(item.context_span[0]),
-                        int(item.context_span[1]),
-                        self._canonical_json(list(item.allowed_predicate_metadata)),
-                        item.planning_reason,
-                        item.cue,
-                        item.type_status,
-                        item.status,
-                        self._canonical_json(item.provenance),
-                        source_kind,
-                        source_record_id,
-                    ),
+                source_context_identity = str(
+                    provenance.get("source_context_id") or ""
                 )
-                persisted = conn.execute(
-                    """SELECT * FROM shadow_relation_pair_opportunities
-                       WHERE id=%s AND run_id=%s""",
-                    (item.opportunity_identity, run_id),
-                ).fetchone()
+                source_context_id = context_id_by_identity.get(
+                    source_context_identity, "",
+                )
                 expected = (
                     str(item.pair_identity),
                     str(item.candidate_policy_version),
@@ -5360,54 +6259,68 @@ class Database:
                     int(item.context_span[0]),
                     int(item.context_span[1]),
                 )
-                actual = (
-                    str(persisted["pair_identity"]),
-                    str(persisted["candidate_policy_version"]),
-                    str(persisted["left_occurrence_key"]),
-                    str(persisted["right_occurrence_key"]),
-                    int(persisted["left_start"]),
-                    int(persisted["left_end"]),
-                    int(persisted["right_start"]),
-                    int(persisted["right_end"]),
-                    str(persisted["context_identity"]),
-                    int(persisted["context_start"]),
-                    int(persisted["context_end"]),
+                previous_expected = expected_by_id.get(
+                    str(item.opportunity_identity),
                 )
-                if actual != expected:
+                if previous_expected is not None and previous_expected != expected:
                     raise ValueError("pair opportunity immutable input mismatch")
-                source_context_identity = str(
-                    provenance.get("source_context_id") or ""
-                )
-                if source_context_identity:
-                    source_context = conn.execute(
-                        """SELECT id FROM shadow_source_contexts
-                           WHERE run_id=%s AND context_identity=%s""",
-                        (run_id, source_context_identity),
-                    ).fetchone()
-                    if source_context:
-                        conn.execute(
-                            """INSERT INTO shadow_relation_pair_contexts(
-                               pair_opportunity_id,context_id,context_role,payload)
-                               VALUES(%s,%s,%s,%s::jsonb)
-                               ON CONFLICT(pair_opportunity_id,context_id,context_role)
-                               DO NOTHING""",
-                            (
-                                item.opportunity_identity,
-                                source_context["id"],
-                                "classification_context",
-                                self._canonical_json({
-                                    "context_identity": item.context_identity,
-                                    "context_span": [
-                                        int(item.context_span[0]),
-                                        int(item.context_span[1]),
-                                    ],
-                                    "candidate_sources": list(
-                                        provenance.get("candidate_sources") or []
-                                    ),
-                                    "planning_reason": item.planning_reason,
-                                }),
+                expected_by_id[str(item.opportunity_identity)] = expected
+                pair_rows.append({
+                    "id": str(item.opportunity_identity),
+                    "run_id": run_id,
+                    "project_id": int(item.project_id),
+                    "document_revision_id": str(item.document_revision_id),
+                    "document_id": provenance.get("document_id"),
+                    "chunk_id": provenance.get("chunk_id"),
+                    "chunk_key": str(item.chunk_key),
+                    "pair_identity": str(item.pair_identity),
+                    "candidate_policy_version": str(
+                        item.candidate_policy_version,
+                    ),
+                    "left_occurrence_key": str(item.left_occurrence_key),
+                    "right_occurrence_key": str(item.right_occurrence_key),
+                    "left_mention_id": str(item.left_mention_id),
+                    "right_mention_id": str(item.right_mention_id),
+                    "left_start": int(item.left_span[0]),
+                    "left_end": int(item.left_span[1]),
+                    "right_start": int(item.right_span[0]),
+                    "right_end": int(item.right_span[1]),
+                    "left_canonical_id": str(item.left_canonical_id),
+                    "right_canonical_id": str(item.right_canonical_id),
+                    "left_assignment_version": str(item.left_assignment_version),
+                    "right_assignment_version": str(item.right_assignment_version),
+                    "context_identity": str(item.context_identity),
+                    "context_start": int(item.context_span[0]),
+                    "context_end": int(item.context_span[1]),
+                    "allowed_predicate_metadata": list(
+                        item.allowed_predicate_metadata,
+                    ),
+                    "planning_reason": str(item.planning_reason),
+                    "cue": str(item.cue),
+                    "type_status": str(item.type_status),
+                    "status": str(item.status),
+                    "provenance": provenance,
+                    "context_id": source_context_id,
+                    "source_kind": source_kind,
+                    "source_record_id": source_record_id,
+                })
+                if source_context_identity and source_context_id:
+                    pair_context_rows.append({
+                        "pair_opportunity_id": str(item.opportunity_identity),
+                        "context_id": source_context_id,
+                        "context_role": "classification_context",
+                        "payload": {
+                            "context_identity": str(item.context_identity),
+                            "context_span": [
+                                int(item.context_span[0]),
+                                int(item.context_span[1]),
+                            ],
+                            "candidate_sources": list(
+                                provenance.get("candidate_sources") or [],
                             ),
-                        )
+                            "planning_reason": str(item.planning_reason),
+                        },
+                    })
                 candidate_sources = [
                     str(value)
                     for value in provenance.get("candidate_sources", [])
@@ -5416,50 +6329,151 @@ class Database:
                 if not candidate_sources:
                     candidate_sources = ["PAIR_PLANNER"]
                 for rank, candidate_source in enumerate(
-                    sorted(set(candidate_sources)),
-                    start=1,
+                    sorted(set(candidate_sources)), start=1,
                 ):
-                    candidate_source_id = self._shadow_relation_v2_db_id(
-                        "relcandsrc_",
-                        run_id,
-                        item.opportunity_identity,
-                        candidate_source,
-                        source_kind,
-                        source_record_id,
-                    )
-                    conn.execute(
-                        """INSERT INTO shadow_relation_candidate_sources(
-                           id,run_id,pair_opportunity_id,candidate_source,
-                           source_kind,source_record_id,candidate_rank,admitted,
-                           terminal_status,metadata)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                           ON CONFLICT(
-                               pair_opportunity_id,candidate_source,
-                               source_kind,source_record_id)
-                           DO NOTHING""",
-                        (
-                            candidate_source_id,
+                    candidate_source_rows.append({
+                        "id": self._shadow_relation_v2_db_id(
+                            "relcandsrc_",
                             run_id,
                             item.opportunity_identity,
                             candidate_source,
                             source_kind,
                             source_record_id,
-                            rank,
-                            bool(item.status == "PENDING_CLASSIFICATION"),
-                            str(item.status),
-                            self._canonical_json({
-                                "planning_reason": item.planning_reason,
-                                "cue": item.cue,
-                                "type_status": item.type_status,
-                            }),
                         ),
+                        "run_id": run_id,
+                        "pair_opportunity_id": str(item.opportunity_identity),
+                        "candidate_source": candidate_source,
+                        "source_kind": source_kind,
+                        "source_record_id": source_record_id,
+                        "candidate_rank": rank,
+                        "admitted": bool(
+                            item.status == "PENDING_CLASSIFICATION",
+                        ),
+                        "terminal_status": str(item.status),
+                        "metadata": {
+                            "planning_reason": str(item.planning_reason),
+                            "cue": str(item.cue),
+                            "type_status": str(item.type_status),
+                        },
+                    })
+            if pair_rows:
+                conn.execute(
+                    """INSERT INTO shadow_relation_pair_opportunities(
+                       id,run_id,project_id,document_revision_id,document_id,chunk_id,
+                       chunk_key,pair_identity,candidate_policy_version,
+                       left_occurrence_key,right_occurrence_key,left_mention_id,right_mention_id,
+                       left_start,left_end,right_start,right_end,left_canonical_id,
+                       right_canonical_id,left_assignment_version,right_assignment_version,
+                       context_identity,context_start,context_end,allowed_predicate_metadata,
+                       planning_reason,cue,type_status,status,provenance,
+                       context_id,source_kind,source_record_id)
+                       SELECT item.id,item.run_id,item.project_id,
+                              item.document_revision_id,item.document_id,item.chunk_id,
+                              item.chunk_key,item.pair_identity,
+                              item.candidate_policy_version,
+                              item.left_occurrence_key,item.right_occurrence_key,
+                              item.left_mention_id,item.right_mention_id,
+                              item.left_start,item.left_end,item.right_start,item.right_end,
+                              item.left_canonical_id,item.right_canonical_id,
+                              item.left_assignment_version,item.right_assignment_version,
+                              item.context_identity,item.context_start,item.context_end,
+                              item.allowed_predicate_metadata,item.planning_reason,
+                              item.cue,item.type_status,item.status,item.provenance,
+                              item.context_id,item.source_kind,item.source_record_id
+                         FROM jsonb_to_recordset(%s::jsonb) AS item(
+                              id TEXT,run_id TEXT,project_id BIGINT,
+                              document_revision_id TEXT,document_id BIGINT,chunk_id BIGINT,
+                              chunk_key TEXT,pair_identity TEXT,
+                              candidate_policy_version TEXT,
+                              left_occurrence_key TEXT,right_occurrence_key TEXT,
+                              left_mention_id TEXT,right_mention_id TEXT,
+                              left_start INTEGER,left_end INTEGER,
+                              right_start INTEGER,right_end INTEGER,
+                              left_canonical_id TEXT,right_canonical_id TEXT,
+                              left_assignment_version TEXT,right_assignment_version TEXT,
+                              context_identity TEXT,context_start INTEGER,context_end INTEGER,
+                              allowed_predicate_metadata JSONB,planning_reason TEXT,
+                              cue TEXT,type_status TEXT,status TEXT,provenance JSONB,
+                              context_id TEXT,source_kind TEXT,source_record_id TEXT
+                         )
+                       ON CONFLICT(id) DO NOTHING""",
+                    (self._canonical_json(pair_rows),),
+                )
+                persisted_rows = conn.execute(
+                    """SELECT id,pair_identity,candidate_policy_version,
+                              left_occurrence_key,right_occurrence_key,
+                              left_start,left_end,right_start,right_end,
+                              context_identity,context_start,context_end
+                         FROM shadow_relation_pair_opportunities
+                        WHERE run_id=%s AND id=ANY(%s)""",
+                    (run_id, list(expected_by_id)),
+                ).fetchall()
+                persisted_by_id = {
+                    str(row["id"]): row for row in persisted_rows
+                }
+                if len(persisted_by_id) != len(expected_by_id):
+                    raise LookupError("persisted pair opportunity is missing")
+                for opportunity_id, expected in expected_by_id.items():
+                    persisted = persisted_by_id[opportunity_id]
+                    actual = (
+                        str(persisted["pair_identity"]),
+                        str(persisted["candidate_policy_version"]),
+                        str(persisted["left_occurrence_key"]),
+                        str(persisted["right_occurrence_key"]),
+                        int(persisted["left_start"]),
+                        int(persisted["left_end"]),
+                        int(persisted["right_start"]),
+                        int(persisted["right_end"]),
+                        str(persisted["context_identity"]),
+                        int(persisted["context_start"]),
+                        int(persisted["context_end"]),
                     )
-            if run["status"] == "planning":
+                    if actual != expected:
+                        raise ValueError("pair opportunity immutable input mismatch")
+            if pair_context_rows:
+                conn.execute(
+                    """INSERT INTO shadow_relation_pair_contexts(
+                           pair_opportunity_id,context_id,context_role,payload)
+                       SELECT item.pair_opportunity_id,item.context_id,
+                              item.context_role,item.payload
+                         FROM jsonb_to_recordset(%s::jsonb) AS item(
+                              pair_opportunity_id TEXT,context_id TEXT,
+                              context_role TEXT,payload JSONB
+                         )
+                       ON CONFLICT(pair_opportunity_id,context_id,context_role)
+                       DO NOTHING""",
+                    (self._canonical_json(pair_context_rows),),
+                )
+            if candidate_source_rows:
+                conn.execute(
+                    """INSERT INTO shadow_relation_candidate_sources(
+                           id,run_id,pair_opportunity_id,candidate_source,
+                           source_kind,source_record_id,candidate_rank,admitted,
+                           terminal_status,metadata)
+                       SELECT item.id,item.run_id,item.pair_opportunity_id,
+                              item.candidate_source,item.source_kind,
+                              item.source_record_id,item.candidate_rank,
+                              item.admitted,item.terminal_status,item.metadata
+                         FROM jsonb_to_recordset(%s::jsonb) AS item(
+                              id TEXT,run_id TEXT,pair_opportunity_id TEXT,
+                              candidate_source TEXT,source_kind TEXT,
+                              source_record_id TEXT,candidate_rank INTEGER,
+                              admitted BOOLEAN,terminal_status TEXT,metadata JSONB
+                         )
+                       ON CONFLICT(
+                           pair_opportunity_id,candidate_source,
+                           source_kind,source_record_id)
+                       DO NOTHING""",
+                    (self._canonical_json(candidate_source_rows),),
+                )
+            if mark_classifying and run["status"] == "planning":
                 conn.execute(
                     """UPDATE shadow_relation_v2_runs SET status='classifying'
                        WHERE id=%s AND status='planning'""",
                     (run_id,),
                 )
+            if not include_persisted_rows:
+                return []
             return conn.execute(
                 """SELECT * FROM shadow_relation_pair_opportunities
                    WHERE run_id=%s ORDER BY pair_identity""",
@@ -5568,19 +6582,25 @@ class Database:
                 (attempt_id,),
             ).fetchone()
 
-    def record_shadow_relation_v2_classification_attempt(
+    def record_shadow_relation_v2_classification_attempts(
         self,
         run_id: str,
-        pair_identity: str,
-        values: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Append one classifier attempt without overwriting an earlier attempt."""
+        attempts: Any,
+    ) -> list[dict[str, Any]]:
+        """Append a classifier-attempt batch without weakening immutability.
 
-        attempt_no = int(values.get("attempt_no") or 0)
-        status = str(values.get("status") or "")
-        if attempt_no <= 0:
-            raise ValueError("classification attempt number must be positive")
-        if status not in {
+        A classifier response normally covers several pairs.  Each member
+        keeps its own durable audit row, but the common model boundary should
+        not require one database connection and four statements per member.
+        This method validates every member first and then writes both audit
+        tables set-wise in one transaction.
+        """
+
+        values = [
+            (str(pair_identity), dict(payload or {}))
+            for pair_identity, payload in attempts
+        ]
+        supported_statuses = {
             "ACCEPTED",
             "RETRYABLE_EMPTY",
             "RETRYABLE_PROTOCOL",
@@ -5594,164 +6614,457 @@ class Database:
             "retryable_failed",
             "permanent_failed",
             "superseded",
-        }:
-            raise ValueError("invalid classification attempt status")
+        }
+        pair_attempt_keys: set[tuple[str, int]] = set()
+        for pair_identity, payload in values:
+            attempt_no = int(payload.get("attempt_no") or 0)
+            status = str(payload.get("status") or "")
+            if attempt_no <= 0:
+                raise ValueError("classification attempt number must be positive")
+            if status not in supported_statuses:
+                raise ValueError("invalid classification attempt status")
+            key = (pair_identity, attempt_no)
+            if key in pair_attempt_keys:
+                raise ValueError("classification batch repeats pair attempt")
+            pair_attempt_keys.add(key)
+        if not values:
+            return []
         with self.connection() as conn:
             self._set_shadow_relation_v2_session(conn, run_id)
-            pair = conn.execute(
+            pair_identities = sorted({pair_identity for pair_identity, _ in values})
+            pair_rows = conn.execute(
                 """SELECT * FROM shadow_relation_pair_opportunities
-                   WHERE run_id=%s AND pair_identity=%s""",
-                (run_id, pair_identity),
-            ).fetchone()
-            if not pair:
+                   WHERE run_id=%s AND pair_identity=ANY(%s)""",
+                (run_id, pair_identities),
+            ).fetchall()
+            pairs_by_identity = {
+                str(item["pair_identity"]): item for item in pair_rows
+            }
+            if len(pairs_by_identity) != len(pair_identities):
                 raise LookupError("classification attempt pair does not exist")
-            attempt_id = self._shadow_relation_v2_db_id(
-                "relclassdb_", pair["id"], attempt_no,
-            )
-            model_call_id = str(
-                values.get("model_call_id")
-                or self._shadow_relation_v2_db_id(
-                    "modelcall_", run_id, "classifier", pair["id"], attempt_no,
+            model_call_rows: list[dict[str, Any]] = []
+            attempt_rows: list[dict[str, Any]] = []
+            expected_by_id: dict[str, tuple[Any, ...]] = {}
+            output_ids: list[str] = []
+            for pair_identity, payload in values:
+                pair = pairs_by_identity[pair_identity]
+                attempt_no = int(payload["attempt_no"])
+                status = str(payload["status"])
+                attempt_id = self._shadow_relation_v2_db_id(
+                    "relclassdb_", pair["id"], attempt_no,
                 )
-            )
-            idempotency_key = f"classifier:{pair['id']}:{attempt_no}"
-            conn.execute(
-                """INSERT INTO shadow_model_calls(
-                   id,run_id,component,model_name,model_digest,
-                   prompt_version,schema_version,parser_version,
-                   idempotency_key,attempt_no,status,request_hash,response_hash,
-                   request_payload,raw_response_text,parsed_response,
-                   token_usage,error_type,error_message,independent_call)
-                   VALUES(%s,%s,'classifier',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                          %s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
-                   ON CONFLICT(run_id,component,idempotency_key,attempt_no)
-                   DO NOTHING""",
-                (
-                    model_call_id,
-                    run_id,
-                    str(values.get("model_name") or ""),
-                    str(values.get("classifier_model_revision") or ""),
-                    str(values.get("classifier_prompt_version") or ""),
-                    str(values.get("classifier_schema_version") or ""),
-                    str(values.get("classifier_parser_version") or ""),
-                    idempotency_key,
+                model_call_id = str(
+                    payload.get("model_call_id")
+                    or self._shadow_relation_v2_db_id(
+                        "modelcall_", run_id, "classifier", pair["id"],
+                        attempt_no,
+                    )
+                )
+                idempotency_key = f"classifier:{pair['id']}:{attempt_no}"
+                request_payload = payload.get("request_payload") or {}
+                parsed_response = payload.get("parsed_response") or {}
+                token_usage = payload.get("token_usage") or {}
+                model_call_rows.append({
+                    "id": model_call_id,
+                    "run_id": str(run_id),
+                    "component": "classifier",
+                    "model_name": str(payload.get("model_name") or ""),
+                    "model_digest": str(
+                        payload.get("classifier_model_revision") or ""
+                    ),
+                    "prompt_version": str(
+                        payload.get("classifier_prompt_version") or ""
+                    ),
+                    "schema_version": str(
+                        payload.get("classifier_schema_version") or ""
+                    ),
+                    "parser_version": str(
+                        payload.get("classifier_parser_version") or ""
+                    ),
+                    "idempotency_key": idempotency_key,
+                    "attempt_no": attempt_no,
+                    "status": status,
+                    "request_hash": str(payload.get("request_hash") or ""),
+                    "response_hash": str(payload.get("response_hash") or ""),
+                    "request_payload": request_payload,
+                    "raw_response_text": str(
+                        payload.get("raw_response_text") or ""
+                    ),
+                    "parsed_response": parsed_response,
+                    "token_usage": token_usage,
+                    "error_type": str(payload.get("error_type") or ""),
+                    "error_message": str(payload.get("error_message") or ""),
+                    "independent_call": bool(
+                        payload.get("independent_call", True)
+                    ),
+                })
+                attempt_rows.append({
+                    "id": attempt_id,
+                    "pair_opportunity_id": str(pair["id"]),
+                    "attempt_no": attempt_no,
+                    "status": status,
+                    "request_hash": str(payload.get("request_hash") or ""),
+                    "response_hash": str(payload.get("response_hash") or ""),
+                    "classifier_prompt_version": str(
+                        payload.get("classifier_prompt_version") or ""
+                    ),
+                    "classifier_schema_version": str(
+                        payload.get("classifier_schema_version") or ""
+                    ),
+                    "classifier_parser_version": str(
+                        payload.get("classifier_parser_version") or ""
+                    ),
+                    "classifier_model_revision": str(
+                        payload.get("classifier_model_revision") or ""
+                    ),
+                    "error_message": str(payload.get("error_message") or ""),
+                    "metadata": payload.get("metadata") or {},
+                    "model_name": str(payload.get("model_name") or ""),
+                    "request_payload": request_payload,
+                    "raw_response_text": str(
+                        payload.get("raw_response_text") or ""
+                    ),
+                    "parsed_response": parsed_response,
+                    "token_usage": token_usage,
+                    "error_type": str(payload.get("error_type") or ""),
+                    "independent_call": bool(
+                        payload.get("independent_call", True)
+                    ),
+                    "model_call_id": model_call_id,
+                    "audit_quality": "complete",
+                    "terminal_status": (
+                        status if status in {
+                            "ACCEPTED", "TERMINAL_FAILED", "SUPERSEDED",
+                            "accepted", "permanent_failed", "superseded",
+                        } else ""
+                    ),
+                })
+                expected_by_id[attempt_id] = (
                     attempt_no,
                     status,
-                    str(values.get("request_hash") or ""),
-                    str(values.get("response_hash") or ""),
-                    self._canonical_json(values.get("request_payload") or {}),
-                    str(values.get("raw_response_text") or ""),
-                    self._canonical_json(values.get("parsed_response") or {}),
-                    self._canonical_json(values.get("token_usage") or {}),
-                    str(values.get("error_type") or ""),
-                    str(values.get("error_message") or ""),
-                    bool(values.get("independent_call", True)),
-                ),
+                    str(payload.get("request_hash") or ""),
+                    str(payload.get("response_hash") or ""),
+                    str(payload.get("classifier_prompt_version") or ""),
+                    str(payload.get("classifier_schema_version") or ""),
+                    str(payload.get("classifier_parser_version") or ""),
+                    str(payload.get("classifier_model_revision") or ""),
+                    str(payload.get("model_name") or ""),
+                    request_payload,
+                    str(payload.get("raw_response_text") or ""),
+                    parsed_response,
+                    token_usage,
+                    str(payload.get("error_type") or ""),
+                    bool(payload.get("independent_call", True)),
+                    model_call_id,
+                )
+                output_ids.append(attempt_id)
+            conn.execute(
+                """INSERT INTO shadow_model_calls(
+                       id,run_id,component,model_name,model_digest,
+                       prompt_version,schema_version,parser_version,
+                       idempotency_key,attempt_no,status,request_hash,response_hash,
+                       request_payload,raw_response_text,parsed_response,
+                       token_usage,error_type,error_message,independent_call)
+                   SELECT item.id,item.run_id,item.component,item.model_name,
+                          item.model_digest,item.prompt_version,item.schema_version,
+                          item.parser_version,item.idempotency_key,item.attempt_no,
+                          item.status,item.request_hash,item.response_hash,
+                          item.request_payload,item.raw_response_text,
+                          item.parsed_response,item.token_usage,item.error_type,
+                          item.error_message,item.independent_call
+                   FROM jsonb_to_recordset(%s::jsonb) AS item(
+                       id TEXT,run_id TEXT,component TEXT,model_name TEXT,
+                       model_digest TEXT,prompt_version TEXT,schema_version TEXT,
+                       parser_version TEXT,idempotency_key TEXT,attempt_no INTEGER,
+                       status TEXT,request_hash TEXT,response_hash TEXT,
+                       request_payload JSONB,raw_response_text TEXT,
+                       parsed_response JSONB,token_usage JSONB,error_type TEXT,
+                       error_message TEXT,independent_call BOOLEAN)
+                   ON CONFLICT(run_id,component,idempotency_key,attempt_no)
+                   DO NOTHING""",
+                (self._json(model_call_rows),),
             )
             conn.execute(
                 """INSERT INTO shadow_relation_classification_attempts(
-                   id,pair_opportunity_id,attempt_no,status,request_hash,response_hash,
-                   classifier_prompt_version,classifier_schema_version,
-                   classifier_parser_version,classifier_model_revision,error_message,
-                   metadata,model_name,request_payload,raw_response_text,
-                   parsed_response,token_usage,error_type,independent_call,
-                   model_call_id)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
-                          %s,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
+                       id,pair_opportunity_id,attempt_no,status,request_hash,response_hash,
+                       classifier_prompt_version,classifier_schema_version,
+                       classifier_parser_version,classifier_model_revision,error_message,
+                       metadata,model_name,request_payload,raw_response_text,
+                       parsed_response,token_usage,error_type,independent_call,
+                       model_call_id,audit_quality,terminal_status)
+                   SELECT item.id,item.pair_opportunity_id,item.attempt_no,item.status,
+                          item.request_hash,item.response_hash,
+                          item.classifier_prompt_version,item.classifier_schema_version,
+                          item.classifier_parser_version,
+                          item.classifier_model_revision,item.error_message,
+                          item.metadata,item.model_name,item.request_payload,
+                          item.raw_response_text,item.parsed_response,item.token_usage,
+                          item.error_type,item.independent_call,item.model_call_id,
+                          item.audit_quality,item.terminal_status
+                   FROM jsonb_to_recordset(%s::jsonb) AS item(
+                       id TEXT,pair_opportunity_id TEXT,attempt_no INTEGER,status TEXT,
+                       request_hash TEXT,response_hash TEXT,
+                       classifier_prompt_version TEXT,classifier_schema_version TEXT,
+                       classifier_parser_version TEXT,classifier_model_revision TEXT,
+                       error_message TEXT,metadata JSONB,model_name TEXT,
+                       request_payload JSONB,raw_response_text TEXT,
+                       parsed_response JSONB,token_usage JSONB,error_type TEXT,
+                       independent_call BOOLEAN,model_call_id TEXT,audit_quality TEXT,
+                       terminal_status TEXT)
                    ON CONFLICT(id) DO NOTHING""",
+                (self._json(attempt_rows),),
+            )
+            persisted_rows = conn.execute(
+                """SELECT * FROM shadow_relation_classification_attempts
+                   WHERE id=ANY(%s)""",
+                (sorted(expected_by_id),),
+            ).fetchall()
+            persisted_by_id = {
+                str(item["id"]): item for item in persisted_rows
+            }
+            if len(persisted_by_id) != len(expected_by_id):
+                raise ValueError("classification attempt immutable payload mismatch")
+            for attempt_id, expected in expected_by_id.items():
+                row = persisted_by_id[attempt_id]
+                immutable = (
+                    int(row["attempt_no"]),
+                    str(row["status"]),
+                    str(row["request_hash"]),
+                    str(row["response_hash"]),
+                    str(row["classifier_prompt_version"]),
+                    str(row["classifier_schema_version"]),
+                    str(row["classifier_parser_version"]),
+                    str(row["classifier_model_revision"]),
+                    str(row.get("model_name") or ""),
+                    row.get("request_payload") or {},
+                    str(row.get("raw_response_text") or ""),
+                    row.get("parsed_response") or {},
+                    row.get("token_usage") or {},
+                    str(row.get("error_type") or ""),
+                    bool(row.get("independent_call", True)),
+                    str(row.get("model_call_id") or ""),
+                )
+                if immutable != expected:
+                    raise ValueError("classification attempt immutable payload mismatch")
+            return [persisted_by_id[attempt_id] for attempt_id in output_ids]
+
+    def record_shadow_relation_v2_classification_attempt(
+        self,
+        run_id: str,
+        pair_identity: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one classifier attempt without overwriting an earlier attempt."""
+        return self.record_shadow_relation_v2_classification_attempts(
+            run_id, [(pair_identity, values)],
+        )[0]
+
+    def record_shadow_relation_v2_source_model_call(
+        self,
+        run_id: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one context/batch-level relation model call."""
+
+        component = str(values.get("component") or "")
+        if component not in SHADOW_RELATION_SOURCE_MODEL_COMPONENTS:
+            raise ValueError("invalid source model-call component")
+        attempt_no = int(values.get("attempt_no") or 1)
+        if attempt_no <= 0:
+            raise ValueError("source model-call attempt number must be positive")
+        request_hash = str(values.get("request_hash") or "")
+        idempotency_key = str(values.get("idempotency_key") or "")
+        if not request_hash or not idempotency_key:
+            raise ValueError("source model call requires request hash and idempotency key")
+        model_call_id = str(
+            values.get("id") or self._shadow_relation_v2_db_id(
+                "modelcall_", run_id, component, idempotency_key, attempt_no,
+            )
+        )
+        status = str(values.get("status") or "COMPLETED")
+        with self.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO shadow_model_calls(
+                   id,run_id,component,model_name,model_digest,prompt_version,
+                   schema_version,parser_version,idempotency_key,attempt_no,status,
+                   request_hash,response_hash,request_payload,raw_response_text,
+                   parsed_response,token_usage,error_type,error_message,
+                   independent_call,audit_quality,terminal_status)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                          %s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,TRUE,'complete',%s)
+                   ON CONFLICT(run_id,component,idempotency_key,attempt_no)
+                   DO UPDATE SET terminal_status=EXCLUDED.terminal_status
+                   WHERE shadow_model_calls.request_hash=EXCLUDED.request_hash
+                   RETURNING *""",
                 (
-                    attempt_id,
-                    pair["id"],
+                    model_call_id,
+                    str(run_id),
+                    component,
+                    str(values.get("model_name") or ""),
+                    str(values.get("model_digest") or ""),
+                    str(values.get("prompt_version") or ""),
+                    str(values.get("schema_version") or ""),
+                    str(values.get("parser_version") or ""),
+                    idempotency_key,
                     attempt_no,
                     status,
-                    str(values.get("request_hash") or ""),
+                    request_hash,
                     str(values.get("response_hash") or ""),
-                    str(values.get("classifier_prompt_version") or ""),
-                    str(values.get("classifier_schema_version") or ""),
-                    str(values.get("classifier_parser_version") or ""),
-                    str(values.get("classifier_model_revision") or ""),
-                    str(values.get("error_message") or ""),
-                    self._canonical_json(values.get("metadata") or {}),
-                    str(values.get("model_name") or ""),
                     self._canonical_json(values.get("request_payload") or {}),
                     str(values.get("raw_response_text") or ""),
                     self._canonical_json(values.get("parsed_response") or {}),
                     self._canonical_json(values.get("token_usage") or {}),
                     str(values.get("error_type") or ""),
-                    bool(values.get("independent_call", True)),
-                    model_call_id,
+                    str(values.get("error_message") or ""),
+                    str(values.get("terminal_status") or status),
                 ),
-            )
-            row = conn.execute(
-                "SELECT * FROM shadow_relation_classification_attempts WHERE id=%s",
-                (attempt_id,),
             ).fetchone()
-            immutable = (
-                int(row["attempt_no"]),
-                str(row["status"]),
-                str(row["request_hash"]),
-                str(row["response_hash"]),
-                str(row["classifier_prompt_version"]),
-                str(row["classifier_schema_version"]),
-                str(row["classifier_parser_version"]),
-                str(row["classifier_model_revision"]),
-                str(row.get("model_name") or ""),
-                row.get("request_payload") or {},
-                str(row.get("raw_response_text") or ""),
-                row.get("parsed_response") or {},
-                row.get("token_usage") or {},
-                str(row.get("error_type") or ""),
-                bool(row.get("independent_call", True)),
-                str(row.get("model_call_id") or ""),
-            )
-            expected = (
-                attempt_no,
-                status,
-                str(values.get("request_hash") or ""),
-                str(values.get("response_hash") or ""),
-                str(values.get("classifier_prompt_version") or ""),
-                str(values.get("classifier_schema_version") or ""),
-                str(values.get("classifier_parser_version") or ""),
-                str(values.get("classifier_model_revision") or ""),
-                str(values.get("model_name") or ""),
-                values.get("request_payload") or {},
-                str(values.get("raw_response_text") or ""),
-                values.get("parsed_response") or {},
-                values.get("token_usage") or {},
-                str(values.get("error_type") or ""),
-                bool(values.get("independent_call", True)),
-                model_call_id,
-            )
-            if immutable != expected:
-                raise ValueError("classification attempt immutable payload mismatch")
+            if not row:
+                raise ValueError("source model-call immutable payload mismatch")
             return row
+
+    def find_reusable_shadow_model_call(
+        self,
+        *,
+        run_id: str,
+        component: str,
+        model_digest: str,
+        prompt_version: str,
+        schema_version: str,
+        parser_version: str,
+        request_hash: str,
+    ) -> dict[str, Any] | None:
+        """Return an immutable accepted response from an equivalent prior run.
+
+        Reuse is deliberately same-project and content-addressed at the model
+        component boundary.  The model digest, prompt/schema contract
+        versions and full rendered request hash must all match.  Parser-only
+        upgrades deliberately may reuse the immutable raw JSON: the current
+        runtime reparses it under the new parser and falls back to a real model
+        call if that stricter parse fails.  A run-wide
+        code-tree match is intentionally *not* required: unrelated downstream
+        or sibling-component edits must not force every expensive source call
+        to run again.  Changed prompts, schemas, parser contracts, generation
+        options or source payloads already change one of the exact keys below.
+        Failed, incomplete-audit, or non-terminal calls are never candidates.
+        """
+
+        component_value = str(component or "")
+        if component_value not in SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS:
+            raise ValueError("invalid reusable model-call component")
+        if not all((
+            str(run_id or ""), str(model_digest or ""),
+            str(prompt_version or ""), str(schema_version or ""),
+            str(parser_version or ""), str(request_hash or ""),
+        )):
+            return None
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT prior.*
+                   FROM shadow_model_calls prior
+                   JOIN shadow_relation_v2_runs prior_run
+                     ON prior_run.id=prior.run_id
+                   JOIN shadow_relation_v2_runs current_run
+                     ON current_run.id=%s
+                   WHERE prior.run_id<>current_run.id
+                     AND prior_run.project_id=current_run.project_id
+                     AND prior.component=%s
+                     AND prior.model_digest=%s
+                     AND prior.prompt_version=%s
+                     AND prior.schema_version=%s
+                     AND prior.request_hash=%s
+                     AND prior.error_type=''
+                     AND prior.audit_quality='complete'
+                     AND prior.terminal_status<>''
+                     AND prior.status IN ('COMPLETED','ACCEPTED')
+                     AND prior_run.status='ready'
+                   ORDER BY prior.created_at DESC, prior.id DESC
+                   LIMIT 1""",
+                (
+                    str(run_id), component_value, str(model_digest),
+                    str(prompt_version), str(schema_version),
+                    str(request_hash),
+                ),
+            ).fetchone()
 
     def persist_shadow_relation_v2_classifications(
         self,
         run_id: str,
         decisions: Any,
     ) -> list[dict[str, Any]]:
-        """Persist pair decisions and zero-to-many positive hypotheses."""
+        """Persist pair decisions and zero-to-many positive hypotheses.
+
+        Classifier prompts are deliberately small, so a dense context is
+        committed through many small decision batches.  Doing a read, attempt
+        lookup, update and hypothesis round-trip for *each* member made this
+        purely local persistence phase slower than model inference.  Lock and
+        validate the whole submitted batch first, then apply decisions and
+        hypotheses set-wise while retaining the same immutable retry checks.
+        """
 
         values = list(decisions)
+        pair_identity_set: set[str] = set()
+        for decision in values:
+            pair_identity = str(decision.pair_identity)
+            if pair_identity in pair_identity_set:
+                raise ValueError("classification batch repeats pair identity")
+            pair_identity_set.add(pair_identity)
         with self.connection() as conn:
             self._set_shadow_relation_v2_session(conn, run_id)
-            for decision in values:
-                pair = conn.execute(
+            pairs_by_identity: dict[str, dict[str, Any]] = {}
+            attempt_outcomes: dict[str, dict[str, bool]] = {}
+            if pair_identity_set:
+                pair_rows = conn.execute(
                     """SELECT * FROM shadow_relation_pair_opportunities
-                       WHERE run_id=%s AND pair_identity=%s FOR UPDATE""",
-                    (run_id, decision.pair_identity),
-                ).fetchone()
-                if not pair:
+                       WHERE run_id=%s AND pair_identity=ANY(%s)
+                       FOR UPDATE""",
+                    (run_id, sorted(pair_identity_set)),
+                ).fetchall()
+                pairs_by_identity = {
+                    str(item["pair_identity"]): item for item in pair_rows
+                }
+                if len(pairs_by_identity) != len(pair_identity_set):
                     raise LookupError("classification decision pair does not exist")
-                accepted_attempt = conn.execute(
-                    """SELECT 1 FROM shadow_relation_classification_attempts
-                       WHERE pair_opportunity_id=%s
-                         AND status IN ('ACCEPTED','accepted')
-                       LIMIT 1""",
-                    (pair["id"],),
-                ).fetchone()
-                if not accepted_attempt:
+                pair_ids = [str(item["id"]) for item in pair_rows]
+                attempt_rows = conn.execute(
+                    """SELECT pair_opportunity_id,
+                              bool_or(lower(status)='accepted') AS accepted,
+                              bool_or(lower(status)='terminal_failed') AS terminal_failed
+                       FROM shadow_relation_classification_attempts
+                       WHERE pair_opportunity_id=ANY(%s)
+                       GROUP BY pair_opportunity_id""",
+                    (pair_ids,),
+                ).fetchall()
+                attempt_outcomes = {
+                    str(item["pair_opportunity_id"]): {
+                        "accepted": bool(item.get("accepted")),
+                        "terminal_failed": bool(item.get("terminal_failed")),
+                    }
+                    for item in attempt_rows
+                }
+
+            decision_rows: list[dict[str, Any]] = []
+            hypothesis_rows: list[dict[str, Any]] = []
+            expected_hypotheses: dict[str, tuple[str, str, str, str, list[list[int]]]] = {}
+            for decision in values:
+                pair_identity = str(decision.pair_identity)
+                pair = pairs_by_identity[pair_identity]
+                outcome = attempt_outcomes.get(str(pair["id"]), {})
+                accepted_attempt = bool(outcome.get("accepted"))
+                terminal_fail_closed = bool(
+                    str(getattr(decision, "decision", ""))
+                    == "OTHER_UNSUPPORTED"
+                    and not tuple(getattr(decision, "hypotheses", ()) or ())
+                    and str(getattr(decision, "reason_code", "")).startswith(
+                        "CLASSIFIER_TERMINAL_"
+                    )
+                )
+                terminal_attempt = bool(
+                    terminal_fail_closed
+                    and not accepted_attempt
+                    and outcome.get("terminal_failed")
+                )
+                if not accepted_attempt and not terminal_attempt:
                     raise ValueError("classification decision has no accepted attempt")
                 decision_status = str(
                     getattr(decision, "decision_status", None)
@@ -5773,20 +7086,18 @@ class Database:
                     "decision": decision.decision,
                     "decision_status": decision_status,
                     "reason_code": decision.reason_code,
+                    "attempt_outcome": (
+                        "accepted" if accepted_attempt else "terminal_fail_closed"
+                    ),
                     "evidence_spans": [
                         [span.start, span.end] for span in decision.evidence_spans
                     ],
                 }
-                conn.execute(
-                    """UPDATE shadow_relation_pair_opportunities
-                       SET status=%s,provenance=%s::jsonb,updated_at=NOW()
-                       WHERE id=%s""",
-                    (
-                        decision_status,
-                        self._canonical_json(provenance),
-                        pair["id"],
-                    ),
-                )
+                decision_rows.append({
+                    "id": str(pair["id"]),
+                    "status": decision_status,
+                    "provenance": provenance,
+                })
                 for hypothesis in decision.hypotheses:
                     if hypothesis.pair_identity != decision.pair_identity:
                         raise ValueError("hypothesis belongs to another pair")
@@ -5794,7 +7105,8 @@ class Database:
                         "relhypdb_", run_id, hypothesis.hypothesis_id,
                     )
                     spans = [
-                        [span.start, span.end] for span in hypothesis.evidence_spans
+                        [span.start, span.end]
+                        for span in hypothesis.evidence_spans
                     ]
                     metadata = {
                         "stable_hypothesis_id": hypothesis.hypothesis_id,
@@ -5805,49 +7117,95 @@ class Database:
                         "classifier_parser_version": hypothesis.classifier_parser_version,
                         "predicate_metadata": hypothesis.predicate_metadata,
                     }
-                    conn.execute(
-                        """INSERT INTO shadow_relation_hypotheses(
-                           id,pair_opportunity_id,hypothesis_key,predicate,
-                           subject_occurrence_key,object_occurrence_key,evidence_start,
-                           evidence_end,classifier_policy_version,
-                           classifier_model_revision,status,metadata,
-                           source_kind,source_record_id)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'CLASSIFIED_POSITIVE',
-                                  %s::jsonb,%s,%s)
-                           ON CONFLICT(id) DO NOTHING""",
-                        (
-                            database_id,
-                            pair["id"],
-                            hypothesis.hypothesis_id,
-                            hypothesis.predicate,
-                            hypothesis.subject_occurrence_key,
-                            hypothesis.object_occurrence_key,
-                            min(span.start for span in hypothesis.evidence_spans),
-                            max(span.end for span in hypothesis.evidence_spans),
-                            hypothesis.classifier_policy_version,
-                            hypothesis.classifier_model_revision,
-                            self._canonical_json(metadata),
-                            "v2_classifier",
-                            hypothesis.pair_identity,
-                        ),
-                    )
-                    persisted = conn.execute(
-                        "SELECT * FROM shadow_relation_hypotheses WHERE id=%s",
-                        (database_id,),
-                    ).fetchone()
-                    immutable = (
-                        str(persisted["hypothesis_key"]),
-                        str(persisted["predicate"]),
-                        str(persisted["subject_occurrence_key"]),
-                        str(persisted["object_occurrence_key"]),
-                        dict(persisted.get("metadata") or {}).get("evidence_spans"),
-                    )
                     expected = (
                         hypothesis.hypothesis_id,
                         hypothesis.predicate,
                         hypothesis.subject_occurrence_key,
                         hypothesis.object_occurrence_key,
                         spans,
+                    )
+                    previous_expected = expected_hypotheses.get(database_id)
+                    if previous_expected is not None and previous_expected != expected:
+                        raise ValueError("hypothesis immutable payload mismatch")
+                    expected_hypotheses[database_id] = expected
+                    hypothesis_rows.append({
+                        "id": database_id,
+                        "pair_opportunity_id": str(pair["id"]),
+                        "hypothesis_key": hypothesis.hypothesis_id,
+                        "predicate": hypothesis.predicate,
+                        "subject_occurrence_key": hypothesis.subject_occurrence_key,
+                        "object_occurrence_key": hypothesis.object_occurrence_key,
+                        "evidence_start": min(
+                            span.start for span in hypothesis.evidence_spans
+                        ),
+                        "evidence_end": max(
+                            span.end for span in hypothesis.evidence_spans
+                        ),
+                        "classifier_policy_version": (
+                            hypothesis.classifier_policy_version
+                        ),
+                        "classifier_model_revision": (
+                            hypothesis.classifier_model_revision
+                        ),
+                        "metadata": metadata,
+                        "source_kind": "v2_classifier",
+                        "source_record_id": hypothesis.pair_identity,
+                    })
+            if decision_rows:
+                conn.execute(
+                    """UPDATE shadow_relation_pair_opportunities AS pair
+                       SET status=item.status,provenance=item.provenance,
+                           updated_at=NOW()
+                       FROM jsonb_to_recordset(%s::jsonb) AS item(
+                           id TEXT,status TEXT,provenance JSONB)
+                       WHERE pair.id=item.id""",
+                    (self._json(decision_rows),),
+                )
+            if hypothesis_rows:
+                conn.execute(
+                    """INSERT INTO shadow_relation_hypotheses(
+                           id,pair_opportunity_id,hypothesis_key,predicate,
+                           subject_occurrence_key,object_occurrence_key,evidence_start,
+                           evidence_end,classifier_policy_version,
+                           classifier_model_revision,status,metadata,
+                           source_kind,source_record_id)
+                       SELECT item.id,item.pair_opportunity_id,item.hypothesis_key,
+                              item.predicate,item.subject_occurrence_key,
+                              item.object_occurrence_key,item.evidence_start,
+                              item.evidence_end,item.classifier_policy_version,
+                              item.classifier_model_revision,'CLASSIFIED_POSITIVE',
+                              item.metadata,item.source_kind,item.source_record_id
+                       FROM jsonb_to_recordset(%s::jsonb) AS item(
+                           id TEXT,pair_opportunity_id TEXT,hypothesis_key TEXT,
+                           predicate TEXT,subject_occurrence_key TEXT,
+                           object_occurrence_key TEXT,evidence_start INTEGER,
+                           evidence_end INTEGER,classifier_policy_version TEXT,
+                           classifier_model_revision TEXT,metadata JSONB,
+                           source_kind TEXT,source_record_id TEXT)
+                       ON CONFLICT(id) DO NOTHING""",
+                    (self._json(hypothesis_rows),),
+                )
+                persisted_rows = conn.execute(
+                    """SELECT id,hypothesis_key,predicate,subject_occurrence_key,
+                              object_occurrence_key,metadata
+                       FROM shadow_relation_hypotheses WHERE id=ANY(%s)""",
+                    (sorted(expected_hypotheses),),
+                ).fetchall()
+                persisted_by_id = {
+                    str(item["id"]): item for item in persisted_rows
+                }
+                if len(persisted_by_id) != len(expected_hypotheses):
+                    raise ValueError("hypothesis immutable payload mismatch")
+                for database_id, expected in expected_hypotheses.items():
+                    persisted = persisted_by_id[database_id]
+                    immutable = (
+                        str(persisted["hypothesis_key"]),
+                        str(persisted["predicate"]),
+                        str(persisted["subject_occurrence_key"]),
+                        str(persisted["object_occurrence_key"]),
+                        dict(persisted.get("metadata") or {}).get(
+                            "evidence_spans"
+                        ),
                     )
                     if immutable != expected:
                         raise ValueError("hypothesis immutable payload mismatch")
@@ -5874,49 +7232,77 @@ class Database:
         values = list(validations)
         with self.connection() as conn:
             self._set_shadow_relation_v2_session(conn, run_id)
+            if not values:
+                return []
+            hypothesis_ids = [
+                str(item.hypothesis_id) for item in values
+            ]
+            if len(set(hypothesis_ids)) != len(hypothesis_ids):
+                raise ValueError("validation batch repeats hypothesis")
+            hypothesis_rows = conn.execute(
+                """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
+                   JOIN shadow_relation_pair_opportunities pair
+                     ON pair.id=hypothesis.pair_opportunity_id
+                   WHERE pair.run_id=%s AND hypothesis.hypothesis_key=ANY(%s)""",
+                (run_id, hypothesis_ids),
+            ).fetchall()
+            hypotheses_by_key = {
+                str(item["hypothesis_key"]): item for item in hypothesis_rows
+            }
+            if len(hypotheses_by_key) != len(hypothesis_ids):
+                raise LookupError("validation hypothesis does not exist")
+            rows = []
             for validation in values:
-                hypothesis = conn.execute(
-                    """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
-                       JOIN shadow_relation_pair_opportunities pair
-                         ON pair.id=hypothesis.pair_opportunity_id
-                       WHERE pair.run_id=%s AND hypothesis.hypothesis_key=%s""",
-                    (run_id, validation.hypothesis_id),
-                ).fetchone()
-                if not hypothesis:
-                    raise LookupError("validation hypothesis does not exist")
-                conn.execute(
-                    """INSERT INTO shadow_relation_hypothesis_validations(
-                       hypothesis_id,status,reason_code,predicate_metadata)
-                       VALUES(%s,%s,%s,%s::jsonb)
-                       ON CONFLICT(hypothesis_id) DO NOTHING""",
-                    (
-                        hypothesis["id"],
-                        validation.status,
-                        validation.reason_code,
-                        self._canonical_json(validation.predicate_metadata),
-                    ),
-                )
-                row = conn.execute(
-                    """SELECT * FROM shadow_relation_hypothesis_validations
-                       WHERE hypothesis_id=%s""",
-                    (hypothesis["id"],),
-                ).fetchone()
-                if (
-                    str(row["status"]) != str(validation.status)
-                    or str(row["reason_code"]) != str(validation.reason_code)
-                    or self._canonical_json(row.get("predicate_metadata") or {})
-                    != self._canonical_json(validation.predicate_metadata)
-                ):
-                    raise ValueError("hypothesis validation immutable payload mismatch")
-                persisted_status = {
+                hypothesis = hypotheses_by_key[str(validation.hypothesis_id)]
+                rows.append({
+                    "hypothesis_id": str(hypothesis["id"]),
+                    "status": str(validation.status),
+                    "reason_code": str(validation.reason_code),
+                    "predicate_metadata": validation.predicate_metadata,
+                    "hypothesis_status": {
                     "PASS": "RULE_VALID",
                     "REVIEW_ONLY": "RULE_REVIEW_ONLY",
                     "REJECTED": "RULE_REJECTED",
-                }[validation.status]
-                conn.execute(
-                    "UPDATE shadow_relation_hypotheses SET status=%s WHERE id=%s",
-                    (persisted_status, hypothesis["id"]),
-                )
+                    }[validation.status],
+                })
+            conn.execute(
+                """INSERT INTO shadow_relation_hypothesis_validations(
+                       hypothesis_id,status,reason_code,predicate_metadata)
+                   SELECT item.hypothesis_id,item.status,item.reason_code,
+                          item.predicate_metadata
+                   FROM jsonb_to_recordset(%s::jsonb) AS item(
+                       hypothesis_id TEXT,status TEXT,reason_code TEXT,
+                       predicate_metadata JSONB)
+                   ON CONFLICT(hypothesis_id) DO NOTHING""",
+                (self._json(rows),),
+            )
+            persisted_rows = conn.execute(
+                """SELECT * FROM shadow_relation_hypothesis_validations
+                   WHERE hypothesis_id=ANY(%s)""",
+                ([str(item["hypothesis_id"]) for item in rows],),
+            ).fetchall()
+            persisted_by_id = {
+                str(item["hypothesis_id"]): item for item in persisted_rows
+            }
+            if len(persisted_by_id) != len(rows):
+                raise ValueError("hypothesis validation immutable payload mismatch")
+            for item in rows:
+                row = persisted_by_id[str(item["hypothesis_id"])]
+                if (
+                    str(row["status"]) != str(item["status"])
+                    or str(row["reason_code"]) != str(item["reason_code"])
+                    or self._canonical_json(row.get("predicate_metadata") or {})
+                    != self._canonical_json(item["predicate_metadata"])
+                ):
+                    raise ValueError("hypothesis validation immutable payload mismatch")
+            conn.execute(
+                """UPDATE shadow_relation_hypotheses AS hypothesis
+                   SET status=item.hypothesis_status
+                   FROM jsonb_to_recordset(%s::jsonb) AS item(
+                       hypothesis_id TEXT,hypothesis_status TEXT)
+                   WHERE hypothesis.id=item.hypothesis_id""",
+                (self._json(rows),),
+            )
             return conn.execute(
                 """SELECT validation.* FROM shadow_relation_hypothesis_validations validation
                    JOIN shadow_relation_hypotheses hypothesis
@@ -6014,9 +7400,16 @@ class Database:
                 sources = set(provenance.get("candidate_sources") or [])
                 sources.add(str(candidate_source))
                 provenance["candidate_sources"] = sorted(sources)
+                provenance["classification"] = {
+                    "decision": "HYPOTHESES",
+                    "decision_status": "HYPOTHESES_EMITTED",
+                    "reason_code": "LOCAL_SUBGRAPH_PROPOSAL",
+                    "entry": "local_subgraph",
+                }
                 conn.execute(
                     """UPDATE shadow_relation_pair_opportunities
-                       SET provenance=%s::jsonb,updated_at=NOW()
+                       SET status='HYPOTHESES_EMITTED',
+                           provenance=%s::jsonb,updated_at=NOW()
                        WHERE id=%s""",
                     (self._canonical_json(provenance), pair["id"]),
                 )
@@ -6032,6 +7425,8 @@ class Database:
         self,
         run_id: str,
         attempts: Any,
+        *,
+        terminal: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Append verifier attempts; retries never overwrite earlier verdicts."""
 
@@ -6066,6 +7461,27 @@ class Database:
                     "attempt_no": int(attempt.attempt_no),
                     "verdict": attempt.verdict,
                     "reason_code": attempt.reason_code,
+                    "forward_entailment": attempt.forward_entailment,
+                    "reverse_entailment": attempt.reverse_entailment,
+                    "subject_role_supported": bool(
+                        attempt.subject_role_supported
+                    ),
+                    "object_role_supported": bool(
+                        attempt.object_role_supported
+                    ),
+                    "subject_context_role": attempt.subject_context_role,
+                    "object_context_role": attempt.object_context_role,
+                    "subject_role_alignment": attempt.subject_role_alignment,
+                    "object_role_alignment": attempt.object_role_alignment,
+                    "forward_role_alignment": attempt.forward_role_alignment,
+                    "reverse_role_alignment": attempt.reverse_role_alignment,
+                    "direction_normalization": attempt.direction_normalization,
+                    "normalized_subject_occurrence_key": (
+                        attempt.normalized_subject_occurrence_key
+                    ),
+                    "normalized_object_occurrence_key": (
+                        attempt.normalized_object_occurrence_key
+                    ),
                     "supported_evidence_spans": [
                         [span.start, span.end]
                         for span in attempt.supported_evidence_spans
@@ -6077,8 +7493,24 @@ class Database:
                     "verifier_model_revision": attempt.verifier_model_revision,
                     "error_message": attempt.error_message,
                 }
-                payload_hash = hashlib.sha256(
-                    self._canonical_json(canonical_attempt).encode("utf-8")
+                model_request_payload = (
+                    dict(attempt.model_request_payload)
+                    if attempt.model_request_payload else canonical_attempt
+                )
+                raw_response_text = str(
+                    attempt.raw_response_text
+                    or self._canonical_json(canonical_attempt)
+                )
+                parsed_response = (
+                    dict(attempt.parsed_response)
+                    if attempt.parsed_response else canonical_attempt
+                )
+                token_usage = dict(attempt.token_usage or {})
+                request_hash = hashlib.sha256(
+                    self._canonical_json(model_request_payload).encode("utf-8")
+                ).hexdigest()
+                response_hash = hashlib.sha256(
+                    raw_response_text.encode("utf-8")
                 ).hexdigest()
                 model_call_id = self._shadow_relation_v2_db_id(
                     "modelcall_",
@@ -6088,21 +7520,36 @@ class Database:
                     int(attempt.attempt_no),
                 )
                 idempotency_key = f"verifier:{hypothesis['id']}:{int(attempt.attempt_no)}"
+                attempt_is_terminal = (
+                    attempt.verdict != "RETRYABLE_FAILED"
+                    if terminal is None else bool(terminal)
+                )
+                terminal_status = (
+                    str(attempt.verdict) if attempt_is_terminal else ""
+                )
                 conn.execute(
                     """INSERT INTO shadow_model_calls(
                        id,run_id,component,model_name,model_digest,
                        prompt_version,schema_version,parser_version,
                        idempotency_key,attempt_no,status,request_hash,response_hash,
                        request_payload,raw_response_text,parsed_response,
-                       token_usage,error_type,error_message,independent_call)
+                       token_usage,error_type,error_message,independent_call,
+                       audit_quality,terminal_status)
                        VALUES(%s,%s,'verifier',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                              %s::jsonb,%s,%s::jsonb,'{}'::jsonb,%s,%s,%s)
+                              %s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,%s,
+                              'complete',%s)
                        ON CONFLICT(run_id,component,idempotency_key,attempt_no)
-                       DO NOTHING""",
+                       DO UPDATE SET terminal_status=EXCLUDED.terminal_status
+                       WHERE shadow_model_calls.request_hash=EXCLUDED.request_hash
+                         AND shadow_model_calls.terminal_status=''""",
                     (
                         model_call_id,
                         run_id,
-                        str(attempt.verifier_model_revision or ""),
+                        str(
+                            model_request_payload.get("model")
+                            or attempt.verifier_model_revision
+                            or ""
+                        ),
                         str(attempt.verifier_model_revision or ""),
                         attempt.verifier_prompt_version,
                         attempt.verifier_schema_version,
@@ -6110,15 +7557,17 @@ class Database:
                         idempotency_key,
                         int(attempt.attempt_no),
                         attempt.verdict,
-                        payload_hash,
-                        payload_hash,
-                        self._canonical_json(canonical_attempt),
-                        self._canonical_json(canonical_attempt),
-                        self._canonical_json(canonical_attempt),
+                        request_hash,
+                        response_hash,
+                        self._canonical_json(model_request_payload),
+                        raw_response_text,
+                        self._canonical_json(parsed_response),
+                        self._canonical_json(token_usage),
                         "ShadowClassificationError"
                         if attempt.verdict == "RETRYABLE_FAILED" else "",
                         str(attempt.error_message or ""),
                         bool(attempt.independent_call),
+                        terminal_status,
                     ),
                 )
                 conn.execute(
@@ -6127,8 +7576,10 @@ class Database:
                        supported_evidence_spans,independent_call,
                        verifier_prompt_version,verifier_schema_version,
                        verifier_parser_version,verifier_model_revision,
-                       request_hash,response_hash,error_message,model_call_id)
-                       VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       request_hash,response_hash,error_message,model_call_id,
+                       audit_quality,terminal_status)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                              'complete',%s)
                        ON CONFLICT(id) DO NOTHING""",
                     (
                         database_id,
@@ -6144,12 +7595,21 @@ class Database:
                         attempt.verifier_schema_version,
                         attempt.verifier_parser_version,
                         attempt.verifier_model_revision,
-                        payload_hash,
-                        payload_hash,
+                        request_hash,
+                        response_hash,
                         attempt.error_message,
                         model_call_id,
+                        terminal_status,
                     ),
                 )
+                if attempt_is_terminal:
+                    conn.execute(
+                        """UPDATE shadow_relation_verification_attempts
+                           SET terminal_status=%s
+                           WHERE id=%s AND request_hash=%s
+                             AND terminal_status=''""",
+                        (terminal_status, database_id, request_hash),
+                    )
                 row = conn.execute(
                     "SELECT * FROM shadow_relation_verification_attempts WHERE id=%s",
                     (database_id,),
@@ -6157,7 +7617,7 @@ class Database:
                 if (
                     int(row["attempt_no"]) != int(attempt.attempt_no)
                     or str(row["verdict"]) != str(attempt.verdict)
-                    or str(row["request_hash"]) != payload_hash
+                    or str(row["request_hash"]) != request_hash
                 ):
                     raise ValueError("verification attempt immutable payload mismatch")
                 conn.execute(
@@ -6204,9 +7664,10 @@ class Database:
                 conn.execute(
                     """INSERT INTO shadow_relation_normalized_facts(
                        id,project_id,semantic_fact_key,subject_canonical_id,predicate,
-                       object_canonical_id,is_symmetric,is_reflexive,is_review_only)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                       ON CONFLICT(id) DO NOTHING""",
+                       object_canonical_id,is_symmetric,is_reflexive,is_review_only,
+                       qualifiers,audit_quality)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb,'complete')
+                       ON CONFLICT(id) DO UPDATE SET audit_quality='complete'""",
                     (
                         fact.fact_id,
                         int(fact.project_id),
@@ -6291,6 +7752,35 @@ class Database:
                     or not verification["independent_call"]
                 ):
                     raise ValueError("fact evidence lacks independent verifier support")
+                pair = conn.execute(
+                    """SELECT * FROM shadow_relation_pair_opportunities
+                       WHERE id=%s AND run_id=%s""",
+                    (hypothesis["pair_opportunity_id"], run_id),
+                ).fetchone()
+                if not pair:
+                    raise LookupError("fact evidence pair does not exist")
+                if str(pair.get("context_id") or ""):
+                    source_context = conn.execute(
+                        """SELECT id FROM shadow_source_contexts
+                           WHERE run_id=%s AND id=%s""",
+                        (run_id, str(pair["context_id"])),
+                    ).fetchone()
+                else:
+                    pair_provenance = dict(pair.get("provenance") or {})
+                    source_context = conn.execute(
+                        """SELECT id FROM shadow_source_contexts
+                           WHERE run_id=%s AND context_identity=%s""",
+                        (
+                            run_id,
+                            str(
+                                pair_provenance.get("source_context_id")
+                                or pair.get("context_identity")
+                                or ""
+                            ),
+                        ),
+                    ).fetchone()
+                if not source_context:
+                    raise ValueError("fact evidence lacks frozen source context")
                 evidence_id = self._shadow_relation_v2_db_id(
                     "relevidencedb_", run_id, evidence.evidence_id,
                 )
@@ -6299,8 +7789,10 @@ class Database:
                        id,fact_id,run_id,evidence_key,document_revision_id,
                        subject_occurrence_key,object_occurrence_key,evidence_spans,
                        hypothesis_id,verification_attempt_id,provenance,
-                       source_kind,source_record_id)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s,%s)
+                       context_id,source_kind,source_record_id,qualifiers,
+                       audit_quality)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,
+                              %s,%s,%s,'{}'::jsonb,'complete')
                        ON CONFLICT(id) DO NOTHING""",
                     (
                         evidence_id,
@@ -6316,6 +7808,7 @@ class Database:
                         hypothesis["id"],
                         verification_id,
                         self._canonical_json(evidence.provenance),
+                        source_context["id"],
                         "v2_verifier",
                         evidence.hypothesis_id,
                     ),
@@ -6449,7 +7942,8 @@ class Database:
             }
             row = conn.execute(
                 """UPDATE shadow_relation_v2_runs
-                   SET status=%s,metrics=%s::jsonb,error_message=%s,completed_at=NOW()
+                   SET status=%s,metrics=%s::jsonb,error_message=%s,
+                       audit_quality='complete',completed_at=NOW()
                    WHERE id=%s RETURNING *""",
                 (
                     status,
@@ -8402,14 +9896,17 @@ class Database:
                        namespace_id,mention_key,project_id,document_id,revision_id,chunk_id,
                        surface,normalized_surface,evidence_text,evidence_start,evidence_end,
                        confidence,extraction_policy_version,filter_decision,filter_reason,provenance)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'accepted','',%s::jsonb)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                        ON CONFLICT(namespace_id,mention_key) DO NOTHING""",
                     (
                         namespace_id, item["mention_id"], project_id, document_id,
                         revision_id, chunk_id, item["surface"], item["normalized_surface"],
                         item.get("evidence") or item["surface"], int(item["start"]),
                         int(item["end"]), float(item["confidence"]),
-                        item["extraction_policy_version"], self._json(item.get("provenance")),
+                        item["extraction_policy_version"],
+                        str(item.get("filter_decision") or "accepted"),
+                        str(item.get("filter_reason") or ""),
+                        self._json(item.get("provenance")),
                     ),
                 )
             for item in type_assertions:
@@ -8443,6 +9940,93 @@ class Database:
                     ),
                 )
 
+    def get_knowledge_forge_entity_extraction_cache(
+        self,
+        project_id: int,
+        cache_key: str,
+    ) -> dict[str, Any] | None:
+        """Return and account for one immutable, exact-input extraction result."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE knowledge_forge_entity_extraction_cache
+                   SET hit_count=hit_count+1,last_used_at=NOW()
+                   WHERE cache_key=%s AND project_id=%s
+                   RETURNING *""",
+                (cache_key, int(project_id)),
+            ).fetchone()
+
+    def persist_knowledge_forge_entity_extraction_cache(
+        self,
+        *,
+        cache_key: str,
+        project_id: int,
+        document_id: int,
+        revision_id: str,
+        chunk_id: int,
+        content_hash: str,
+        schema_fingerprint: str,
+        model_name: str,
+        model_digest: str,
+        extraction_policy_version: str,
+        code_version: str,
+        request_fingerprint: str,
+        request_metadata: dict[str, Any],
+        output: dict[str, Any],
+        output_hash: str,
+    ) -> dict[str, Any]:
+        """Persist a successful extraction without replacing prior evidence."""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """INSERT INTO knowledge_forge_entity_extraction_cache(
+                   cache_key,project_id,document_id,revision_id,chunk_id,
+                   content_hash,schema_fingerprint,model_name,model_digest,
+                   extraction_policy_version,code_version,request_fingerprint,
+                   request_metadata,output_json,output_hash)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
+                   ON CONFLICT(cache_key) DO NOTHING
+                   RETURNING *""",
+                (
+                    cache_key, int(project_id), int(document_id), revision_id,
+                    int(chunk_id), content_hash, schema_fingerprint, model_name,
+                    model_digest, extraction_policy_version, code_version,
+                    request_fingerprint, self._json(request_metadata),
+                    self._json(output), output_hash,
+                ),
+            ).fetchone()
+            if row:
+                return row
+            existing = conn.execute(
+                """SELECT * FROM knowledge_forge_entity_extraction_cache
+                   WHERE cache_key=%s AND project_id=%s FOR UPDATE""",
+                (cache_key, int(project_id)),
+            ).fetchone()
+            if not existing:
+                raise RuntimeError("Knowledge Forge 实体抽取缓存写入冲突")
+            if (
+                str(existing.get("request_fingerprint") or "")
+                != request_fingerprint
+                or str(existing.get("output_hash") or "") != output_hash
+            ):
+                raise RuntimeError("Knowledge Forge 实体抽取缓存不可变内容不一致")
+            return existing
+
+    def delete_knowledge_forge_entity_extraction_cache(
+        self,
+        project_id: int,
+        cache_key: str,
+    ) -> bool:
+        """Remove only a corrupt cache row; source and graph facts are untouched."""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                """DELETE FROM knowledge_forge_entity_extraction_cache
+                   WHERE cache_key=%s AND project_id=%s RETURNING cache_key""",
+                (cache_key, int(project_id)),
+            ).fetchone()
+            return bool(row)
+
     def list_entity_shadow_mentions(
         self, namespace_id: str, *, chunk_id: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -8469,11 +10053,25 @@ class Database:
     ) -> list[dict[str, Any]]:
         with self.connection() as conn:
             return conn.execute(
-                """SELECT canonical.*,1.0 AS lexical_score
+                """SELECT DISTINCT ON (canonical.canonical_key)
+                          canonical.*,1.0 AS lexical_score,
+                          occurrence.evidence_text AS mention_evidence
                    FROM entity_shadow_aliases alias
                    JOIN entity_shadow_canonicals canonical
                      ON canonical.namespace_id=alias.namespace_id
                     AND canonical.canonical_key=alias.canonical_key
+                   LEFT JOIN LATERAL (
+                     SELECT mention.evidence_text
+                     FROM entity_shadow_assignments assignment
+                     JOIN entity_shadow_mentions mention
+                       ON mention.namespace_id=assignment.namespace_id
+                      AND mention.mention_key=assignment.mention_key
+                     WHERE assignment.namespace_id=canonical.namespace_id
+                       AND assignment.canonical_key=canonical.canonical_key
+                     ORDER BY mention.document_id,mention.chunk_id,
+                              mention.evidence_start,mention.mention_key
+                     LIMIT 1
+                   ) occurrence ON TRUE
                    WHERE alias.namespace_id=%s AND alias.normalized_alias=%s
                    ORDER BY canonical.canonical_key LIMIT %s""",
                 (namespace_id, normalized_alias, max(1, min(10, limit))),
@@ -8490,19 +10088,61 @@ class Database:
             ).fetchone()
 
     def search_entity_shadow_name_candidates(
-        self, namespace_id: str, normalized_alias: str, limit: int,
+        self,
+        namespace_id: str,
+        normalized_alias: str,
+        limit: int,
+        *,
+        preferred_document_id: int | None = None,
+        preferred_chunk_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(50, limit))
+        preferred_document = int(preferred_document_id or -1)
+        preferred_chunk = int(preferred_chunk_id or -1)
         with self.connection() as conn:
             return conn.execute(
-                """SELECT canonical.*,MAX(similarity(alias.normalized_alias,%s)) AS lexical_score
-                   FROM entity_shadow_aliases alias
-                   JOIN entity_shadow_canonicals canonical
-                     ON canonical.namespace_id=alias.namespace_id
-                    AND canonical.canonical_key=alias.canonical_key
-                   WHERE alias.namespace_id=%s AND alias.normalized_alias %% %s
-                   GROUP BY canonical.namespace_id,canonical.canonical_key
-                   ORDER BY lexical_score DESC,canonical.canonical_key LIMIT %s""",
-                (normalized_alias, namespace_id, normalized_alias, max(1, min(50, limit))),
+                """WITH ranked AS MATERIALIZED (
+                     SELECT canonical.*,
+                            MAX(similarity(alias.normalized_alias,%s)) AS lexical_score
+                     FROM entity_shadow_aliases alias
+                     JOIN entity_shadow_canonicals canonical
+                       ON canonical.namespace_id=alias.namespace_id
+                      AND canonical.canonical_key=alias.canonical_key
+                     WHERE alias.namespace_id=%s AND alias.normalized_alias %% %s
+                     GROUP BY canonical.namespace_id,canonical.canonical_key
+                     ORDER BY lexical_score DESC,canonical.canonical_key LIMIT %s
+                   )
+                   SELECT ranked.*,occurrence.evidence_text AS mention_evidence,
+                          occurrence.document_id AS mention_document_id,
+                          occurrence.chunk_id AS mention_chunk_id,
+                          occurrence.evidence_start AS mention_evidence_start,
+                          occurrence.evidence_end AS mention_evidence_end,
+                          occurrence.surface AS mention_surface
+                   FROM ranked
+                   LEFT JOIN LATERAL (
+                     SELECT mention.evidence_text,mention.document_id,mention.chunk_id,
+                            mention.evidence_start,mention.evidence_end,mention.surface
+                     FROM entity_shadow_assignments assignment
+                     JOIN entity_shadow_mentions mention
+                       ON mention.namespace_id=assignment.namespace_id
+                      AND mention.mention_key=assignment.mention_key
+                     WHERE assignment.namespace_id=ranked.namespace_id
+                       AND assignment.canonical_key=ranked.canonical_key
+                     ORDER BY (mention.chunk_id=%s) DESC,
+                              (mention.document_id=%s) DESC,
+                              mention.document_id,mention.chunk_id,
+                              mention.evidence_start,mention.mention_key
+                     LIMIT 1
+                   ) occurrence ON TRUE
+                   ORDER BY ranked.lexical_score DESC,ranked.canonical_key""",
+                (
+                    normalized_alias,
+                    namespace_id,
+                    normalized_alias,
+                    bounded_limit,
+                    preferred_chunk,
+                    preferred_document,
+                ),
             ).fetchall()
 
     def _ensure_entity_shadow_hnsw_index(
@@ -8531,20 +10171,56 @@ class Database:
         model_name: str,
         query_vector: list[float],
         limit: int,
+        *,
+        preferred_document_id: int | None = None,
+        preferred_chunk_id: int | None = None,
     ) -> list[dict[str, Any]]:
         vector_literal = self._vector_literal(query_vector)
         dimension = len(query_vector)
         vector_type = sql.SQL("vector({})").format(sql.Literal(dimension))
         statement = sql.SQL(
-            """SELECT canonical.*,
-               GREATEST(0.0,1.0-(embedding.embedding_vector::{} <=> %s::{})) AS vector_score
-               FROM entity_shadow_embeddings embedding
+            """WITH ranked AS MATERIALIZED (
+                 SELECT embedding.namespace_id,embedding.canonical_key,
+                        embedding.embedding_vector::{} <=> %s::{} AS distance
+                 FROM entity_shadow_embeddings embedding
+                 JOIN entity_shadow_canonicals eligible
+                   ON eligible.namespace_id=embedding.namespace_id
+                  AND eligible.canonical_key=embedding.canonical_key
+                 WHERE embedding.namespace_id=%s AND embedding.model_name=%s
+                   AND embedding.dimension=%s
+                   AND COALESCE(
+                     (eligible.metadata#>>'{{entity_publishability,retrieval_eligible}}')::boolean,
+                     TRUE
+                   )
+                 ORDER BY embedding.embedding_vector::{} <=> %s::{} LIMIT %s
+               )
+               SELECT canonical.*,GREATEST(0.0,1.0-ranked.distance) AS vector_score,
+                      occurrence.evidence_text AS mention_evidence,
+                      occurrence.document_id AS mention_document_id,
+                      occurrence.chunk_id AS mention_chunk_id,
+                      occurrence.evidence_start AS mention_evidence_start,
+                      occurrence.evidence_end AS mention_evidence_end,
+                      occurrence.surface AS mention_surface
+               FROM ranked
                JOIN entity_shadow_canonicals canonical
-                 ON canonical.namespace_id=embedding.namespace_id
-                AND canonical.canonical_key=embedding.canonical_key
-               WHERE embedding.namespace_id=%s AND embedding.model_name=%s
-                 AND embedding.dimension=%s
-               ORDER BY embedding.embedding_vector::{} <=> %s::{} LIMIT %s"""
+                 ON canonical.namespace_id=ranked.namespace_id
+                AND canonical.canonical_key=ranked.canonical_key
+               LEFT JOIN LATERAL (
+                 SELECT mention.evidence_text,mention.document_id,mention.chunk_id,
+                        mention.evidence_start,mention.evidence_end,mention.surface
+                 FROM entity_shadow_assignments assignment
+                 JOIN entity_shadow_mentions mention
+                   ON mention.namespace_id=assignment.namespace_id
+                  AND mention.mention_key=assignment.mention_key
+                 WHERE assignment.namespace_id=ranked.namespace_id
+                   AND assignment.canonical_key=ranked.canonical_key
+                 ORDER BY (mention.chunk_id=%s) DESC,
+                          (mention.document_id=%s) DESC,
+                          mention.document_id,mention.chunk_id,
+                          mention.evidence_start,mention.mention_key
+                 LIMIT 1
+               ) occurrence ON TRUE
+               ORDER BY ranked.distance,ranked.canonical_key"""
         ).format(vector_type, vector_type, vector_type, vector_type)
         with self.connection() as conn:
             self._ensure_entity_shadow_hnsw_index(conn, model_name, dimension)
@@ -8554,6 +10230,8 @@ class Database:
                 (
                     vector_literal, namespace_id, model_name, dimension,
                     vector_literal, max(1, min(100, limit)),
+                    int(preferred_chunk_id or -1),
+                    int(preferred_document_id or -1),
                 ),
             ).fetchall()
 
@@ -8583,6 +10261,23 @@ class Database:
                     ),
                 )
 
+    @staticmethod
+    def _entity_shadow_display_aliases(
+        canonical: dict[str, Any],
+        mention: dict[str, Any],
+        aliases: list[dict[str, Any]],
+    ) -> list[str]:
+        return sorted({
+            str(value).strip()
+            for value in (
+                canonical.get("name"),
+                mention.get("surface"),
+                *(canonical.get("aliases") or []),
+                *(item.get("surface") for item in aliases),
+            )
+            if str(value or "").strip()
+        })
+
     def upsert_entity_shadow_canonical(
         self,
         namespace_id: str,
@@ -8598,6 +10293,13 @@ class Database:
         config_hash: str,
     ) -> dict[str, Any]:
         canonical_key = str(canonical["canonical_key"])
+        # Canonical aliases are presentation/search surfaces, while normalized
+        # keys live in ``entity_shadow_aliases.normalized_alias``.  Keeping
+        # only compact normalized strings here made merged names disappear
+        # from graph display and surface-based retrieval/evaluation.
+        display_aliases = self._entity_shadow_display_aliases(
+            canonical, mention, aliases,
+        )
         with self.connection() as conn:
             existing_assignment = conn.execute(
                 """SELECT canonical_key FROM entity_shadow_assignments
@@ -8616,7 +10318,7 @@ class Database:
                 (
                     namespace_id, canonical_key, canonical["name"], canonical["normalized_name"],
                     canonical.get("primary_type") or "GenericEntity",
-                    canonical.get("aliases") or [], self._json(canonical.get("metadata")),
+                    display_aliases, self._json(canonical.get("metadata")),
                 ),
             ).fetchone()
             alias_rows = [{
@@ -8667,7 +10369,12 @@ class Database:
                     (
                         namespace_id, canonical_key, embedding_model, embedding, vector_literal,
                         len(embedding), content_hash, mention["policy_version"],
-                        self._json({"config_hash": config_hash}),
+                        self._json({
+                            "config_hash": config_hash,
+                            "embedding_runtime_profile": (
+                                Config.ollama_embedding_runtime_profile
+                            ),
+                        }),
                     ),
                 )
             conn.execute(
@@ -8806,6 +10513,15 @@ class Database:
         self, namespace_id: str, rows: list[dict[str, Any]],
     ) -> None:
         with self.connection() as conn:
+            # A namespace can be reused for an idempotent source snapshot
+            # while each relation run independently re-evaluates publication.
+            # Replace the namespace's derived endpoint contribution atomically
+            # so a rejected fact from an older run cannot remain navigable in
+            # the current graph.
+            conn.execute(
+                "DELETE FROM entity_shadow_relation_endpoints WHERE namespace_id=%s",
+                (namespace_id,),
+            )
             for item in rows:
                 conn.execute(
                     """INSERT INTO entity_shadow_relation_endpoints(
@@ -8836,6 +10552,79 @@ class Database:
                     ),
                 )
 
+    def validate_entity_shadow_relation_artifact(
+        self,
+        namespace_id: str,
+        run_id: str,
+    ) -> dict[str, int | bool]:
+        """Prove a namespace endpoint snapshot is exactly one ready run's facts.
+
+        A graph projection is an immutable derived view, not a new inference.
+        This check permits a code-only deployment to reproject an already
+        audited source run without claiming that a new runtime reproduced its
+        historical model-request batching.  Both sides are compared as sets:
+        every endpoint must be an eligible fact in the referenced run, and
+        every eligible fact must have exactly one endpoint in the namespace.
+        """
+
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT id,project_id,status FROM shadow_relation_v2_runs
+                   WHERE id=%s""",
+                (run_id,),
+            ).fetchone()
+            namespace = conn.execute(
+                """SELECT id,project_id,status,snapshot_complete
+                   FROM entity_shadow_namespaces WHERE id=%s""",
+                (namespace_id,),
+            ).fetchone()
+            if (
+                not run or not namespace
+                or int(run["project_id"]) != int(namespace["project_id"])
+                or str(run.get("status") or "") != "ready"
+                or str(namespace.get("status") or "") != "ready"
+                or not bool(namespace.get("snapshot_complete"))
+            ):
+                return {
+                    "valid": False,
+                    "endpoints": 0,
+                    "eligible_facts": 0,
+                    "endpoint_only": 0,
+                    "fact_only": 0,
+                }
+            counts = conn.execute(
+                """WITH endpoint_keys AS (
+                       SELECT relation_key
+                       FROM entity_shadow_relation_endpoints
+                       WHERE namespace_id=%s
+                     ), eligible_fact_keys AS (
+                       SELECT DISTINCT fact_id AS relation_key
+                       FROM shadow_relation_fact_memberships
+                       WHERE run_id=%s AND status='ELIGIBLE'
+                     )
+                   SELECT
+                     (SELECT COUNT(*) FROM endpoint_keys) AS endpoints,
+                     (SELECT COUNT(*) FROM eligible_fact_keys) AS eligible_facts,
+                     (SELECT COUNT(*) FROM endpoint_keys endpoint
+                       LEFT JOIN eligible_fact_keys fact
+                         ON fact.relation_key=endpoint.relation_key
+                       WHERE fact.relation_key IS NULL) AS endpoint_only,
+                     (SELECT COUNT(*) FROM eligible_fact_keys fact
+                       LEFT JOIN endpoint_keys endpoint
+                         ON endpoint.relation_key=fact.relation_key
+                       WHERE endpoint.relation_key IS NULL) AS fact_only""",
+                (namespace_id, run_id),
+            ).fetchone()
+            endpoint_only = int(counts["endpoint_only"] or 0)
+            fact_only = int(counts["fact_only"] or 0)
+            return {
+                "valid": endpoint_only == 0 and fact_only == 0,
+                "endpoints": int(counts["endpoints"] or 0),
+                "eligible_facts": int(counts["eligible_facts"] or 0),
+                "endpoint_only": endpoint_only,
+                "fact_only": fact_only,
+            }
+
     def load_entity_shadow_snapshot(self, namespace_id: str) -> dict[str, Any]:
         with self.connection() as conn:
             namespace = conn.execute(
@@ -8861,6 +10650,79 @@ class Database:
                 "assignments": assignments,
                 "relation_endpoints": endpoints,
             }
+
+    def persist_entity_shadow_publishability_audit(
+        self,
+        namespace_id: str,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Attach a deterministic publication projection to canonicals.
+
+        Raw mentions, assignments and embeddings remain immutable. Re-running
+        this policy therefore costs bounded JSON metadata updates instead of a
+        second extraction or identity-resolution pass.
+        """
+
+        updated = 0
+        with self.connection() as conn:
+            for item in rows:
+                row = conn.execute(
+                    """UPDATE entity_shadow_canonicals
+                       SET metadata=jsonb_set(
+                         COALESCE(metadata,'{}'::jsonb),
+                         '{entity_publishability}',%s::jsonb,TRUE
+                       )
+                       WHERE namespace_id=%s AND canonical_key=%s
+                       RETURNING canonical_key""",
+                    (
+                        self._json(item.get("audit") or {}),
+                        namespace_id,
+                        str(item["canonical_key"]),
+                    ),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError(
+                        "entity publishability audit references missing canonical: "
+                        + str(item.get("canonical_key") or "")
+                    )
+                updated += 1
+        return updated
+
+    def entity_shadow_publishability_summary(
+        self, namespace_id: str,
+    ) -> dict[str, Any]:
+        """Return persisted mention and rejection decision counters."""
+
+        with self.connection() as conn:
+            mention_rows = conn.execute(
+                """SELECT filter_decision AS decision,filter_reason AS reason,
+                          COUNT(*) AS count
+                   FROM entity_shadow_mentions
+                   WHERE namespace_id=%s
+                   GROUP BY filter_decision,filter_reason
+                   ORDER BY filter_decision,filter_reason""",
+                (namespace_id,),
+            ).fetchall()
+            rejected_rows = conn.execute(
+                """SELECT decision,reason,COUNT(*) AS count
+                   FROM entity_shadow_filter_decisions
+                   WHERE namespace_id=%s
+                   GROUP BY decision,reason
+                   ORDER BY decision,reason""",
+                (namespace_id,),
+            ).fetchall()
+        decisions: Counter[str] = Counter()
+        reasons: Counter[str] = Counter()
+        for item in [*mention_rows, *rejected_rows]:
+            count = int(item.get("count") or 0)
+            decisions[str(item.get("decision") or "unknown")] += count
+            reason = str(item.get("reason") or "")
+            if reason:
+                reasons[reason] += count
+        return {
+            "decisions": dict(sorted(decisions.items())),
+            "reasons": dict(sorted(reasons.items())),
+        }
 
     def search_knowledge_forge_entities(
         self, namespace_id: str, query: str, limit: int = 20,
@@ -8895,7 +10757,11 @@ class Database:
                      WHERE alias.namespace_id=canonical.namespace_id
                        AND alias.canonical_key=canonical.canonical_key
                    ) alias_score ON TRUE
-                   WHERE canonical.namespace_id=%s AND (
+                   WHERE canonical.namespace_id=%s
+                     AND COALESCE(
+                       (canonical.metadata#>>'{entity_publishability,retrieval_eligible}')::boolean,
+                       TRUE
+                     ) AND (
                      canonical.name ILIKE %s
                      OR canonical.normalized_name ILIKE %s
                      OR COALESCE(canonical.metadata->>'description','') ILIKE %s
@@ -8921,6 +10787,201 @@ class Database:
                 (str(run_id),),
             ).fetchone()
 
+    def start_shadow_relation_secondary_pass(
+        self, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create one append-only, reason-routed child pass for a v2 run."""
+
+        pass_id = str(values.get("id") or "")
+        parent_run_id = str(values.get("parent_run_id") or "")
+        fingerprint = str(values.get("input_fingerprint") or "")
+        if not pass_id or not parent_run_id or not fingerprint:
+            raise ValueError("secondary pass requires immutable parent and fingerprint")
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, parent_run_id)
+            parent = conn.execute(
+                "SELECT project_id FROM shadow_relation_v2_runs WHERE id=%s",
+                (parent_run_id,),
+            ).fetchone()
+            if not parent:
+                raise LookupError("secondary pass parent Shadow run does not exist")
+            project_id = int(values.get("project_id") or parent["project_id"])
+            if project_id != int(parent["project_id"]):
+                raise ValueError("secondary pass project mismatch")
+            conn.execute(
+                """INSERT INTO shadow_relation_secondary_passes(
+                   id,parent_run_id,project_id,pass_version,input_fingerprint,status)
+                   VALUES(%s,%s,%s,%s,%s,'planning')
+                   ON CONFLICT(id) DO NOTHING""",
+                (
+                    pass_id, parent_run_id, project_id,
+                    str(values.get("pass_version") or ""), fingerprint,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM shadow_relation_secondary_passes WHERE id=%s",
+                (pass_id,),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("secondary pass could not be created")
+            if (
+                str(row["parent_run_id"]) != parent_run_id
+                or int(row["project_id"]) != project_id
+                or str(row["input_fingerprint"]) != fingerprint
+            ):
+                raise ValueError("secondary pass immutable input mismatch")
+            if str(row.get("status") or "") in {"failed", "cancelled"}:
+                row = conn.execute(
+                    """UPDATE shadow_relation_secondary_passes
+                       SET status='planning',route_counts='{}'::jsonb,
+                           metrics='{}'::jsonb,error_message='',completed_at=NULL
+                       WHERE id=%s RETURNING *""",
+                    (pass_id,),
+                ).fetchone()
+            return row
+
+    def persist_shadow_relation_secondary_candidates(
+        self, pass_id: str, candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Persist secondary routing decisions without changing primary rows."""
+
+        values = list(candidates)
+        with self.connection() as conn:
+            pass_row = conn.execute(
+                "SELECT * FROM shadow_relation_secondary_passes WHERE id=%s FOR UPDATE",
+                (str(pass_id),),
+            ).fetchone()
+            if not pass_row:
+                raise LookupError("secondary pass does not exist")
+            for item in values:
+                pair = conn.execute(
+                    """SELECT id,run_id FROM shadow_relation_pair_opportunities
+                       WHERE id=%s""",
+                    (str(item["pair_opportunity_id"]),),
+                ).fetchone()
+                if not pair or str(pair["run_id"]) != str(pass_row["parent_run_id"]):
+                    raise ValueError("secondary candidate pair belongs to another run")
+                parent_hypothesis_id = item.get("parent_hypothesis_id")
+                if parent_hypothesis_id:
+                    parent = conn.execute(
+                        """SELECT hypothesis.id FROM shadow_relation_hypotheses hypothesis
+                           JOIN shadow_relation_pair_opportunities pair
+                             ON pair.id=hypothesis.pair_opportunity_id
+                           WHERE hypothesis.id=%s AND pair.run_id=%s""",
+                        (str(parent_hypothesis_id), str(pass_row["parent_run_id"])),
+                    ).fetchone()
+                    if not parent:
+                        raise ValueError("secondary candidate parent hypothesis mismatch")
+                conn.execute(
+                    """INSERT INTO shadow_relation_secondary_candidates(
+                       id,secondary_pass_id,parent_hypothesis_id,pair_opportunity_id,
+                       route,source_reason_code,predicate_before,predicate_after,
+                       subject_occurrence_key,object_occurrence_key,evidence_spans,
+                       status,reason_code,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb)
+                       ON CONFLICT(id) DO UPDATE SET
+                           predicate_after=EXCLUDED.predicate_after,
+                           subject_occurrence_key=EXCLUDED.subject_occurrence_key,
+                           object_occurrence_key=EXCLUDED.object_occurrence_key,
+                           evidence_spans=EXCLUDED.evidence_spans,
+                           status=EXCLUDED.status,reason_code=EXCLUDED.reason_code,
+                           metadata=EXCLUDED.metadata""",
+                    (
+                        str(item["id"]), str(pass_id),
+                        str(parent_hypothesis_id) if parent_hypothesis_id else None,
+                        str(item["pair_opportunity_id"]), str(item["route"]),
+                        str(item.get("source_reason_code") or ""),
+                        str(item.get("predicate_before") or ""),
+                        str(item.get("predicate_after") or ""),
+                        str(item.get("subject_occurrence_key") or ""),
+                        str(item.get("object_occurrence_key") or ""),
+                        self._canonical_json(item.get("evidence_spans") or []),
+                        str(item.get("status") or "PLANNED"),
+                        str(item.get("reason_code") or ""),
+                        self._canonical_json(item.get("metadata") or {}),
+                    ),
+                )
+            return conn.execute(
+                """SELECT * FROM shadow_relation_secondary_candidates
+                   WHERE secondary_pass_id=%s ORDER BY id""",
+                (str(pass_id),),
+            ).fetchall()
+
+    def record_shadow_relation_secondary_model_call(
+        self, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Audit one secondary recovery request in the parent run's call ledger."""
+
+        with self.connection() as conn:
+            self._set_shadow_relation_v2_session(conn, str(values["run_id"]))
+            request_payload = values.get("request_payload") or {}
+            response_payload = values.get("parsed_response") or {}
+            request_hash = str(values.get("request_hash") or "")
+            response_hash = str(values.get("response_hash") or "")
+            row = conn.execute(
+                """INSERT INTO shadow_model_calls(
+                   id,run_id,component,model_name,model_digest,prompt_version,
+                   schema_version,parser_version,idempotency_key,attempt_no,status,
+                   request_hash,response_hash,request_payload,raw_response_text,
+                   parsed_response,token_usage,error_type,error_message,
+                   independent_call,audit_quality,terminal_status)
+                   VALUES(%s,%s,'secondary_recovery',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                          %s::jsonb,%s,%s::jsonb,%s::jsonb,%s,%s,TRUE,'complete',%s)
+                   ON CONFLICT(run_id,component,idempotency_key,attempt_no)
+                   DO UPDATE SET terminal_status=EXCLUDED.terminal_status
+                   WHERE shadow_model_calls.request_hash=EXCLUDED.request_hash
+                   RETURNING *""",
+                (
+                    str(values["id"]), str(values["run_id"]),
+                    str(values.get("model_name") or ""), str(values.get("model_digest") or ""),
+                    str(values.get("prompt_version") or ""),
+                    str(values.get("schema_version") or ""),
+                    str(values.get("parser_version") or ""),
+                    str(values.get("idempotency_key") or ""),
+                    int(values.get("attempt_no") or 1), str(values.get("status") or ""),
+                    request_hash, response_hash,
+                    self._canonical_json(request_payload),
+                    str(values.get("raw_response_text") or ""),
+                    self._canonical_json(response_payload),
+                    self._canonical_json(values.get("token_usage") or {}),
+                    str(values.get("error_type") or ""),
+                    str(values.get("error_message") or ""),
+                    str(values.get("terminal_status") or str(values.get("status") or "")),
+                ),
+            ).fetchone()
+            if not row:
+                raise ValueError("secondary model call immutable payload mismatch")
+            return row
+
+    def finish_shadow_relation_secondary_pass(
+        self, pass_id: str, *, status: str, metrics: dict[str, Any],
+        route_counts: dict[str, Any], error_message: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"ready", "failed", "cancelled"}:
+            raise ValueError("invalid secondary pass terminal status")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE shadow_relation_secondary_passes
+                   SET status=%s,metrics=%s::jsonb,route_counts=%s::jsonb,
+                       error_message=%s,completed_at=NOW()
+                   WHERE id=%s RETURNING *""",
+                (
+                    status, self._canonical_json(metrics),
+                    self._canonical_json(route_counts), error_message or "",
+                    str(pass_id),
+                ),
+            ).fetchone()
+            if not row:
+                raise LookupError("secondary pass does not exist")
+            return row
+
+    def get_shadow_relation_secondary_pass(self, pass_id: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM shadow_relation_secondary_passes WHERE id=%s",
+                (str(pass_id),),
+            ).fetchone()
+
     def search_knowledge_forge_relations(
         self,
         namespace_id: str,
@@ -8928,25 +10989,37 @@ class Database:
         query: str,
         *,
         chunk_ids: list[int] | None = None,
+        canonical_keys: list[str] | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Search only materialized, independently verified facts for one run."""
+        """Search verified facts, optionally fanning out from entity seeds.
+
+        ``canonical_keys`` is deliberately bounded by the caller and only
+        matches relation endpoints in the immutable namespace.  This gives the
+        retrieval layer a project-local graph traversal primitive without
+        loading the complete graph or consulting legacy/HugeGraph state.
+        """
 
         query = str(query or "").strip()
         if not query:
             return []
         pattern = f"%{query}%"
         chunk_ids = sorted({int(value) for value in (chunk_ids or [])})
+        canonical_keys = sorted({
+            str(value) for value in (canonical_keys or []) if str(value)
+        })[:50]
         chunk_clause = (
             " OR endpoint.chunk_id=ANY(%s)"
             if chunk_ids else ""
         )
         params: list[Any] = [
-            pattern, pattern, pattern, pattern,
-            query, query, query, query,
+            canonical_keys, canonical_keys,
+            pattern, pattern, pattern, pattern, pattern, pattern,
+            query, query, query, query, query, query,
             relation_run_id, relation_run_id,
             namespace_id, relation_run_id,
-            pattern, pattern, pattern, pattern,
+            pattern, pattern, pattern, pattern, pattern, pattern,
+            canonical_keys, canonical_keys,
         ]
         if chunk_ids:
             params.append(chunk_ids)
@@ -8962,15 +11035,30 @@ class Database:
                    fact.semantic_fact_key,fact.qualifiers,fact.audit_quality,
                    evidence.evidence_count,evidence.evidence_records,
                    document.original_filename,document.storage_path,chunk.chunk_key,
+                   CASE WHEN endpoint.source_canonical_key=ANY(%s::text[])
+                          OR endpoint.target_canonical_key=ANY(%s::text[])
+                        THEN 1 ELSE 0 END AS seed_match,
                    GREATEST(
                      CASE WHEN source.name ILIKE %s THEN 1.0 ELSE 0.0 END,
                      CASE WHEN target.name ILIKE %s THEN 1.0 ELSE 0.0 END,
                      CASE WHEN endpoint.relation_type ILIKE %s THEN 1.0 ELSE 0.0 END,
                      CASE WHEN endpoint.evidence_text ILIKE %s THEN 0.9 ELSE 0.0 END,
+                     CASE WHEN endpoint.metadata->>'display_relation_label' ILIKE %s
+                          THEN 1.0 ELSE 0.0 END,
+                     CASE WHEN endpoint.metadata->>'source_relation_expression' ILIKE %s
+                          THEN 1.0 ELSE 0.0 END,
                      similarity(LOWER(source.name),LOWER(%s)),
                      similarity(LOWER(target.name),LOWER(%s)),
                      similarity(LOWER(endpoint.relation_type),LOWER(%s)),
-                     similarity(LOWER(endpoint.evidence_text),LOWER(%s))
+                     similarity(LOWER(endpoint.evidence_text),LOWER(%s)),
+                     similarity(
+                       LOWER(COALESCE(endpoint.metadata->>'display_relation_label','')),
+                       LOWER(%s)
+                     ),
+                     similarity(
+                       LOWER(COALESCE(endpoint.metadata->>'source_relation_expression','')),
+                       LOWER(%s)
+                     )
                    ) AS lexical_score
                    FROM entity_shadow_relation_endpoints endpoint
                    JOIN entity_shadow_canonicals source
@@ -9019,10 +11107,15 @@ class Database:
                      AND (
                        source.name ILIKE %s OR target.name ILIKE %s
                        OR endpoint.relation_type ILIKE %s
-                       OR endpoint.evidence_text ILIKE %s"""
+                       OR endpoint.evidence_text ILIKE %s
+                       OR endpoint.metadata->>'display_relation_label' ILIKE %s
+                       OR endpoint.metadata->>'source_relation_expression' ILIKE %s
+                       OR endpoint.source_canonical_key=ANY(%s::text[])
+                       OR endpoint.target_canonical_key=ANY(%s::text[])"""
                 + chunk_clause
                 + """)
-                   ORDER BY lexical_score DESC,evidence.evidence_count DESC,
+                   ORDER BY seed_match DESC,lexical_score DESC,
+                            evidence.evidence_count DESC,
                             endpoint.relation_key
                    LIMIT %s""",
                 tuple(params),
@@ -9213,7 +11306,7 @@ class Database:
             "entity_namespace_id=%s",
         ]
         params: list[Any] = [
-            int(project_id), ENHANCED_SHADOW_STRATEGY,
+            int(project_id), KNOWLEDGE_FORGE_STRATEGY,
             int(graph_generation), str(entity_namespace_id),
         ]
         if input_hash:
@@ -9250,7 +11343,7 @@ class Database:
                      project_id,strategy_key,graph_generation,entity_namespace_id,input_hash
                    ) DO NOTHING RETURNING *""",
                 (
-                    str(run_id), int(project_id), ENHANCED_SHADOW_STRATEGY,
+                    str(run_id), int(project_id), KNOWLEDGE_FORGE_STRATEGY,
                     int(graph_generation), str(entity_namespace_id), str(input_hash),
                     int(node_count), int(edge_count), self._json(config),
                 ),
@@ -9263,7 +11356,7 @@ class Database:
                      AND entity_namespace_id=%s AND input_hash=%s
                    ORDER BY created_at DESC LIMIT 1""",
                 (
-                    int(project_id), ENHANCED_SHADOW_STRATEGY,
+                    int(project_id), KNOWLEDGE_FORGE_STRATEGY,
                     int(graph_generation), str(entity_namespace_id), str(input_hash),
                 ),
             ).fetchone()
@@ -9318,6 +11411,767 @@ class Database:
                    WHERE run_id=%s AND status='running' RETURNING *""",
                 (str(error)[-4000:], str(run_id)),
             ).fetchone() or {}
+
+    def get_matching_knowledge_forge_community_report_run(
+        self,
+        *,
+        project_id: int,
+        community_run_id: str,
+        model_id: str,
+        prompt_hash: str,
+        config_hash: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE project_id=%s AND community_run_id=%s AND model_id=%s
+                     AND prompt_hash=%s AND config_hash=%s
+                   ORDER BY retry_round DESC,created_at DESC LIMIT 1""",
+                (
+                    int(project_id), str(community_run_id), str(model_id),
+                    str(prompt_hash), str(config_hash),
+                ),
+            ).fetchone()
+
+    def create_knowledge_forge_community_report_build(
+        self,
+        values: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically persist one immutable report plan and its durable job."""
+
+        with self.connection() as conn:
+            community_run = conn.execute(
+                """SELECT * FROM knowledge_forge_community_runs
+                   WHERE run_id=%s FOR SHARE""",
+                (str(values["community_run_id"]),),
+            ).fetchone()
+            if (
+                not community_run
+                or int(community_run["project_id"]) != int(values["project_id"])
+                or str(community_run.get("status") or "")
+                not in {"completed", "completed_empty"}
+                or int(community_run["graph_generation"])
+                != int(values["graph_generation"])
+                or str(community_run["entity_namespace_id"])
+                != str(values["entity_namespace_id"])
+                or str(community_run["input_hash"])
+                != str(values["community_input_hash"])
+            ):
+                raise RuntimeError("社区报告输入不是完整且匹配的社区快照")
+            existing = conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE project_id=%s AND community_run_id=%s AND model_id=%s
+                     AND prompt_hash=%s AND config_hash=%s AND retry_round=%s
+                   FOR SHARE""",
+                (
+                    int(values["project_id"]), str(values["community_run_id"]),
+                    str(values["model_id"]), str(values["prompt_hash"]),
+                    str(values["config_hash"]), int(values.get("retry_round") or 0),
+                ),
+            ).fetchone()
+            if existing:
+                immutable = (
+                    "graph_generation", "entity_namespace_id",
+                    "community_input_hash", "input_hash", "embedding_model_id",
+                    "prompt_version",
+                )
+                if any(str(existing[key]) != str(values[key]) for key in immutable):
+                    raise RuntimeError("社区报告运行幂等键对应的不可变输入不一致")
+                job = (
+                    conn.execute(
+                        "SELECT * FROM jobs WHERE id=%s",
+                        (str(existing.get("job_id") or ""),),
+                    ).fetchone()
+                    if existing.get("job_id") else None
+                )
+                return {"run": existing, "job": job, "_coalesced": True}
+
+            job_id = str(values["job_id"])
+            job = conn.execute(
+                """INSERT INTO jobs(
+                       id,kind,project_id,metadata,strategy_key
+                   ) VALUES(%s,'community_report_build',%s,%s::jsonb,%s)
+                   RETURNING *""",
+                (
+                    job_id, int(values["project_id"]),
+                    self._json({
+                        "stage": "queued",
+                        "report_run_id": str(values["run_id"]),
+                        "community_run_id": str(values["community_run_id"]),
+                        "graph_generation": int(values["graph_generation"]),
+                        "automatic": bool(values.get("automatic")),
+                    }),
+                    KNOWLEDGE_FORGE_STRATEGY,
+                ),
+            ).fetchone()
+            run = conn.execute(
+                """INSERT INTO knowledge_forge_community_report_runs(
+                       run_id,project_id,community_run_id,graph_generation,
+                       entity_namespace_id,community_input_hash,input_hash,
+                       model_id,embedding_model_id,prompt_version,prompt_hash,
+                       config_hash,retry_round,status,expected_count,eligible_count,
+                       skipped_count,job_id,config)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'queued',
+                          %s,%s,%s,%s,%s::jsonb)
+                   RETURNING *""",
+                (
+                    str(values["run_id"]), int(values["project_id"]),
+                    str(values["community_run_id"]), int(values["graph_generation"]),
+                    str(values["entity_namespace_id"]),
+                    str(values["community_input_hash"]), str(values["input_hash"]),
+                    str(values["model_id"]), str(values["embedding_model_id"]),
+                    str(values["prompt_version"]), str(values["prompt_hash"]),
+                    str(values["config_hash"]), int(values.get("retry_round") or 0),
+                    int(values.get("expected_count") or 0),
+                    int(values.get("eligible_count") or 0),
+                    int(values.get("skipped_count") or 0), job_id,
+                    self._json(values.get("config") or {}),
+                ),
+            ).fetchone()
+            rows = []
+            for item in items:
+                status = str(item["status"])
+                rows.append({
+                    "report_id": str(item["report_id"]),
+                    "run_id": str(values["run_id"]),
+                    "project_id": int(values["project_id"]),
+                    "community_run_id": str(values["community_run_id"]),
+                    "community_key": str(item["community_key"]),
+                    "community_content_hash": str(item["community_content_hash"]),
+                    "context_hash": str(item["context_hash"]),
+                    "level": int(item.get("level") or 0),
+                    "status": status,
+                    "priority": int(item.get("priority") or 0),
+                    "max_attempts": int(item.get("max_attempts") or 2),
+                    "entity_keys": list(item.get("entity_keys") or []),
+                    "relation_keys": list(item.get("relation_keys") or []),
+                    "input_context": item.get("input_context") or {},
+                    "embedding_status": (
+                        "not_requested" if status == "skipped" else "pending"
+                    ),
+                    "error_category": (
+                        "Deferred" if bool(item.get("deferred")) else ""
+                    ),
+                    "error_message": str(item.get("skip_reason") or ""),
+                })
+            if rows:
+                conn.execute(
+                    """INSERT INTO knowledge_forge_community_reports(
+                           report_id,run_id,project_id,community_run_id,
+                           community_key,community_content_hash,context_hash,level,
+                           status,priority,max_attempts,entity_keys,relation_keys,
+                           input_context,embedding_status,error_category,
+                           error_message,completed_at)
+                       SELECT item.report_id,item.run_id,item.project_id,
+                              item.community_run_id,item.community_key,
+                              item.community_content_hash,item.context_hash,item.level,
+                              item.status,item.priority,item.max_attempts,
+                              item.entity_keys,item.relation_keys,item.input_context,
+                              item.embedding_status,item.error_category,
+                              item.error_message,
+                              CASE WHEN item.status='skipped' THEN NOW() ELSE NULL END
+                       FROM jsonb_to_recordset(%s::jsonb) AS item(
+                           report_id TEXT,run_id TEXT,project_id BIGINT,
+                           community_run_id TEXT,community_key TEXT,
+                           community_content_hash TEXT,context_hash TEXT,level INTEGER,
+                           status TEXT,priority INTEGER,max_attempts INTEGER,
+                           entity_keys TEXT[],relation_keys TEXT[],input_context JSONB,
+                           embedding_status TEXT,error_category TEXT,
+                           error_message TEXT
+                       )""",
+                    (self._json(rows),),
+                )
+            return {"run": run, "job": job, "_coalesced": False}
+
+    def start_knowledge_forge_community_report_run(
+        self, run_id: str,
+    ) -> dict[str, Any]:
+        """Resume a report run and close attempts interrupted by a restart."""
+
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE run_id=%s FOR UPDATE""",
+                (str(run_id),),
+            ).fetchone()
+            if not run:
+                raise LookupError("社区报告运行不存在")
+            if str(run["status"]) not in {"queued", "running"}:
+                return run
+            conn.execute(
+                """UPDATE knowledge_forge_community_report_attempts
+                   SET status='failed',error_category='ServiceRestart',
+                       error_message='服务重启中断了本次模型调用',completed_at=NOW()
+                   WHERE run_id=%s AND status='running'""",
+                (str(run_id),),
+            )
+            conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET status=CASE WHEN attempt_count<max_attempts
+                                   THEN 'pending' ELSE 'failed' END,
+                       error_category=CASE WHEN attempt_count<max_attempts
+                                           THEN '' ELSE 'ServiceRestart' END,
+                       error_message=CASE WHEN attempt_count<max_attempts
+                                         THEN '' ELSE '重启后重试预算已耗尽' END,
+                       updated_at=NOW(),
+                       completed_at=CASE WHEN attempt_count<max_attempts
+                                         THEN NULL ELSE NOW() END
+                   WHERE run_id=%s AND status='running'""",
+                (str(run_id),),
+            )
+            return conn.execute(
+                """UPDATE knowledge_forge_community_report_runs
+                   SET status='running',started_at=COALESCE(started_at,NOW()),
+                       error_message=''
+                   WHERE run_id=%s RETURNING *""",
+                (str(run_id),),
+            ).fetchone()
+
+    def claim_knowledge_forge_community_report(
+        self, run_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT report_id FROM knowledge_forge_community_reports
+                   WHERE run_id=%s AND status='pending'
+                     AND attempt_count<max_attempts
+                   ORDER BY priority DESC,level,community_key
+                   LIMIT 1 FOR UPDATE SKIP LOCKED""",
+                (str(run_id),),
+            ).fetchone()
+            if not row:
+                return None
+            return conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET status='running',
+                       error_category='',error_message='',updated_at=NOW(),
+                       completed_at=NULL
+                   WHERE report_id=%s RETURNING *""",
+                (str(row["report_id"]),),
+            ).fetchone()
+
+    def begin_knowledge_forge_community_report_model_attempt(
+        self, report_id: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET attempt_count=attempt_count+1,updated_at=NOW()
+                   WHERE report_id=%s AND status='running'
+                     AND attempt_count<max_attempts RETURNING *""",
+                (str(report_id),),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("社区报告模型重试预算已耗尽")
+            return row
+
+    def find_reusable_knowledge_forge_community_report(
+        self, run_id: str, report_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            current = conn.execute(
+                """SELECT report.*,run.model_id,run.prompt_hash,run.config_hash
+                   FROM knowledge_forge_community_reports report
+                   JOIN knowledge_forge_community_report_runs run
+                     ON run.run_id=report.run_id
+                   WHERE report.report_id=%s AND report.run_id=%s""",
+                (str(report_id), str(run_id)),
+            ).fetchone()
+            if not current:
+                raise LookupError("社区报告工作项不存在")
+            return conn.execute(
+                """SELECT prior.* FROM knowledge_forge_community_reports prior
+                   JOIN knowledge_forge_community_report_runs prior_run
+                     ON prior_run.run_id=prior.run_id
+                   WHERE prior.project_id=%s AND prior.report_id<>%s
+                     AND prior.community_content_hash=%s
+                     AND prior.context_hash=%s
+                     AND prior.status IN ('succeeded','reused')
+                     AND prior.content<>''
+                     AND prior_run.model_id=%s
+                     AND prior_run.prompt_hash=%s
+                     AND prior_run.config_hash=%s
+                   ORDER BY prior.completed_at DESC NULLS LAST,prior.updated_at DESC
+                   LIMIT 1""",
+                (
+                    int(current["project_id"]), str(report_id),
+                    str(current["community_content_hash"]),
+                    str(current["context_hash"]), str(current["model_id"]),
+                    str(current["prompt_hash"]), str(current["config_hash"]),
+                ),
+            ).fetchone()
+
+    def reuse_knowledge_forge_community_report(
+        self, report_id: str, source_report_id: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            source = conn.execute(
+                """SELECT * FROM knowledge_forge_community_reports
+                   WHERE report_id=%s AND status IN ('succeeded','reused')""",
+                (str(source_report_id),),
+            ).fetchone()
+            current = conn.execute(
+                """SELECT * FROM knowledge_forge_community_reports
+                   WHERE report_id=%s FOR UPDATE""",
+                (str(report_id),),
+            ).fetchone()
+            if not source or not current:
+                raise LookupError("可复用社区报告或当前工作项不存在")
+            if (
+                str(source["community_content_hash"])
+                != str(current["community_content_hash"])
+                or str(source["context_hash"]) != str(current["context_hash"])
+            ):
+                raise RuntimeError("社区报告复用内容哈希不一致")
+            return conn.execute(
+                """UPDATE knowledge_forge_community_reports SET
+                       status='reused',title=%s,summary=%s,findings=%s::jsonb,
+                       limitations=%s,content=%s,output_hash=%s,
+                       cited_entity_keys=%s,cited_relation_keys=%s,
+                       source_report_id=%s,usage=%s::jsonb,latency_ms=0,
+                       embedding_status='pending',embedding_error='',
+                       error_category='',error_message='',updated_at=NOW(),
+                       completed_at=NOW()
+                   WHERE report_id=%s AND status='running' RETURNING *""",
+                (
+                    source["title"], source["summary"], self._json(source["findings"]),
+                    source["limitations"], source["content"], source["output_hash"],
+                    source["cited_entity_keys"], source["cited_relation_keys"],
+                    str(source_report_id), self._json(source.get("usage") or {}),
+                    str(report_id),
+                ),
+            ).fetchone()
+
+    def record_knowledge_forge_community_report_attempt_start(
+        self,
+        *,
+        attempt_id: str,
+        report_id: str,
+        run_id: str,
+        attempt_no: int,
+        model_id: str,
+        prompt_version: str,
+        request_hash: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO knowledge_forge_community_report_attempts(
+                       attempt_id,report_id,run_id,attempt_no,model_id,
+                       prompt_version,request_hash,status)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,'running')
+                   ON CONFLICT(report_id,attempt_no) DO UPDATE SET
+                       status='running',request_hash=EXCLUDED.request_hash,
+                       raw_response_text='',parsed_response='{}'::jsonb,
+                       diagnostics='{}'::jsonb,latency_ms=0,error_category='',
+                       error_message='',completed_at=NULL
+                   RETURNING *""",
+                (
+                    str(attempt_id), str(report_id), str(run_id), int(attempt_no),
+                    str(model_id), str(prompt_version), str(request_hash),
+                ),
+            ).fetchone()
+
+    def complete_knowledge_forge_community_report_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        raw_response_text: str = "",
+        parsed_response: dict[str, Any] | None = None,
+        diagnostics: dict[str, Any] | None = None,
+        latency_ms: int = 0,
+        error_category: str = "",
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("非法社区报告尝试状态")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE knowledge_forge_community_report_attempts
+                   SET status=%s,raw_response_text=%s,parsed_response=%s::jsonb,
+                       diagnostics=%s::jsonb,latency_ms=%s,error_category=%s,
+                       error_message=%s,completed_at=NOW()
+                   WHERE attempt_id=%s AND status='running' RETURNING *""",
+                (
+                    status, str(raw_response_text)[-100_000:],
+                    self._json(parsed_response or {}),
+                    self._json(diagnostics or {}), max(0, int(latency_ms)),
+                    str(error_category), str(error_message)[-4000:],
+                    str(attempt_id),
+                ),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("社区报告尝试不存在或已完成")
+            return row
+
+    def complete_knowledge_forge_community_report(
+        self, report_id: str, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE knowledge_forge_community_reports SET
+                       status='succeeded',title=%s,summary=%s,findings=%s::jsonb,
+                       limitations=%s,content=%s,output_hash=%s,
+                       cited_entity_keys=%s,cited_relation_keys=%s,
+                       usage=%s::jsonb,latency_ms=%s,error_category='',
+                       error_message='',embedding_status='pending',
+                       embedding_error='',updated_at=NOW(),completed_at=NOW()
+                   WHERE report_id=%s AND status='running' RETURNING *""",
+                (
+                    str(values.get("title") or ""),
+                    str(values.get("summary") or ""),
+                    self._json(values.get("findings") or []),
+                    str(values.get("limitations") or ""),
+                    str(values.get("content") or ""),
+                    str(values.get("output_hash") or ""),
+                    list(values.get("cited_entity_keys") or []),
+                    list(values.get("cited_relation_keys") or []),
+                    self._json(values.get("usage") or {}),
+                    max(0, int(values.get("latency_ms") or 0)), str(report_id),
+                ),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("社区报告工作项已结束，拒绝覆盖")
+            return row
+
+    def fail_or_retry_knowledge_forge_community_report(
+        self,
+        report_id: str,
+        *,
+        error_category: str,
+        error_message: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            current = conn.execute(
+                """SELECT * FROM knowledge_forge_community_reports
+                   WHERE report_id=%s FOR UPDATE""",
+                (str(report_id),),
+            ).fetchone()
+            if not current:
+                raise LookupError("社区报告工作项不存在")
+            retry = int(current["attempt_count"]) < int(current["max_attempts"])
+            return conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET status=%s,error_category=%s,error_message=%s,
+                       updated_at=NOW(),completed_at=%s
+                   WHERE report_id=%s AND status='running' RETURNING *""",
+                (
+                    "pending" if retry else "failed", str(error_category),
+                    str(error_message)[-4000:], None if retry else datetime.now(timezone.utc),
+                    str(report_id),
+                ),
+            ).fetchone()
+
+    def set_knowledge_forge_community_report_embedding_status(
+        self, report_id: str, *, status: str, error: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"succeeded", "failed", "not_requested"}:
+            raise ValueError("非法社区报告向量状态")
+        with self.connection() as conn:
+            return conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET embedding_status=%s,embedding_error=%s,updated_at=NOW()
+                   WHERE report_id=%s RETURNING *""",
+                (status, str(error)[-2000:], str(report_id)),
+            ).fetchone()
+
+    def finalize_knowledge_forge_community_report_run(
+        self, run_id: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE run_id=%s FOR UPDATE""",
+                (str(run_id),),
+            ).fetchone()
+            if not run:
+                raise LookupError("社区报告运行不存在")
+            if str(run["status"]) in {"superseded", "cancelled"}:
+                return run
+            counts = conn.execute(
+                """SELECT
+                     COUNT(*) FILTER(WHERE status IN ('succeeded','reused')) AS completed,
+                     COUNT(*) FILTER(WHERE status='reused') AS reused,
+                     COUNT(*) FILTER(WHERE status='failed') AS failed,
+                     COUNT(*) FILTER(WHERE status='skipped') AS skipped,
+                     COUNT(*) FILTER(WHERE status IN ('pending','running')) AS pending
+                   FROM knowledge_forge_community_reports WHERE run_id=%s""",
+                (str(run_id),),
+            ).fetchone()
+            completed = int(counts["completed"] or 0)
+            reused = int(counts["reused"] or 0)
+            failed = int(counts["failed"] or 0)
+            skipped = int(counts["skipped"] or 0)
+            pending = int(counts["pending"] or 0)
+            if pending:
+                # An on-demand activation can win the run-row lock immediately
+                # after the worker observed an empty queue.  Leave the run
+                # active so the worker can claim the newly pending item rather
+                # than failing a healthy, serialized race.
+                return {**run, "_pending": pending}
+            eligible = int(run["eligible_count"] or 0)
+            if eligible == 0:
+                status = "completed_empty"
+            elif failed == 0 and completed == eligible:
+                status = "completed"
+            elif completed:
+                status = "partial"
+            else:
+                status = "failed"
+            error = (
+                f"{failed} 个社区报告生成失败" if failed else ""
+            )
+            return conn.execute(
+                """UPDATE knowledge_forge_community_report_runs SET
+                       status=%s,completed_count=%s,reused_count=%s,
+                       failed_count=%s,skipped_count=%s,
+                       metrics=%s::jsonb,error_message=%s,completed_at=NOW()
+                   WHERE run_id=%s RETURNING *""",
+                (
+                    status, completed, reused, failed, skipped,
+                    self._json({
+                        "coverage": (
+                            completed / eligible if eligible else 1.0
+                        ),
+                        "pending": pending,
+                    }),
+                    error, str(run_id),
+                ),
+            ).fetchone()
+
+    def terminate_knowledge_forge_community_report_run(
+        self, run_id: str, *, status: str, reason: str,
+    ) -> dict[str, Any]:
+        if status not in {"cancelled", "superseded", "failed"}:
+            raise ValueError("非法社区报告终止状态")
+        with self.connection() as conn:
+            conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET status=%s,error_message=%s,updated_at=NOW(),completed_at=NOW()
+                   WHERE run_id=%s AND status IN ('pending','running')""",
+                (status, str(reason)[-4000:], str(run_id)),
+            )
+            return conn.execute(
+                """UPDATE knowledge_forge_community_report_runs
+                   SET status=%s,error_message=%s,completed_at=NOW()
+                   WHERE run_id=%s AND status IN ('queued','running') RETURNING *""",
+                (status, str(reason)[-4000:], str(run_id)),
+            ).fetchone() or conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE run_id=%s""", (str(run_id),),
+            ).fetchone()
+
+    def get_knowledge_forge_community_report_state(
+        self,
+        *,
+        project_id: int,
+        community_run_id: str,
+        graph_generation: int,
+        entity_namespace_id: str,
+        community_input_hash: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE project_id=%s AND community_run_id=%s
+                     AND graph_generation=%s AND entity_namespace_id=%s
+                     AND community_input_hash=%s
+                   ORDER BY retry_round DESC,created_at DESC LIMIT 1""",
+                (
+                    int(project_id), str(community_run_id), int(graph_generation),
+                    str(entity_namespace_id), str(community_input_hash),
+                ),
+            ).fetchone()
+            reports = (
+                conn.execute(
+                    """SELECT * FROM knowledge_forge_community_reports
+                       WHERE run_id=%s ORDER BY level,community_key""",
+                    (str(run["run_id"]),),
+                ).fetchall()
+                if run else []
+            )
+            return {"run": run, "reports": reports}
+
+    def get_knowledge_forge_community_report_run(
+        self, run_id: str,
+    ) -> dict[str, Any] | None:
+        """Read current counters for one durable report run."""
+
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE run_id=%s""",
+                (str(run_id),),
+            ).fetchone()
+
+    def list_searchable_knowledge_forge_community_reports(
+        self, run_id: str, embedding_model_id: str,
+    ) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT report.*,vector.embedding
+                   FROM knowledge_forge_community_reports report
+                   LEFT JOIN vector_embeddings vector
+                     ON vector.project_id=report.project_id
+                    AND vector.object_type='community_report'
+                    AND vector.object_key=report.report_id
+                    AND vector.model_name=%s AND vector.is_deleted=FALSE
+                   WHERE report.run_id=%s
+                     AND report.status IN ('succeeded','reused')
+                   ORDER BY report.level,report.community_key""",
+                (str(embedding_model_id), str(run_id)),
+            ).fetchall()
+
+    def bump_knowledge_forge_community_report_priority(
+        self,
+        *,
+        run_id: str,
+        community_key: str = "",
+        entity_keys: list[str] | None = None,
+    ) -> int:
+        if not community_key and not entity_keys:
+            return 0
+        clauses = []
+        params: list[Any] = [str(run_id)]
+        if community_key:
+            clauses.append("community_key=%s")
+            params.append(str(community_key))
+        if entity_keys:
+            clauses.append("entity_keys && %s::text[]")
+            params.append(sorted({str(value) for value in entity_keys if str(value)}))
+        with self.connection() as conn:
+            result = conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET priority=GREATEST(priority,2000000000),updated_at=NOW()
+                   WHERE run_id=%s AND status='pending' AND ("""
+                + " OR ".join(clauses) + ")",
+                tuple(params),
+            )
+            return max(0, int(result.rowcount or 0))
+
+    def queue_deferred_knowledge_forge_community_reports(
+        self,
+        *,
+        project_id: int,
+        run_id: str,
+        job_id: str,
+        community_key: str = "",
+        entity_keys: list[str] | None = None,
+        limit: int = 1,
+    ) -> dict[str, Any]:
+        """Activate a bounded set of fact-rich deferred reports.
+
+        The report run row serializes this transition with finalization.  If
+        the initial batch has already ended, the same immutable run is resumed
+        under a fresh durable job; completed reports are never regenerated.
+        """
+
+        keys = sorted({str(value) for value in entity_keys or [] if str(value)})
+        if not community_key and not keys:
+            return {"activated": 0, "prioritized": 0, "dispatch": False}
+        clauses: list[str] = []
+        selector_params: list[Any] = []
+        if community_key:
+            clauses.append("community_key=%s")
+            selector_params.append(str(community_key))
+        if keys:
+            clauses.append("entity_keys && %s::text[]")
+            selector_params.append(keys)
+        selector = " OR ".join(clauses)
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT * FROM knowledge_forge_community_report_runs
+                   WHERE run_id=%s AND project_id=%s FOR UPDATE""",
+                (str(run_id), int(project_id)),
+            ).fetchone()
+            if not run:
+                raise LookupError("社区报告运行不存在")
+            if str(run.get("status") or "") in {"cancelled", "superseded"}:
+                return {
+                    "activated": 0, "prioritized": 0, "dispatch": False,
+                    "run": run,
+                }
+            prioritized = conn.execute(
+                """UPDATE knowledge_forge_community_reports
+                   SET priority=GREATEST(priority,2000000000),updated_at=NOW()
+                   WHERE run_id=%s AND status='pending' AND ("""
+                + selector + ")",
+                (str(run_id), *selector_params),
+            ).rowcount
+            deferred = conn.execute(
+                """SELECT report_id FROM knowledge_forge_community_reports
+                   WHERE run_id=%s AND status='skipped'
+                     AND error_category='Deferred' AND ("""
+                + selector
+                + ") ORDER BY priority DESC,level,community_key "
+                  "LIMIT %s FOR UPDATE",
+                (
+                    str(run_id), *selector_params,
+                    max(1, min(20, int(limit))),
+                ),
+            ).fetchall()
+            report_ids = [str(item["report_id"]) for item in deferred]
+            activated = len(report_ids)
+            if report_ids:
+                conn.execute(
+                    """UPDATE knowledge_forge_community_reports SET
+                           status='pending',priority=2000000000,
+                           embedding_status='pending',embedding_error='',
+                           error_category='',error_message='',updated_at=NOW(),
+                           completed_at=NULL
+                       WHERE report_id=ANY(%s)""",
+                    (report_ids,),
+                )
+                run = conn.execute(
+                    """UPDATE knowledge_forge_community_report_runs SET
+                           eligible_count=eligible_count+%s,
+                           skipped_count=GREATEST(0,skipped_count-%s)
+                       WHERE run_id=%s RETURNING *""",
+                    (activated, activated, str(run_id)),
+                ).fetchone()
+            dispatch = False
+            job = None
+            if activated and str(run.get("status") or "") in {
+                "completed", "completed_empty", "partial", "failed",
+            }:
+                job = conn.execute(
+                    """INSERT INTO jobs(
+                           id,kind,project_id,metadata,strategy_key
+                       ) VALUES(%s,'community_report_build',%s,%s::jsonb,%s)
+                       RETURNING *""",
+                    (
+                        str(job_id), int(project_id), self._json({
+                            "stage": "queued",
+                            "report_run_id": str(run_id),
+                            "community_run_id": str(run["community_run_id"]),
+                            "graph_generation": int(run["graph_generation"]),
+                            "automatic": False,
+                            "on_demand": True,
+                        }),
+                        KNOWLEDGE_FORGE_STRATEGY,
+                    ),
+                ).fetchone()
+                run = conn.execute(
+                    """UPDATE knowledge_forge_community_report_runs SET
+                           status='queued',job_id=%s,error_message='',
+                           completed_at=NULL
+                       WHERE run_id=%s RETURNING *""",
+                    (str(job_id), str(run_id)),
+                ).fetchone()
+                dispatch = True
+            elif run.get("job_id"):
+                job = conn.execute(
+                    "SELECT * FROM jobs WHERE id=%s",
+                    (str(run["job_id"]),),
+                ).fetchone()
+            return {
+                "activated": activated,
+                "prioritized": max(0, int(prioritized or 0)),
+                "dispatch": dispatch,
+                "run": run,
+                "job": job,
+            }
 
     def create_graphrag_community_run(
         self,

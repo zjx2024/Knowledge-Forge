@@ -72,8 +72,9 @@ def test_live_ollama_structured_output_and_embedding_contract():
 def test_live_reranker_preserves_pair_score_alignment_and_finite_values():
     _require_enabled("RUN_LIVE_MODEL_TESTS")
     reranker = EntityReranker()
-    if not reranker.available:
-        pytest.skip("configured local reranker model is unavailable")
+    readiness = reranker.probe()
+    if not readiness.get("ready"):
+        pytest.skip("configured reranker HTTP service is unavailable")
 
     mention = {
         "name": "World Health Organization",

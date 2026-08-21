@@ -1,0 +1,41 @@
+[
+  {
+    "link_id": "zh-narrative-coreference:coref01",
+    "document_id": "zh-narrative-coreference",
+    "source_span": [
+      15,
+      16
+    ],
+    "source_text": "她",
+    "target_mention_id": "zh-narrative-coreference:m001",
+    "relation": "refers_to",
+    "label_source": "assistant_expert_annotator",
+    "review_status": "single_expert_reviewed"
+  },
+  {
+    "link_id": "zh-narrative-coreference:coref02",
+    "document_id": "zh-narrative-coreference",
+    "source_span": [
+      30,
+      31
+    ],
+    "source_text": "它",
+    "target_mention_id": "zh-narrative-coreference:m002",
+    "relation": "refers_to",
+    "label_source": "assistant_expert_annotator",
+    "review_status": "single_expert_reviewed"
+  },
+  {
+    "link_id": "zh-narrative-coreference:coref03",
+    "document_id": "zh-narrative-coreference",
+    "source_span": [
+      44,
+      45
+    ],
+    "source_text": "他",
+    "target_mention_id": "zh-narrative-coreference:m005",
+    "relation": "refers_to",
+    "label_source": "assistant_expert_annotator",
+    "review_status": "single_expert_reviewed"
+  }
+]

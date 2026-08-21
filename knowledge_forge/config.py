@@ -49,8 +49,31 @@ class Config:
     postgres_maintenance_db = os.getenv("POSTGRES_MAINTENANCE_DB", "postgres")
 
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", f"http://{service_host}:11434")
+    # Embeddings may remain on a separately validated runtime while structured
+    # generation uses another accelerator.  The default preserves the original
+    # single-endpoint deployment exactly.
+    ollama_embedding_base_url = os.getenv(
+        "OLLAMA_EMBEDDING_BASE_URL", ollama_base_url,
+    )
+    # A model tag does not fully identify its numerical vector space: moving
+    # the same model between execution backends (for example CPU -> CUDA) can
+    # introduce small floating-point differences. Persist a stable execution
+    # identity with rebuildable vector indexes. Entity facts themselves remain
+    # reusable when the model and extraction policy are unchanged; treating a
+    # hardware move as a semantic-input change would force expensive LLM work.
+    # If a deployment changes the backend behind the same URL, it must bump
+    # the explicit profile value.
+    ollama_embedding_runtime_profile = (
+        os.getenv("OLLAMA_EMBEDDING_RUNTIME_PROFILE", "").strip()
+        or "ollama-endpoint-"
+        + hashlib.sha256(ollama_embedding_base_url.encode("utf-8")).hexdigest()[:12]
+    )
     ollama_keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "-1m")
     ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "480"))
+    # Keep model-backed extraction reproducible across retries and service
+    # restarts.  This is an Ollama generation option, not a Python process
+    # random seed; changing it intentionally invalidates extraction snapshots.
+    ollama_seed = int(os.getenv("OLLAMA_SEED", "17"))
     # Application request budgets. These never alter Ollama's runner num_ctx.
     ollama_effective_context_fallback = int(
         os.getenv("OLLAMA_EFFECTIVE_CONTEXT_FALLBACK_TOKENS", "8192")
@@ -68,7 +91,29 @@ class Config:
     ollama_image_token_estimate = int(os.getenv("OLLAMA_IMAGE_TOKEN_ESTIMATE", "1024"))
     entity_review_max_output_tokens = int(os.getenv("ENTITY_REVIEW_MAX_OUTPUT_TOKENS", "512"))
     relation_review_max_output_tokens = int(os.getenv("RELATION_REVIEW_MAX_OUTPUT_TOKENS", "2048"))
-    schema_review_max_output_tokens = int(os.getenv("SCHEMA_REVIEW_MAX_OUTPUT_TOKENS", "2048"))
+    schema_review_max_output_tokens = int(os.getenv("SCHEMA_REVIEW_MAX_OUTPUT_TOKENS", "8192"))
+    # Open relation observations follow the broad schema review.  Recurring,
+    # source-grounded observations are grouped into candidate relation
+    # families; every family still passes the ordinary evidence, policy,
+    # semantic-novelty and independent-verifier gates.
+    schema_relation_coverage_rounds = max(
+        0, min(2, int(os.getenv("SCHEMA_RELATION_COVERAGE_ROUNDS", "2")))
+    )
+    schema_relation_compound_audit_enabled = os.getenv(
+        "SCHEMA_RELATION_COMPOUND_AUDIT_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    schema_relation_induction_batch_size = max(
+        1, min(8, int(os.getenv(
+            "SCHEMA_RELATION_INDUCTION_BATCH_SIZE", "8",
+        )))
+    )
+    # A single, explicit source-grounded observation can be enough to discover
+    # a reusable relation family when a project has only one document.  The
+    # candidate still passes evidence, policy, novelty and verifier gates; this
+    # switch only controls whether the bounded induction request is scheduled.
+    schema_single_observation_relation_induction = os.getenv(
+        "SCHEMA_SINGLE_OBSERVATION_RELATION_INDUCTION", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
     extraction_max_output_tokens = int(os.getenv("EXTRACTION_MAX_OUTPUT_TOKENS", "4096"))
     entity_only_max_output_tokens = int(
         os.getenv("ENTITY_ONLY_MAX_OUTPUT_TOKENS", "8192")
@@ -76,12 +121,49 @@ class Config:
     entity_only_segment_max_chars = max(
         256, int(os.getenv("ENTITY_ONLY_SEGMENT_MAX_CHARS", "900"))
     )
+    entity_only_max_sentences_per_segment = max(
+        1, min(8, int(os.getenv("ENTITY_ONLY_MAX_SENTENCES_PER_SEGMENT", "2")))
+    )
     entity_only_max_items_per_segment = max(
         8, int(os.getenv("ENTITY_ONLY_MAX_ITEMS_PER_SEGMENT", "48"))
+    )
+    # The enhanced path uses one compact mention inventory instead of the
+    # former primary-entity + proposition-argument + endpoint-gleaning stack.
+    # It deliberately has its own segmentation budget so legacy extraction
+    # fixtures and replayed snapshots retain their immutable protocol.
+    entity_grounded_inventory_enabled = os.getenv(
+        "ENTITY_GROUNDED_INVENTORY_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    entity_grounded_segment_max_chars = max(
+        512, int(os.getenv("ENTITY_GROUNDED_SEGMENT_MAX_CHARS", "2400"))
+    )
+    entity_grounded_max_sentences_per_segment = max(
+        1, min(24, int(os.getenv(
+            "ENTITY_GROUNDED_MAX_SENTENCES_PER_SEGMENT", "8",
+        )))
+    )
+    entity_grounded_max_items_per_segment = max(
+        16, min(256, int(os.getenv(
+            "ENTITY_GROUNDED_MAX_ITEMS_PER_SEGMENT", "96",
+        )))
+    )
+    entity_grounded_gleaning_rounds = max(
+        0, min(1, int(os.getenv(
+            "ENTITY_GROUNDED_GLEANING_ROUNDS", "1",
+        )))
+    )
+    entity_endpoint_gleaning_rounds = max(
+        0, min(2, int(os.getenv("ENTITY_ENDPOINT_GLEANING_ROUNDS", "1")))
     )
     image_analysis_max_output_tokens = int(os.getenv("IMAGE_ANALYSIS_MAX_OUTPUT_TOKENS", "2048"))
     default_llm_model = os.getenv("DEFAULT_LLM_MODEL", "qwen3.6:latest")
     default_embedding_model = os.getenv("DEFAULT_EMBEDDING_MODEL", "bge-m3:latest")
+    # Native GraphRAG Standard indexing is an isolated long-running job.  The
+    # budget is execution control only; it never changes GraphRAG algorithms or
+    # permits publication of an incomplete staging bundle.
+    graphrag_native_timeout_seconds = max(
+        600, int(os.getenv("GRAPHRAG_NATIVE_TIMEOUT_SECONDS", "7200"))
+    )
 
     hugegraph_host = os.getenv("HUGEGRAPH_HOST", service_host)
     hugegraph_port = int(os.getenv("HUGEGRAPH_PORT", "8080"))
@@ -97,6 +179,51 @@ class Config:
 
     retrieval_top_k = int(os.getenv("RETRIEVAL_TOP_K", "8"))
     retrieval_dense_weight = float(os.getenv("RETRIEVAL_DENSE_WEIGHT", "0.72"))
+    # Detailed community reports are an asynchronous enhancement over the
+    # immutable Knowledge Forge graph.  Graph publication and ordinary
+    # chunk/entity/relation retrieval never wait for these model calls.
+    knowledge_forge_community_reports_enabled = os.getenv(
+        "KF_COMMUNITY_REPORTS_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    knowledge_forge_community_reports_auto_build = os.getenv(
+        "KF_COMMUNITY_REPORTS_AUTO_BUILD", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    # Large hierarchical graphs can contain hundreds of report-worthy
+    # communities.  Generate a bounded, priority-ordered initial set and leave
+    # the rest available for exact on-demand activation from graph browsing or
+    # retrieval, rather than monopolising the local LLM for many hours.
+    knowledge_forge_community_report_initial_limit = max(
+        1, min(200, int(os.getenv("KF_COMMUNITY_REPORT_INITIAL_LIMIT", "12"))),
+    )
+    knowledge_forge_community_report_search_activation_limit = max(
+        1, min(10, int(os.getenv(
+            "KF_COMMUNITY_REPORT_SEARCH_ACTIVATION_LIMIT", "2",
+        ))),
+    )
+    knowledge_forge_community_report_min_entities = max(
+        2, int(os.getenv("KF_COMMUNITY_REPORT_MIN_ENTITIES", "2")),
+    )
+    knowledge_forge_community_report_min_relations = max(
+        1, int(os.getenv("KF_COMMUNITY_REPORT_MIN_RELATIONS", "1")),
+    )
+    knowledge_forge_community_report_max_entities = max(
+        4, min(80, int(os.getenv("KF_COMMUNITY_REPORT_MAX_ENTITIES", "24"))),
+    )
+    knowledge_forge_community_report_max_relations = max(
+        4, min(120, int(os.getenv("KF_COMMUNITY_REPORT_MAX_RELATIONS", "36"))),
+    )
+    knowledge_forge_community_report_context_tokens = max(
+        2048, int(os.getenv("KF_COMMUNITY_REPORT_CONTEXT_TOKENS", "8192")),
+    )
+    knowledge_forge_community_report_max_output_tokens = max(
+        512, int(os.getenv("KF_COMMUNITY_REPORT_MAX_OUTPUT_TOKENS", "1800")),
+    )
+    knowledge_forge_community_report_max_attempts = max(
+        1, min(5, int(os.getenv("KF_COMMUNITY_REPORT_MAX_ATTEMPTS", "2"))),
+    )
+    knowledge_forge_community_report_search_top_k = max(
+        1, min(20, int(os.getenv("KF_COMMUNITY_REPORT_SEARCH_TOP_K", "5"))),
+    )
     pgvector_candidate_multiplier = int(os.getenv("PGVECTOR_CANDIDATE_MULTIPLIER", "8"))
     pgvector_max_candidates = int(os.getenv("PGVECTOR_MAX_CANDIDATES", "200"))
     pgvector_hnsw_m = int(os.getenv("PGVECTOR_HNSW_M", "16"))
@@ -137,6 +264,59 @@ class Config:
     entity_reranker_enabled = os.getenv("ENTITY_RERANKER_ENABLED", "true").strip().lower() in {
         "1", "true", "yes", "on",
     }
+    # Entity resolution consumes reranking over an internal HTTP boundary.  The
+    # model process has its own lifecycle so the web/job process never imports
+    # torch or owns model memory.
+    entity_reranker_url = os.getenv(
+        "ENTITY_RERANKER_URL", "http://127.0.0.1:8012",
+    ).strip().rstrip("/")
+    entity_reranker_model = os.getenv(
+        "ENTITY_RERANKER_MODEL", "bge-reranker-v2-m3",
+    ).strip()
+    entity_reranker_api_key = os.getenv("RERANKER_API_KEY", "").strip()
+    entity_reranker_connect_timeout = max(
+        1, int(os.getenv("ENTITY_RERANKER_CONNECT_TIMEOUT", "5")),
+    )
+    entity_reranker_timeout = max(
+        entity_reranker_connect_timeout,
+        int(os.getenv("ENTITY_RERANKER_TIMEOUT", "240")),
+    )
+    entity_reranker_retries = max(
+        0, min(5, int(os.getenv("ENTITY_RERANKER_RETRIES", "2"))),
+    )
+
+    # Dedicated reranker service settings.  They are intentionally separate
+    # from ENTITY_RERANKER_URL so this process can be deployed on another host.
+    reranker_host = os.getenv("RERANKER_HOST", "127.0.0.1").strip()
+    reranker_port = int(os.getenv("RERANKER_PORT", "8012"))
+    reranker_model_name = os.getenv(
+        "RERANKER_MODEL_NAME", entity_reranker_model,
+    ).strip()
+    reranker_allow_unauthenticated_lan = os.getenv(
+        "RERANKER_ALLOW_UNAUTHENTICATED_LAN", "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    reranker_preload = os.getenv(
+        "RERANKER_PRELOAD", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    reranker_max_documents = max(
+        1, min(1024, int(os.getenv("RERANKER_MAX_DOCUMENTS", "128"))),
+    )
+    reranker_max_text_chars = max(
+        256, int(os.getenv("RERANKER_MAX_TEXT_CHARS", "20000")),
+    )
+    reranker_max_total_chars = max(
+        reranker_max_text_chars,
+        int(os.getenv("RERANKER_MAX_TOTAL_CHARS", "500000")),
+    )
+    reranker_max_body_bytes = max(
+        4096, int(os.getenv("RERANKER_MAX_BODY_BYTES", "1048576")),
+    )
+    reranker_max_pending_requests = max(
+        1, min(256, int(os.getenv("RERANKER_MAX_PENDING_REQUESTS", "32"))),
+    )
+    reranker_queue_timeout = max(
+        1, int(os.getenv("RERANKER_QUEUE_TIMEOUT", "180")),
+    )
     entity_reranker_model_path = os.getenv("ENTITY_RERANKER_MODEL_PATH", "/models/entity-reranker")
     entity_reranker_device = os.getenv("ENTITY_RERANKER_DEVICE", "auto").strip().lower()
     entity_reranker_batch_size = max(1, int(os.getenv("ENTITY_RERANKER_BATCH_SIZE", "4")))
@@ -149,6 +329,13 @@ class Config:
     entity_reranker_review_threshold = float(os.getenv("ENTITY_RERANKER_REVIEW_THRESHOLD", "0.55"))
     entity_reranker_auto_threshold = float(os.getenv("ENTITY_RERANKER_AUTO_THRESHOLD", "0.93"))
     schema_auto_apply = os.getenv("SCHEMA_AUTO_APPLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+    # Ordinary Knowledge Forge builds are recall-first and publish grounded
+    # open facts against the currently active logical Schema. Expensive LLM
+    # Schema discovery is a separate governance job by default, so it cannot
+    # block first graph availability or turn normalization into a recall gate.
+    schema_discovery_during_build = os.getenv(
+        "SCHEMA_DISCOVERY_DURING_BUILD", "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
     schema_sample_base_chunks = max(
         1,
         int(os.getenv("SCHEMA_SAMPLE_BASE_CHUNKS", os.getenv("SCHEMA_SAMPLE_MAX_CHUNKS", "12"))),
@@ -168,7 +355,14 @@ class Config:
     )
     schema_sample_min_chars = int(os.getenv("SCHEMA_SAMPLE_MIN_CHARS", "160"))
     schema_sample_per_section = int(os.getenv("SCHEMA_SAMPLE_PER_SECTION", "2"))
-    schema_review_batch_size = int(os.getenv("SCHEMA_REVIEW_BATCH_SIZE", "4"))
+    schema_review_batch_size = int(os.getenv("SCHEMA_REVIEW_BATCH_SIZE", "1"))
+    # Project builds review a stratified corpus sample rather than evolving the
+    # logical Schema once per document.  Four excerpts fit comfortably in the
+    # configured local-model context while cutting long-corpus review calls by
+    # roughly 75%; the discovery routine still splits a batch on truncation.
+    schema_corpus_review_batch_size = max(
+        1, min(8, int(os.getenv("SCHEMA_CORPUS_REVIEW_BATCH_SIZE", "4")))
+    )
     schema_review_min_confidence = float(os.getenv("SCHEMA_REVIEW_MIN_CONFIDENCE", "0.85"))
     schema_review_single_evidence_confidence = float(
         os.getenv("SCHEMA_REVIEW_SINGLE_EVIDENCE_CONFIDENCE", "0.96")
@@ -198,11 +392,133 @@ class Config:
     relation_classifier_max_candidates = max(
         1, min(32, int(os.getenv("RELATION_CLASSIFIER_MAX_CANDIDATES", "8"))),
     )
+    # Relation prompts must never repeat an entire long document for every
+    # candidate.  The source inventory remains complete; pair-level prompts
+    # receive a bounded, provenance-preserving display around their endpoints.
+    relation_model_context_max_chars = max(
+        2048, min(200_000, int(os.getenv("RELATION_MODEL_CONTEXT_MAX_CHARS", "24000"))),
+    )
+    relation_classifier_context_max_chars = max(
+        2048, min(100_000, int(os.getenv("RELATION_CLASSIFIER_CONTEXT_MAX_CHARS", "12000"))),
+    )
+    relation_grounded_open_facts_enabled = os.getenv(
+        "RELATION_GROUNDED_OPEN_FACTS_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    relation_open_fact_gleaning_rounds = max(
+        0, min(2, int(os.getenv("RELATION_OPEN_FACT_GLEANING_ROUNDS", "1"))),
+    )
+    # Preserve an exact grounded source relation as a bounded parallel safety
+    # hypothesis. It remains through normalization and every publication gate;
+    # only a precise logical predicate that survives the final role audit may
+    # suppress an exact duplicate at publication. This prevents Schema coverage
+    # from becoming a recall gate. It still passes deterministic and independent
+    # verification and is never a co-occurrence fallback.
+    relation_open_carrier_max_per_context = max(
+        0,
+        min(
+            128,
+            int(os.getenv(
+                "RELATION_OPEN_CARRIER_MAX_PER_CONTEXT", "96",
+            )),
+        ),
+    )
+    # Coreference is a separate semantic decision from open-fact extraction.
+    # Run one bounded predicate-blind adjudicator over unresolved local
+    # references before deterministic syntax recovery.
+    relation_reference_adjudication_enabled = os.getenv(
+        "RELATION_REFERENCE_ADJUDICATION_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    # Binding recovery is optional rather than a universal second pass.  The
+    # frozen six-domain calibration recovered only two extra bindings from six
+    # additional calls, while the deterministic semantic shortlist remains the
+    # ordinary recall backstop.  Keep the knob for unusually recall-sensitive
+    # deployments, but avoid one low-yield model call per context by default.
+    relation_source_binding_gleaning_rounds = max(
+        0,
+        min(
+            2,
+            int(os.getenv("RELATION_SOURCE_BINDING_GLEANING_ROUNDS", "0")),
+        ),
+    )
+    # A tiny deterministic semantic shortlist is a recall backstop after the
+    # enumerative model binder.  These rows remain ordinary hypotheses and
+    # cannot publish without validation and the independent verifier.
+    relation_source_binding_recall_alternatives = max(
+        0,
+        min(
+            4,
+            int(os.getenv(
+                "RELATION_SOURCE_BINDING_RECALL_ALTERNATIVES", "1",
+            )),
+        ),
+    )
+    relation_source_binding_recall_min_score = max(
+        0.0,
+        min(
+            1.0,
+            float(os.getenv(
+                "RELATION_SOURCE_BINDING_RECALL_MIN_SCORE", "0.18",
+            )),
+        ),
+    )
+    relation_verifier_batch_size = max(
+        1,
+        min(
+            32,
+            int(os.getenv(
+                "RELATION_VERIFIER_BATCH_SIZE",
+                os.getenv("RELATION_SOURCE_VERIFIER_BATCH_SIZE", "8"),
+            )),
+        ),
+    )
+    relation_verifier_batch_max_chars = max(
+        4096,
+        min(
+            200_000,
+            int(os.getenv(
+                "RELATION_VERIFIER_BATCH_MAX_CHARS",
+                os.getenv(
+                    "RELATION_SOURCE_VERIFIER_BATCH_MAX_CHARS", "48000",
+                ),
+            )),
+        ),
+    )
+    # Candidate-ledger persistence is database-only operational work.  Keep
+    # it deliberately separate from semantic batch sizes so deployment tuning
+    # cannot invalidate completed relation snapshots.
+    relation_ledger_persist_batch_size = max(
+        128,
+        min(
+            8192,
+            int(os.getenv("RELATION_LEDGER_PERSIST_BATCH_SIZE", "4096")),
+        ),
+    )
+    # Batch verification is the efficient primary pass. A small project-run
+    # budget independently rechecks only provenance-defined high-risk accepts
+    # and high-confidence source-grounded rejects.
+    relation_verifier_focused_review_max = max(
+        0,
+        min(
+            256,
+            int(os.getenv("RELATION_VERIFIER_FOCUSED_REVIEW_MAX", "24")),
+        ),
+    )
+    relation_verification_mode = os.getenv(
+        "RELATION_VERIFICATION_MODE", "lean",
+    ).strip().lower()
+    if relation_verification_mode not in {"lean", "legacy_consensus"}:
+        relation_verification_mode = "lean"
     relation_shadow_max_attempts = max(
         1, min(20, int(os.getenv("RELATION_SHADOW_MAX_ATTEMPTS", "3"))),
     )
+    relation_secondary_enabled = os.getenv(
+        "RELATION_SECONDARY_ENABLED", "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    relation_secondary_max_candidates = max(
+        1, min(512, int(os.getenv("RELATION_SECONDARY_MAX_CANDIDATES", "64"))),
+    )
     relation_proposer_failure_circuit_breaker = max(
-        0, min(100, int(os.getenv("RELATION_PROPOSER_FAILURE_CIRCUIT_BREAKER", "2"))),
+        0, min(100, int(os.getenv("RELATION_PROPOSER_FAILURE_CIRCUIT_BREAKER", "0"))),
     )
     relation_proposer_max_proposals = max(
         0, min(128, int(os.getenv("RELATION_PROPOSER_MAX_PROPOSALS", "8"))),
@@ -253,6 +569,9 @@ class Config:
     general_chunk_target_tokens = int(os.getenv("GENERAL_CHUNK_TARGET_TOKENS", "512"))
     general_chunk_max_tokens = int(os.getenv("GENERAL_CHUNK_MAX_TOKENS", "800"))
     general_chunk_overlap_percent = int(os.getenv("GENERAL_CHUNK_OVERLAP_PERCENT", "12"))
+    general_coalesce_min_sections = max(
+        0, int(os.getenv("GENERAL_COALESCE_MIN_SECTIONS", "24"))
+    )
     paper_chunk_target_tokens = int(os.getenv("PAPER_CHUNK_TARGET_TOKENS", "640"))
     paper_chunk_max_tokens = int(os.getenv("PAPER_CHUNK_MAX_TOKENS", "900"))
     paper_chunk_overlap_percent = int(os.getenv("PAPER_CHUNK_OVERLAP_PERCENT", "10"))

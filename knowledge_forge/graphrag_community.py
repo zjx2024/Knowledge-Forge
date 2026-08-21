@@ -8,12 +8,15 @@ import hashlib
 from importlib.metadata import version
 import json
 import math
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterable
+import time
+from typing import Any, Callable, Iterable
 import uuid
 
 import pandas as pd
@@ -28,6 +31,10 @@ REQUIRED_COMMUNITY_COLUMNS = frozenset({
     "id", "community", "level", "parent", "title", "entity_ids",
     "relationship_ids", "text_unit_ids", "period", "size",
 })
+
+
+class CommunityDetectionCancelled(RuntimeError):
+    """The owning durable job stopped the isolated community worker."""
 
 
 @dataclass(frozen=True)
@@ -334,7 +341,13 @@ class GraphRAGCommunityRunner:
             f"  seed: {config.seed}\n"
         )
 
-    def run(self, snapshot: BYOGSnapshot, config: CommunityConfig) -> GraphRAGResult:
+    def run(
+        self,
+        snapshot: BYOGSnapshot,
+        config: CommunityConfig,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> GraphRAGResult:
         config.validate()
         validate_byog_snapshot(snapshot)
         if not snapshot.relationships:
@@ -356,20 +369,63 @@ class GraphRAGCommunityRunner:
                 output / "relationships.parquet", index=False,
             )
             (workspace / "settings.yaml").write_text(self._settings(config), encoding="utf-8")
-            completed = subprocess.run(
-                self._command(workspace),
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=config.timeout_seconds,
-                check=False,
-            )
-            combined_log = "\n".join((completed.stdout, completed.stderr)).replace(
+            if cancel_requested is None:
+                completed = subprocess.run(
+                    self._command(workspace), cwd=workspace,
+                    capture_output=True, text=True,
+                    timeout=config.timeout_seconds, check=False,
+                )
+                stdout, stderr = completed.stdout, completed.stderr
+                returncode = completed.returncode
+            else:
+                process = subprocess.Popen(
+                    self._command(workspace),
+                    cwd=workspace,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                started = time.monotonic()
+                cancelled = False
+                timed_out = False
+                while True:
+                    if cancel_requested():
+                        cancelled = True
+                        break
+                    if time.monotonic() - started > config.timeout_seconds:
+                        timed_out = True
+                        break
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                if cancelled or timed_out:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, AttributeError):
+                        process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, AttributeError):
+                            process.kill()
+                        stdout, stderr = process.communicate()
+                    if cancelled:
+                        raise CommunityDetectionCancelled(
+                            "GraphRAG 社区识别已取消"
+                        )
+                    raise TimeoutError("GraphRAG 社区识别超时")
+                returncode = process.returncode
+            combined_log = "\n".join((stdout, stderr)).replace(
                 str(workspace), "<workspace>"
             )[-12000:]
-            if completed.returncode:
+            if returncode:
                 raise RuntimeError(
-                    f"GraphRAG create_communities 失败(exit={completed.returncode}): "
+                    f"GraphRAG create_communities 失败(exit={returncode}): "
                     f"{combined_log}"
                 )
             result_path = output / "communities.parquet"

@@ -20,6 +20,7 @@ def _mention(
     surface: str,
     canonical: str | None = None,
     entity_type: str = "Organization",
+    endpoint_candidate: bool = False,
 ):
     return {
         "mention_id": f"id-{key}",
@@ -30,6 +31,7 @@ def _mention(
         "canonical_id": canonical if canonical is not None else f"canonical-{key}",
         "assignment_version": "assignment-v1",
         "type": entity_type,
+        "endpoint_candidate": endpoint_candidate,
     }
 
 
@@ -150,6 +152,28 @@ def test_wildcard_and_unknown_types_are_not_treated_as_incompatible() -> None:
     assert wildcard.type_status == "compatible"
     assert unresolved.status == TYPE_UNRESOLVED
     assert unresolved.status != TYPE_INCOMPATIBLE
+
+
+def test_exact_endpoint_projection_keeps_unknown_type_in_verifier_queue() -> None:
+    content = "工业机器人应用于汽车制造生产线。"
+    plan = _plan(
+        content,
+        [
+            _mention("robot", 0, 5, surface="工业机器人", entity_type="Product"),
+            _mention(
+                "line", 8, 15, surface="汽车制造生产线", entity_type="",
+                endpoint_candidate=True,
+            ),
+        ],
+        logical_schema=_schema(predicate_policy(
+            "applies_to", domain=["Product"], range_=["Organization"],
+            optional_soft_cues=["应用于"],
+        )),
+    )
+    opportunity = plan.opportunities[0]
+    assert opportunity.type_status == "unresolved"
+    assert opportunity.status == PENDING_CLASSIFICATION
+    assert opportunity.planning_reason == "endpoint_type_requires_verification"
 
 
 def test_known_incompatible_types_are_recorded_separately() -> None:

@@ -6,12 +6,16 @@ import pytest
 import psycopg
 from psycopg import sql
 
-from knowledge_forge.construction_strategies import ENHANCED_SHADOW_STRATEGY
+from knowledge_forge.construction_strategies import KNOWLEDGE_FORGE_STRATEGY
 from knowledge_forge.database import Database, SCHEMA_SQL
 from knowledge_forge.graph_policy import GraphNotReadyError
 from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import GRAPH_POLICY_VERSION
 from knowledge_forge.relation_verification import PUBLISHABLE_RELATION_STATUSES
+from knowledge_forge.relation_shadow_runtime import (
+    LOADED_RELATION_CODE_DIGEST,
+    relation_runtime_treatment_digest,
+)
 from knowledge_forge.service import KnowledgeForgeService
 
 
@@ -37,12 +41,12 @@ class SearchDatabase:
 
     def assert_project_construction_strategy(self, project_id, expected):
         assert project_id == 4
-        assert expected == ENHANCED_SHADOW_STRATEGY
+        assert expected == KNOWLEDGE_FORGE_STRATEGY
         return expected
 
     def get_project_strategy_graph(self, project_id, strategy):
         assert project_id == 4
-        assert strategy == ENHANCED_SHADOW_STRATEGY
+        assert strategy == KNOWLEDGE_FORGE_STRATEGY
         return {
             "status": "ready", "generation": 3, "ready_generation": 3,
             "policy_summary": {
@@ -62,6 +66,12 @@ class SearchDatabase:
         assert run_id == "relation-run-current"
         return {
             "id": run_id, "project_id": 4, "status": "ready",
+            "fingerprint_components": {
+                "materialization_root": {
+                    "code_tree": LOADED_RELATION_CODE_DIGEST,
+                    "treatment": relation_runtime_treatment_digest(),
+                },
+            },
         }
 
     def search_knowledge_forge_entities(self, namespace_id, query, limit):
@@ -83,14 +93,18 @@ class SearchDatabase:
         }]
 
     def search_knowledge_forge_relations(
-        self, namespace_id, relation_run_id, query, *, chunk_ids, limit,
+        self, namespace_id, relation_run_id, query, *, chunk_ids,
+        canonical_keys, limit,
     ):
         self.snapshot_calls.append((
             "relations", namespace_id, relation_run_id, tuple(chunk_ids),
+            tuple(canonical_keys),
         ))
         return [{
             "id": "fact-current", "source_name": "Alpha",
+            "source_canonical_key": "entity-current",
             "relation_type": "connected_to", "target_name": "Beta",
+            "target_canonical_key": "entity-beta",
             "evidence_text": "Alpha connects to Beta.", "chunk_id": 7,
             "metadata": {"confidence": 0.91}, "evidence_count": 1,
             "evidence_records": [{
@@ -120,9 +134,11 @@ class SearchVectors:
 
 class SearchOllama:
     def embed(self, texts, model):
-        assert texts == ["Alpha"]
         assert model == "embed"
-        return [[0.1, 0.2]]
+        if texts == ["Alpha"]:
+            return [[0.1, 0.2]]
+        assert any("Alpha" in text and "Beta" in text for text in texts)
+        return [[0.1, 0.2] for _ in texts]
 
 
 def test_service_search_reads_only_current_knowledge_forge_snapshot():
@@ -133,7 +149,7 @@ def test_service_search_reads_only_current_knowledge_forge_snapshot():
 
     result = service.search(4, "Alpha")
 
-    assert result["strategy"] == ENHANCED_SHADOW_STRATEGY
+    assert result["strategy"] == KNOWLEDGE_FORGE_STRATEGY
     assert result["graph_generation"] == 3
     assert result["entity_namespace_id"] == "namespace-current"
     assert result["relation_run_id"] == "relation-run-current"
@@ -143,8 +159,12 @@ def test_service_search_reads_only_current_knowledge_forge_snapshot():
     assert result["relations"][0]["evidence_count"] == 1
     assert ("entities", "namespace-current", "Alpha") in service.db.snapshot_calls
     assert (
-        "relations", "namespace-current", "relation-run-current", (7,)
+        "relations", "namespace-current", "relation-run-current", (7,),
+        ("entity-current",),
     ) in service.db.snapshot_calls
+    assert result["relations"][0]["network_scope"] == "seed_boundary"
+    assert result["relations"][0]["graph_hop"] == 1
+    assert result["graph_retrieval"]["maximum_hops"] == 2
 
 
 def test_service_search_fails_closed_when_knowledge_forge_graph_is_stale():
@@ -173,6 +193,28 @@ def test_service_search_fails_closed_for_cross_project_relation_run():
     service.ollama = SearchOllama()
 
     with pytest.raises(GraphNotReadyError, match="关系快照不完整"):
+        service.search(4, "Alpha")
+
+
+def test_service_search_fails_closed_for_obsolete_relation_treatment():
+    database = SearchDatabase()
+    database.get_shadow_relation_v2_run = lambda *_args: {
+        "id": "relation-run-current",
+        "project_id": 4,
+        "status": "ready",
+        "fingerprint_components": {
+            "materialization_root": {
+                "code_tree": LOADED_RELATION_CODE_DIGEST,
+                "treatment": "obsolete-treatment",
+            },
+        },
+    }
+    service = object.__new__(KnowledgeForgeService)
+    service.db = database
+    service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
+
+    with pytest.raises(GraphNotReadyError, match="抽取策略已升级"):
         service.search(4, "Alpha")
 
 

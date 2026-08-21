@@ -215,9 +215,9 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
     service.schemas = fake_schemas
     service.resolver.reranker._disabled_reason = "test fixture"
 
-    first = service.build_entity_shadow_namespace(project_id)
+    first = service.build_grounded_entity_namespace(project_id)
     first_model_calls = (fake_schemas.calls, fake_ollama.embedding_calls, fake_ollama.review_calls)
-    second = service.build_entity_shadow_namespace(project_id)
+    second = service.build_grounded_entity_namespace(project_id)
 
     assert first["namespace_id"] == second["namespace_id"]
     assert (fake_schemas.calls, fake_ollama.embedding_calls, fake_ollama.review_calls) == first_model_calls
@@ -235,6 +235,19 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
     ]
     assert len({item["canonical_key"] for item in ibm_assignments}) == 2
     assert first["relation_endpoints"] == []
+    assert all(
+        (item.get("metadata") or {}).get("entity_publishability", {}).get(
+            "graph_publishable"
+        ) is True
+        for item in first["canonicals"]
+    )
+    assert (
+        (first.get("namespace") or {}).get("metrics", {})
+        .get("entity_publishability", {})
+        .get("after_relations", {})
+        .get("graph_publishable")
+        == len(first["canonicals"])
+    )
 
     with database.connection() as conn:
         after = {

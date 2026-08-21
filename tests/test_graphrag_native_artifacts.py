@@ -23,7 +23,11 @@ from knowledge_forge.graphrag_native_artifacts import (
     describe_file,
     safe_bundle_path,
     assert_bundle_has_no_plaintext_credentials,
+    redact_plaintext_credential_lines,
     write_run_manifest,
+)
+from knowledge_forge.graphrag_native_config import (
+    GraphRAGNativePromptProfileBuilder,
 )
 
 
@@ -112,11 +116,59 @@ def _refresh_manifest_artifact(root: Path, relative: str) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
+def _add_project_language_profile(root: Path) -> dict:
+    prompts = root / "prompts"
+    prompts.mkdir()
+    for name in GraphRAGNativePromptProfileBuilder.required_prompt_names:
+        content = (
+            "Return output in English with {input_text}."
+            if name in {"extract_graph.txt", "extract_claims.txt"}
+            else "native prompt"
+        )
+        (prompts / name).write_text(content, encoding="utf-8")
+    result = GraphRAGNativePromptProfileBuilder.apply(
+        run_root=root, texts=("这是中文项目正文。" * 100,),
+    )
+    (root / "settings.yaml").write_text("concurrent_requests: 1\n", encoding="utf-8")
+    manifest_path = root / "kf-manifest/run-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    paths = [
+        root / "settings.yaml", result["profile_path"],
+        *(root / item["relative_path"] for item in result["prompts"]),
+    ]
+    manifest["artifacts"].extend(
+        asdict(describe_file(
+            root, path, logical_name=path.relative_to(root).as_posix(),
+        ))
+        for path in paths
+    )
+    manifest["identity"]["prompt_profile_hash"] = result["prompt_profile_hash"]
+    manifest["identity"]["output_language"] = "zh"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return result
+
+
 def test_native_bundle_validator_accepts_complete_independent_bundle(tmp_path):
     _valid_bundle(tmp_path)
     report = GraphRAGNativeBundleValidator().validate(tmp_path)
     assert report["relationships"] == 1
     assert report["lancedb"]["entity_description"]["rows"] == 2
+
+
+def test_validator_freezes_project_language_profile_and_every_prompt(tmp_path):
+    _valid_bundle(tmp_path)
+    profile = _add_project_language_profile(tmp_path)
+
+    report = GraphRAGNativeBundleValidator().validate(tmp_path)
+
+    assert report["prompt_profile"]["status"] == "validated"
+    assert report["prompt_profile"]["language_code"] == "zh"
+    prompt = tmp_path / "prompts/extract_graph.txt"
+    prompt.write_text(prompt.read_text(encoding="utf-8") + "\ntampered", encoding="utf-8")
+    _refresh_manifest_artifact(tmp_path, "prompts/extract_graph.txt")
+    with pytest.raises(GraphRAGNativeBundleError, match="prompt 哈希"):
+        GraphRAGNativeBundleValidator().validate(tmp_path)
+    assert profile["prompt_profile_hash"]
 
 
 def test_global_query_subset_reads_only_global_parquet_and_never_opens_lancedb(monkeypatch, tmp_path):
@@ -171,6 +223,34 @@ def test_bundle_secret_scan_rejects_real_bearer_credential(tmp_path):
     (tmp_path / "logs" / "bad.log").write_text("Authorization: Bearer secret-token-value-123456", encoding="utf-8")
     with pytest.raises(GraphRAGNativeBundleError, match="明文凭据"):
         assert_bundle_has_no_plaintext_credentials(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ("$RERANKER_API_KEY", "${RERANKER_API_KEY}", "${REDACTED}"),
+)
+def test_bundle_secret_scan_allows_bearer_environment_references(tmp_path, reference):
+    (tmp_path / "README.md").write_text(
+        f'curl -H "Authorization: Bearer {reference}" http://localhost',
+        encoding="utf-8",
+    )
+
+    assert_bundle_has_no_plaintext_credentials(tmp_path)
+
+
+def test_candidate_patch_redaction_removes_credential_fixture_and_keeps_diff_marker():
+    content = (
+        "+safe = True\n"
+        '+token = "Authorization: Bearer secret-token-value-123456"\n'
+        " context remains\n"
+    )
+
+    redacted, count = redact_plaintext_credential_lines(content)
+
+    assert count == 1
+    assert "secret-token-value" not in redacted
+    assert "+[KF_REDACTED_CREDENTIAL_LIKE_LINE]" in redacted
+    assert "+safe = True" in redacted
 
 
 @pytest.mark.parametrize(

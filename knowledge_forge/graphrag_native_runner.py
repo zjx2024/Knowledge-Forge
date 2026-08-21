@@ -250,28 +250,38 @@ class GraphRAGNativeRunner:
     def _root_is_empty(root: Path) -> bool:
         return root.is_dir() and not any(root.iterdir())
 
-    def initialize(self, *, root: Path, completion_model: str, embedding_model: str, environment: dict[str, str]) -> NativeProcessResult:
+    def initialize(
+        self, *, root: Path, completion_model: str, embedding_model: str,
+        environment: dict[str, str],
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> NativeProcessResult:
         root = Path(root).resolve()
         if not self._root_is_empty(root):
             raise GraphRAGNativeRunnerError("graphrag init 只允许在全新的空 staging root 执行")
         return self._run(
             root=root, stage="init",
             argv=[self.python, "-m", "graphrag", "init", "--root", str(root), "--model", completion_model, "--embedding", embedding_model],
-            environment=environment,
+            environment=environment, cancel_requested=cancel_requested,
         )
 
-    def config_dry_run(self, *, root: Path, environment: dict[str, str]) -> NativeProcessResult:
+    def config_dry_run(
+        self, *, root: Path, environment: dict[str, str],
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> NativeProcessResult:
         return self._run(
             root=root, stage="config_dry_run",
             argv=[self.python, "-m", "graphrag", "index", "--root", str(Path(root).resolve()), "--method", "standard", "--dry-run", "--skip-validation", "--verbose"],
-            environment=environment,
+            environment=environment, cancel_requested=cancel_requested,
         )
 
-    def connectivity_dry_run(self, *, root: Path, environment: dict[str, str]) -> NativeProcessResult:
+    def connectivity_dry_run(
+        self, *, root: Path, environment: dict[str, str],
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> NativeProcessResult:
         return self._run(
             root=root, stage="connectivity_dry_run",
             argv=[self.python, "-m", "graphrag", "index", "--root", str(Path(root).resolve()), "--method", "standard", "--dry-run", "--verbose"],
-            environment=environment,
+            environment=environment, cancel_requested=cancel_requested,
         )
 
     def index(

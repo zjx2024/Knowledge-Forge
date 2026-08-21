@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,12 +19,18 @@ from typing import Any, Protocol
 import pyarrow.parquet as pq
 
 from .config import Config
+from .database import JobCancellationRequested
 from .graphrag_native_artifacts import (
     GraphRAGNativeBundleValidator,
     describe_file,
+    redact_plaintext_credential_lines,
+    safe_bundle_path,
     write_run_manifest,
 )
-from .graphrag_native_config import GraphRAGNativeSettingsBuilder
+from .graphrag_native_config import (
+    GraphRAGNativePromptProfileBuilder,
+    GraphRAGNativeSettingsBuilder,
+)
 from .graphrag_native_inputs import GraphRAGNativeInputBuilder, NativeInputPreflight
 from .graphrag_native_runner import (
     GraphRAGNativeProviderDoctor,
@@ -40,6 +47,10 @@ class NativeNoGraphUnsupported(RuntimeError):
     """Non-empty native input produced no semantic graph in Standard mode."""
 
 
+class NativeBuildCancelled(RuntimeError):
+    """The durable job requested cancellation before bundle publication."""
+
+
 class GraphRAGNativeExecutor:
     """Explicit project-wide executor for the third construction strategy."""
 
@@ -53,7 +64,9 @@ class GraphRAGNativeExecutor:
 
     def __init__(self, service: Any):
         self.service = service
-        self.runner = GraphRAGNativeRunner()
+        self.runner = GraphRAGNativeRunner(
+            timeout_seconds=Config.graphrag_native_timeout_seconds,
+        )
         self.settings = GraphRAGNativeSettingsBuilder()
         self.validator = GraphRAGNativeBundleValidator()
 
@@ -141,6 +154,42 @@ class GraphRAGNativeExecutor:
         }, int(probe["dimension"])
 
     @staticmethod
+    def _job_cancel_requested(job: dict[str, Any] | None) -> bool:
+        job = job or {}
+        metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        return bool(
+            str(job.get("status") or "") == "cancelled"
+            or metadata.get("cancel_requested")
+        )
+
+    def _cancellation_requested(self, job_id: str) -> bool:
+        return self._job_cancel_requested(self.service.db.get_job(job_id))
+
+    def _assert_not_cancelled(self, job_id: str) -> None:
+        job = self.service.db.get_job(job_id) or {}
+        if self._job_cancel_requested(job):
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            raise NativeBuildCancelled(
+                str(metadata.get("cancel_reason") or "GraphRAG Native 构建已取消")
+            )
+
+    def _discard_cancelled_bundle_path(self, path: Path) -> None:
+        """Remove only this generated run's staging/final directory."""
+
+        root = self.native_root
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError("拒绝清理 native 根目录之外的取消产物") from exc
+        if not relative.parts or resolved == root:
+            raise RuntimeError("拒绝清理 GraphRAG Native 根目录")
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+
+    @staticmethod
     def _workflow_progress_value(event: NativeProcessProgress, previous: int) -> int:
         """Map a CLI's generic ``completed/total`` signal into the index band.
 
@@ -157,20 +206,6 @@ class GraphRAGNativeExecutor:
         return max(int(previous), min(68, 30 + max(1, round(38 * fraction))))
 
     @staticmethod
-    def _patch_source_identity_prompt(root: Path) -> str:
-        path = root / "prompts" / "extract_graph.txt"
-        if not path.is_file():
-            raise RuntimeError("GraphRAG init 未生成 extract_graph prompt")
-        text = path.read_text(encoding="utf-8")
-        instruction = (
-            "\n\nKnowledge-Forge native input may include a [KF_SOURCE_ID:...] metadata marker. "
-            "It is provenance metadata, never an entity, relationship endpoint, type, or claim.\n"
-        )
-        if instruction not in text:
-            path.write_text(text + instruction, encoding="utf-8")
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-
-    @staticmethod
     def _remove_generated_env_file(root: Path) -> None:
         """Do not retain an ``init``-generated env file in an immutable bundle.
 
@@ -185,17 +220,125 @@ class GraphRAGNativeExecutor:
                 raise RuntimeError("GraphRAG init 生成了不安全的 .env 路径")
             path.unlink()
 
+    def _seed_compatible_graph_cache(
+        self,
+        root: Path,
+        *,
+        project_id: int,
+        current_run: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reuse only GraphRAG's content-addressed call cache after a late failure.
+
+        A complete Standard workflow can still fail closed during independent
+        bundle validation.  Re-running every model call after fixing such a
+        validator issue adds hours without changing graph quality.  A failed
+        run's cache is safe to seed when all algorithm inputs, prompt/settings
+        identities and model digests match.  GraphRAG still executes its full
+        upstream workflow and regenerates every output table; no prior graph
+        artifact is copied or published.
+        """
+
+        list_runs = getattr(self.service.db, "list_graphrag_native_runs", None)
+        if not callable(list_runs):
+            return None
+        identity_fields = (
+            "source_snapshot_hash",
+            "settings_hash",
+            "prompt_profile_hash",
+            "completion_model_id",
+            "completion_model_digest",
+            "embedding_model_id",
+            "embedding_model_digest",
+            "embedding_dimension",
+            "graphrag_version",
+        )
+        candidates = list_runs(int(project_id))
+        for candidate in candidates:
+            if str(candidate.get("run_id") or "") == str(current_run.get("run_id") or ""):
+                continue
+            if (
+                str(candidate.get("state") or "") != "FAILED"
+                or str(candidate.get("failure_class") or "") != "GraphRAGNativeBundleError"
+                or not candidate.get("execution_completed_at")
+                or any(
+                    str(candidate.get(field) or "") != str(current_run.get(field) or "")
+                    for field in identity_fields
+                )
+            ):
+                continue
+            relative = str(candidate.get("staging_relative_path") or "")
+            if not relative:
+                continue
+            try:
+                source_root = safe_bundle_path(self.native_root, relative)
+                source_cache = source_root / "cache"
+                if (
+                    not source_cache.is_dir()
+                    or source_cache.is_symlink()
+                    or source_root.resolve() == Path(root).resolve()
+                ):
+                    continue
+                entries = sorted(source_cache.rglob("*"))
+                if any(path.is_symlink() for path in entries):
+                    continue
+                files = [path for path in entries if path.is_file()]
+                if not files:
+                    continue
+                destination = Path(root) / "cache"
+                destination.mkdir(parents=True, exist_ok=True)
+                byte_size = 0
+                for source in files:
+                    relative_file = source.relative_to(source_cache)
+                    target = destination / relative_file
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                    byte_size += source.stat().st_size
+                evidence = {
+                    "schema_version": "graphrag-native-cache-reuse-v1",
+                    "source_run_id": str(candidate.get("run_id") or ""),
+                    "reason": "compatible_failed_run_after_execution_complete",
+                    "file_count": len(files),
+                    "byte_size": byte_size,
+                    "identity_fields": list(identity_fields),
+                }
+                manifest = Path(root) / "kf-manifest" / "cache-reuse.json"
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(
+                    json.dumps(evidence, ensure_ascii=False, sort_keys=True, indent=2),
+                    encoding="utf-8",
+                )
+                return evidence
+            except (OSError, RuntimeError, ValueError):
+                # Cache reuse is an optimization only.  A malformed or
+                # unreadable previous cache must never weaken a fresh build.
+                continue
+        return None
+
     @staticmethod
     def _collect_artifacts(root: Path) -> list[Any]:
         artifacts: list[Any] = []
-        for relative in (
+        relatives = [
             "input/documents.parquet", "kf-manifest/source-map.parquet",
-            "kf-manifest/input-documents-manifest.jsonl", "settings.redacted.yaml",
+            "kf-manifest/input-documents-manifest.jsonl", "settings.yaml",
+            "settings.redacted.yaml", "kf-manifest/prompt-profile.json",
             "kf-manifest/workflow-ledger.jsonl", "output/documents.parquet",
             "output/text_units.parquet", "output/entities.parquet", "output/relationships.parquet",
             "output/raw_entities.parquet", "output/raw_relationships.parquet",
             "output/communities.parquet", "output/community_reports.parquet", "output/graph.graphml",
-        ):
+        ]
+        profile_path = root / "kf-manifest" / "prompt-profile.json"
+        if not profile_path.is_file() or profile_path.is_symlink():
+            raise RuntimeError("GraphRAG Native 缺少冻结的项目语言提示配置")
+        try:
+            prompt_profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GraphRAG Native 项目语言提示配置不是合法 JSON") from exc
+        for item in prompt_profile.get("prompts") or []:
+            relative = str(item.get("relative_path") or "") if isinstance(item, dict) else ""
+            if not relative.startswith("prompts/") or relative.count("/") != 1:
+                raise RuntimeError("GraphRAG Native 项目语言提示配置包含非法路径")
+            relatives.append(relative)
+        for relative in relatives:
             path = root / relative
             if not path.is_file():
                 raise RuntimeError(f"GraphRAG Native 缺少必需原生 artifact: {relative}")
@@ -210,6 +353,7 @@ class GraphRAGNativeExecutor:
 
     def _write_candidate_evidence(
         self, root: Path, *, identity: dict[str, str], prompt_hash: str,
+        prompt_profile: dict[str, Any] | None = None,
     ) -> None:
         """Freeze reproducible code/runtime evidence without exporting secrets."""
 
@@ -238,8 +382,20 @@ class GraphRAGNativeExecutor:
         (manifest_root / "candidate-source-manifest.json").write_text(
             json.dumps(source_manifest, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8",
         )
-        patch = self._git_output(repo, "diff", "--binary", identity["base_sha"])
-        (manifest_root / "candidate-worktree.patch").write_text(patch, encoding="utf-8")
+        raw_patch = self._git_output(repo, "diff", "--binary", identity["base_sha"])
+        patch, redacted_lines = redact_plaintext_credential_lines(raw_patch)
+        patch_path = manifest_root / "candidate-worktree.patch"
+        patch_path.write_text(patch, encoding="utf-8")
+        (manifest_root / "candidate-worktree-redaction.json").write_text(
+            json.dumps({
+                "schema_version": "graphrag-native-worktree-redaction-v1",
+                "raw_patch_sha256": self._sha256_bytes(raw_patch.encode("utf-8")),
+                "stored_patch_sha256": self._sha256_bytes(patch.encode("utf-8")),
+                "redacted_line_count": redacted_lines,
+                "policy": "credential-like lines are omitted; raw content is never stored",
+            }, ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
         archive_tar = manifest_root / "candidate-source-archive.tar"
         with tarfile.open(archive_tar, "w") as archive:
             for item in source_manifest:
@@ -252,8 +408,17 @@ class GraphRAGNativeExecutor:
         (manifest_root / "runtime-environment.json").write_text(json.dumps({
             "python": sys.version, "executable": sys.executable, "graphrag_version": "3.1.1",
         }, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        prompt_profile = prompt_profile or {}
+        prompt_records = prompt_profile.get("prompts") or []
+        extract_graph_hash = next((
+            str(item.get("sha256") or "")
+            for item in prompt_records if isinstance(item, dict)
+            and item.get("relative_path") == "prompts/extract_graph.txt"
+        ), "")
         (manifest_root / "prompt-manifest.json").write_text(json.dumps({
-            "extract_graph_prompt_sha256": prompt_hash,
+            "prompt_profile_sha256": prompt_hash,
+            "extract_graph_prompt_sha256": extract_graph_hash or prompt_hash,
+            "output_language": (prompt_profile.get("language") or {}).get("language_code", ""),
             "source_metadata_rule": "KF_SOURCE_ID is provenance metadata and never a graph item",
         }, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         (manifest_root / "model-metrics.jsonl").write_text(json.dumps({
@@ -284,12 +449,12 @@ class GraphRAGNativeExecutor:
         (manifest_root / "migration-report.json").write_text(json.dumps(migration_report, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         (manifest_root / "native-isolation.json").write_text(json.dumps({
             "legacy_entry_invocations": 0,
-            "forbidden": ["HugeGraph", "pgvector", "stable_entity_relation", "enhanced_shadow", "graphrag_community"],
+            "forbidden": ["HugeGraph", "pgvector", "stable_entity_relation", "knowledge_forge", "graphrag_community"],
             "evidence": "native executor uses only persisted structures, GraphRAG CLI, control-plane DB, and bundle files",
         }, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
-        (manifest_root / "stable-enhanced-invariance.json").write_text(json.dumps({
+        (manifest_root / "stable-knowledge-forge-invariance.json").write_text(json.dumps({
             "native_writes": ["graphrag_native_* control-plane tables only"],
-            "stable_enhanced_projection_mutation": 0,
+            "stable_knowledge_forge_projection_mutation": 0,
         }, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         (manifest_root / "metric-summary.json").write_text(json.dumps(validation_report, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         (manifest_root / "validation-report.json").write_text(json.dumps(validation_report, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
@@ -389,14 +554,27 @@ class GraphRAGNativeExecutor:
         stage_root = self.native_root / self._staging_relative_path(run_id, attempt_id)
         final_root = self.native_root / self._run_relative_path(project_id, run_id)
         run: dict[str, Any] | None = None
+        activated = False
         try:
+            self._assert_not_cancelled(job_id)
             self.service.db.assert_graphrag_native_ready()
             project = self.service.db.get_project(project_id)
             if not project:
                 raise LookupError("项目不存在")
+            job = self.service.db.get_job(job_id) or {}
+            job_metadata = (
+                job.get("metadata")
+                if isinstance(job.get("metadata"), dict) else {}
+            )
+            requested_knowledge_language = str(
+                job_metadata.get("knowledge_language")
+                or project.get("knowledge_language")
+                or "auto"
+            )
             if self.service.db.latest_active_job(project_id, "ingestion"):
                 raise RuntimeError("源文档正在变化，拒绝创建 GraphRAG Native 快照")
             preflight = GraphRAGNativeInputBuilder(self.service).preflight(project_id=project_id)
+            self._assert_not_cancelled(job_id)
             if not preflight.ready:
                 self._record_empty_input(
                     job_id=job_id, project_id=project_id, project=project, run_id=run_id,
@@ -415,14 +593,49 @@ class GraphRAGNativeExecutor:
             self.runner.initialize(
                 root=stage_root, completion_model=models["completion"], embedding_model=models["embedding"],
                 environment=provider_environment,
+                cancel_requested=lambda: self._cancellation_requested(job_id),
             )
+            self._assert_not_cancelled(job_id)
             self._remove_generated_env_file(stage_root)
-            prompt_hash = self._patch_source_identity_prompt(stage_root)
             identity = self._candidate_identity()
-            self._write_candidate_evidence(stage_root, identity=identity, prompt_hash=prompt_hash)
             self.service.db.update_job(job_id, progress=10, log="GraphRAG Native：冻结 active revision 与结构化 Documents")
             inputs = GraphRAGNativeInputBuilder(self.service).build(project_id=project_id, run_root=stage_root)
+            prompt_profile = GraphRAGNativePromptProfileBuilder.apply(
+                run_root=stage_root,
+                texts=tuple(item.text for item in inputs.input_documents),
+                requested_language=str(
+                    requested_knowledge_language
+                ),
+            )
+            prompt_hash = str(prompt_profile["prompt_profile_hash"])
+            output_language = str(
+                (prompt_profile.get("language") or {}).get("language_code") or "en"
+            )
+            output_language_name = str(
+                (prompt_profile.get("language") or {}).get("display_name")
+                or output_language
+            )
+            self._write_candidate_evidence(
+                stage_root, identity=identity, prompt_hash=prompt_hash,
+                prompt_profile=prompt_profile,
+            )
+            self.service.db.update_job(
+                job_id, progress=13,
+                log=(
+                    "GraphRAG Native：项目输出语言已冻结为"
+                    f"{output_language_name}（"
+                    + (
+                        "项目设置"
+                        if (prompt_profile.get("language") or {}).get(
+                            "selection_mode"
+                        ) == "explicit"
+                        else "随文档语言"
+                    )
+                    + "）"
+                ),
+            )
             model_identity, dimension = self._provider_identity(project)
+            self._assert_not_cancelled(job_id)
             settings = self.settings.write_and_validate(
                 run_root=stage_root, completion_model=models["completion"], embedding_model=models["embedding"],
                 embedding_dimension=dimension, api_base=self._provider_api_base(),
@@ -439,10 +652,29 @@ class GraphRAGNativeExecutor:
                 run_id, owner, ttl_seconds=self._LEASE_TTL_SECONDS,
             )
             self.service.db.replace_graphrag_native_run_documents(run_id, list(inputs.run_documents), owner=owner)
+            reused_cache = self._seed_compatible_graph_cache(
+                stage_root, project_id=project_id, current_run=run,
+            )
+            if reused_cache:
+                self.service.db.update_job(
+                    job_id, progress=16,
+                    log=(
+                        "GraphRAG Native：复用同源失败运行的模型调用缓存 "
+                        f"{int(reused_cache['file_count'])} 项"
+                    ),
+                )
             self.service.db.update_job(job_id, progress=18, log="GraphRAG Native：验证 3.1.1 配置")
-            self.runner.config_dry_run(root=stage_root, environment=provider_environment)
+            self.runner.config_dry_run(
+                root=stage_root, environment=provider_environment,
+                cancel_requested=lambda: self._cancellation_requested(job_id),
+            )
+            self._assert_not_cancelled(job_id)
             self.service.db.update_job(job_id, progress=25, log="GraphRAG Native：验证 completion/embedding 连通性")
-            self.runner.connectivity_dry_run(root=stage_root, environment=provider_environment)
+            self.runner.connectivity_dry_run(
+                root=stage_root, environment=provider_environment,
+                cancel_requested=lambda: self._cancellation_requested(job_id),
+            )
+            self._assert_not_cancelled(job_id)
             self.service.db.update_graphrag_native_run(run_id, owner=owner, state="RUNNING")
             self.service.db.update_job(job_id, progress=30, log="GraphRAG Native：执行 Standard workflow")
             workflow_progress = 30
@@ -481,7 +713,10 @@ class GraphRAGNativeExecutor:
                 # Do not revive a job that has been cancelled while the
                 # isolated child is shutting down.
                 current_job = self.service.db.get_job(job_id) or {}
-                if str(current_job.get("status") or "") not in {"queued", "running"}:
+                if (
+                    str(current_job.get("status") or "") not in {"queued", "running"}
+                    or self._job_cancel_requested(current_job)
+                ):
                     return
                 workflow_progress = self._workflow_progress_value(event, workflow_progress)
                 self.service.db.update_job(
@@ -493,7 +728,7 @@ class GraphRAGNativeExecutor:
                 root=stage_root, environment=provider_environment,
                 cancel_requested=lambda: (
                     lease_failure is not None
-                    or (self.service.db.get_job(job_id) or {}).get("status") == "cancelled"
+                    or self._cancellation_requested(job_id)
                 ),
                 progress_callback=report_workflow_progress,
             )
@@ -501,12 +736,13 @@ class GraphRAGNativeExecutor:
                 raise RuntimeError(f"GraphRAG Native run lease 续期失败：{lease_failure}") from lease_failure
             if not renew_native_lease(force=True):
                 raise RuntimeError(f"GraphRAG Native run lease 续期失败：{lease_failure}") from lease_failure
+            self._assert_not_cancelled(job_id)
             self._write_workflow_ledger(stage_root, index_result)
             self._require_nonempty_semantic_graph(stage_root)
             self._reject_source_metadata_pollution(stage_root)
             self.service.db.update_job(
                 job_id, progress=72,
-                log="GraphRAG Native：Standard workflow 完成，开始独立验证原生输出",
+                log="GraphRAG Native：知识提取完成，开始检查构建结果",
             )
             self.service.db.update_graphrag_native_run(
                 run_id, owner=owner, state="EXECUTION_COMPLETE",
@@ -514,11 +750,17 @@ class GraphRAGNativeExecutor:
             self.service.db.update_graphrag_native_run(run_id, owner=owner, state="VALIDATING")
             artifacts = self._collect_artifacts(stage_root)
             write_run_manifest(
-                stage_root, identity={**identity, "run_id": run_id, "source_snapshot_hash": inputs.source_snapshot_hash},
+                stage_root, identity={
+                    **identity, "run_id": run_id,
+                    "source_snapshot_hash": inputs.source_snapshot_hash,
+                    "prompt_profile_hash": prompt_hash,
+                    "output_language": output_language,
+                },
                 artifacts=artifacts, workflow_ledger_path="kf-manifest/workflow-ledger.jsonl",
                 settings_redacted_path="settings.redacted.yaml", lancedb_relative_path="output/lancedb",
             )
             report = self.validator.validate(stage_root)
+            self._assert_not_cancelled(job_id)
             if not renew_native_lease(force=True):
                 raise RuntimeError(f"GraphRAG Native run lease 续期失败：{lease_failure}") from lease_failure
             self._write_post_index_evidence(
@@ -527,22 +769,25 @@ class GraphRAGNativeExecutor:
             )
             self.service.db.update_job(
                 job_id, progress=86,
-                log="GraphRAG Native：原生输出结构与 LanceDB 已验证，写入可审计证据",
+                log="GraphRAG Native：图谱结构与问答索引已检查，正在保存审计记录",
             )
             # Post-index evidence is generated after the first structural
             # report.  Run the independent validator again so its credential
             # scanner and file-safety checks cover those evidence files too;
             # READY is bound to this final validation result.
             report = self.validator.validate(stage_root)
+            self._assert_not_cancelled(job_id)
             if not renew_native_lease(force=True):
                 raise RuntimeError(f"GraphRAG Native run lease 续期失败：{lease_failure}") from lease_failure
             report_hash = hashlib.sha256(json.dumps(report, sort_keys=True).encode("utf-8")).hexdigest()
             self.service.db.update_job(
                 job_id, progress=94,
-                log="GraphRAG Native：最终独立验证通过，发布 immutable native bundle",
+                log="GraphRAG Native：最终检查通过，正在发布知识图谱成果",
             )
+            self._assert_not_cancelled(job_id)
             final_root.parent.mkdir(parents=True, exist_ok=True)
             stage_root.replace(final_root)
+            self._assert_not_cancelled(job_id)
             if not renew_native_lease(force=True):
                 raise RuntimeError(f"GraphRAG Native run lease 续期失败：{lease_failure}") from lease_failure
             self.service.db.update_graphrag_native_run(
@@ -555,15 +800,29 @@ class GraphRAGNativeExecutor:
             self.service.db.activate_graphrag_native_run(
                 run_id, owner=owner, validation_report_hash=report_hash,
                 expected_source_snapshot_hash=inputs.source_snapshot_hash,
+                job_id=job_id,
             )
+            activated = True
             self.service.db.update_job(
                 job_id, status="completed", progress=100,
-                log="GraphRAG Native：原生语义图、社区、报告与 LanceDB bundle 已通过独立验证",
-                metadata={"run_id": run_id, "source_snapshot_hash": inputs.source_snapshot_hash},
+                log="GraphRAG Native：实体关系、主题社区、摘要与问答索引已通过检查",
+                metadata={
+                    "run_id": run_id,
+                    "source_snapshot_hash": inputs.source_snapshot_hash,
+                    "output_language": output_language,
+                },
             )
         except Exception as exc:
-            message = f"GraphRAG Native 构建失败，禁止回退旧流程：{exc}"
-            cancelled = bool((self.service.db.get_job(job_id) or {}).get("status") == "cancelled")
+            current_job = self.service.db.get_job(job_id) or {}
+            cancelled = bool(
+                isinstance(exc, (NativeBuildCancelled, JobCancellationRequested))
+                or self._job_cancel_requested(current_job)
+            )
+            message = (
+                f"GraphRAG Native 构建已安全终止：{exc}"
+                if cancelled else
+                f"GraphRAG Native 构建失败，禁止回退旧流程：{exc}"
+            )
             no_graph = isinstance(exc, NativeNoGraphUnsupported)
             if run:
                 try:
@@ -591,5 +850,20 @@ class GraphRAGNativeExecutor:
                         )
                 except Exception:
                     pass
-            if not cancelled:
+            if cancelled:
+                if not activated:
+                    for path in (stage_root, final_root):
+                        try:
+                            self._discard_cancelled_bundle_path(path)
+                        except Exception:
+                            pass
+                self.service.db.update_job(
+                    job_id, status="cancelled", progress=100,
+                    log=message + "；未完成 bundle 未发布",
+                    metadata={
+                        "stage": "cancelled",
+                        "cancel_acknowledged_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            else:
                 self.service.db.update_job(job_id, status="failed", progress=100, log=message, error=message)

@@ -13,6 +13,12 @@ from tests.test_shadow_relation_runtime_wiring import (
 )
 
 
+def test_verifier_retry_budget_increases_instead_of_repeating_same_request():
+    assert ShadowRelationV2Runtime._verifier_output_budget(262144, 1) == 4096
+    assert ShadowRelationV2Runtime._verifier_output_budget(262144, 2) == 8192
+    assert ShadowRelationV2Runtime._verifier_output_budget(262144, 3) == 16384
+
+
 def _keep_chunks(database: _RuntimeDatabase, chunk_ids: set[int]) -> None:
     database.chunks = [
         item for item in database.chunks if int(item["id"]) in chunk_ids
@@ -116,7 +122,7 @@ def test_missing_pair_in_batch_is_retried_by_shrinking_without_losing_pairs(
     assert database.finished[-1][1]["status"] == "ready"
 
 
-def test_verifier_terminal_failure_is_not_ready_and_does_not_materialize(
+def test_verifier_terminal_failure_is_quarantined_and_does_not_materialize(
     monkeypatch,
 ):
     monkeypatch.setattr(Config, "relation_shadow_max_attempts", 2)
@@ -126,20 +132,27 @@ def test_verifier_terminal_failure_is_not_ready_and_does_not_materialize(
     class TimeoutVerifierGateway(_ScriptedGateway):
         def json_chat(self, **kwargs):
             system = str(kwargs["system"])
-            if "proposer" in system or "classifier" in system:
-                return super().json_chat(**kwargs)
-            self.verifier_calls += 1
-            raise TimeoutError("verifier timeout")
+            payload = json.loads(kwargs["prompt"])
+            if (
+                "relation v2 evidence verifier" in system
+                or "有向关系证据核验器" in system
+                or isinstance(payload.get("claims"), list)
+            ):
+                self.verifier_calls += 1
+                raise TimeoutError("verifier timeout")
+            return super().json_chat(**kwargs)
 
-    with pytest.raises(RuntimeError, match="verifier 存在终态失败"):
-        ShadowRelationV2Runtime(
-            database, TimeoutVerifierGateway(),
-        ).run_namespace(namespace_id="namespace-runtime", project_id=1)
+    result = ShadowRelationV2Runtime(
+        database, TimeoutVerifierGateway(),
+    ).run_namespace(namespace_id="namespace-runtime", project_id=1)
 
-    assert database.normalization is None
+    assert database.normalization is not None
     assert database.endpoints == []
-    assert database.finished[-1][1]["status"] == "failed"
+    assert database.finished[-1][1]["status"] == "ready"
+    assert result["metrics"]["verifier_terminal_failures"] == 1
+    assert result["metrics"]["verifier_hypotheses_quarantined"] == 1
     assert [item.verdict for item in database.verification_attempts] == [
         RETRYABLE_FAILED,
         RETRYABLE_FAILED,
     ]
+    assert database.verification_terminal_flags == [False, True]

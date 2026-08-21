@@ -4,7 +4,7 @@ import inspect
 from concurrent.futures import Future
 
 from knowledge_forge.construction_strategies import (
-    ENHANCED_SHADOW_STRATEGY,
+    KNOWLEDGE_FORGE_STRATEGY,
     STABLE_STRATEGY,
 )
 from knowledge_forge.policy import POLICY_AXES
@@ -37,7 +37,7 @@ class _StrategyDatabase:
         }
         self.builds = {
             STABLE_STRATEGY: {"status": "indexed"},
-            ENHANCED_SHADOW_STRATEGY: {"status": "indexed"},
+            KNOWLEDGE_FORGE_STRATEGY: {"status": "indexed"},
         }
         self.active: dict[str, dict] = {}
         self.shadow_v2_readiness_checks = 0
@@ -75,7 +75,7 @@ class _StrategyDatabase:
         self.builds[strategy_key] = {**self.builds[strategy_key], **values}
         return self.builds[strategy_key]
 
-    def invalidate_enhanced_strategy_for_document(self, document_id, *, reason):
+    def invalidate_knowledge_forge_for_document(self, document_id, *, reason):
         self.invalidated.append((document_id, reason))
 
     def set_graph_state(self, project_id, status, **values):
@@ -103,7 +103,7 @@ def _service(database: _StrategyDatabase) -> KnowledgeForgeService:
     return service
 
 
-def test_stable_submit_does_not_touch_enhanced_shadow_runtime_or_state() -> None:
+def test_stable_submit_does_not_touch_knowledge_forge_runtime_or_state() -> None:
     database = _StrategyDatabase()
     service = _service(database)
 
@@ -115,12 +115,12 @@ def test_stable_submit_does_not_touch_enhanced_shadow_runtime_or_state() -> None
     assert service.executor.calls == [("_ingest_document", ("job-stable", 11))]
 
 
-def test_enhanced_shadow_entry_does_not_call_legacy_p1_or_stable_extractors() -> None:
+def test_knowledge_forge_entry_does_not_call_legacy_p1_or_stable_extractors() -> None:
     enhanced_source = inspect.getsource(
-        KnowledgeForgeService._ingest_enhanced_strategy
+        KnowledgeForgeService._ingest_knowledge_forge_strategy
     )
     entity_source = inspect.getsource(
-        KnowledgeForgeService.build_entity_shadow_namespace
+        KnowledgeForgeService.build_grounded_entity_namespace
     )
     runtime_source = inspect.getsource(ShadowRelationV2Runtime)
     combined = "\n".join((enhanced_source, entity_source, runtime_source))

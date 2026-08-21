@@ -1,0 +1,17 @@
+[Unit]
+Description=Knowledge Forge dedicated reranker service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/zjx-projects/knowledge-forge
+ExecStart=%h/zjx-projects/knowledge-forge/.venv/bin/python %h/zjx-projects/knowledge-forge/reranker_server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+StandardOutput=append:%h/zjx-projects/knowledge-forge/.codex/work/knowledge-forge-reranker-systemd.log
+StandardError=append:%h/zjx-projects/knowledge-forge/.codex/work/knowledge-forge-reranker-systemd.log
+
+[Install]
+WantedBy=default.target
