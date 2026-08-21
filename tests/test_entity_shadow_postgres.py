@@ -222,32 +222,40 @@ def test_independent_entity_shadow_is_restart_safe_and_product_zero_write():
     assert first["namespace_id"] == second["namespace_id"]
     assert (fake_schemas.calls, fake_ollama.embedding_calls, fake_ollama.review_calls) == first_model_calls
     assert fake_schemas.calls == 2
-    # The current conservative identity profile only merges an exact canonical
-    # name.  The explicit "IBM" alias therefore remains a separate canonical
-    # and requires its own embedding batch, while the completed namespace must
-    # still be reused without any additional model calls on restart.
-    assert fake_ollama.embedding_calls == 2
-    assert fake_ollama.embedding_batch_sizes == [2, 1]
+    # Unresolved mentions are embedded once per chunk in one batch.  The
+    # explicit IBM alias learned from the first chunk then resolves the second
+    # chunk exactly, while a completed namespace performs no additional calls.
+    assert fake_ollama.embedding_calls == 1
+    assert fake_ollama.embedding_batch_sizes == [2]
     assignments = first["assignments"]
     ibm_assignments = [
         item for item in assignments
         if (item.get("metadata") or {}).get("evidence_start") in (0,)
     ]
-    assert len({item["canonical_key"] for item in ibm_assignments}) == 2
+    assert len({item["canonical_key"] for item in ibm_assignments}) == 1
     assert first["relation_endpoints"] == []
     assert all(
         (item.get("metadata") or {}).get("entity_publishability", {}).get(
-            "graph_publishable"
+            "retrieval_eligible"
         ) is True
         for item in first["canonicals"]
     )
-    assert (
+    assert all(
+        (item.get("metadata") or {}).get("entity_publishability", {}).get(
+            "graph_publishable"
+        ) is False
+        for item in first["canonicals"]
+    )
+    publishability_metrics = (
         (first.get("namespace") or {}).get("metrics", {})
         .get("entity_publishability", {})
         .get("after_relations", {})
-        .get("graph_publishable")
+    )
+    assert (
+        publishability_metrics.get("retrieval_eligible")
         == len(first["canonicals"])
     )
+    assert publishability_metrics.get("graph_publishable") == 0
 
     with database.connection() as conn:
         after = {

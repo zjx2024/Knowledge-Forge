@@ -200,12 +200,23 @@ class PersistedShadowModelReplayGateway:
                 # Deterministic validation also persists a verification
                 # terminal row for rejected/review-only hypotheses, but those
                 # rows explicitly have independent_call=false and never
-                # crossed the model boundary.
+                # crossed the model boundary. Batch-verifier decisions are
+                # likewise persisted per hypothesis with independent semantic
+                # judgment, but their one transport call is already represented
+                # by the separately audited ``batch_verifier`` row. Current
+                # terminal envelopes are recognizable by their canonical
+                # attempt fields and must not become duplicate replay calls.
                 if not bool(row.get("independent_call", True)):
                     continue
-                self._source_counts[component] += 1
                 payload = dict(row.get("parsed_response") or {})
                 request_payload = dict(row.get("request_payload") or {})
+                if (
+                    not request_payload.get("prompt")
+                    and request_payload.get("stable_attempt_id")
+                    and request_payload.get("verdict")
+                ):
+                    continue
+                self._source_counts[component] += 1
                 hypothesis_id = str(
                     payload.get("hypothesis_id")
                     or request_payload.get("hypothesis_id")
@@ -268,8 +279,8 @@ class PersistedShadowModelReplayGateway:
             request_payload = dict(row.get("request_payload") or {})
             self._source_counts["classifier"] += 1
             self._request_calls[_request_key(request_payload)].append(row)
-        if not self._source_counts["classifier"]:
-            raise ShadowReplayError("恢复源没有 classifier 审计调用")
+        if not sum(self._source_counts.values()):
+            raise ShadowReplayError("恢复源没有可重放的模型审计调用")
 
     def effective_model_context(self, model: str) -> Any:
         return self.runtime_model_gateway.effective_model_context(model)
@@ -328,6 +339,18 @@ class PersistedShadowModelReplayGateway:
             "supported_evidence_spans": spans,
         }
 
+    @staticmethod
+    def _source_response(row: dict[str, Any]) -> Any:
+        """Reconstruct the response at the source-model transport boundary."""
+
+        raw_text = str(row.get("raw_response_text") or "").strip()
+        if raw_text:
+            try:
+                return json.loads(raw_text)
+            except json.JSONDecodeError:
+                pass
+        return row.get("parsed_response")
+
     def json_chat(self, **kwargs: Any) -> Any:
         """Return the next exact persisted response; never call Ollama."""
 
@@ -345,7 +368,7 @@ class PersistedShadowModelReplayGateway:
             )
             if str(row.get("status") or "") not in self._TERMINAL_MODEL_STATUSES:
                 raise self._error(row)
-            parsed = row.get("parsed_response")
+            parsed = self._source_response(row)
             self.last_parsed_json_response = parsed
             return parsed
         structured_queue: deque[tuple[str, dict[str, Any]]] | None = None
@@ -365,7 +388,7 @@ class PersistedShadowModelReplayGateway:
             )
             if str(row.get("status") or "") not in self._TERMINAL_MODEL_STATUSES:
                 raise self._error(row)
-            parsed = row.get("parsed_response")
+            parsed = self._source_response(row)
             self.last_parsed_json_response = parsed
             return parsed
         if "proposer" in system.casefold():
@@ -419,7 +442,11 @@ class PersistedShadowModelReplayGateway:
             component = "verifier"
             lookup_key = hypothesis_id
         else:
-            raise ShadowReplayError("恢复期间出现未知模型组件")
+            marker = "unknown:" + _request_key(dict(kwargs))
+            self._misses.append(marker)
+            raise ShadowReplayError(
+                f"恢复期间出现未记录的模型组件: {marker}"
+            )
         if not queue:
             differences = []
             for candidate_queue in self._request_calls.values():

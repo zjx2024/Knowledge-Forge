@@ -23,7 +23,11 @@ from knowledge_forge.relation_shadow_v2 import (
     verify_hypothesis,
 )
 from scripts.export_shadow_v2_evaluation_bundle import export_shadow_v2_bundle
-from tests.shadow_v2_fixtures import logical_schema, predicate_policy
+from tests.shadow_v2_fixtures import (
+    logical_schema,
+    persist_pair_source_context,
+    predicate_policy,
+)
 
 
 def _role_probe(*_args):
@@ -179,6 +183,7 @@ def test_shadow_v2_artifact_exporter_exports_and_audits_ready_run(tmp_path):
         "fingerprint_components": {"test": suffix},
         "source_generation": 1,
     })
+    persist_pair_source_context(database, run_id, pair, content)
     database.persist_shadow_relation_v2_opportunities(run_id, plan.opportunities)
     request_payload = {"stage": "classifier", "pair_ids": [pair.pair_identity]}
     raw_response_text = json.dumps({"decisions": []}, separators=(",", ":"))

@@ -277,7 +277,9 @@ def test_empty_isolated_database_applies_complete_v2_migration_chain():
         database.bootstrap()
         with database.connection() as conn:
             evidence = _assert_v2_catalog(conn)
-            assert evidence["migration_count"] == 8
+            assert evidence["migration_count"] == len(
+                SHADOW_RELATION_V2_REQUIRED_MIGRATIONS
+            )
         assert database.assert_shadow_relation_v2_ready()["migrations"] == list(
             SHADOW_RELATION_V2_REQUIRED_MIGRATIONS
         )
@@ -321,7 +323,9 @@ def test_isolated_0013_to_0021_compatibility_upgrade_and_catalog_contract():
             MigrationRunner().apply(conn)
             evidence = _assert_v2_catalog(conn)
             assert evidence == {
-                "migration_count": 8,
+                "migration_count": len(
+                    SHADOW_RELATION_V2_REQUIRED_MIGRATIONS
+                ),
                 "table_count": len(SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS),
                 "index_count": len(V2_INDEXES),
                 "foreign_key_count": sum(

@@ -2534,7 +2534,7 @@ class ShadowRelationV2Runtime:
         )
         return attempt, result, model_called
 
-    def _verify_relation_batch(
+    def _batch_verifier_model_request(
         self,
         *,
         model: str,
@@ -2542,14 +2542,14 @@ class ShadowRelationV2Runtime:
         prompt: str,
         response_schema: dict[str, Any],
         claim_count: int,
-    ) -> Any:
-        """Adjudicate independent relation claims in one transport call."""
+    ) -> dict[str, Any]:
+        """Build the exact transport request persisted for batch replay."""
 
         desired_output = max(4096, min(16384, int(claim_count) * 768))
         context_cap = max(1024, int(context_budget_tokens) // 2)
-        return self.models.json_chat(
-            model=model,
-            system=(
+        return {
+            "model": model,
+            "system": (
                 "You are an independent directed-relation evidence verifier. "
                 "Evaluate every supplied claim separately from its own frozen "
                 "context, Schema policy, endpoints, and evidence. Never infer a "
@@ -2562,13 +2562,32 @@ class ShadowRelationV2Runtime:
                 "them to entailment or evidence_spans. reason_code is one concise "
                 "diagnostic label of at most 160 characters, never analysis."
             ),
-            prompt=prompt,
-            schema=response_schema,
-            temperature=0.0,
+            "prompt": prompt,
+            "schema": response_schema,
+            "temperature": 0.0,
+            "context_budget_tokens": context_budget_tokens,
+            "max_output_tokens": min(desired_output, context_cap),
+            "safety_margin_tokens": Config.relation_classifier_safety_margin,
+        }
+
+    def _verify_relation_batch(
+        self,
+        *,
+        model: str,
+        context_budget_tokens: int,
+        prompt: str,
+        response_schema: dict[str, Any],
+        claim_count: int,
+    ) -> Any:
+        """Adjudicate independent relation claims in one transport call."""
+
+        return self.models.json_chat(**self._batch_verifier_model_request(
+            model=model,
             context_budget_tokens=context_budget_tokens,
-            max_output_tokens=min(desired_output, context_cap),
-            safety_margin_tokens=Config.relation_classifier_safety_margin,
-        )
+            prompt=prompt,
+            response_schema=response_schema,
+            claim_count=claim_count,
+        ))
 
     def _probe_verifier_roles(
         self,
@@ -3914,6 +3933,9 @@ class ShadowRelationV2Runtime:
                 "temperature": 0.0,
                 "context_budget_tokens": int(context_budget_tokens),
                 "max_output_tokens": 2048,
+                "safety_margin_tokens": (
+                    Config.relation_classifier_safety_margin
+                ),
                 "system": (
                     "Audit direct ordered semantic roles in immutable source "
                     "evidence. Return only the exact requested JSON map."
@@ -8550,13 +8572,15 @@ class ShadowRelationV2Runtime:
                 )
                 batch_request_payload = {
                     "stage": "batch_verifier",
-                    "model": context["model"],
                     "model_revision": context["model_revision"],
-                    "prompt": batch_prompt,
-                    "schema": batch_schema,
-                    "temperature": 0.0,
-                    "context_budget_tokens": context_budget,
                     "claim_count": len(claim_batch),
+                    **self._batch_verifier_model_request(
+                        model=context["model"],
+                        context_budget_tokens=context_budget,
+                        prompt=batch_prompt,
+                        response_schema=batch_schema,
+                        claim_count=len(claim_batch),
+                    ),
                 }
                 batch_request_hash = shadow_model_payload_hash(
                     "request", batch_request_payload,
@@ -9517,6 +9541,9 @@ class ShadowRelationV2Runtime:
                         "temperature": 0.0,
                         "context_budget_tokens": context_budget,
                         "max_output_tokens": 256,
+                        "safety_margin_tokens": (
+                            Config.relation_classifier_safety_margin
+                        ),
                     }
                     try:
                         role_audit_prompt = (
@@ -10168,17 +10195,6 @@ class ShadowRelationV2Runtime:
                 coordinated_source_recoveries += 1
 
             terminal_verifier_attempts = {}
-            replay_assertion = getattr(
-                self.models, "assert_replay_complete", None,
-            )
-            if callable(replay_assertion):
-                replay_assertion()
-            replay_summary = getattr(self.models, "replay_summary", None)
-            replay_metrics = (
-                dict(replay_summary())
-                if callable(replay_summary)
-                else {}
-            )
             for item in verification_attempts:
                 current_attempt = terminal_verifier_attempts.get(
                     str(item.hypothesis_id)
@@ -10254,6 +10270,21 @@ class ShadowRelationV2Runtime:
                 rows=publication_candidate_rows,
                 context=context,
                 context_budget_tokens=context_budget,
+            )
+            # Publication auditing is itself model-backed. A replay is complete
+            # only after that final model boundary has consumed its persisted
+            # response; checking immediately after relation verification would
+            # reject every valid ledger that contains publication-audit calls.
+            replay_assertion = getattr(
+                self.models, "assert_replay_complete", None,
+            )
+            if callable(replay_assertion):
+                replay_assertion()
+            replay_summary = getattr(self.models, "replay_summary", None)
+            replay_metrics = (
+                dict(replay_summary())
+                if callable(replay_summary)
+                else {}
             )
             publication_candidate_rows, _ = (
                 suppress_exact_open_schema_duplicates(
@@ -10776,6 +10807,14 @@ class ShadowRelationV2Runtime:
                 "legacy_pipeline_calls": 0,
                 "production_approved": False,
             }
+            # The publication audit is model-backed and may run after the
+            # earlier materialization-decision snapshot. Re-read every frozen
+            # input at the final commit boundary so a document, Schema, policy
+            # or semantic-code change during that audit cannot publish a stale
+            # graph.
+            current = self._context(
+                project_id, namespace_id,
+            )["fingerprint"]
             if fingerprint.root != current.root:
                 terminal_status = "stale"
                 self.db.finish_shadow_relation_v2_run(

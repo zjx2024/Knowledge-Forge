@@ -40,8 +40,11 @@ class _ImmediateExecutor:
 
 
 class _ScriptedV2Gateway:
-    def __init__(self, *, fail_classifier: bool = False):
-        self.fail_classifier = fail_classifier
+    def __init__(self):
+        self.source_inventory_calls = 0
+        self.source_binding_calls = 0
+        self.source_role_audit_calls = 0
+        self.publication_audit_calls = 0
         self.classifier_calls = 0
         self.role_probe_calls = 0
         self.role_alignment_calls = 0
@@ -55,6 +58,54 @@ class _ScriptedV2Gateway:
 
     def json_chat(self, **kwargs):
         payload = json.loads(kwargs["prompt"])
+        if (
+            isinstance(payload.get("mentions"), list)
+            and isinstance(payload.get("source"), str)
+            and payload.get("context_id")
+        ):
+            self.source_inventory_calls += 1
+            mentions = list(payload["mentions"])
+            return {
+                "resolved_references": [],
+                "facts": [{
+                    "subject_id": str(mentions[0]["id"]),
+                    "predicate": "acts on",
+                    "object_id": str(mentions[1]["id"]),
+                    "evidence": str(payload["source"]),
+                }],
+            }
+        if (
+            isinstance(payload.get("frames"), list)
+            and isinstance(payload.get("predicates"), list)
+        ):
+            self.source_binding_calls += 1
+            return {
+                "coverage_complete": True,
+                "bindings": [{
+                    "frame_index": 0,
+                    "predicate": "acts_on",
+                    "subject_index": 0,
+                    "object_index": 1,
+                }],
+            }
+        if (
+            isinstance(payload.get("candidate"), dict)
+            and isinstance(payload.get("required_roles"), dict)
+            and isinstance(payload.get("source"), str)
+        ):
+            self.source_role_audit_calls += 1
+            return {"projection_status": "ALIGNED"}
+        if (
+            isinstance(payload.get("candidates"), list)
+            and "atomic-publication-audit" in str(
+                payload.get("contract_version") or ""
+            )
+        ):
+            self.publication_audit_calls += 1
+            return {
+                str(candidate["candidate_id"]): "ALIGNED"
+                for candidate in payload["candidates"]
+            }
         if "proposer" in str(kwargs["system"]):
             return {
                 "proposals": [],
@@ -63,8 +114,6 @@ class _ScriptedV2Gateway:
             }
         if "classifier" in str(kwargs["system"]):
             self.classifier_calls += 1
-            if self.fail_classifier:
-                raise RuntimeError("scripted public-entry classifier failure")
             return {
                 "items": [{
                     "pair_id": pair["pair_id"],
@@ -150,6 +199,7 @@ class _NoopStrategyGraph:
         *,
         strategy_key,
         mutation,
+        **_kwargs,
     ):
         assert strategy_key == KNOWLEDGE_FORGE_STRATEGY
         assert mutation.namespace_id
@@ -418,7 +468,7 @@ def _wire_public_service(
 
     service._run_relation_shadow = legacy_service_tripwire
     service.relation_shadow.prepare_shadow = legacy_pipeline_tripwire
-    service._prepare_shared_content = lambda _job_id, document_id: (
+    service._prepare_shared_content = lambda _job_id, document_id, **_kwargs: (
         database.get_document(document_id),
         database.get_project(int(seeded["project_id"])),
         database.list_document_chunks(document_id),
@@ -502,13 +552,13 @@ def test_public_knowledge_forge_entry_executes_v2_with_zero_legacy_calls(
 
     assert database.get_job(job_id)["status"] == "completed"
     assert legacy_calls == {"service": 0, "pipeline": 0}
-    assert stage_calls == {
-        "planner": 1,
-        "classifier_parser": 1,
-        "verifier": 1,
-        "normalizer": 1,
-    }
-    assert gateway.classifier_calls == 1
+    assert stage_calls["planner"] >= 1
+    assert stage_calls["classifier_parser"] == 0
+    assert stage_calls["verifier"] >= 1
+    assert stage_calls["normalizer"] == 1
+    assert gateway.source_inventory_calls >= 1
+    assert gateway.source_binding_calls == 1
+    assert gateway.classifier_calls == 0
     assert gateway.role_probe_calls == 0
     assert gateway.role_alignment_calls == 0
     assert gateway.exact_argument_calls == 0
@@ -577,10 +627,11 @@ def test_public_knowledge_forge_entry_executes_v2_with_zero_legacy_calls(
         ).fetchone()["count"])
     assert run["status"] == "ready"
     assert pair_count == 1
-    assert hypothesis_count == 1
-    assert verifier_counts == {"total": 1, "supported": 1}
-    assert facts == {"total": 1, "supported": 1}
+    assert hypothesis_count == 2
+    assert verifier_counts == {"total": 2, "supported": 2}
+    assert facts == {"total": 2, "supported": 2}
     assert endpoints == 1
+    assert run["metrics"]["facts_predicate_publication_suppressed"] == 1
 
     before_retry_counts = (
         pair_count,
@@ -637,7 +688,9 @@ def test_public_knowledge_forge_entry_executes_v2_with_zero_legacy_calls(
 
 
 @pytest.mark.integration
-def test_public_knowledge_forge_v2_failure_never_falls_back_or_materializes():
+def test_public_knowledge_forge_v2_failure_never_falls_back_or_materializes(
+    monkeypatch,
+):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
@@ -645,9 +698,18 @@ def test_public_knowledge_forge_v2_failure_never_falls_back_or_materializes():
     database.bootstrap()
     suffix = uuid.uuid4().hex
     seeded = _seed_runtime(database, suffix)
-    gateway = _ScriptedV2Gateway(fail_classifier=True)
+    gateway = _ScriptedV2Gateway()
     service, graph, legacy_calls = _wire_public_service(
         database, seeded, gateway,
+    )
+
+    def fail_normalization(*_args, **_kwargs):
+        raise RuntimeError("scripted mandatory normalization persistence failure")
+
+    monkeypatch.setattr(
+        database,
+        "persist_shadow_relation_v2_normalization",
+        fail_normalization,
     )
     before = _formal_state(database, int(seeded["project_id"]))
 
@@ -760,10 +822,16 @@ def test_code_only_stale_run_replays_every_persisted_call_without_model_io(
         relation_runtime, "LOADED_RELATION_CODE_DIGEST", source_code,
     )
 
-    class DriftAfterVerifier(_ScriptedV2Gateway):
+    class DriftAfterPublicationAudit(_ScriptedV2Gateway):
         def json_chat(self, **kwargs):
             response = super().json_chat(**kwargs)
-            if "verifier" in str(kwargs["system"]):
+            payload = json.loads(kwargs["prompt"])
+            if (
+                isinstance(payload.get("candidates"), list)
+                and "atomic-publication-audit" in str(
+                    payload.get("contract_version") or ""
+                )
+            ):
                 monkeypatch.setattr(
                     relation_runtime,
                     "LOADED_RELATION_CODE_DIGEST",
@@ -771,7 +839,7 @@ def test_code_only_stale_run_replays_every_persisted_call_without_model_io(
                 )
             return response
 
-    source_gateway = DriftAfterVerifier()
+    source_gateway = DriftAfterPublicationAudit()
     with pytest.raises(v2.StaleRelationSnapshotError):
         ShadowRelationV2Runtime(database, source_gateway).run_namespace(
             namespace_id=str(seeded["namespace_id"]),
@@ -814,8 +882,12 @@ def test_code_only_stale_run_replays_every_persisted_call_without_model_io(
     assert recovered["metrics"]["replay"]["live_model_calls"] == 0
     assert recovered["metrics"]["replay"]["misses"] == 0
     assert recovered["metrics"]["replay"]["remaining_calls"] == 0
-    assert recovered["metrics"]["verifier_supported"] == 1
-    assert len(recovered["endpoint_rows"]) == 1
+    assert recovered["metrics"]["verifier_supported"] == int(
+        source_run["metrics"]["verifier_supported"]
+    )
+    assert len(recovered["endpoint_rows"]) == int(
+        source_run["metrics"]["facts_materialization_eligible"]
+    ) == 1
     with database.connection() as conn:
         assert conn.execute(
             """SELECT COUNT(*) AS count

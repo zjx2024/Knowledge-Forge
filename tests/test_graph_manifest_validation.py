@@ -144,6 +144,12 @@ def test_disposable_postgres_graph_lease_is_exclusive_recoverable_and_generation
     assert stable_graph["stats"] == {
         "documents": 0, "chunks": 0, "entities": 0, "relations": 0,
     }
+    # The writer owns the lease lifecycle.  Production releases this in its
+    # finally block after publication; mirror that contract before testing a
+    # later recovery owner on the same stable namespace.
+    assert database.release_graph_lease(
+        second["id"], second["lease_token"],
+    )
 
     strategy_graph = next(
         item for item in database.ensure_project_strategy_graphs(project["id"])

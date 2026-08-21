@@ -21,7 +21,11 @@ from knowledge_forge.relation_shadow_v2 import (
     validate_hypothesis,
     verify_hypothesis,
 )
-from tests.shadow_v2_fixtures import logical_schema, predicate_policy
+from tests.shadow_v2_fixtures import (
+    logical_schema,
+    persist_pair_source_context,
+    predicate_policy,
+)
 
 
 def _role_probe(*_args):
@@ -292,6 +296,7 @@ def test_shadow_relation_v2_persistence_is_idempotent_and_product_isolated() -> 
         "fingerprint_components": {"test": suffix},
         "source_generation": 1,
     })
+    persist_pair_source_context(database, run_id, pair, content)
     database.persist_shadow_relation_v2_opportunities(run_id, plan.opportunities)
     database.record_shadow_relation_v2_classification_attempt(
         run_id,

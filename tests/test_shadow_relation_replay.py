@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -228,3 +229,76 @@ def test_persisted_gateway_fails_closed_on_unmatched_or_unused_call():
         )
     with pytest.raises(ShadowReplayError, match="拒绝物化"):
         gateway.assert_replay_complete()
+
+
+def test_persisted_gateway_accepts_source_first_ledger_without_classifier():
+    prompt_payload = {
+        "context_id": "c1",
+        "source": "Alpha acts on Beta.",
+        "mentions": [{"id": "a"}, {"id": "b"}],
+    }
+    response = {
+        "resolved_references": [],
+        "facts": [{
+            "subject_id": "a",
+            "predicate": "acts on",
+            "object_id": "b",
+            "evidence": "Alpha acts on Beta.",
+        }],
+    }
+    call = {
+        "id": "m-source",
+        "component": "source_inventory",
+        "status": "COMPLETED",
+        "attempt_no": 1,
+        "request_payload": prompt_payload,
+        "raw_response_text": json.dumps(response),
+        "parsed_response": {"normalized_audit_view": True},
+        "error_type": "",
+        "error_message": "",
+        "created_at": 1,
+    }
+    gateway = PersistedShadowModelReplayGateway(
+        _ReplayDatabase([call]),
+        "run-old",
+        runtime_model_gateway=_RuntimeModel(),
+    )
+
+    request = _request(
+        "source-grounded relation extraction",
+        json.dumps(
+            prompt_payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    assert gateway.json_chat(**request) == response
+    gateway.assert_replay_complete()
+    assert gateway.replay_summary()["source_calls"] == {
+        "source_inventory": 1,
+    }
+
+
+def test_persisted_gateway_records_unknown_current_model_call_as_replay_miss():
+    call = {
+        "id": "m-source",
+        "component": "source_inventory",
+        "status": "COMPLETED",
+        "attempt_no": 1,
+        "request_payload": {"context_id": "c1"},
+        "raw_response_text": "{}",
+        "parsed_response": {},
+        "error_type": "",
+        "error_message": "",
+        "created_at": 1,
+    }
+    gateway = PersistedShadowModelReplayGateway(
+        _ReplayDatabase([call]),
+        "run-old",
+        runtime_model_gateway=_RuntimeModel(),
+    )
+
+    with pytest.raises(ShadowReplayError, match="未记录的模型组件"):
+        gateway.json_chat(**_request("new model stage", "{}"))
+    with pytest.raises(ShadowReplayError, match="拒绝物化"):
+        gateway.assert_replay_complete()
+    assert gateway.replay_summary()["misses"] == 1

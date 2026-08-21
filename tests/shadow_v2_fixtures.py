@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -103,3 +104,50 @@ def logical_schema(
         "version": version,
         "relation_types": list(predicates),
     }
+
+
+def persist_pair_source_context(
+    database: Any,
+    run_id: str,
+    pair: Any,
+    content: str,
+) -> str:
+    """Persist the frozen source row required by relation evidence fixtures."""
+
+    provenance = (
+        pair.provenance if isinstance(pair.provenance, dict) else {}
+    )
+    context_identity = str(
+        provenance.get("source_context_id") or pair.context_identity
+    )
+    database.persist_shadow_relation_v2_source_contexts(
+        run_id,
+        [{
+            "context_identity": context_identity,
+            "project_id": int(pair.project_id),
+            "document_revision_id": str(pair.document_revision_id),
+            "chunk_key": str(pair.chunk_key),
+            "context_kind": "test_fixture",
+            "context_start": 0,
+            "context_end": len(content),
+            "content_hash": hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
+            "structure_artifact_hash": "test-fixture",
+            "parser_version": "test-fixture-v1",
+            "payload": {
+                "context_id": context_identity,
+                "rendered_hash": hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest(),
+                "structure_quality": "test_fixture",
+            },
+            "source_maps": [{
+                "source_kind": "test_fixture",
+                "source_record_id": str(pair.chunk_key),
+                "source_start": 0,
+                "source_end": len(content),
+            }],
+        }],
+    )
+    return context_identity

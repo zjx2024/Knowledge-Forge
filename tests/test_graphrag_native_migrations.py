@@ -219,8 +219,24 @@ def test_native_migrations_upgrade_existing_stable_and_enhanced_state_without_mu
             conn.commit()
         database = _database(schema_dsn)
         project = database.create_project("native migration fixture", "", "llm", "embed")
-        database.ensure_project_strategy_graphs(int(project["id"]))
         with database.connection() as conn:
+            # Seed only the two strategy rows understood by the frozen
+            # pre-native schema.  Calling the current helper before applying
+            # later migrations would incorrectly ask that historical CHECK
+            # constraint to accept the current `knowledge_forge` key.
+            conn.execute(
+                """INSERT INTO project_strategy_graphs(
+                   project_id,strategy_key,namespace_id,status,policy_summary)
+                   VALUES
+                   (%s,'stable',%s,'empty',%s::jsonb),
+                   (%s,'enhanced_shadow',%s,'empty',%s::jsonb)""",
+                (
+                    project["id"], project["graph_namespace_id"],
+                    json.dumps({"mode": "stable", "production_approved": True}),
+                    project["id"], str(uuid.uuid4()),
+                    json.dumps({"mode": "shadow", "production_approved": False}),
+                ),
+            )
             before = _legacy_strategy_fingerprint(conn, int(project["id"]))
             assert conn.execute(
                 "SELECT to_regclass(current_schema()||'.graphrag_native_runs') AS table_name"
@@ -230,14 +246,15 @@ def test_native_migrations_upgrade_existing_stable_and_enhanced_state_without_mu
                 (project["id"],),
             ).fetchone()["count"] == 2
 
-            assert MigrationRunner().apply(conn) == [
+            native_upgrade = MigrationRunner(MIGRATIONS[:26])
+            assert native_upgrade.apply(conn) == [
                 "0022_graphrag_native_control_plane",
                 "0023_project_construction_strategy_selection",
                 "0024_project_strategy_binding",
                 "0025_knowledge_forge_communities",
                 "0026_schema_evaluation_audit",
             ]
-            assert MigrationRunner().apply(conn) == []
+            assert native_upgrade.apply(conn) == []
             evidence = _catalog_evidence(conn)
             assert evidence["migration_count"] == 3
             assert _legacy_strategy_fingerprint(conn, int(project["id"])) == before
