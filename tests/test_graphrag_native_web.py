@@ -1064,7 +1064,10 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
 
     page = web.render_home_page()
 
-    assert "新建项目" in page
+    assert "新建知识库" in page
+    assert "创建知识库" in page
+    assert ">知识库</button>" in page
+    assert '<a class="button secondary" href="/chat">智能问答</a>' in page
     assert 'name="strategy_key"' in page
     assert 'name="knowledge_language"' in page
     assert '<option value="zh" selected>中文</option>' in page
@@ -1080,7 +1083,7 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert "实体归一" in page
     assert "开放探索型" in page
     assert "Leiden 社区" in page
-    assert "项目创建后不能切换构建方式" in page
+    assert "知识库创建后不能切换构建方式" in page
     assert '<section class="panel strategy-overview"' in page
     assert 'id="create-strategy-key"' in page
     assert 'id="strategy-choice-help"' in page
@@ -1090,8 +1093,8 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert "function filterProjects()" in page
     assert ".project-card[hidden]{display:none}" in web.CSS
 
-    # Project selection is opened from the header instead of being pushed
-    # below the long product introduction. Creation stays inside that list.
+    # Knowledge-base selection is opened from the header instead of being
+    # pushed below the long product introduction. Creation stays in the list.
     header = page[page.index('<header class="home-header">'):page.index("</header>")]
     project_dialog = page[
         page.index('<dialog id="project-list-dialog"'):
@@ -1101,6 +1104,19 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert 'id="open-project-list"' in header
     assert 'id="open-create-project"' in project_dialog
     assert '<section class="panel project-list-panel"' not in page
+
+
+def test_chat_entry_is_top_level_and_not_bound_to_one_knowledge_base(monkeypatch):
+    monkeypatch.setattr(web, "SERVICE", _Service())
+
+    page = web.render_chat_page()
+
+    assert "跨知识库问答工作台" in page
+    assert "选择一个或多个知识库" in page
+    assert '<a class="button secondary" href="/#knowledge-bases">知识库</a>' in page
+    assert '<a class="button primary" href="/chat" aria-current="page">智能问答</a>' in page
+    assert 'name="project_id"' not in page
+    assert 'window.KF.projectId' not in page
 
 
 def test_new_project_form_defaults_to_qwen36(monkeypatch):
