@@ -380,9 +380,6 @@ class Config:
     extraction_rule_accept_confidence = float(os.getenv("EXTRACTION_RULE_ACCEPT_CONFIDENCE", "0.78"))
     extraction_min_relation_confidence = float(os.getenv("EXTRACTION_MIN_RELATION_CONFIDENCE", "0.55"))
     extraction_gleaning_information_score = float(os.getenv("EXTRACTION_GLEANING_INFORMATION_SCORE", "0.35"))
-    relation_shadow_enabled = os.getenv("RELATION_SHADOW_ENABLED", "false").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
     relation_classifier_output_reserve = max(
         128, int(os.getenv("RELATION_CLASSIFIER_OUTPUT_RESERVE", "2048")),
     )
@@ -508,8 +505,15 @@ class Config:
     ).strip().lower()
     if relation_verification_mode not in {"lean", "legacy_consensus"}:
         relation_verification_mode = "lean"
-    relation_shadow_max_attempts = max(
-        1, min(20, int(os.getenv("RELATION_SHADOW_MAX_ATTEMPTS", "3"))),
+    relation_max_attempts = max(
+        1,
+        min(
+            20,
+            int(os.getenv(
+                "RELATION_MAX_ATTEMPTS",
+                os.getenv("RELATION_SHADOW_MAX_ATTEMPTS", "3"),
+            )),
+        ),
     )
     relation_secondary_enabled = os.getenv(
         "RELATION_SECONDARY_ENABLED", "false",
@@ -523,11 +527,19 @@ class Config:
     relation_proposer_max_proposals = max(
         0, min(128, int(os.getenv("RELATION_PROPOSER_MAX_PROPOSALS", "8"))),
     )
-    relation_shadow_lease_seconds = max(
-        10, int(os.getenv("RELATION_SHADOW_LEASE_SECONDS", "300")),
+    relation_work_lease_seconds = max(
+        10,
+        int(os.getenv(
+            "RELATION_WORK_LEASE_SECONDS",
+            os.getenv("RELATION_SHADOW_LEASE_SECONDS", "300"),
+        )),
     )
-    relation_shadow_retry_delay_seconds = max(
-        0, int(os.getenv("RELATION_SHADOW_RETRY_DELAY_SECONDS", "0")),
+    relation_retry_delay_seconds = max(
+        0,
+        int(os.getenv(
+            "RELATION_RETRY_DELAY_SECONDS",
+            os.getenv("RELATION_SHADOW_RETRY_DELAY_SECONDS", "0"),
+        )),
     )
     relation_classifier_gleaning_window = max(
         1, min(3, int(os.getenv("RELATION_CLASSIFIER_GLEANING_WINDOW", "2"))),

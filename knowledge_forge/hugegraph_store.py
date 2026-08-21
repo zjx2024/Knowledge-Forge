@@ -176,9 +176,6 @@ class HugeGraphStore:
         digest = hashlib.sha256(str(canonical_key).encode("utf-8")).hexdigest()
         return f"kf:shadow-entity:{namespace_id}:{digest}"
 
-    # Compatibility for callers that still import the historical storage term.
-    shadow_entity_vertex_id = grounded_entity_vertex_id
-
     @staticmethod
     def _stable_int(value: str) -> int:
         return int(hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:7], 16)

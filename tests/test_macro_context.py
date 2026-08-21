@@ -3,8 +3,8 @@ from knowledge_forge.macro_context import (
     build_project_macro_context,
     select_macro_context,
 )
-from knowledge_forge.relation_shadow_v2 import proposer_prompt
-from tests.shadow_v2_fixtures import logical_schema, predicate_policy
+from knowledge_forge.relation_extraction import proposer_prompt
+from tests.grounded_relation_fixtures import logical_schema, predicate_policy
 
 
 def _inputs():

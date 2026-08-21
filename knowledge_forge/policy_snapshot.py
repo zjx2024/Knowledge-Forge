@@ -19,7 +19,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from .database import Database
-from .policy import P1_RELATION_SHADOW_POLICY_SET, P2_ENTITY_SHADOW_POLICY_SET, normalize_policy_set
+from .policy import RELATION_CANDIDATE_POLICY_SET, GROUNDED_ENTITY_POLICY_SET, normalize_policy_set
 
 
 class SnapshotManifestError(ValueError):
@@ -349,8 +349,8 @@ def _cli() -> int:
         if not project:
             raise SystemExit("project not found")
         policy = (
-            P2_ENTITY_SHADOW_POLICY_SET
-            if args.mode == "end_to_end" else P1_RELATION_SHADOW_POLICY_SET
+            GROUNDED_ENTITY_POLICY_SET
+            if args.mode == "end_to_end" else RELATION_CANDIDATE_POLICY_SET
         )
         manifest = build_snapshot_manifest(
             project=project,
@@ -374,7 +374,7 @@ def _cli() -> int:
         result = orchestrator.cancel(args.snapshot_id)
     else:
         # Resume is intentionally explicit about the processor.  The service
-        # callback performs only shadow writes and is imported lazily.
+        # callback performs only isolated snapshot writes and is imported lazily.
         from .service import KnowledgeForgeService
 
         service = KnowledgeForgeService()

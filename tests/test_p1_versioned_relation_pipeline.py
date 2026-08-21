@@ -7,13 +7,13 @@ import pytest
 from knowledge_forge.database import Database, SCHEMA_SQL
 from knowledge_forge.config import Config
 from knowledge_forge.graph_policy import graph_policy_hash
-from knowledge_forge.policy import CONTROL_POLICY_SET, P1_RELATION_SHADOW_POLICY_SET
+from knowledge_forge.policy import CONTROL_POLICY_SET, RELATION_CANDIDATE_POLICY_SET
 from knowledge_forge.relation_pipeline import (
     NO_RELATION,
     RelationCandidate,
     RelationPlan,
     RelationBatchValidationError,
-    VersionedRelationPipeline,
+    RelationCandidatePipeline,
 )
 from knowledge_forge.schema_evolution import BASE_SCHEMA
 
@@ -56,7 +56,7 @@ def test_graph_policy_hash_covers_all_six_policy_axes():
 
 
 def test_stage_one_mentions_produce_stable_blocked_candidates_and_counts():
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     first = pipeline.plan(
         project_scope="project-1", chunk_key="chunk-1",
         content="Alpha uses Beta.", entities=_entities(), logical_schema=_schema(),
@@ -83,7 +83,7 @@ def test_stage_one_mentions_produce_stable_blocked_candidates_and_counts():
 
 
 def test_base_schema_wildcard_matches_multiple_concrete_entity_types() -> None:
-    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+    plan = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET).plan(
         project_scope="project-1",
         chunk_key="wildcard",
         content="Alpha uses Beta.",
@@ -105,7 +105,7 @@ def test_relation_planner_rejects_pairs_already_resolved_to_same_entity() -> Non
         {**_entities()[1], "canonical_id": "canonical-shared"},
     ]
 
-    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+    plan = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET).plan(
         project_scope="project-1",
         chunk_key="same-canonical",
         content="Alpha uses Beta.",
@@ -141,7 +141,7 @@ def test_dense_entity_list_without_relation_cue_does_not_create_cartesian_candid
             "evidence": content,
         })
 
-    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+    plan = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET).plan(
         project_scope="project-1",
         chunk_key="dense-list",
         content=content,
@@ -185,7 +185,7 @@ def test_relation_cue_outside_endpoint_span_does_not_qualify_list_pairs() -> Non
             "evidence": content,
         })
 
-    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+    plan = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET).plan(
         project_scope="project-1",
         chunk_key="misleading-context-cue",
         content=content,
@@ -223,7 +223,7 @@ def test_dense_sentence_with_explicit_relation_cue_remains_eligible() -> None:
             "evidence": content,
         })
 
-    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+    plan = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET).plan(
         project_scope="project-1",
         chunk_key="dense-cue",
         content=content,
@@ -243,7 +243,7 @@ def test_dense_sentence_with_explicit_relation_cue_remains_eligible() -> None:
 
 
 def test_relation_batches_do_not_mix_different_predicate_contracts() -> None:
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     content = "Alpha uses Beta in Paris."
     common = {
         "source_mention_id": "m1",
@@ -279,7 +279,7 @@ def test_relation_batches_do_not_mix_different_predicate_contracts() -> None:
         ),
     ]
     plan = RelationPlan(
-        policy_set=dict(P1_RELATION_SHADOW_POLICY_SET),
+        policy_set=dict(RELATION_CANDIDATE_POLICY_SET),
         raw_pairs=2,
         blocked_pairs=0,
         candidates=candidates,
@@ -308,7 +308,7 @@ def test_relation_batches_do_not_mix_different_predicate_contracts() -> None:
 
 
 def test_relation_batches_do_not_mix_different_evidence_contexts() -> None:
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     content = "Alpha uses Beta. Gamma uses Delta."
     common = {
         "allowed_predicates": ("related_to", "uses"),
@@ -357,7 +357,7 @@ def test_relation_batches_do_not_mix_different_evidence_contexts() -> None:
         ),
     ]
     plan = RelationPlan(
-        policy_set=dict(P1_RELATION_SHADOW_POLICY_SET),
+        policy_set=dict(RELATION_CANDIDATE_POLICY_SET),
         raw_pairs=2,
         blocked_pairs=0,
         candidates=candidates,
@@ -414,7 +414,7 @@ def test_relation_planner_checks_only_sentence_local_pairs_without_changing_deno
         return original(actual, expected)
 
     monkeypatch.setattr(relation_pipeline, "_type_allowed", counted)
-    plan = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET).plan(
+    plan = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET).plan(
         project_scope="project-1", chunk_key="chunk-dense", content=content,
         entities=entities,
         logical_schema={"relation_types": [{
@@ -430,7 +430,7 @@ def test_relation_planner_checks_only_sentence_local_pairs_without_changing_deno
 
 
 def test_compact_batches_repeat_context_once_and_defer_without_truncation():
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     plan = pipeline.plan(
         project_scope="project-1", chunk_key="chunk-1",
         content="Alpha uses Beta.", entities=_entities(), logical_schema=_schema(),
@@ -459,7 +459,7 @@ def test_compact_batches_repeat_context_once_and_defer_without_truncation():
 
 
 def test_classifier_requires_one_explicit_decision_per_admitted_candidate():
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     plan = pipeline.plan(
         project_scope="project-1", chunk_key="chunk-1",
         content="Alpha uses Beta.", entities=_entities(), logical_schema=_schema(),
@@ -489,7 +489,7 @@ def test_classifier_requires_one_explicit_decision_per_admitted_candidate():
 
 
 def test_candidate_direction_constraints_cover_inverse_and_symmetric_relations():
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     direct = pipeline.plan(
         project_scope="p", chunk_key="c", content="Alpha uses Beta.",
         entities=_entities(), logical_schema=_schema(),
@@ -531,7 +531,7 @@ def test_candidate_direction_constraints_cover_inverse_and_symmetric_relations()
 
 
 def test_coverage_gleaning_expands_only_uncovered_cue_windows_once():
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     content = "Alpha is present. The system depends on context. Beta is present."
     entities = [
         {**_entities()[0], "mention_start": 0, "mention_end": 5, "evidence": content},
@@ -540,7 +540,7 @@ def test_coverage_gleaning_expands_only_uncovered_cue_windows_once():
             "mention_end": content.index("Beta") + 4, "evidence": content,
         },
     ]
-    result = pipeline.classify_shadow(
+    result = pipeline.classify_relation_batch(
         classifier=_Classifier(), model="fixture", context_budget_tokens=4096,
         project_scope="p", chunk_key="c", content=content,
         entities=entities, logical_schema=_schema(),
@@ -549,7 +549,7 @@ def test_coverage_gleaning_expands_only_uncovered_cue_windows_once():
     assert result.metrics["raw_pairs"] == 2
 
 
-def test_shadow_schema_is_additive_and_shadow_write_never_updates_product_projection():
+def test_grounded_schema_is_additive_and_shadow_write_never_updates_product_projection():
     assert "CREATE TABLE IF NOT EXISTS policy_snapshots" in SCHEMA_SQL
     assert "CREATE TABLE IF NOT EXISTS policy_snapshot_documents" in SCHEMA_SQL
     assert "CREATE TABLE IF NOT EXISTS relation_shadow_runs" in SCHEMA_SQL
@@ -577,10 +577,10 @@ def test_shadow_schema_is_additive_and_shadow_write_never_updates_product_projec
         yield connection
 
     database.connection = connect
-    database.start_relation_shadow_run({
+    database.start_relation_pipeline_run({
         "id": "shadow-1", "project_id": 3, "document_id": 5, "chunk_id": 9,
         "control_policy_hash": "control", "treatment_policy_hash": "treatment",
-        "policy_set": P1_RELATION_SHADOW_POLICY_SET,
+        "policy_set": RELATION_CANDIDATE_POLICY_SET,
     })
     statements = "\n".join(statement for statement, _ in connection.calls)
     assert "INSERT INTO relation_shadow_runs" in statements
@@ -607,11 +607,10 @@ class _Classifier:
         return {"decisions": decisions}
 
 
-def test_shadow_classifier_is_bounded_and_missing_decision_fails_closed():
-    assert Config.relation_shadow_enabled is False
-    pipeline = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+def test_relation_classifier_is_bounded_and_missing_decision_fails_closed():
+    pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
     classifier = _Classifier()
-    result = pipeline.classify_shadow(
+    result = pipeline.classify_relation_batch(
         classifier=classifier, model="fixture", context_budget_tokens=4096,
         project_scope="project-1", chunk_key="chunk-1", content="Alpha uses Beta.",
         entities=_entities(), logical_schema=_schema(),
@@ -622,7 +621,7 @@ def test_shadow_classifier_is_bounded_and_missing_decision_fails_closed():
     assert classifier.calls[0]["context_budget_tokens"] == 4096
     assert classifier.calls[0]["max_output_tokens"] < 4096
 
-    failed = pipeline.classify_shadow(
+    failed = pipeline.classify_relation_batch(
         classifier=_Classifier(omit=True), model="fixture", context_budget_tokens=4096,
         project_scope="project-1", chunk_key="chunk-1", content="Alpha uses Beta.",
         entities=_entities(), logical_schema=_schema(),

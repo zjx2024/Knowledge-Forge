@@ -5,16 +5,14 @@ compatibility.  This facade prevents those storage names from becoming the
 application's product vocabulary.
 """
 
-from .relation_shadow_runtime import (
+from .relation_runtime import (
     LOADED_RELATION_CODE_DIGEST,
-    SHADOW_RELATION_V2_POLICY_SET,
-    ShadowRelationV2Runtime,
+    GROUNDED_RELATION_POLICY_SET,
+    GroundedRelationRuntime,
     relation_runtime_treatment_digest,
 )
 
 
-GROUNDED_RELATION_POLICY_SET = SHADOW_RELATION_V2_POLICY_SET
-GroundedRelationRuntime = ShadowRelationV2Runtime
 grounded_relation_treatment_digest = relation_runtime_treatment_digest
 
 __all__ = [

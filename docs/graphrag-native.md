@@ -1,8 +1,12 @@
-# GraphRAG Native 第三策略
+# GraphRAG Native 策略
 
-`graphrag_native` 是与 Stable、增强 Shadow 平行的项目级构建策略。它从当前 active document revision 的已持久化结构块生成 GraphRAG 3.1.1 `standard` 输入，所有算法事实保留在 run-local Parquet、GraphML 与 LanceDB 中。
+`graphrag_native` 是 Knowledge Forge 产品当前两种项目级构建策略之一。它从当前
+active document revision 的已持久化结构块生成 GraphRAG 3.1.1 `standard` 输入，
+所有算法事实保留在 run-local Parquet、GraphML 与 LanceDB 中。
 
-它不会调用或写入 Stable/增强的实体、关系、别名、pgvector 或 HugeGraph。native 的 `READY` 只代表 native 的内部 active-run 指针可查询；不会改变项目的默认构建策略、不会自动发布，也不会激活 HugeGraph 投影。
+它不会调用或写入 Knowledge Forge 策略的实体、关系、别名、pgvector 或 HugeGraph。
+native 的 `READY` 只代表 native 的内部 active-run 指针可查询；不会改变项目绑定的
+构建策略、不会自动选择该策略，也不会激活 HugeGraph 投影。
 
 ## 运行与状态
 
@@ -11,7 +15,8 @@
 3. executor 在新的 staging 目录运行 `graphrag init`、配置/连通性 dry-run 与标准 index。
 4. 独立 bundle validator 验证 Parquet、原生关系端点、社区/报告闭包、LanceDB、日志、hash 与凭据扫描后，才可能把 native run 标为 `READY`。
 
-文档上传、删除或任何新的 active revision 都会让 native snapshot 变为 stale。旧 bundle 即使仍存在，也不能回答当前文档状态；新构建失败也不会回退到旧策略。
+文档上传、删除或任何新的 active revision 都会让 native snapshot 变为 stale。旧 bundle
+即使仍存在，也不能回答当前文档状态；新构建失败也不会回退到 Knowledge Forge 策略。
 
 `EMPTY_INPUT`、`NO_GRAPH_UNSUPPORTED`、`FAILED`、`CANCELLED`、`STALE` 与 `SUPERSEDED` 都不可查询。非空输入但没有原生语义关系的 GraphRAG Standard 结果会进入 `NO_GRAPH_UNSUPPORTED`，而不是伪造空图为成功。
 

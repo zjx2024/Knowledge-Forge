@@ -24,9 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from knowledge_forge.config import Config
 from knowledge_forge.ollama import OllamaClient
-from knowledge_forge.policy import ENTITY_SHADOW_POLICY_SET
+from knowledge_forge.policy import ENTITY_EXTRACTION_POLICY_SET
 from knowledge_forge.schema_evolution import BASE_SCHEMA, SchemaEvolutionService
-from knowledge_forge.shadow_context import structural_spans_for_chunk
+from knowledge_forge.evidence_context import structural_spans_for_chunk
 from knowledge_forge.span_entities import (
     SpanFirstEntityExtractor,
     policy_relation_endpoint_candidates,
@@ -280,7 +280,7 @@ def _evaluate_document(
         *structured_section_label_endpoint_candidates(content, structural_spans),
     ]
     normalized = SpanFirstEntityExtractor(
-        ENTITY_SHADOW_POLICY_SET["entity_extraction_policy_version"]
+        ENTITY_EXTRACTION_POLICY_SET["entity_extraction_policy_version"]
     ).normalize(
         project_scope="mention-calibration",
         document_key=str(document["id"]),

@@ -97,9 +97,12 @@ class GraphRAGNativeExecutor:
         """Bind a run to the exact checked-out candidate, including untracked code."""
 
         repo = Path(__file__).resolve().parents[1]
-        base_sha = self._git_output(repo, "rev-parse", "origin/fix/shadow-relation-quality-v2").strip()
+        # A bundle is bound to the checked-out commit plus its local changes.
+        # Depending on a historical remote feature branch made clean builds
+        # fail after that branch was renamed or deleted.
         head = self._git_output(repo, "rev-parse", "HEAD").strip()
-        diff = self._git_output(repo, "diff", "--binary", base_sha).encode("utf-8")
+        base_sha = head
+        diff = self._git_output(repo, "diff", "--binary", head).encode("utf-8")
         untracked = self._git_output(repo, "ls-files", "--others", "--exclude-standard").splitlines()
         untracked_manifest: list[dict[str, Any]] = []
         for relative in sorted(untracked):
@@ -546,7 +549,7 @@ class GraphRAGNativeExecutor:
         self.service.db.update_job(job_id, status="failed", progress=100, log=message, error=message)
 
     def run(self, *, job_id: str, project_id: int) -> None:
-        """Run a fresh Standard workflow; no Stable/Shadow/HugeGraph fallback exists."""
+        """Run a fresh Standard workflow without KF or HugeGraph fallback."""
 
         run_id = "grn_" + uuid.uuid4().hex
         attempt_id = uuid.uuid4().hex

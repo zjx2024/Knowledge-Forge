@@ -83,7 +83,7 @@ class JobPublicationCommitted(RuntimeError):
     """A cancellation arrived after the task's atomic publication boundary."""
 
 
-SHADOW_RELATION_V2_REQUIRED_MIGRATIONS = (
+GROUNDED_RELATION_V2_REQUIRED_MIGRATIONS = (
     "0014_shadow_relation_v2_ledger",
     "0015_shadow_relation_v2_verification",
     "0016_shadow_relation_v2_normalization",
@@ -134,7 +134,7 @@ GRAPHRAG_NATIVE_REQUIRED_TABLE_COLUMNS = {
     },
 }
 
-SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS = {
+GROUNDED_RELATION_V2_REQUIRED_TABLE_COLUMNS = {
     "shadow_relation_v2_runs": {
         "id", "project_id", "input_fingerprint", "fingerprint_components",
         "source_generation", "status", "pipeline_generation", "audit_quality",
@@ -838,7 +838,7 @@ WHERE d.processing_stage='uploaded' OR d.processing_stage IS NULL;
 """
 
 
-SHADOW_RELATION_SOURCE_MODEL_COMPONENTS = frozenset({
+GROUNDED_RELATION_SOURCE_MODEL_COMPONENTS = frozenset({
     "source_inventory",
     "source_reference",
     "source_binding",
@@ -850,8 +850,8 @@ SHADOW_RELATION_SOURCE_MODEL_COMPONENTS = frozenset({
     "source_projection_group_anchor_audit",
     "atomic_publication_audit",
 })
-SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS = frozenset({
-    *SHADOW_RELATION_SOURCE_MODEL_COMPONENTS,
+GROUNDED_RELATION_REUSABLE_MODEL_COMPONENTS = frozenset({
+    *GROUNDED_RELATION_SOURCE_MODEL_COMPONENTS,
     "proposer",
     "classifier",
 })
@@ -914,18 +914,18 @@ class Database:
             self._migrate_entity_aliases(conn)
             self._seed_settings(conn)
 
-    def assert_shadow_relation_v2_ready(self) -> dict[str, Any]:
+    def assert_grounded_relation_ready(self) -> dict[str, Any]:
         """Fail closed unless every immutable v2 migration and runtime table is present."""
 
         runner = MigrationRunner()
         with self.connection() as conn:
             missing_migrations = [
-                version for version in SHADOW_RELATION_V2_REQUIRED_MIGRATIONS
+                version for version in GROUNDED_RELATION_V2_REQUIRED_MIGRATIONS
                 if not runner.is_applied(conn, version)
             ]
             missing_tables: list[str] = []
             missing_columns: dict[str, list[str]] = {}
-            for table, required_columns in SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS.items():
+            for table, required_columns in GROUNDED_RELATION_V2_REQUIRED_TABLE_COLUMNS.items():
                 relation = conn.execute(
                     "SELECT to_regclass(%s) AS table_name", (table,),
                 ).fetchone()
@@ -955,14 +955,9 @@ class Database:
                     + self._canonical_json(details)
                 )
             return {
-                "migrations": list(SHADOW_RELATION_V2_REQUIRED_MIGRATIONS),
-                "tables": sorted(SHADOW_RELATION_V2_REQUIRED_TABLE_COLUMNS),
+                "migrations": list(GROUNDED_RELATION_V2_REQUIRED_MIGRATIONS),
+                "tables": sorted(GROUNDED_RELATION_V2_REQUIRED_TABLE_COLUMNS),
             }
-
-    def assert_grounded_relation_ready(self) -> dict[str, Any]:
-        """Validate the grounded relation runtime's immutable storage contract."""
-
-        return self.assert_shadow_relation_v2_ready()
 
     def assert_graphrag_native_ready(self) -> dict[str, Any]:
         """Fail closed if the isolated native control-plane migration is incomplete."""
@@ -1939,7 +1934,7 @@ class Database:
                         uuid.NAMESPACE_URL,
                         f"knowledge-forge:{project['graph_namespace_id']}:grounded",
                     )),
-                    self._json({"mode": "grounded", "production_approved": False}),
+                    self._json({"mode": "grounded"}),
                 ),
             )
             conn.execute(
@@ -4463,7 +4458,7 @@ class Database:
                 (chunk_id, revision_id, *policy_params),
             ).fetchall()
 
-    def get_entity_shadow_namespace_for_snapshot(
+    def get_grounded_entity_namespace_for_snapshot(
         self, snapshot_id: str,
     ) -> dict[str, Any] | None:
         with self.connection() as conn:
@@ -5560,7 +5555,7 @@ class Database:
             ).fetchall()
         return {str(row.pop("mention_key")): row for row in rows}
 
-    def start_relation_shadow_run(self, values: dict[str, Any]) -> dict[str, Any]:
+    def start_relation_pipeline_run(self, values: dict[str, Any]) -> dict[str, Any]:
         """Start an isolated treatment run without mutating product projection state."""
 
         policy_set = normalize_policy_set(values["policy_set"])
@@ -5585,12 +5580,12 @@ class Database:
                 "SELECT * FROM relation_shadow_runs WHERE id=%s", (values["id"],),
             ).fetchone()
             if existing and existing.get("input_fingerprint") != values.get("input_fingerprint", ""):
-                raise ValueError("relation shadow run input fingerprint mismatch")
+                raise ValueError("relation pipeline run input fingerprint mismatch")
             if not existing:
-                raise RuntimeError("relation shadow run could not be started")
+                raise RuntimeError("relation pipeline run could not be started")
             return existing
 
-    def prepare_relation_shadow_work(
+    def prepare_relation_pipeline_work(
         self,
         run_id: str,
         work_items: list[dict[str, Any]],
@@ -5605,7 +5600,7 @@ class Database:
                 "SELECT * FROM relation_shadow_runs WHERE id=%s FOR UPDATE", (run_id,),
             ).fetchone()
             if not run:
-                raise LookupError("relation shadow run 不存在")
+                raise LookupError("关系流水线运行不存在")
             for item in values:
                 conn.execute(
                     """INSERT INTO relation_shadow_work_items(
@@ -5631,7 +5626,7 @@ class Database:
                     (run_id, item["batch_id"]),
                 ).fetchone()
                 if not existing or existing["input_fingerprint"] != item["input_fingerprint"]:
-                    raise ValueError("relation shadow work item fingerprint mismatch")
+                    raise ValueError("relation work item fingerprint mismatch")
             count = conn.execute(
                 "SELECT COUNT(*) AS count FROM relation_shadow_work_items WHERE shadow_run_id=%s",
                 (run_id,),
@@ -5647,7 +5642,7 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def lease_relation_shadow_work(
+    def lease_relation_pipeline_work(
         self,
         run_id: str,
         owner: str,
@@ -5687,7 +5682,7 @@ class Database:
             )
             return leased
 
-    def settle_relation_shadow_work(
+    def settle_relation_pipeline_work(
         self,
         work_item_id: str,
         lease_token: str,
@@ -5707,14 +5702,14 @@ class Database:
                 (work_item_id,),
             ).fetchone()
             if not item:
-                raise LookupError("relation shadow work item 不存在")
+                raise LookupError("关系工作项不存在")
             attempt = conn.execute(
                 """SELECT * FROM relation_shadow_attempts
                    WHERE work_item_id=%s AND lease_token=%s FOR UPDATE""",
                 (work_item_id, lease_token),
             ).fetchone()
             if not attempt:
-                raise ValueError("relation shadow attempt lease token 不存在")
+                raise ValueError("关系处理 attempt lease token 不存在")
             attempt_no = int(attempt["attempt_no"])
             attempt_id = str(attempt["id"])
             owns_lease = item["status"] == "leased" and item["lease_token"] == lease_token
@@ -5766,7 +5761,7 @@ class Database:
                 "SELECT * FROM relation_shadow_work_items WHERE id=%s", (work_item_id,),
             ).fetchone()
 
-    def list_relation_shadow_work(self, run_id: str) -> list[dict[str, Any]]:
+    def list_relation_pipeline_work(self, run_id: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
             return conn.execute(
                 """SELECT item.*,attempt.output_json,attempt.output_hash,
@@ -5778,7 +5773,7 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def finish_relation_shadow_run(
+    def finish_relation_pipeline_run(
         self,
         run_id: str,
         *,
@@ -5791,10 +5786,10 @@ class Database:
         """Atomically persist treatment-only decisions and final run counters."""
 
         if status not in {"completed", "failed", "deferred", "terminal_failed", "quarantined"}:
-            raise ValueError(f"非法 shadow 状态: {status}")
+            raise ValueError(f"非法关系运行状态: {status}")
         candidate_map = {str(item["candidate_id"]): item for item in candidates}
         if any(str(item.get("candidate_id") or "") not in candidate_map for item in decisions):
-            raise ValueError("shadow decision 引用了未知 candidate")
+            raise ValueError("关系 decision 引用了未知 candidate")
         with self.connection() as conn:
             for decision in decisions:
                 candidate = candidate_map[str(decision["candidate_id"])]
@@ -5839,9 +5834,9 @@ class Database:
                 (run_id,),
             ).fetchone()
             if status == "completed" and int(work_counts["open"] or 0) > 0:
-                raise ValueError("relation shadow 仍有未完成 work item，不能标记 completed")
+                raise ValueError("关系流水线仍有未完成 work item，不能标记 completed")
             if status == "completed" and int(work_counts["failed"] or 0) > 0:
-                raise ValueError("relation shadow 存在 failed work item，不能标记 completed")
+                raise ValueError("关系流水线存在 failed work item，不能标记 completed")
             terminal_hashes = [
                 row["accepted_output_hash"] or f"{row['status']}:{row['id']}"
                 for row in conn.execute(
@@ -5870,16 +5865,16 @@ class Database:
                 ),
             ).fetchone()
             if not row:
-                raise LookupError("shadow run 不存在")
+                raise LookupError("关系运行不存在")
             return row
 
     @staticmethod
-    def _shadow_relation_v2_db_id(prefix: str, *parts: object) -> str:
+    def _grounded_relation_db_id(prefix: str, *parts: object) -> str:
         material = "\x1f".join(str(part) for part in parts)
         return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _set_shadow_relation_v2_session(
+    def _set_grounded_relation_session(
         conn: psycopg.Connection,
         run_id: str,
     ) -> None:
@@ -5890,7 +5885,7 @@ class Database:
             (run_id,),
         )
 
-    def start_shadow_relation_v2_run(
+    def start_grounded_relation_run(
         self,
         values: dict[str, Any],
     ) -> dict[str, Any]:
@@ -5900,11 +5895,11 @@ class Database:
         fingerprint = str(values.get("input_fingerprint") or "")
         components = dict(values.get("fingerprint_components") or {})
         if not run_id or not fingerprint or not components:
-            raise ValueError("Shadow relation v2 run requires id and complete fingerprint")
+            raise ValueError("Relation run requires an id and complete fingerprint")
         project_id = int(values["project_id"])
         source_generation = int(values.get("source_generation") or 0)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             conn.execute(
                 """INSERT INTO shadow_relation_v2_runs(
                    id,project_id,snapshot_id,input_fingerprint,fingerprint_components,
@@ -5925,16 +5920,16 @@ class Database:
                 (run_id,),
             ).fetchone()
             if not row:
-                raise RuntimeError("Shadow relation v2 run could not be created")
+                raise RuntimeError("Relation run could not be created")
             if (
                 int(row["project_id"]) != project_id
                 or str(row["input_fingerprint"]) != fingerprint
                 or int(row["source_generation"]) != source_generation
                 or dict(row.get("fingerprint_components") or {}) != components
             ):
-                raise ValueError("Shadow relation v2 run immutable input mismatch")
+                raise ValueError("Relation run immutable input mismatch")
             if str(row.get("status") or "") in {"failed", "cancelled", "stale"}:
-                self._reset_shadow_relation_v2_run_attempt(conn, run_id)
+                self._reset_grounded_relation_run_attempt(conn, run_id)
                 row = conn.execute(
                     """UPDATE shadow_relation_v2_runs
                        SET status='planning',metrics='{}'::jsonb,error_message='',
@@ -5944,27 +5939,27 @@ class Database:
                 ).fetchone()
             return row
 
-    def persist_shadow_relation_v2_source_contexts(
+    def persist_grounded_relation_source_contexts(
         self,
         run_id: str,
         contexts: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Persist Shadow v2 SourceUnit/ProposalWindow context audit rows.
+        """Persist relation SourceUnit/ProposalWindow context audit rows.
 
-        This is an Enhanced/Shadow-only ledger.  It records the rendered
+        This is an isolated relation ledger. It records the rendered
         relation context and source-map rows used by the v2 runtime; it never
         mutates product chunks, stable entities or formal graph state.
         """
 
         values = list(contexts)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             run = conn.execute(
                 "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
                 (run_id,),
             ).fetchone()
             if not run:
-                raise LookupError("Shadow relation v2 run does not exist")
+                raise LookupError("Relation run does not exist")
             persisted: list[dict[str, Any]] = []
             for item in values:
                 context_identity = str(item.get("context_identity") or "")
@@ -5973,7 +5968,7 @@ class Database:
                 project_id = int(item.get("project_id") or run["project_id"])
                 if project_id != int(run["project_id"]):
                     raise ValueError("Shadow source context project mismatch")
-                context_id = self._shadow_relation_v2_db_id(
+                context_id = self._grounded_relation_db_id(
                     "srcctx_", run_id, context_identity,
                 )
                 payload = dict(item.get("payload") or {})
@@ -6037,7 +6032,7 @@ class Database:
                     payload_hash = hashlib.sha256(
                         payload_json.encode("utf-8")
                     ).hexdigest()
-                    source_map_id = self._shadow_relation_v2_db_id(
+                    source_map_id = self._grounded_relation_db_id(
                         "srcmap_",
                         run_id,
                         context_identity,
@@ -6075,8 +6070,8 @@ class Database:
                 })
             return persisted
 
-    def _reset_shadow_relation_v2_run_attempt(self, conn: Any, run_id: str) -> None:
-        """Discard one failed/incomplete Shadow v2 attempt before same-input retry.
+    def _reset_grounded_relation_run_attempt(self, conn: Any, run_id: str) -> None:
+        """Discard one failed relation attempt before a same-input retry.
 
         The run id is deterministic over the immutable input fingerprint.  A
         crashed or failed worker can therefore be retried with exactly the same
@@ -6170,7 +6165,7 @@ class Database:
         for sql, params in delete_statements:
             conn.execute(sql, params)
 
-    def persist_shadow_relation_v2_opportunities(
+    def persist_grounded_relation_opportunities(
         self,
         run_id: str,
         opportunities: Any,
@@ -6195,13 +6190,13 @@ class Database:
 
         values = list(opportunities)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             run = conn.execute(
                 "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
                 (run_id,),
             ).fetchone()
             if not run:
-                raise LookupError("Shadow relation v2 run does not exist")
+                raise LookupError("Relation run does not exist")
             source_context_identities = sorted({
                 str(item.provenance.get("source_context_id") or "")
                 for item in values
@@ -6332,7 +6327,7 @@ class Database:
                     sorted(set(candidate_sources)), start=1,
                 ):
                     candidate_source_rows.append({
-                        "id": self._shadow_relation_v2_db_id(
+                        "id": self._grounded_relation_db_id(
                             "relcandsrc_",
                             run_id,
                             item.opportunity_identity,
@@ -6480,7 +6475,7 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def record_shadow_relation_v2_proposal_attempt(
+    def record_grounded_relation_proposal_attempt(
         self,
         run_id: str,
         values: dict[str, Any],
@@ -6493,7 +6488,7 @@ class Database:
         if not context_identity or attempt_no <= 0 or not status:
             raise ValueError("proposal attempt requires context, attempt and status")
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             context = conn.execute(
                 """SELECT * FROM shadow_source_contexts
                    WHERE run_id=%s AND context_identity=%s""",
@@ -6503,7 +6498,7 @@ class Database:
                 raise LookupError("proposal attempt context does not exist")
             model_call_id = str(
                 values.get("model_call_id")
-                or self._shadow_relation_v2_db_id(
+                or self._grounded_relation_db_id(
                     "modelcall_", run_id, "proposer", context["id"], attempt_no,
                 )
             )
@@ -6540,7 +6535,7 @@ class Database:
                     str(values.get("error_message") or ""),
                 ),
             )
-            attempt_id = self._shadow_relation_v2_db_id(
+            attempt_id = self._grounded_relation_db_id(
                 "relpropattdb_",
                 run_id,
                 context["id"],
@@ -6582,7 +6577,7 @@ class Database:
                 (attempt_id,),
             ).fetchone()
 
-    def record_shadow_relation_v2_classification_attempts(
+    def record_grounded_relation_classification_attempts(
         self,
         run_id: str,
         attempts: Any,
@@ -6630,7 +6625,7 @@ class Database:
         if not values:
             return []
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             pair_identities = sorted({pair_identity for pair_identity, _ in values})
             pair_rows = conn.execute(
                 """SELECT * FROM shadow_relation_pair_opportunities
@@ -6650,12 +6645,12 @@ class Database:
                 pair = pairs_by_identity[pair_identity]
                 attempt_no = int(payload["attempt_no"])
                 status = str(payload["status"])
-                attempt_id = self._shadow_relation_v2_db_id(
+                attempt_id = self._grounded_relation_db_id(
                     "relclassdb_", pair["id"], attempt_no,
                 )
                 model_call_id = str(
                     payload.get("model_call_id")
-                    or self._shadow_relation_v2_db_id(
+                    or self._grounded_relation_db_id(
                         "modelcall_", run_id, "classifier", pair["id"],
                         attempt_no,
                     )
@@ -6848,18 +6843,18 @@ class Database:
                     raise ValueError("classification attempt immutable payload mismatch")
             return [persisted_by_id[attempt_id] for attempt_id in output_ids]
 
-    def record_shadow_relation_v2_classification_attempt(
+    def record_grounded_relation_classification_attempt(
         self,
         run_id: str,
         pair_identity: str,
         values: dict[str, Any],
     ) -> dict[str, Any]:
         """Append one classifier attempt without overwriting an earlier attempt."""
-        return self.record_shadow_relation_v2_classification_attempts(
+        return self.record_grounded_relation_classification_attempts(
             run_id, [(pair_identity, values)],
         )[0]
 
-    def record_shadow_relation_v2_source_model_call(
+    def record_grounded_relation_source_model_call(
         self,
         run_id: str,
         values: dict[str, Any],
@@ -6867,7 +6862,7 @@ class Database:
         """Persist one context/batch-level relation model call."""
 
         component = str(values.get("component") or "")
-        if component not in SHADOW_RELATION_SOURCE_MODEL_COMPONENTS:
+        if component not in GROUNDED_RELATION_SOURCE_MODEL_COMPONENTS:
             raise ValueError("invalid source model-call component")
         attempt_no = int(values.get("attempt_no") or 1)
         if attempt_no <= 0:
@@ -6877,7 +6872,7 @@ class Database:
         if not request_hash or not idempotency_key:
             raise ValueError("source model call requires request hash and idempotency key")
         model_call_id = str(
-            values.get("id") or self._shadow_relation_v2_db_id(
+            values.get("id") or self._grounded_relation_db_id(
                 "modelcall_", run_id, component, idempotency_key, attempt_no,
             )
         )
@@ -6923,7 +6918,7 @@ class Database:
                 raise ValueError("source model-call immutable payload mismatch")
             return row
 
-    def find_reusable_shadow_model_call(
+    def find_reusable_relation_model_call(
         self,
         *,
         run_id: str,
@@ -6950,7 +6945,7 @@ class Database:
         """
 
         component_value = str(component or "")
-        if component_value not in SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS:
+        if component_value not in GROUNDED_RELATION_REUSABLE_MODEL_COMPONENTS:
             raise ValueError("invalid reusable model-call component")
         if not all((
             str(run_id or ""), str(model_digest or ""),
@@ -6987,7 +6982,7 @@ class Database:
                 ),
             ).fetchone()
 
-    def persist_shadow_relation_v2_classifications(
+    def persist_grounded_relation_classifications(
         self,
         run_id: str,
         decisions: Any,
@@ -7010,7 +7005,7 @@ class Database:
                 raise ValueError("classification batch repeats pair identity")
             pair_identity_set.add(pair_identity)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             pairs_by_identity: dict[str, dict[str, Any]] = {}
             attempt_outcomes: dict[str, dict[str, bool]] = {}
             if pair_identity_set:
@@ -7101,7 +7096,7 @@ class Database:
                 for hypothesis in decision.hypotheses:
                     if hypothesis.pair_identity != decision.pair_identity:
                         raise ValueError("hypothesis belongs to another pair")
-                    database_id = self._shadow_relation_v2_db_id(
+                    database_id = self._grounded_relation_db_id(
                         "relhypdb_", run_id, hypothesis.hypothesis_id,
                     )
                     spans = [
@@ -7222,7 +7217,7 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def persist_shadow_relation_v2_validations(
+    def persist_grounded_relation_validations(
         self,
         run_id: str,
         validations: Any,
@@ -7231,7 +7226,7 @@ class Database:
 
         values = list(validations)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             if not values:
                 return []
             hypothesis_ids = [
@@ -7313,18 +7308,18 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def persist_shadow_relation_v2_proposed_hypotheses(
+    def persist_grounded_relation_proposed_hypotheses(
         self,
         run_id: str,
         hypotheses: Any,
         *,
         candidate_source: str,
     ) -> list[dict[str, Any]]:
-        """Persist non-classifier candidate hypotheses into the same Shadow ledger."""
+        """Persist non-classifier candidate hypotheses in the relation ledger."""
 
         values = list(hypotheses)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             for hypothesis in values:
                 pair = conn.execute(
                     """SELECT * FROM shadow_relation_pair_opportunities
@@ -7333,7 +7328,7 @@ class Database:
                 ).fetchone()
                 if not pair:
                     raise LookupError("proposed hypothesis pair does not exist")
-                database_id = self._shadow_relation_v2_db_id(
+                database_id = self._grounded_relation_db_id(
                     "relhypdb_", run_id, hypothesis.hypothesis_id,
                 )
                 spans = [
@@ -7421,7 +7416,7 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def persist_shadow_relation_v2_verification_attempts(
+    def persist_grounded_relation_verification_attempts(
         self,
         run_id: str,
         attempts: Any,
@@ -7432,7 +7427,7 @@ class Database:
 
         values = list(attempts)
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             for attempt in values:
                 hypothesis = conn.execute(
                     """SELECT hypothesis.* FROM shadow_relation_hypotheses hypothesis
@@ -7452,7 +7447,7 @@ class Database:
                     raise ValueError("verification requires deterministic validation")
                 if attempt.independent_call and validation["status"] != "PASS":
                     raise ValueError("independent verifier cannot bypass failed rules")
-                database_id = self._shadow_relation_v2_db_id(
+                database_id = self._grounded_relation_db_id(
                     "relverifydb_", run_id, attempt.attempt_id,
                 )
                 canonical_attempt = {
@@ -7512,7 +7507,7 @@ class Database:
                 response_hash = hashlib.sha256(
                     raw_response_text.encode("utf-8")
                 ).hexdigest()
-                model_call_id = self._shadow_relation_v2_db_id(
+                model_call_id = self._grounded_relation_db_id(
                     "modelcall_",
                     run_id,
                     "verifier",
@@ -7563,7 +7558,7 @@ class Database:
                         raw_response_text,
                         self._canonical_json(parsed_response),
                         self._canonical_json(token_usage),
-                        "ShadowClassificationError"
+                        "RelationClassificationError"
                         if attempt.verdict == "RETRYABLE_FAILED" else "",
                         str(attempt.error_message or ""),
                         bool(attempt.independent_call),
@@ -7635,7 +7630,7 @@ class Database:
                 (run_id,),
             ).fetchall()
 
-    def persist_shadow_relation_v2_normalization(
+    def persist_grounded_relation_normalization(
         self,
         run_id: str,
         result: Any,
@@ -7643,19 +7638,19 @@ class Database:
         input_fingerprint: str,
         materialization_decisions: Any = (),
     ) -> dict[str, int]:
-        """Persist normalized Shadow facts and provenance, never product assertions."""
+        """Persist normalized relation facts and provenance, not product assertions."""
 
         decisions = {
             str(item.fact_id): item for item in materialization_decisions
         }
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             run = conn.execute(
                 "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
                 (run_id,),
             ).fetchone()
             if not run:
-                raise LookupError("Shadow relation v2 run does not exist")
+                raise LookupError("Relation run does not exist")
             if str(run["input_fingerprint"]) != str(input_fingerprint):
                 raise ValueError("normalization fingerprint does not match run")
             for fact in result.facts:
@@ -7738,7 +7733,7 @@ class Database:
                 ).fetchone()
                 if not hypothesis:
                     raise LookupError("fact evidence hypothesis does not exist")
-                verification_id = self._shadow_relation_v2_db_id(
+                verification_id = self._grounded_relation_db_id(
                     "relverifydb_", run_id, evidence.verification_attempt_id,
                 )
                 verification = conn.execute(
@@ -7781,7 +7776,7 @@ class Database:
                     ).fetchone()
                 if not source_context:
                     raise ValueError("fact evidence lacks frozen source context")
-                evidence_id = self._shadow_relation_v2_db_id(
+                evidence_id = self._grounded_relation_db_id(
                     "relevidencedb_", run_id, evidence.evidence_id,
                 )
                 conn.execute(
@@ -7823,7 +7818,7 @@ class Database:
                 ).fetchone()
                 if not hypothesis:
                     raise LookupError("collapse audit hypothesis does not exist")
-                audit_id = self._shadow_relation_v2_db_id(
+                audit_id = self._grounded_relation_db_id(
                     "relcollapsedb_",
                     run_id,
                     collapse["fact_id"],
@@ -7851,7 +7846,7 @@ class Database:
                        VALUES(%s,%s,%s,%s,%s,%s::jsonb)
                        ON CONFLICT(id) DO NOTHING""",
                     (
-                        self._shadow_relation_v2_db_id(
+                        self._grounded_relation_db_id(
                             "relconflictdb_", run_id, conflict.conflict_id,
                         ),
                         run_id,
@@ -7874,7 +7869,7 @@ class Database:
                 "collapsed": len(result.collapse_audit),
             }
 
-    def finish_shadow_relation_v2_run(
+    def finish_grounded_relation_run(
         self,
         run_id: str,
         *,
@@ -7886,15 +7881,15 @@ class Database:
         """Close the isolated run only after its pair and verifier ledgers settle."""
 
         if status not in {"ready", "stale", "failed", "cancelled"}:
-            raise ValueError("invalid Shadow relation v2 terminal status")
+            raise ValueError("invalid relation run terminal status")
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, run_id)
+            self._set_grounded_relation_session(conn, run_id)
             run = conn.execute(
                 "SELECT * FROM shadow_relation_v2_runs WHERE id=%s FOR UPDATE",
                 (run_id,),
             ).fetchone()
             if not run:
-                raise LookupError("Shadow relation v2 run does not exist")
+                raise LookupError("Relation run does not exist")
             if str(run["input_fingerprint"]) != str(input_fingerprint):
                 raise ValueError("completion fingerprint does not match run")
             if status == "ready":
@@ -7934,7 +7929,7 @@ class Database:
                 ).fetchone()["count"])
                 if pending_pairs or incomplete_hypotheses or unsupported_eligible:
                     raise ValueError(
-                        "Shadow relation v2 run is incomplete and cannot become ready"
+                        "Relation run is incomplete and cannot become ready"
                     )
             merged_metrics = {
                 **dict(run.get("metrics") or {}),
@@ -9511,7 +9506,7 @@ class Database:
                 "affected_entity_ids": affected_entity_ids,
             }
 
-    def create_entity_shadow_namespace(
+    def create_grounded_entity_namespace(
         self,
         project_id: int,
         namespace_id: str,
@@ -9536,7 +9531,7 @@ class Database:
                     and existing.get("input_fingerprint")
                     and existing["input_fingerprint"] != input_fingerprint
                 ):
-                    raise RuntimeError("entity shadow namespace 输入指纹冲突")
+                    raise RuntimeError("实体快照 namespace 输入指纹冲突")
                 return existing
             return conn.execute(
                 """INSERT INTO entity_shadow_namespaces(
@@ -9551,13 +9546,13 @@ class Database:
                 ),
             ).fetchone()
 
-    def get_entity_shadow_namespace(self, namespace_id: str) -> dict[str, Any] | None:
+    def get_grounded_entity_namespace(self, namespace_id: str) -> dict[str, Any] | None:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT * FROM entity_shadow_namespaces WHERE id=%s", (namespace_id,),
             ).fetchone()
 
-    def seed_entity_shadow_work_items(
+    def seed_grounded_entity_work_items(
         self,
         namespace_id: str,
         items: list[dict[str, Any]],
@@ -9589,7 +9584,7 @@ class Database:
             )
             return count
 
-    def requeue_terminal_entity_shadow_work(self, namespace_id: str) -> int:
+    def requeue_terminal_grounded_entity_work(self, namespace_id: str) -> int:
         """Requeue a failed snapshot when a new build explicitly retries it."""
 
         with self.connection() as conn:
@@ -9602,7 +9597,7 @@ class Database:
             if not rows:
                 return 0
             for row in rows:
-                self._clear_entity_shadow_chunk_artifacts(
+                self._clear_grounded_entity_chunk_artifacts(
                     conn, namespace_id, int(row["chunk_id"]),
                 )
             reset = conn.execute(
@@ -9632,7 +9627,7 @@ class Database:
             )
             return len(reset)
 
-    def claim_entity_shadow_work(
+    def claim_grounded_entity_work(
         self,
         namespace_id: str,
         worker_id: str,
@@ -9661,7 +9656,7 @@ class Database:
                 (namespace_id, worker_id, lease_token, max(30, int(lease_seconds))),
             ).fetchone()
 
-    def entity_shadow_work_summary(self, namespace_id: str) -> dict[str, Any]:
+    def grounded_entity_work_summary(self, namespace_id: str) -> dict[str, Any]:
         """Return durable progress and the first terminal error for one snapshot."""
 
         with self.connection() as conn:
@@ -9675,7 +9670,7 @@ class Database:
                 (namespace_id,),
             ).fetchone()
 
-    def complete_entity_shadow_work(
+    def complete_grounded_entity_work(
         self,
         work_id: str,
         lease_token: str,
@@ -9692,7 +9687,7 @@ class Database:
             ).fetchone()
             return bool(row)
 
-    def fail_entity_shadow_work(
+    def fail_grounded_entity_work(
         self,
         work_id: str,
         lease_token: str,
@@ -9710,12 +9705,12 @@ class Database:
                 (error[:4000], work_id, lease_token),
             ).fetchone()
             if row:
-                self._clear_entity_shadow_chunk_artifacts(
+                self._clear_grounded_entity_chunk_artifacts(
                     conn, str(row["namespace_id"]), int(row["chunk_id"]),
                 )
             return str((row or {}).get("status") or "stale")
 
-    def reset_entity_shadow_chunk_attempt(
+    def reset_grounded_entity_chunk_attempt(
         self,
         namespace_id: str,
         chunk_id: int,
@@ -9723,11 +9718,11 @@ class Database:
         """Remove partial artifacts before a leased chunk attempt is retried."""
 
         with self.connection() as conn:
-            return self._clear_entity_shadow_chunk_artifacts(
+            return self._clear_grounded_entity_chunk_artifacts(
                 conn, namespace_id, chunk_id,
             )
 
-    def _clear_entity_shadow_chunk_artifacts(
+    def _clear_grounded_entity_chunk_artifacts(
         self,
         conn: Any,
         namespace_id: str,
@@ -9877,7 +9872,7 @@ class Database:
             "canonicals": removed_canonicals,
         }
 
-    def persist_entity_shadow_extraction(
+    def persist_grounded_entity_extraction(
         self,
         namespace_id: str,
         *,
@@ -10027,7 +10022,7 @@ class Database:
             ).fetchone()
             return bool(row)
 
-    def list_entity_shadow_mentions(
+    def list_grounded_entity_mentions(
         self, namespace_id: str, *, chunk_id: int | None = None,
     ) -> list[dict[str, Any]]:
         clause = "" if chunk_id is None else " AND mention.chunk_id=%s"
@@ -10048,7 +10043,7 @@ class Database:
                 params,
             ).fetchall()
 
-    def find_exact_entity_shadow_candidates(
+    def find_exact_grounded_entity_candidates(
         self, namespace_id: str, normalized_alias: str, limit: int = 10,
     ) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -10077,7 +10072,7 @@ class Database:
                 (namespace_id, normalized_alias, max(1, min(10, limit))),
             ).fetchall()
 
-    def find_entity_shadow_canonical(
+    def find_grounded_entity_canonical(
         self, namespace_id: str, canonical_key: str,
     ) -> dict[str, Any] | None:
         with self.connection() as conn:
@@ -10087,7 +10082,7 @@ class Database:
                 (namespace_id, canonical_key),
             ).fetchone()
 
-    def search_entity_shadow_name_candidates(
+    def search_grounded_entity_name_candidates(
         self,
         namespace_id: str,
         normalized_alias: str,
@@ -10145,12 +10140,12 @@ class Database:
                 ),
             ).fetchall()
 
-    def _ensure_entity_shadow_hnsw_index(
+    def _ensure_grounded_entity_hnsw_index(
         self, conn: psycopg.Connection, model_name: str, dimension: int,
     ) -> None:
         if dimension <= 0 or dimension > Config.pgvector_hnsw_max_dimensions:
             raise RuntimeError(
-                f"shadow embedding 维度 {dimension} 无可用 HNSW，按策略拒绝退化为全表扫描"
+                f"实体 embedding 维度 {dimension} 无可用 HNSW，按策略拒绝退化为全表扫描"
             )
         suffix = hashlib.sha256(f"shadow|{model_name}|{dimension}".encode()).hexdigest()[:12]
         statement = sql.SQL(
@@ -10165,7 +10160,7 @@ class Database:
         )
         conn.execute(statement)
 
-    def search_entity_shadow_vector_candidates(
+    def search_grounded_entity_vector_candidates(
         self,
         namespace_id: str,
         model_name: str,
@@ -10223,7 +10218,7 @@ class Database:
                ORDER BY ranked.distance,ranked.canonical_key"""
         ).format(vector_type, vector_type, vector_type, vector_type)
         with self.connection() as conn:
-            self._ensure_entity_shadow_hnsw_index(conn, model_name, dimension)
+            self._ensure_grounded_entity_hnsw_index(conn, model_name, dimension)
             conn.execute("SELECT set_config('hnsw.iterative_scan','relaxed_order',TRUE)")
             return conn.execute(
                 statement,
@@ -10235,7 +10230,7 @@ class Database:
                 ),
             ).fetchall()
 
-    def persist_entity_shadow_candidates(self, rows: list[dict[str, Any]]) -> None:
+    def persist_grounded_entity_candidates(self, rows: list[dict[str, Any]]) -> None:
         with self.connection() as conn:
             for item in rows:
                 scores = item.get("scores") or {}
@@ -10262,7 +10257,7 @@ class Database:
                 )
 
     @staticmethod
-    def _entity_shadow_display_aliases(
+    def _grounded_entity_display_aliases(
         canonical: dict[str, Any],
         mention: dict[str, Any],
         aliases: list[dict[str, Any]],
@@ -10278,7 +10273,7 @@ class Database:
             if str(value or "").strip()
         })
 
-    def upsert_entity_shadow_canonical(
+    def upsert_grounded_entity_canonical(
         self,
         namespace_id: str,
         canonical: dict[str, Any],
@@ -10297,7 +10292,7 @@ class Database:
         # keys live in ``entity_shadow_aliases.normalized_alias``.  Keeping
         # only compact normalized strings here made merged names disappear
         # from graph display and surface-based retrieval/evaluation.
-        display_aliases = self._entity_shadow_display_aliases(
+        display_aliases = self._grounded_entity_display_aliases(
             canonical, mention, aliases,
         )
         with self.connection() as conn:
@@ -10352,7 +10347,7 @@ class Database:
                     ),
                 )
             if embedding is not None:
-                self._ensure_entity_shadow_hnsw_index(conn, embedding_model, len(embedding))
+                self._ensure_grounded_entity_hnsw_index(conn, embedding_model, len(embedding))
                 vector_literal = self._vector_literal(embedding)
                 content_hash = hashlib.sha256(
                     f"{canonical['name']}|{canonical.get('primary_type') or ''}".encode()
@@ -10445,7 +10440,7 @@ class Database:
             )
             return row
 
-    def list_entity_shadow_cannot_links(self, namespace_id: str) -> set[frozenset[str]]:
+    def list_grounded_entity_cannot_links(self, namespace_id: str) -> set[frozenset[str]]:
         with self.connection() as conn:
             rows = conn.execute(
                 """SELECT left_key,right_key FROM entity_shadow_cannot_links
@@ -10454,7 +10449,7 @@ class Database:
             ).fetchall()
             return {frozenset((str(item["left_key"]), str(item["right_key"]))) for item in rows}
 
-    def list_entity_shadow_must_links(self, namespace_id: str) -> dict[str, str]:
+    def list_grounded_entity_must_links(self, namespace_id: str) -> dict[str, str]:
         with self.connection() as conn:
             rows = conn.execute(
                 """SELECT mention_key,canonical_key FROM entity_shadow_must_links
@@ -10471,7 +10466,7 @@ class Database:
                 result[mention_key] = canonical_key
             return result
 
-    def finalize_entity_shadow_namespace(
+    def finalize_grounded_entity_namespace(
         self, namespace_id: str, *, metrics: dict[str, Any], artifact_hash: str,
     ) -> dict[str, Any]:
         with self.connection() as conn:
@@ -10495,7 +10490,7 @@ class Database:
                     status, self._json(metrics), artifact_hash, int(counts["expected"]),
                     int(counts["completed"]), int(counts["failed"]), status == "ready",
                     "" if status == "ready" else str(
-                        counts.get("first_error") or "entity shadow work 未全部成功"
+                        counts.get("first_error") or "实体快照 work 未全部成功"
                     ),
                     status == "ready", namespace_id,
                 ),
@@ -10503,13 +10498,13 @@ class Database:
             if status != "ready":
                 detail = str(counts.get("first_error") or "存在未完成知识块")
                 raise RuntimeError(
-                    "entity shadow snapshot 不完整，不能标记 ready："
+                    "实体快照不完整，不能标记 ready："
                     f"已完成 {int(counts['completed'])}/{int(counts['expected'])}，"
                     f"失败 {int(counts['failed'])}；{detail}"
                 )
             return row
 
-    def persist_entity_shadow_relation_endpoints(
+    def persist_grounded_entity_relation_endpoints(
         self, namespace_id: str, rows: list[dict[str, Any]],
     ) -> None:
         with self.connection() as conn:
@@ -10552,7 +10547,7 @@ class Database:
                     ),
                 )
 
-    def validate_entity_shadow_relation_artifact(
+    def validate_grounded_entity_relation_artifact(
         self,
         namespace_id: str,
         run_id: str,
@@ -10625,13 +10620,13 @@ class Database:
                 "fact_only": fact_only,
             }
 
-    def load_entity_shadow_snapshot(self, namespace_id: str) -> dict[str, Any]:
+    def load_grounded_entity_snapshot(self, namespace_id: str) -> dict[str, Any]:
         with self.connection() as conn:
             namespace = conn.execute(
                 "SELECT * FROM entity_shadow_namespaces WHERE id=%s", (namespace_id,),
             ).fetchone()
             if not namespace:
-                raise LookupError("entity shadow namespace 不存在")
+                raise LookupError("实体快照 namespace 不存在")
             canonicals = conn.execute(
                 """SELECT * FROM entity_shadow_canonicals WHERE namespace_id=%s
                    ORDER BY canonical_key""", (namespace_id,),
@@ -10651,7 +10646,7 @@ class Database:
                 "relation_endpoints": endpoints,
             }
 
-    def persist_entity_shadow_publishability_audit(
+    def persist_grounded_entity_publishability_audit(
         self,
         namespace_id: str,
         rows: list[dict[str, Any]],
@@ -10688,7 +10683,7 @@ class Database:
                 updated += 1
         return updated
 
-    def entity_shadow_publishability_summary(
+    def grounded_entity_publishability_summary(
         self, namespace_id: str,
     ) -> dict[str, Any]:
         """Return persisted mention and rejection decision counters."""
@@ -10778,7 +10773,7 @@ class Database:
                 ),
             ).fetchall()
 
-    def get_shadow_relation_v2_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_grounded_relation_run(self, run_id: str) -> dict[str, Any] | None:
         """Return the immutable relation run referenced by a Knowledge Forge graph."""
 
         with self.connection() as conn:
@@ -10787,7 +10782,7 @@ class Database:
                 (str(run_id),),
             ).fetchone()
 
-    def start_shadow_relation_secondary_pass(
+    def start_relation_secondary_pass(
         self, values: dict[str, Any],
     ) -> dict[str, Any]:
         """Create one append-only, reason-routed child pass for a v2 run."""
@@ -10798,13 +10793,13 @@ class Database:
         if not pass_id or not parent_run_id or not fingerprint:
             raise ValueError("secondary pass requires immutable parent and fingerprint")
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, parent_run_id)
+            self._set_grounded_relation_session(conn, parent_run_id)
             parent = conn.execute(
                 "SELECT project_id FROM shadow_relation_v2_runs WHERE id=%s",
                 (parent_run_id,),
             ).fetchone()
             if not parent:
-                raise LookupError("secondary pass parent Shadow run does not exist")
+                raise LookupError("secondary pass parent relation run does not exist")
             project_id = int(values.get("project_id") or parent["project_id"])
             if project_id != int(parent["project_id"]):
                 raise ValueError("secondary pass project mismatch")
@@ -10840,7 +10835,7 @@ class Database:
                 ).fetchone()
             return row
 
-    def persist_shadow_relation_secondary_candidates(
+    def persist_relation_secondary_candidates(
         self, pass_id: str, candidates: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Persist secondary routing decisions without changing primary rows."""
@@ -10907,13 +10902,13 @@ class Database:
                 (str(pass_id),),
             ).fetchall()
 
-    def record_shadow_relation_secondary_model_call(
+    def record_relation_secondary_model_call(
         self, values: dict[str, Any],
     ) -> dict[str, Any]:
         """Audit one secondary recovery request in the parent run's call ledger."""
 
         with self.connection() as conn:
-            self._set_shadow_relation_v2_session(conn, str(values["run_id"]))
+            self._set_grounded_relation_session(conn, str(values["run_id"]))
             request_payload = values.get("request_payload") or {}
             response_payload = values.get("parsed_response") or {}
             request_hash = str(values.get("request_hash") or "")
@@ -10953,7 +10948,7 @@ class Database:
                 raise ValueError("secondary model call immutable payload mismatch")
             return row
 
-    def finish_shadow_relation_secondary_pass(
+    def finish_relation_secondary_pass(
         self, pass_id: str, *, status: str, metrics: dict[str, Any],
         route_counts: dict[str, Any], error_message: str = "",
     ) -> dict[str, Any]:
@@ -10975,7 +10970,7 @@ class Database:
                 raise LookupError("secondary pass does not exist")
             return row
 
-    def get_shadow_relation_secondary_pass(self, pass_id: str) -> dict[str, Any] | None:
+    def get_relation_secondary_pass(self, pass_id: str) -> dict[str, Any] | None:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT * FROM shadow_relation_secondary_passes WHERE id=%s",
@@ -11121,7 +11116,7 @@ class Database:
                 tuple(params),
             ).fetchall()
 
-    def persist_entity_shadow_snapshot(
+    def persist_grounded_entity_snapshot(
         self,
         namespace_id: str,
         canonicals: list[dict[str, Any]],
@@ -11169,7 +11164,7 @@ class Database:
                 (self._json(metrics), namespace_id),
             ).fetchone()
             if not row:
-                raise LookupError("entity shadow namespace 不存在")
+                raise LookupError("实体快照 namespace 不存在")
             return row
 
     def list_relation_verification_events(

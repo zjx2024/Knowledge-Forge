@@ -78,7 +78,7 @@ from .grounded_entities import (
     GroundedModelGateway,
     bounded_identity_evidence,
 )
-from .extraction_funnel import relation_shadow_funnel
+from .extraction_funnel import relation_quality_funnel
 from .graph_policy import (
     GRAPH_EMPTY,
     GRAPH_FAILED,
@@ -107,23 +107,23 @@ from .media import DocumentMediaService
 from .ollama import OllamaClient
 from .observability import recorded_job
 from .policy import (
-    ENTITY_SHADOW_POLICY_SET,
+    ENTITY_EXTRACTION_POLICY_SET,
     POLICY_AXES,
-    P1_RELATION_SHADOW_POLICY_SET,
-    P2_ENTITY_SHADOW_POLICY_SET,
+    RELATION_CANDIDATE_POLICY_SET,
+    GROUNDED_ENTITY_POLICY_SET,
 )
 from .quality import canonical_digest
 from .release_gate import ALLOWED_EVALUATOR_VERSIONS, evaluate_frozen_bundle
-from .relation_pipeline import VersionedRelationPipeline
+from .relation_pipeline import RelationCandidatePipeline
 from .grounded_relations import (
     LOADED_RELATION_CODE_DIGEST,
     GROUNDED_RELATION_POLICY_SET,
     GroundedRelationRuntime,
     grounded_relation_treatment_digest,
 )
-from .shadow_relation_replay import (
-    PersistedShadowModelReplayGateway,
-    ShadowReplayError,
+from .relation_replay import (
+    PersistedRelationModelReplayGateway,
+    RelationReplayError,
     assert_code_only_replay_compatible,
 )
 from .schema_evolution import SchemaEvolutionService
@@ -359,7 +359,7 @@ def _grounded_entity_freshness_policy_set() -> dict[str, str]:
     """
 
     return {
-        **ENTITY_SHADOW_POLICY_SET,
+        **ENTITY_EXTRACTION_POLICY_SET,
         "entity_publishability_policy_version": (
             ENTITY_PUBLISHABILITY_POLICY_VERSION
         ),
@@ -421,7 +421,7 @@ class KnowledgeForgeService:
         return resolved
 
     @staticmethod
-    def _shadow_relation_mention_id(
+    def _relation_endpoint_mention_id(
         endpoint_id: str,
         raw_to_mention: dict[str, str],
         canonical_by_mention: dict[str, str],
@@ -434,7 +434,7 @@ class KnowledgeForgeService:
         return mention_id if mention_id in canonical_by_mention else ""
 
     @staticmethod
-    def _relation_shadow_run_id(
+    def _relation_run_id(
         project_id: int,
         document_id: int,
         revision_id: str,
@@ -453,7 +453,7 @@ class KnowledgeForgeService:
         return "relshadow_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _relation_shadow_input_fingerprint(
+    def _relation_input_fingerprint(
         *,
         revision_id: str,
         chunk_id: int,
@@ -487,7 +487,7 @@ class KnowledgeForgeService:
         self.vectors = VectorStore(self.db, self.ollama)
         self.schemas = SchemaEvolutionService(self.db, self.ollama)
         self.resolver = EntityResolver(self.db, self.vectors)
-        self.relation_shadow = VersionedRelationPipeline(P1_RELATION_SHADOW_POLICY_SET)
+        self.relation_pipeline = RelationCandidatePipeline(RELATION_CANDIDATE_POLICY_SET)
         self.graph = HugeGraphStore(self.db)
         self._document_locks_guard = threading.Lock()
         self._document_locks: dict[int, threading.RLock] = {}
@@ -1213,7 +1213,7 @@ class KnowledgeForgeService:
             getattr(
                 self.db,
                 "assert_grounded_relation_ready",
-                self.db.assert_shadow_relation_v2_ready,
+                self.db.assert_grounded_relation_ready,
             )()
         self.db.ensure_project_strategy_graphs(int(document["project_id"]))
         for target in target_documents:
@@ -1623,7 +1623,7 @@ class KnowledgeForgeService:
             raise GraphNotReadyError(
                 "Knowledge Forge 图谱缺少当前实体或关系快照引用，拒绝读取旧流程数据"
             )
-        namespace = self.db.get_entity_shadow_namespace(entity_namespace_id)
+        namespace = self.db.get_grounded_entity_namespace(entity_namespace_id)
         if (
             not namespace
             or int(namespace.get("project_id") or 0) != int(project_id)
@@ -1633,7 +1633,7 @@ class KnowledgeForgeService:
             raise GraphNotReadyError(
                 "Knowledge Forge 实体快照不完整或不属于当前项目"
             )
-        relation_run = self.db.get_shadow_relation_v2_run(relation_run_id)
+        relation_run = self.db.get_grounded_relation_run(relation_run_id)
         if (
             not relation_run
             or int(relation_run.get("project_id") or 0) != int(project_id)
@@ -1662,7 +1662,7 @@ class KnowledgeForgeService:
                 dict(preservation) if isinstance(preservation, dict) else {}
             )
             validate = getattr(
-                self.db, "validate_entity_shadow_relation_artifact", None,
+                self.db, "validate_grounded_entity_relation_artifact", None,
             )
             proof = (
                 validate(entity_namespace_id, relation_run_id)
@@ -1788,12 +1788,12 @@ class KnowledgeForgeService:
             int(existing.get("retry_round") or 0) + 1
             if existing and retry_failed else 0
         )
-        snapshot = snapshot or self.db.load_entity_shadow_snapshot(
+        snapshot = snapshot or self.db.load_grounded_entity_snapshot(
             entity_namespace_id,
         )
         snapshot_mentions = list(snapshot.get("mentions") or [])
         if not snapshot_mentions:
-            snapshot_mentions = self.db.list_entity_shadow_mentions(
+            snapshot_mentions = self.db.list_grounded_entity_mentions(
                 entity_namespace_id,
             )
         snapshot = project_publishable_snapshot(
@@ -2389,10 +2389,10 @@ class KnowledgeForgeService:
             policy_summary.get("knowledge_language") or CHINESE,
         )
         entity_namespace_id = str(reference["entity_namespace_id"])
-        snapshot = self.db.load_entity_shadow_snapshot(entity_namespace_id)
+        snapshot = self.db.load_grounded_entity_snapshot(entity_namespace_id)
         snapshot = project_publishable_snapshot(
             snapshot,
-            mentions=self.db.list_entity_shadow_mentions(entity_namespace_id),
+            mentions=self.db.list_grounded_entity_mentions(entity_namespace_id),
         )
         snapshot = enrich_knowledge_forge_snapshot(
             snapshot,
@@ -3177,7 +3177,7 @@ class KnowledgeForgeService:
         if not source_id:
             return None
         runtime = self._grounded_relation_runtime(self.ollama)
-        previous_snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+        previous_snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
         previous_relation_keys = {
             str(item.get("relation_key") or "")
             for item in previous_snapshot.get("relation_endpoints") or []
@@ -3196,7 +3196,7 @@ class KnowledgeForgeService:
             compatibility = assert_code_only_replay_compatible(
                 dict(source_run or {}), current,
             )
-            replay_gateway = PersistedShadowModelReplayGateway(
+            replay_gateway = PersistedRelationModelReplayGateway(
                 self.db,
                 source_id,
                 runtime_model_gateway=self.ollama,
@@ -3215,7 +3215,7 @@ class KnowledgeForgeService:
                     "persisted-call-replay-v1:" + source_id
                 ),
             )
-            current_snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+            current_snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
             recovered_relation_keys = {
                 str(item.get("relation_key") or "")
                 for item in current_snapshot.get("relation_endpoints") or []
@@ -3237,7 +3237,7 @@ class KnowledgeForgeService:
                 # contribution of a completed replay.  Restore it before
                 # failing closed so a rejected recovery never changes the
                 # stale snapshot's observable facts.
-                self.db.persist_entity_shadow_relation_endpoints(
+                self.db.persist_grounded_entity_relation_endpoints(
                     namespace_id,
                     list(previous_snapshot.get("relation_endpoints") or []),
                 )
@@ -3247,7 +3247,7 @@ class KnowledgeForgeService:
                     "expected_fact_count": expected_fact_count,
                     "recovered_fact_count": recovered_fact_count,
                 }
-                self.db.finish_shadow_relation_v2_run(
+                self.db.finish_grounded_relation_run(
                     str(recovered["run_id"]),
                     status="stale",
                     metrics={
@@ -3257,11 +3257,11 @@ class KnowledgeForgeService:
                     input_fingerprint=str(recovered["input_fingerprint"]),
                     error_message="persisted-call replay output parity mismatch",
                 )
-                raise ShadowReplayError(
+                raise RelationReplayError(
                     "持久化调用重放结果与冻结关系快照不一致: "
                     + json.dumps(mismatch, sort_keys=True)
                 )
-        except ShadowReplayError as exc:
+        except RelationReplayError as exc:
             LOGGER.info(
                 "Knowledge Forge relation replay is incompatible for %s: %s",
                 namespace_id, exc,
@@ -3304,7 +3304,7 @@ class KnowledgeForgeService:
                 dict(source_run or {}), current,
             )
             validate = getattr(
-                self.db, "validate_entity_shadow_relation_artifact", None,
+                self.db, "validate_grounded_entity_relation_artifact", None,
             )
             if not callable(validate):
                 return None
@@ -3322,11 +3322,11 @@ class KnowledgeForgeService:
                 or int(artifact.get("eligible_facts") or 0)
                 != expected_fact_count
             ):
-                raise ShadowReplayError(
+                raise RelationReplayError(
                     "冻结关系事实与实体快照不满足精确集合一致性: "
                     + json.dumps(artifact, sort_keys=True)
                 )
-        except ShadowReplayError as exc:
+        except RelationReplayError as exc:
             LOGGER.info(
                 "Knowledge Forge frozen relation artifact cannot be reprojected for %s: %s",
                 namespace_id, exc,
@@ -3387,8 +3387,8 @@ class KnowledgeForgeService:
     ) -> dict[str, Any]:
         """Recompute the cheap canonical projection from immutable support."""
 
-        snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
-        mentions = self.db.list_entity_shadow_mentions(namespace_id)
+        snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
+        mentions = self.db.list_grounded_entity_mentions(namespace_id)
         endpoint_rows = (
             list(relation_endpoints)
             if relation_endpoints is not None
@@ -3400,7 +3400,7 @@ class KnowledgeForgeService:
             mentions=mentions,
             relation_endpoints=endpoint_rows,
         )
-        updated = self.db.persist_entity_shadow_publishability_audit(
+        updated = self.db.persist_grounded_entity_publishability_audit(
             namespace_id, rows,
         )
         if updated != len(rows):
@@ -3413,7 +3413,7 @@ class KnowledgeForgeService:
             "relation_endpoint_fingerprint": (
                 self._grounded_relation_endpoint_fingerprint(endpoint_rows)
             ),
-            "mention_filter": self.db.entity_shadow_publishability_summary(
+            "mention_filter": self.db.grounded_entity_publishability_summary(
                 namespace_id
             ),
         }
@@ -3515,7 +3515,7 @@ class KnowledgeForgeService:
             if int(unit.structure.get("chunk_id") or 0) > 0
         }
         policy_set = {
-            **ENTITY_SHADOW_POLICY_SET,
+            **ENTITY_EXTRACTION_POLICY_SET,
             "entity_publishability_policy_version": (
                 ENTITY_PUBLISHABILITY_POLICY_VERSION
             ),
@@ -3544,7 +3544,7 @@ class KnowledgeForgeService:
         getattr(
             self.db,
             "assert_grounded_relation_ready",
-            self.db.assert_shadow_relation_v2_ready,
+            self.db.assert_grounded_relation_ready,
         )()
         code_version = GROUNDED_ENTITY_CODE_VERSION
         config_payload = {
@@ -3595,7 +3595,7 @@ class KnowledgeForgeService:
         namespace_id = "grounded_entity_" + hashlib.sha256(
             f"{snapshot_id or 'live'}|{input_fingerprint}".encode("utf-8")
         ).hexdigest()
-        namespace = self.db.create_entity_shadow_namespace(
+        namespace = self.db.create_grounded_entity_namespace(
             project_id, namespace_id, policy_set,
             [int(item["id"]) for item in documents], snapshot_id or None,
             input_fingerprint=input_fingerprint,
@@ -3605,7 +3605,7 @@ class KnowledgeForgeService:
             code_version=code_version,
         )
         if namespace.get("snapshot_complete") and namespace.get("status") == "ready":
-            snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+            snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
             # Entity work is safely reusable, but relation code is an
             # independent treatment.  A ready entity namespace must not
             # short-circuit a newly deployed relation classifier/verifier:
@@ -3616,7 +3616,7 @@ class KnowledgeForgeService:
                 relation_metrics.get("relation_v2_run_id") or ""
             ).strip()
             relation_run = (
-                self.db.get_shadow_relation_v2_run(relation_run_id)
+                self.db.get_grounded_relation_run(relation_run_id)
                 if relation_run_id else None
             )
             stored_code_digest = str(
@@ -3657,7 +3657,7 @@ class KnowledgeForgeService:
                 # retrieval-only can become a relation endpoint while keeping
                 # its stale ``graph_publishable=False`` audit, producing a
                 # dangling edge at the publication boundary.
-                persisted = self.db.load_entity_shadow_snapshot(namespace_id)
+                persisted = self.db.load_grounded_entity_snapshot(namespace_id)
                 publishability_after_relations = (
                     self._audit_grounded_entity_publishability(
                         namespace_id,
@@ -3669,7 +3669,7 @@ class KnowledgeForgeService:
                 # The audit updates canonical metadata in PostgreSQL; reload
                 # so the artifact hash and subsequent graph projection are
                 # computed from the same atomically coherent entity/edge view.
-                persisted = self.db.load_entity_shadow_snapshot(namespace_id)
+                persisted = self.db.load_grounded_entity_snapshot(namespace_id)
                 artifact_payload = {
                     "namespace_id": namespace_id,
                     "input_fingerprint": input_fingerprint,
@@ -3707,12 +3707,12 @@ class KnowledgeForgeService:
                     "relation_v2_fingerprint": relation_v2["input_fingerprint"],
                     "relation_v2": relation_v2["metrics"],
                 }
-                self.db.finalize_entity_shadow_namespace(
+                self.db.finalize_grounded_entity_namespace(
                     namespace_id,
                     metrics=refreshed_metrics,
                     artifact_hash=artifact_hash,
                 )
-                snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+                snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
             # A relation-only refresh reuses the immutable entity namespace.
             # Older refresh code updated the nested v2 run metrics but left
             # this top-level count at the prior run's value, so the strategy
@@ -3753,7 +3753,7 @@ class KnowledgeForgeService:
                         ),
                     )
                 )
-                snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+                snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
                 snapshot_namespace = snapshot.get("namespace") or {}
                 snapshot_metrics = dict(
                     snapshot_namespace.get("metrics") or {}
@@ -3776,7 +3776,7 @@ class KnowledgeForgeService:
                 != relation_endpoint_count
                 or publishability_metrics_changed
             ):
-                self.db.finalize_entity_shadow_namespace(
+                self.db.finalize_grounded_entity_namespace(
                     namespace_id,
                     metrics={
                         **snapshot_metrics,
@@ -3794,7 +3794,7 @@ class KnowledgeForgeService:
                         snapshot_namespace.get("artifact_hash") or ""
                     ),
                 )
-                snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+                snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
             if progress:
                 total = int(namespace.get("expected_work_items") or len(chunks))
                 progress(total, total, "复用已完成的增强实体关系快照")
@@ -3817,12 +3817,12 @@ class KnowledgeForgeService:
                 "chunk_id": int(chunk["id"]),
                 "input_fingerprint": chunk_fingerprint,
             })
-        self.db.seed_entity_shadow_work_items(namespace_id, work_items)
-        summary = self.db.entity_shadow_work_summary(namespace_id)
+        self.db.seed_grounded_entity_work_items(namespace_id, work_items)
+        summary = self.db.grounded_entity_work_summary(namespace_id)
         retried = 0
         if int(summary.get("failed") or 0):
-            retried = self.db.requeue_terminal_entity_shadow_work(namespace_id)
-            summary = self.db.entity_shadow_work_summary(namespace_id)
+            retried = self.db.requeue_terminal_grounded_entity_work(namespace_id)
+            summary = self.db.grounded_entity_work_summary(namespace_id)
         if progress and retried:
             progress(
                 int(summary["completed"]), int(summary["expected"]),
@@ -3885,8 +3885,8 @@ class KnowledgeForgeService:
             store=store,
             models=model_gateway,
             reranker=rerank,
-            must_links=self.db.list_entity_shadow_must_links(namespace_id),
-            cannot_links=self.db.list_entity_shadow_cannot_links(namespace_id),
+            must_links=self.db.list_grounded_entity_must_links(namespace_id),
+            cannot_links=self.db.list_grounded_entity_cannot_links(namespace_id),
             lexical_cap=config_payload["lexical_cap"],
             vector_cap=config_payload["vector_cap"],
             reranker_cap=config_payload["reranker_cap"],
@@ -3897,12 +3897,12 @@ class KnowledgeForgeService:
         )
         worker_id = f"grounded-entity:{uuid.uuid4().hex}"
         while True:
-            work = self.db.claim_entity_shadow_work(namespace_id, worker_id)
+            work = self.db.claim_grounded_entity_work(namespace_id, worker_id)
             if not work:
                 break
             chunk = chunk_by_id.get(int(work["chunk_id"]))
             try:
-                summary = self.db.entity_shadow_work_summary(namespace_id)
+                summary = self.db.grounded_entity_work_summary(namespace_id)
                 if progress:
                     chunk_label = str(
                         (chunk or {}).get("section_title")
@@ -3918,15 +3918,15 @@ class KnowledgeForgeService:
                 # A cancellation checkpoint can fire immediately after a
                 # durable work lease is claimed.  Release that lease before
                 # propagating so a later retry does not wait for its expiry.
-                self.db.fail_entity_shadow_work(
+                self.db.fail_grounded_entity_work(
                     str(work["id"]), str(work["lease_token"]), str(exc),
                 )
                 raise
             if not chunk:
-                status = self.db.fail_entity_shadow_work(
+                status = self.db.fail_grounded_entity_work(
                     str(work["id"]), str(work["lease_token"]), "active Chunk 不存在",
                 )
-                summary = self.db.entity_shadow_work_summary(namespace_id)
+                summary = self.db.grounded_entity_work_summary(namespace_id)
                 if progress:
                     progress(
                         int(summary["completed"]), int(summary["expected"]),
@@ -3934,7 +3934,7 @@ class KnowledgeForgeService:
                     )
                 continue
             try:
-                self.db.reset_entity_shadow_chunk_attempt(
+                self.db.reset_grounded_entity_chunk_attempt(
                     namespace_id, int(chunk["id"]),
                 )
                 structure = structure_by_chunk.get(int(chunk["id"]), {})
@@ -4218,7 +4218,7 @@ class KnowledgeForgeService:
                         or policy_set["entity_extraction_policy_version"]
                     ),
                 } for item in [*normalized.rejected, *sanitizer_rejected]]
-                self.db.persist_entity_shadow_extraction(
+                self.db.persist_grounded_entity_extraction(
                     namespace_id,
                     project_id=project_id,
                     document_id=int(chunk["document_id"]),
@@ -4349,7 +4349,7 @@ class KnowledgeForgeService:
                             "quarantined": bool(result.get("quarantined")),
                         },
                     }
-                    self.db.upsert_entity_shadow_canonical(
+                    self.db.upsert_grounded_entity_canonical(
                         namespace_id, canonical, mention,
                         aliases=alias_by_mention.get(item.mention_id, []),
                         embedding_model=embedding_model,
@@ -4387,21 +4387,21 @@ class KnowledgeForgeService:
                 output_hash = hashlib.sha256(
                     json.dumps(output, sort_keys=True).encode("utf-8")
                 ).hexdigest()
-                if not self.db.complete_entity_shadow_work(
+                if not self.db.complete_grounded_entity_work(
                     str(work["id"]), str(work["lease_token"]), output, output_hash,
                 ):
                     raise RuntimeError("grounded entity work lease 已失效")
-                summary = self.db.entity_shadow_work_summary(namespace_id)
+                summary = self.db.grounded_entity_work_summary(namespace_id)
                 if progress:
                     progress(
                         int(summary["completed"]), int(summary["expected"]),
                         f"知识块实体阶段完成：{output['mentions']} 个实体提及",
                     )
             except Exception as exc:
-                status = self.db.fail_entity_shadow_work(
+                status = self.db.fail_grounded_entity_work(
                     str(work["id"]), str(work["lease_token"]), str(exc),
                 )
-                summary = self.db.entity_shadow_work_summary(namespace_id)
+                summary = self.db.grounded_entity_work_summary(namespace_id)
                 if progress:
                     label = "终止失败" if status == "terminal_failed" else "等待重试"
                     progress(
@@ -4423,8 +4423,8 @@ class KnowledgeForgeService:
                 relation_endpoints=list(relation_v2.get("endpoint_rows") or []),
             )
         )
-        persisted = self.db.load_entity_shadow_snapshot(namespace_id)
-        mention_count = len(self.db.list_entity_shadow_mentions(namespace_id))
+        persisted = self.db.load_grounded_entity_snapshot(namespace_id)
+        mention_count = len(self.db.list_grounded_entity_mentions(namespace_id))
         canonical_count = len(persisted["canonicals"])
         artifact_payload = {
             "namespace_id": namespace_id,
@@ -4463,10 +4463,10 @@ class KnowledgeForgeService:
             "grounded_context": grounded_context.summary,
             "structure_artifact_hash": grounded_context.artifact_hash,
         }
-        self.db.finalize_entity_shadow_namespace(
+        self.db.finalize_grounded_entity_namespace(
             namespace_id, metrics=metrics, artifact_hash=artifact_hash,
         )
-        return {"namespace_id": namespace_id, **self.db.load_entity_shadow_snapshot(namespace_id)}
+        return {"namespace_id": namespace_id, **self.db.load_grounded_entity_snapshot(namespace_id)}
 
     def _refresh_replayed_relation_namespace(
         self,
@@ -4475,7 +4475,7 @@ class KnowledgeForgeService:
     ) -> dict[str, Any]:
         """Attach a replayed relation run to an unchanged entity namespace."""
 
-        snapshot = self.db.load_entity_shadow_snapshot(namespace_id)
+        snapshot = self.db.load_grounded_entity_snapshot(namespace_id)
         namespace = dict(snapshot.get("namespace") or {})
         previous_metrics = dict(namespace.get("metrics") or {})
         artifact_payload = {
@@ -4500,7 +4500,7 @@ class KnowledgeForgeService:
         artifact_hash = hashlib.sha256(
             json.dumps(artifact_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        self.db.finalize_entity_shadow_namespace(
+        self.db.finalize_grounded_entity_namespace(
             namespace_id,
             metrics={
                 **previous_metrics,
@@ -4515,7 +4515,7 @@ class KnowledgeForgeService:
             },
             artifact_hash=artifact_hash,
         )
-        return self.db.load_entity_shadow_snapshot(namespace_id)
+        return self.db.load_grounded_entity_snapshot(namespace_id)
 
     def recover_code_only_knowledge_forge_snapshot(
         self,
@@ -4557,8 +4557,8 @@ class KnowledgeForgeService:
             raise TreatmentMaterializationRequired(
                 "stale 图谱缺少冻结实体或关系快照引用"
             )
-        namespace = self.db.get_entity_shadow_namespace(namespace_id)
-        source_run = self.db.get_shadow_relation_v2_run(source_run_id)
+        namespace = self.db.get_grounded_entity_namespace(namespace_id)
+        source_run = self.db.get_grounded_relation_run(source_run_id)
         if (
             not namespace
             or int(namespace.get("project_id") or 0) != int(project_id)
@@ -4609,7 +4609,7 @@ class KnowledgeForgeService:
         )
         snapshot = project_publishable_snapshot(
             snapshot,
-            mentions=self.db.list_entity_shadow_mentions(namespace_id),
+            mentions=self.db.list_grounded_entity_mentions(namespace_id),
         )
         project = self.db.get_project(project_id)
         schema_record = self.db.get_active_schema(project_id)
@@ -4663,7 +4663,7 @@ class KnowledgeForgeService:
                 "schema_discovery_during_build": schema_discovery,
                 "knowledge_language_setting": recovery_language_setting,
                 "knowledge_language": recovery_knowledge_language,
-                "entity_policy": dict(P2_ENTITY_SHADOW_POLICY_SET),
+                "entity_policy": dict(GROUNDED_ENTITY_POLICY_SET),
                 "entity_publishability_policy": (
                     ENTITY_PUBLISHABILITY_POLICY_VERSION
                 ),
@@ -4725,7 +4725,6 @@ class KnowledgeForgeService:
                 stats=graph_stats,
                 policy_summary={
                     "mode": "grounded",
-                    "production_approved": False,
                     "policy_hash": policy_hash,
                     "schema_version": int(schema_record["version"]),
                     "schema_discovery_during_build": schema_discovery,
@@ -4937,11 +4936,11 @@ class KnowledgeForgeService:
         if not schema_record:
             raise RuntimeError("snapshot frozen Schema 不存在")
         if str(snapshot.get("mode")) == "end_to_end":
-            namespace = self.db.get_entity_shadow_namespace_for_snapshot(str(snapshot["id"]))
+            namespace = self.db.get_grounded_entity_namespace_for_snapshot(str(snapshot["id"]))
             if not namespace or namespace.get("status") != "ready":
                 raise RuntimeError("relation treatment 缺少完整 grounded entity endpoint")
-            mentions = self.db.list_entity_shadow_mentions(str(namespace["id"]), chunk_id=chunk_id)
-            grounded_state = self.db.load_entity_shadow_snapshot(str(namespace["id"]))
+            mentions = self.db.list_grounded_entity_mentions(str(namespace["id"]), chunk_id=chunk_id)
+            grounded_state = self.db.load_grounded_entity_snapshot(str(namespace["id"]))
             canonical_by_mention = {
                 str(item["mention_key"]): str(item["canonical_key"])
                 for item in grounded_state.get("assignments") or []
@@ -4977,7 +4976,7 @@ class KnowledgeForgeService:
                     "confidence": float(item.get("confidence") or 0.0),
                     "canonical_id": str(item.get("canonical_entity_id") or item["id"]),
                 })
-        treatment_run = self._run_relation_shadow(
+        treatment_run = self._run_versioned_relation_pipeline(
             str(snapshot["id"]), project, int(work["document_id"]), chunk,
             {"entities": entities}, schema_record, raise_on_failure=True,
         )
@@ -6862,10 +6861,6 @@ class KnowledgeForgeService:
                     self._assert_ingestion_active(job_id, document_id)
                     extraction = self.schemas.extract_chunk(project, schema_record, chunk)
                     diagnostics = extraction.get("_diagnostics") or {}
-                    if Config.relation_shadow_enabled:
-                        self._run_relation_shadow(
-                            job_id, project, document_id, chunk, extraction, schema_record,
-                        )
                     with self._document_lock(document_id):
                         self._assert_ingestion_active(job_id, document_id)
                         mentions, relations = self.resolver.resolve_chunk(
@@ -7163,7 +7158,7 @@ class KnowledgeForgeService:
             getattr(
                 self.db,
                 "assert_grounded_relation_ready",
-                self.db.assert_shadow_relation_v2_ready,
+                self.db.assert_grounded_relation_ready,
             )()
             prerequisite_subtasks = self._empty_ingestion_subtasks()
             prerequisite_subtasks["structure"] = {
@@ -7389,7 +7384,7 @@ class KnowledgeForgeService:
             namespace = grounded_snapshot.get("namespace") or {}
             if namespace.get("status") != "ready" or not namespace.get("snapshot_complete"):
                 raise RuntimeError("Knowledge Forge 快照未完整收敛")
-            persisted_mentions = self.db.list_entity_shadow_mentions(
+            persisted_mentions = self.db.list_grounded_entity_mentions(
                 grounded_snapshot["namespace_id"]
             )
             grounded_snapshot = project_publishable_snapshot(
@@ -7426,7 +7421,7 @@ class KnowledgeForgeService:
                 log=(
                     f"Knowledge Forge 快照完成：{len(grounded_snapshot['mentions'])} 个实体提及，"
                     f"{len(grounded_snapshot.get('canonicals') or [])} 个规范实体，"
-                    f"{len(grounded_snapshot.get('relation_endpoints') or [])} 条 v2 可物化关系"
+                    f"{len(grounded_snapshot.get('relation_endpoints') or [])} 条可发布关系"
                 ),
             )
             state = self.db.start_strategy_graph_rebuild(project_id, strategy_key)
@@ -7438,7 +7433,7 @@ class KnowledgeForgeService:
                 "schema_discovery_during_build": schema_discovery,
                 "knowledge_language_setting": build_knowledge_language,
                 "knowledge_language": effective_knowledge_language,
-                "entity_policy": dict(P2_ENTITY_SHADOW_POLICY_SET),
+                "entity_policy": dict(GROUNDED_ENTITY_POLICY_SET),
                 "entity_publishability_policy": (
                     ENTITY_PUBLISHABILITY_POLICY_VERSION
                 ),
@@ -7506,7 +7501,7 @@ class KnowledgeForgeService:
                 project_id, strategy_key, generation,
                 stats=graph_stats,
                 policy_summary={
-                    "mode": "grounded", "production_approved": False,
+                    "mode": "grounded",
                     "policy_hash": policy_hash,
                     "schema_version": int(schema_record["version"]),
                     "schema_discovery_during_build": schema_discovery,
@@ -7558,9 +7553,9 @@ class KnowledgeForgeService:
                 ),
             )
             self._job(
-                job_id, "completed", 100, "Knowledge Forge 构建完成（隔离运行，未激活生产）",
+                job_id, "completed", 100, "Knowledge Forge 构建完成，当前图谱已发布",
                 stage="completed", graph_ready=True, strategy_key=strategy_key,
-                graph_stats=graph_stats, production_approved=False,
+                graph_stats=graph_stats,
                 knowledge_language=effective_knowledge_language,
             )
             self._schedule_knowledge_forge_community_reports(
@@ -7691,7 +7686,7 @@ class KnowledgeForgeService:
             failures.append("unclassified_candidate")
         return sorted(set(failures))
 
-    def _run_relation_shadow(
+    def _run_versioned_relation_pipeline(
         self,
         ingestion_run_id: str,
         project: dict[str, Any],
@@ -7706,7 +7701,7 @@ class KnowledgeForgeService:
 
         schema_version = int(schema_record.get("version") or 1)
         treatment_hash = graph_policy_hash(
-            P1_RELATION_SHADOW_POLICY_SET,
+            RELATION_CANDIDATE_POLICY_SET,
             schema_version=schema_version,
             config_summary={
                 "max_candidates": Config.relation_classifier_max_candidates,
@@ -7717,11 +7712,11 @@ class KnowledgeForgeService:
         )
         revision_id = str(chunk.get("revision_id") or "")
         if not revision_id:
-            raise ValueError("relation shadow 必须绑定不可变 revision_id")
+            raise ValueError("关系运行必须绑定不可变 revision_id")
         context_budget = int(
             project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS
         )
-        prepared = self.relation_shadow.prepare_shadow(
+        prepared = self.relation_pipeline.prepare_relation_batch(
             context_budget_tokens=context_budget,
             project_scope=f"{project.get('project_key') or project['id']}:{revision_id}",
             chunk_key=str(chunk.get("chunk_key") or chunk["id"]),
@@ -7740,7 +7735,7 @@ class KnowledgeForgeService:
         ]
         candidates = [*admitted_candidates, *overflow_candidates]
         candidate_map = {item["candidate_id"]: item for item in candidates}
-        input_fingerprint = self._relation_shadow_input_fingerprint(
+        input_fingerprint = self._relation_input_fingerprint(
             revision_id=revision_id,
             chunk_id=int(chunk["id"]),
             content=str(chunk.get("content") or ""),
@@ -7748,7 +7743,7 @@ class KnowledgeForgeService:
             treatment_hash=treatment_hash,
             candidate_map=candidate_map,
         )
-        run_id = self._relation_shadow_run_id(
+        run_id = self._relation_run_id(
             int(project["id"]),
             document_id,
             revision_id,
@@ -7758,14 +7753,14 @@ class KnowledgeForgeService:
         )
         started = False
         try:
-            self.db.start_relation_shadow_run({
+            self.db.start_relation_pipeline_run({
                 "id": run_id,
                 "project_id": int(project["id"]),
                 "document_id": document_id,
                 "chunk_id": int(chunk["id"]),
                 "control_policy_hash": GRAPH_POLICY_HASH,
                 "treatment_policy_hash": treatment_hash,
-                "policy_set": dict(P1_RELATION_SHADOW_POLICY_SET),
+                "policy_set": dict(RELATION_CANDIDATE_POLICY_SET),
                 "input_fingerprint": input_fingerprint,
             })
             started = True
@@ -7789,7 +7784,7 @@ class KnowledgeForgeService:
                     },
                     "estimated_input_tokens": batch.estimated_input_tokens,
                     "max_output_tokens": batch.output_token_reserve,
-                    "max_attempts": Config.relation_shadow_max_attempts,
+                    "max_attempts": Config.relation_max_attempts,
                 })
             quarantined = []
             for item in [*prepared.plan.deferred, *prepared.plan.overflow]:
@@ -7813,10 +7808,10 @@ class KnowledgeForgeService:
                     "estimated_input_tokens": 0,
                     "max_output_tokens": 0,
                     "status": "quarantined",
-                    "max_attempts": Config.relation_shadow_max_attempts,
+                    "max_attempts": Config.relation_max_attempts,
                     "error_message": item.get("reason") or "candidate deferred",
                 })
-            self.db.prepare_relation_shadow_work(
+            self.db.prepare_relation_pipeline_work(
                 run_id, work_items, quarantined=quarantined,
             )
 
@@ -7826,8 +7821,8 @@ class KnowledgeForgeService:
             }
             owner = f"{ingestion_run_id}:{threading.get_ident()}"
             while True:
-                leased = self.db.lease_relation_shadow_work(
-                    run_id, owner, lease_seconds=Config.relation_shadow_lease_seconds,
+                leased = self.db.lease_relation_pipeline_work(
+                    run_id, owner, lease_seconds=Config.relation_work_lease_seconds,
                 )
                 if not leased:
                     break
@@ -7837,7 +7832,7 @@ class KnowledgeForgeService:
                     for candidate_id in list(leased.get("candidate_ids") or [])
                 ]
                 try:
-                    decisions, raw = self.relation_shadow.classify_prepared_batch(
+                    decisions, raw = self.relation_pipeline.classify_prepared_batch(
                         classifier=self.ollama,
                         model=project.get("llm_model") or Config.default_llm_model,
                         context_budget_tokens=context_budget,
@@ -7846,24 +7841,24 @@ class KnowledgeForgeService:
                         content=str(chunk.get("content") or ""),
                         logical_schema=schema_record.get("schema_json") or {},
                     )
-                    self.db.settle_relation_shadow_work(
+                    self.db.settle_relation_pipeline_work(
                         str(leased["id"]), str(leased["lease_token"]),
                         output={"decisions": decisions, "raw": raw},
                     )
                 except Exception as exc:
-                    self.db.settle_relation_shadow_work(
+                    self.db.settle_relation_pipeline_work(
                         str(leased["id"]), str(leased["lease_token"]),
                         error_message=str(exc)[:2000],
-                        retry_delay_seconds=Config.relation_shadow_retry_delay_seconds,
+                        retry_delay_seconds=Config.relation_retry_delay_seconds,
                     )
 
-            persisted_work = self.db.list_relation_shadow_work(run_id)
+            persisted_work = self.db.list_relation_pipeline_work(run_id)
             open_items = [
                 item for item in persisted_work
                 if item["status"] in {"pending", "leased", "retryable_failed"}
             ]
             if open_items:
-                raise RuntimeError("relation shadow work queue 尚未收敛")
+                raise RuntimeError("关系工作队列尚未收敛")
             decisions: list[dict[str, Any]] = []
             output_tokens = 0
             for item in persisted_work:
@@ -7873,7 +7868,7 @@ class KnowledgeForgeService:
                 for decision in output.get("decisions") or []:
                     decisions.append({
                         **decision,
-                        "policy_version": P1_RELATION_SHADOW_POLICY_SET[
+                        "policy_version": RELATION_CANDIDATE_POLICY_SET[
                             "relation_classifier_policy_version"
                         ],
                         "model_name": project.get("llm_model") or Config.default_llm_model,
@@ -7901,7 +7896,7 @@ class KnowledgeForgeService:
             coverage_failures = self._relation_coverage_failures(
                 prepared.plan, persisted_work, len(decisions),
             )
-            funnel_report = relation_shadow_funnel(
+            funnel_report = relation_quality_funnel(
                 run_id=run_id,
                 plan=prepared.plan,
                 persisted_work=persisted_work,
@@ -7946,7 +7941,7 @@ class KnowledgeForgeService:
                     1 for item in decisions if item.get("status") == "classified"
                 ),
             }
-            finished = self.db.finish_relation_shadow_run(
+            finished = self.db.finish_relation_pipeline_run(
                 run_id,
                 candidates=candidates,
                 decisions=decisions,
@@ -7968,25 +7963,25 @@ class KnowledgeForgeService:
                 "coverage_failures": coverage_failures,
             }
         except Exception as exc:
-            LOGGER.warning("Relation shadow failed without affecting control: %s", exc)
+            LOGGER.warning("Isolated relation pipeline failed without publication: %s", exc)
             if started:
                 try:
-                    self.db.finish_relation_shadow_run(
+                    self.db.finish_relation_pipeline_run(
                         run_id, candidates=[], decisions=[],
-                        metrics={"shadow_exception": type(exc).__name__,
+                        metrics={"relation_exception": type(exc).__name__,
                                  "coverage_complete": False,
                                  "coverage_failures": ["terminal_failure"]},
                         status="failed", error_message=str(exc)[:2000],
                     )
                 except Exception:
-                    LOGGER.exception("Unable to persist isolated relation shadow failure")
+                    LOGGER.exception("Unable to persist isolated relation pipeline failure")
             if raise_on_failure:
                 raise
             return {
                 "run_id": run_id,
                 "status": "failed",
                 "artifact_hash": "",
-                "metrics": {"shadow_exception": type(exc).__name__,
+                "metrics": {"relation_exception": type(exc).__name__,
                             "coverage_complete": False,
                             "coverage_failures": ["terminal_failure"]},
                 "candidates": [],
@@ -8635,7 +8630,7 @@ class KnowledgeForgeService:
         lexical_entities = self.db.search_knowledge_forge_entities(
             namespace_id, query, limit,
         )
-        vector_entities = self.db.search_entity_shadow_vector_candidates(
+        vector_entities = self.db.search_grounded_entity_vector_candidates(
             namespace_id, embedding_model, query_vector, limit,
         )
         entities: dict[str, dict[str, Any]] = {}

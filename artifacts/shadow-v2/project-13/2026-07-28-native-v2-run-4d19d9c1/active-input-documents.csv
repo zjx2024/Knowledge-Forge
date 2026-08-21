@@ -1,3 +1,0 @@
-document_id,original_filename,status,active_revision_id,file_size_bytes,effective_parser,effective_chunk_strategy,structure_ready_at_utc,chunks_ready_at_utc
-19,usgs-cobalt-2025.pdf,indexed,revision_6b633dcc26f74e332c37a10e98d5384634d911b000499f5e83561677a5106e08,764275,plaintext_pdf,general,2026-07-28T01:01:05.759390+00:00,2026-07-28T01:01:05.873507+00:00
-18,usgs-lithium-2025.pdf,indexed,revision_6333d5a794c246480a5e13fcbbf750d2cb53c959b2c98f5ad2a8f88e7b8beddf,746901,plaintext_pdf,general,2026-07-28T01:00:46.209908+00:00,2026-07-28T01:00:46.312753+00:00

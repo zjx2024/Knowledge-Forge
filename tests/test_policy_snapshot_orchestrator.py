@@ -5,7 +5,7 @@ import pytest
 
 from knowledge_forge.database import Database
 from knowledge_forge.config import Config
-from knowledge_forge.policy import P2_ENTITY_SHADOW_POLICY_SET
+from knowledge_forge.policy import GROUNDED_ENTITY_POLICY_SET
 from knowledge_forge.policy_snapshot import (
     GitProvenance,
     PolicySnapshotOrchestrator,
@@ -39,7 +39,7 @@ def test_manifest_is_canonical_immutable_and_dirty_release_is_rejected():
     first = build_snapshot_manifest(
         project={"id": 7, "project_key": "project-7", "active_schema_version": 3},
         documents=_documents(), mode="end_to_end",
-        policy_set=P2_ENTITY_SHADOW_POLICY_SET,
+        policy_set=GROUNDED_ENTITY_POLICY_SET,
         models={"llm": "llm@digest", "embedding": "embed@digest"},
         config={"candidate_cap": 20}, prompts={"entity": "entity-v1"},
         gold_manifest={"id": "pilot-gold", "pilot": True},
@@ -49,7 +49,7 @@ def test_manifest_is_canonical_immutable_and_dirty_release_is_rejected():
     second = build_snapshot_manifest(
         project={"id": 7, "project_key": "project-7", "active_schema_version": 3},
         documents=list(reversed(_documents())), mode="end_to_end",
-        policy_set=P2_ENTITY_SHADOW_POLICY_SET,
+        policy_set=GROUNDED_ENTITY_POLICY_SET,
         models={"embedding": "embed@digest", "llm": "llm@digest"},
         config={"candidate_cap": 20}, prompts={"entity": "entity-v1"},
         gold_manifest={"pilot": True, "id": "pilot-gold"},
@@ -71,7 +71,7 @@ def test_manifest_is_canonical_immutable_and_dirty_release_is_rejected():
         build_snapshot_manifest(
             project={"id": 7, "project_key": "project-7", "active_schema_version": 3},
             documents=_documents(), mode="relation_only",
-            policy_set=P2_ENTITY_SHADOW_POLICY_SET, models={}, config={}, prompts={},
+            policy_set=GROUNDED_ENTITY_POLICY_SET, models={}, config={}, prompts={},
             gold_manifest={"pilot": False}, thresholds={}, metric_formulas={},
             created_by="test", git=git, release=True,
             created_at="2026-07-20T00:00:00+00:00",
@@ -139,13 +139,13 @@ def test_orchestrator_orders_phases_resumes_and_keeps_artifacts_immutable():
     orchestrator = PolicySnapshotOrchestrator(store)
     manifest = build_snapshot_manifest(
         project={"id": 7, "project_key": "project-7", "active_schema_version": 1},
-        documents=_documents(), mode="end_to_end", policy_set=P2_ENTITY_SHADOW_POLICY_SET,
+        documents=_documents(), mode="end_to_end", policy_set=GROUNDED_ENTITY_POLICY_SET,
         models={}, config={}, prompts={}, gold_manifest={"pilot": True}, thresholds={},
         metric_formulas={}, created_by="test",
         git=GitProvenance("abc", "tree", False, "", ()),
         created_at="2026-07-20T00:00:00+00:00",
     )
-    snapshot = orchestrator.create(7, manifest, P2_ENTITY_SHADOW_POLICY_SET)
+    snapshot = orchestrator.create(7, manifest, GROUNDED_ENTITY_POLICY_SET)
     seen = []
 
     def processor(_snapshot, work):
@@ -213,13 +213,13 @@ def test_disposable_postgres_snapshot_leases_cas_and_artifact_immutability():
     inputs = database.list_policy_snapshot_inputs(project["id"])
     manifest = build_snapshot_manifest(
         project=project, documents=inputs, mode="relation_only",
-        policy_set=P2_ENTITY_SHADOW_POLICY_SET, models={}, config={}, prompts={},
+        policy_set=GROUNDED_ENTITY_POLICY_SET, models={}, config={}, prompts={},
         gold_manifest={"pilot": True}, thresholds={}, metric_formulas={}, created_by="test",
         git=GitProvenance("abc", "tree", False, "", ()),
         created_at="2026-07-20T00:00:00+00:00",
     )
     orchestrator = PolicySnapshotOrchestrator(database)
-    snapshot = orchestrator.create(project["id"], manifest, P2_ENTITY_SHADOW_POLICY_SET)
+    snapshot = orchestrator.create(project["id"], manifest, GROUNDED_ENTITY_POLICY_SET)
     leased = database.claim_policy_snapshot_work(snapshot["id"], "worker-a", lease_seconds=1)
     assert leased and leased["lease_token"]
     assert database.claim_policy_snapshot_work(snapshot["id"], "worker-b", lease_seconds=1) is None
@@ -260,14 +260,14 @@ def test_disposable_postgres_snapshot_leases_cas_and_artifact_immutability():
 
     incomplete_manifest = build_snapshot_manifest(
         project=project, documents=inputs, mode="relation_only",
-        policy_set=P2_ENTITY_SHADOW_POLICY_SET, models={},
+        policy_set=GROUNDED_ENTITY_POLICY_SET, models={},
         config={"coverage": "overflow"}, prompts={},
         gold_manifest={"pilot": True}, thresholds={}, metric_formulas={}, created_by="test",
         git=GitProvenance("abc", "tree", False, "", ()),
         created_at="2026-07-20T00:00:00.500000+00:00",
     )
     incomplete = orchestrator.create(
-        project["id"], incomplete_manifest, P2_ENTITY_SHADOW_POLICY_SET,
+        project["id"], incomplete_manifest, GROUNDED_ENTITY_POLICY_SET,
     )
     control = database.claim_policy_snapshot_work(incomplete["id"], "coverage-worker")
     assert control and control["phase"] == "control"
@@ -298,13 +298,13 @@ def test_disposable_postgres_snapshot_leases_cas_and_artifact_immutability():
 
     cancelled_manifest = build_snapshot_manifest(
         project=project, documents=inputs, mode="relation_only",
-        policy_set=P2_ENTITY_SHADOW_POLICY_SET, models={}, config={"cancel": True}, prompts={},
+        policy_set=GROUNDED_ENTITY_POLICY_SET, models={}, config={"cancel": True}, prompts={},
         gold_manifest={"pilot": True}, thresholds={}, metric_formulas={}, created_by="test",
         git=GitProvenance("abc", "tree", False, "", ()),
         created_at="2026-07-20T00:00:01+00:00",
     )
     cancelled = orchestrator.create(
-        project["id"], cancelled_manifest, P2_ENTITY_SHADOW_POLICY_SET,
+        project["id"], cancelled_manifest, GROUNDED_ENTITY_POLICY_SET,
     )
     database.request_policy_snapshot_cancel(cancelled["id"])
     assert database.claim_policy_snapshot_work(cancelled["id"], "worker-c") is None

@@ -1,4 +1,4 @@
-"""Bounded, versioned relation classification used by shadow experiments."""
+"""Bounded, versioned relation candidate planning and classification."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ class RelationPlan:
 
 
 @dataclass
-class ShadowClassificationResult:
+class RelationClassificationResult:
     status: str
     plan: RelationPlan
     decisions: list[dict[str, Any]]
@@ -116,7 +116,7 @@ class ShadowClassificationResult:
 
 
 @dataclass
-class PreparedRelationShadow:
+class PreparedRelationBatch:
     plan: RelationPlan
     batches: list[RelationBatch]
     metrics: dict[str, int]
@@ -149,8 +149,8 @@ def _type_allowed(actual: str, expected: set[str]) -> bool:
     )
 
 
-class VersionedRelationPipeline:
-    """Plan and validate relation classification without writing product facts."""
+class RelationCandidatePipeline:
+    """Plan and validate candidates without writing published graph facts."""
 
     def __init__(self, policy_set: Mapping[str, object]):
         self.policy_set = normalize_policy_set(policy_set)
@@ -812,7 +812,7 @@ class VersionedRelationPipeline:
             normalized.append(decision)
         return normalized
 
-    def classify_shadow(
+    def classify_relation_batch(
         self,
         *,
         classifier: Any,
@@ -823,7 +823,7 @@ class VersionedRelationPipeline:
         content: str,
         entities: list[dict[str, Any]],
         logical_schema: Mapping[str, Any],
-    ) -> ShadowClassificationResult:
+    ) -> RelationClassificationResult:
         """Run the treatment classifier with strict completeness and bounded budgets."""
 
         plan = self.plan(
@@ -891,7 +891,7 @@ class VersionedRelationPipeline:
             "gleaning_passes": plan.gleaning_passes,
         }
         if plan.deferred:
-            return ShadowClassificationResult(
+            return RelationClassificationResult(
                 status="deferred", plan=plan, decisions=[], batches=[], metrics=metrics,
                 error="one or more admitted candidates exceeded the bounded request budget",
             )
@@ -934,7 +934,7 @@ class VersionedRelationPipeline:
                 )
             except Exception as exc:
                 increment("relation_classifier_failures")
-                return ShadowClassificationResult(
+                return RelationClassificationResult(
                     status="failed", plan=plan, decisions=[], batches=batch_audit,
                     metrics={**metrics, "classified": 0}, error=str(exc),
                 )
@@ -957,7 +957,7 @@ class VersionedRelationPipeline:
             ))
         plan.classified_count = len(decisions)
         metrics["classified"] = len(decisions)
-        return ShadowClassificationResult(
+        return RelationClassificationResult(
             status="incomplete" if plan.overflow else "completed",
             plan=plan, decisions=decisions, batches=batch_audit, metrics=metrics,
             error=(
@@ -966,7 +966,7 @@ class VersionedRelationPipeline:
             ),
         )
 
-    def prepare_shadow(
+    def prepare_relation_batch(
         self,
         *,
         context_budget_tokens: int,
@@ -975,7 +975,7 @@ class VersionedRelationPipeline:
         content: str,
         entities: list[dict[str, Any]],
         logical_schema: Mapping[str, Any],
-    ) -> PreparedRelationShadow:
+    ) -> PreparedRelationBatch:
         """Create deterministic, bounded work without performing model I/O."""
 
         plan = self.plan(
@@ -1024,7 +1024,7 @@ class VersionedRelationPipeline:
             output_token_reserve=output_reserve,
             max_candidates_per_batch=Config.relation_classifier_max_candidates,
         )
-        return PreparedRelationShadow(
+        return PreparedRelationBatch(
             plan=plan,
             batches=batches,
             metrics={

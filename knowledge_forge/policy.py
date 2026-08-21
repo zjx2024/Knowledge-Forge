@@ -26,28 +26,31 @@ CONTROL_POLICY_SET: Mapping[str, str] = MappingProxyType({
     "schema_policy_version": "schema-policy-p0-v1",
 })
 
-P1_RELATION_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
+RELATION_CANDIDATE_POLICY_SET: Mapping[str, str] = MappingProxyType({
     **CONTROL_POLICY_SET,
+    # Persisted identifiers are immutable audit data.  Their historical
+    # ``shadow`` segment is intentionally retained even though current Python
+    # symbols and product terminology no longer use it.
     "relation_candidate_policy_version": "relation-candidate-p1-shadow-v4",
     "relation_classifier_policy_version": "relation-classifier-p1-shadow-v1",
     "verification_policy_version": "relation-classifier-p1-shadow-v1",
 })
 
-P2_ENTITY_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
-    **P1_RELATION_SHADOW_POLICY_SET,
+GROUNDED_ENTITY_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **RELATION_CANDIDATE_POLICY_SET,
     "entity_extraction_policy_version": "entity-extraction-p2-proposition-arguments-v15-reference-placeholders",
     "entity_resolution_policy_version": "entity-resolution-p2-symbol-safe-v10",
     "entity_identity_policy_version": "entity-identity-symbol-safe-v9",
     "entity_identity_profile": "bounded_similarity",
 })
 
-# The entity snapshot is reused by relation-policy experiments.  Keep the
+# The entity snapshot is reused by relation-policy evaluations.  Keep the
 # required policy axes present for audit compatibility, but make relation axes
 # explicitly non-semantic here; the relation runtime owns and fingerprints its
 # own policy set.  Otherwise a verifier/predicate change needlessly re-runs the
 # expensive, model-backed entity extraction.
-ENTITY_SHADOW_POLICY_SET: Mapping[str, str] = MappingProxyType({
-    **P2_ENTITY_SHADOW_POLICY_SET,
+ENTITY_EXTRACTION_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **GROUNDED_ENTITY_POLICY_SET,
     "relation_candidate_policy_version": "entity-shadow-relation-independent-v1",
     "relation_classifier_policy_version": "entity-shadow-relation-independent-v1",
     "verification_policy_version": "entity-shadow-relation-independent-v1",

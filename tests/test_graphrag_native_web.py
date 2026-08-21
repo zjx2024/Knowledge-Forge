@@ -21,7 +21,7 @@ from knowledge_forge.construction_strategies import (
 from knowledge_forge.graph_policy import GraphNotReadyError
 from knowledge_forge.graphrag_native_runtime import GraphRAGNativeStale
 from knowledge_forge.schema_evolution import BASE_SCHEMA
-from knowledge_forge.relation_shadow_runtime import (
+from knowledge_forge.relation_runtime import (
     LOADED_RELATION_CODE_DIGEST,
     relation_runtime_treatment_digest,
 )
@@ -749,14 +749,14 @@ def test_knowledge_forge_graph_reads_ready_snapshot_without_hubble():
                 },
             }
 
-        def get_entity_shadow_namespace(self, namespace_id):
+        def get_grounded_entity_namespace(self, namespace_id):
             assert namespace_id == "namespace-1"
             return {
                 "id": namespace_id, "project_id": 9, "status": "ready",
                 "snapshot_complete": True, "embedding_model": "embed",
             }
 
-        def get_shadow_relation_v2_run(self, run_id):
+        def get_grounded_relation_run(self, run_id):
             assert run_id == "relation-run-1"
             return {
                 "id": run_id, "project_id": 9, "status": "ready",
@@ -768,7 +768,7 @@ def test_knowledge_forge_graph_reads_ready_snapshot_without_hubble():
                 },
             }
 
-        def load_entity_shadow_snapshot(self, namespace_id):
+        def load_grounded_entity_snapshot(self, namespace_id):
             assert namespace_id == "namespace-1"
             return {
                 "canonicals": [
@@ -806,7 +806,7 @@ def test_knowledge_forge_graph_reads_ready_snapshot_without_hubble():
                 }],
             }
 
-        def list_entity_shadow_mentions(self, namespace_id):
+        def list_grounded_entity_mentions(self, namespace_id):
             assert namespace_id == "namespace-1"
             return []
 

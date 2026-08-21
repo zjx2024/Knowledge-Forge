@@ -1,3 +1,0 @@
-project_id,document_id,original_filename,strategy_key,status,content_revision_id,latest_job_id,stats,error_message,started_at,completed_at,updated_at
-13,18,usgs-lithium-2025.pdf,stable,indexed,revision_b73cb160c0e5e862440505d0c86358df15b08c4a6839b332b7848d543f7993b4,8ce8e1e8eaf8472e9ea627eac8acd0d9,"{""chunk_count"": 8, ""entity_mentions"": 107, ""relations"": 2, ""section_count"": 5}",,,2026-07-27T06:23:08.852834+00:00,2026-07-27T06:23:08.869495+00:00
-13,19,usgs-cobalt-2025.pdf,stable,indexed,revision_4097a0c5645a2f66e21882ea8caef94a3c97f84f258fc406591ca8aabc0782c5,c4d1ebd2038e4018812db1fd68612cbc,"{""chunk_count"": 7, ""entity_mentions"": 66, ""relations"": 8, ""section_count"": 5}",,,2026-07-27T06:28:17.514387+00:00,2026-07-27T06:28:17.530964+00:00

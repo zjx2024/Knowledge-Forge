@@ -5,17 +5,13 @@ because its records are immutable provenance.  New runtime code should import
 these names rather than propagating the discontinued prototype terminology.
 """
 
-from .entity_shadow import (
-    DatabaseShadowStore,
-    ShadowEntityResolver,
-    ShadowModelGateway,
+from .entity_runtime import (
+    DatabaseGroundedStore,
+    GroundedEntityResolver,
+    GroundedModelGateway,
     bounded_identity_evidence,
 )
 
-
-DatabaseGroundedStore = DatabaseShadowStore
-GroundedEntityResolver = ShadowEntityResolver
-GroundedModelGateway = ShadowModelGateway
 
 __all__ = [
     "DatabaseGroundedStore",

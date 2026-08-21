@@ -12,7 +12,7 @@ from knowledge_forge.graph_policy import GraphNotReadyError
 from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import GRAPH_POLICY_VERSION
 from knowledge_forge.relation_verification import PUBLISHABLE_RELATION_STATUSES
-from knowledge_forge.relation_shadow_runtime import (
+from knowledge_forge.relation_runtime import (
     LOADED_RELATION_CODE_DIGEST,
     relation_runtime_treatment_digest,
 )
@@ -55,14 +55,14 @@ class SearchDatabase:
             },
         }
 
-    def get_entity_shadow_namespace(self, namespace_id):
+    def get_grounded_entity_namespace(self, namespace_id):
         assert namespace_id == "namespace-current"
         return {
             "id": namespace_id, "project_id": 4, "status": "ready",
             "snapshot_complete": True, "embedding_model": "embed",
         }
 
-    def get_shadow_relation_v2_run(self, run_id):
+    def get_grounded_relation_run(self, run_id):
         assert run_id == "relation-run-current"
         return {
             "id": run_id, "project_id": 4, "status": "ready",
@@ -82,7 +82,7 @@ class SearchDatabase:
             "source_count": 2, "lexical_score": 1.0,
         }]
 
-    def search_entity_shadow_vector_candidates(
+    def search_grounded_entity_vector_candidates(
         self, namespace_id, model_name, query_vector, limit,
     ):
         self.snapshot_calls.append(("entity-vectors", namespace_id, model_name))
@@ -184,7 +184,7 @@ def test_service_search_fails_closed_when_knowledge_forge_graph_is_stale():
 
 def test_service_search_fails_closed_for_cross_project_relation_run():
     database = SearchDatabase()
-    database.get_shadow_relation_v2_run = lambda *_args: {
+    database.get_grounded_relation_run = lambda *_args: {
         "id": "relation-run-current", "project_id": 99, "status": "ready",
     }
     service = object.__new__(KnowledgeForgeService)
@@ -198,7 +198,7 @@ def test_service_search_fails_closed_for_cross_project_relation_run():
 
 def test_service_search_fails_closed_for_obsolete_relation_treatment():
     database = SearchDatabase()
-    database.get_shadow_relation_v2_run = lambda *_args: {
+    database.get_grounded_relation_run = lambda *_args: {
         "id": "relation-run-current",
         "project_id": 4,
         "status": "ready",

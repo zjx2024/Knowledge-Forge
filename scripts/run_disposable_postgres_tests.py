@@ -24,6 +24,15 @@ from knowledge_forge.postgres_test_safety import (
 
 
 def main() -> int:
+    # Introspection must not provision an external database. Pytest exits
+    # successfully for --help without producing the JUnit report expected by
+    # the actual guarded test path.
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", *sys.argv[1:]],
+            check=False,
+        ).returncode
+
     production_dsn = make_conninfo(**Config.postgres)
     production_identity, server_version, pgvector_version = inspect_postgres_identity(
         production_dsn, schema="public",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from knowledge_forge.shadow_context import build_context_units_for_document
+from knowledge_forge.evidence_context import build_context_units_for_document
 
 
 def test_table_row_context_preserves_header_row_cell_source_metadata():

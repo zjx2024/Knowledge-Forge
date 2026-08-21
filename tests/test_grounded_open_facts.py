@@ -2,11 +2,11 @@ import json
 
 import pytest
 
-from knowledge_forge.relation_shadow_v2 import (
-    SHADOW_RELATION_OPEN_FACT_PRIMARY_CONTRACT_VERSION,
-    SHADOW_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION,
-    SHADOW_RELATION_OPEN_FACT_PARSER_VERSION,
-    ShadowClassificationError,
+from knowledge_forge.relation_extraction import (
+    GROUNDED_RELATION_OPEN_FACT_PRIMARY_CONTRACT_VERSION,
+    GROUNDED_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION,
+    GROUNDED_RELATION_OPEN_FACT_PARSER_VERSION,
+    RelationClassificationError,
     augment_grounded_open_fact_inventory,
     deterministic_source_structure_schema_bindings,
     grounded_open_fact_prompt,
@@ -16,7 +16,7 @@ from knowledge_forge.relation_shadow_v2 import (
     relation_reference_resolution_prompt,
     relation_reference_resolution_response_schema,
 )
-from tests.shadow_v2_fixtures import logical_schema, predicate_policy
+from tests.grounded_relation_fixtures import logical_schema, predicate_policy
 
 
 def _occurrence(key: str, surface: str, start: int, end: int, canonical: str):
@@ -59,7 +59,7 @@ def test_grounded_open_fact_contract_uses_short_frozen_mention_ids():
     assert "predefined logical relation" in payload["instruction"]
     assert "exact contiguous relation phrase" in payload["instruction"]
     assert payload["contract_version"] == (
-        SHADOW_RELATION_OPEN_FACT_PRIMARY_CONTRACT_VERSION
+        GROUNDED_RELATION_OPEN_FACT_PRIMARY_CONTRACT_VERSION
     )
 
 
@@ -138,7 +138,7 @@ def test_grounded_open_fact_recovery_targets_uncovered_mentions_and_roles():
         "accepted_fact_count": 1,
     }]
     assert payload["contract_version"] == (
-        SHADOW_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION
+        GROUNDED_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION
     )
 
 
@@ -163,10 +163,10 @@ def test_grounded_open_fact_empty_recovery_is_distinct_from_empty_primary():
     ))
 
     assert primary["contract_version"] == (
-        SHADOW_RELATION_OPEN_FACT_PRIMARY_CONTRACT_VERSION
+        GROUNDED_RELATION_OPEN_FACT_PRIMARY_CONTRACT_VERSION
     )
     assert recovery["contract_version"] == (
-        SHADOW_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION
+        GROUNDED_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION
     )
     assert recovery["coverage_audit"][
         "mention_ids_without_accepted_fact"
@@ -488,7 +488,7 @@ def test_parse_grounded_open_facts_preserves_exact_endpoints_and_evidence():
     )
 
     assert parsed["coverage_complete"] is True
-    assert parsed["parser_version"] == SHADOW_RELATION_OPEN_FACT_PARSER_VERSION
+    assert parsed["parser_version"] == GROUNDED_RELATION_OPEN_FACT_PARSER_VERSION
     assert parsed["frames"] == [{
         "relation": "sends",
         "arguments": ["controller", "message"],
@@ -831,7 +831,7 @@ def test_parse_grounded_open_facts_quarantines_only_invalid_partial_item():
         },
     ]}
 
-    with pytest.raises(ShadowClassificationError):
+    with pytest.raises(RelationClassificationError):
         parse_grounded_open_facts(
             raw, content=content, occurrences=occurrences,
         )
@@ -983,7 +983,7 @@ def test_grounded_open_fact_recovery_exposes_rejected_clause_endpoint():
         "mention_ids_without_accepted_fact"
     ] == ["M0000", "M0001", "M0002"]
     assert payload["contract_version"] == (
-        SHADOW_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION
+        GROUNDED_RELATION_OPEN_FACT_RECOVERY_CONTRACT_VERSION
     )
 
 

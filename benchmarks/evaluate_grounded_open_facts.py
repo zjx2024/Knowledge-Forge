@@ -25,12 +25,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from knowledge_forge.config import Config
 from knowledge_forge.ollama import OllamaClient
-from knowledge_forge import relation_shadow_v2 as relation_v2
+from knowledge_forge import relation_extraction as relation_v2
 from benchmarks.calibration_policy import (
     partition_assertions,
     unique_fact_rows,
 )
-from knowledge_forge.relation_shadow_runtime import ShadowRelationV2Runtime
+from knowledge_forge.relation_runtime import GroundedRelationRuntime
 from knowledge_forge.relation_secondary import (
     SECONDARY_POLARITY_PROMPT_VERSION,
     SECONDARY_PASS_VERSION,
@@ -45,8 +45,8 @@ from knowledge_forge.relation_secondary import (
     source_frame_polarity_prompt,
     source_frame_polarity_response_schema,
 )
-from knowledge_forge.relation_shadow_v2 import (
-    SHADOW_RELATION_OPEN_FACT_SYSTEM_PROMPT,
+from knowledge_forge.relation_extraction import (
+    GROUNDED_RELATION_OPEN_FACT_SYSTEM_PROMPT,
     augment_grounded_open_fact_inventory,
     deterministic_source_structure_schema_bindings,
     grounded_open_fact_prompt,
@@ -462,7 +462,7 @@ def _oracle_final_verify(
     for frame in frames:
         if not isinstance(frame, dict):
             continue
-        opportunity = ShadowRelationV2Runtime._grounded_open_fact_opportunity(
+        opportunity = GroundedRelationRuntime._grounded_open_fact_opportunity(
             run_id=f"gold-run:{document_id}",
             project_id=1,
             chunk=chunk,
@@ -1055,7 +1055,7 @@ def _oracle_final_verify(
                     source_role_audit_uncertain += 1
         if attempt is None:
             for attempt_no in range(
-                1, Config.relation_shadow_max_attempts + 1,
+                1, Config.relation_max_attempts + 1,
             ):
 
                 def verifier(
@@ -1897,7 +1897,7 @@ def _evaluate_document(
         started = time.perf_counter()
         raw = client.json_chat(
             model=model,
-            system=SHADOW_RELATION_OPEN_FACT_SYSTEM_PROMPT,
+            system=GROUNDED_RELATION_OPEN_FACT_SYSTEM_PROMPT,
             prompt=grounded_open_fact_prompt(
                 context_id=document_id,
                 content=content,

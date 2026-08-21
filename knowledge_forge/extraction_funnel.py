@@ -132,14 +132,14 @@ class ExtractionFunnel:
         }
 
 
-def relation_shadow_funnel(
+def relation_quality_funnel(
     *,
     run_id: str,
     plan: Any,
     persisted_work: Iterable[dict[str, Any]],
     decisions: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build a conserved terminal report from one persisted relation shadow run."""
+    """Build a conserved terminal report from one persisted relation run."""
 
     candidate_ids = {
         str(item.candidate_id)

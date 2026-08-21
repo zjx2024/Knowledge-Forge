@@ -5,8 +5,8 @@ import uuid
 from knowledge_forge.database import (
     Database,
     SCHEMA_SQL,
-    SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS,
-    SHADOW_RELATION_SOURCE_MODEL_COMPONENTS,
+    GROUNDED_RELATION_REUSABLE_MODEL_COMPONENTS,
+    GROUNDED_RELATION_SOURCE_MODEL_COMPONENTS,
 )
 from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import (
@@ -36,12 +36,12 @@ def test_relation_source_model_component_registry_covers_runtime_audits():
         "source_structure_binding_audit",
         "source_projection_role_audit",
         "atomic_publication_audit",
-    } <= SHADOW_RELATION_SOURCE_MODEL_COMPONENTS
-    assert SHADOW_RELATION_SOURCE_MODEL_COMPONENTS <= (
-        SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS
+    } <= GROUNDED_RELATION_SOURCE_MODEL_COMPONENTS
+    assert GROUNDED_RELATION_SOURCE_MODEL_COMPONENTS <= (
+        GROUNDED_RELATION_REUSABLE_MODEL_COMPONENTS
     )
     assert {"proposer", "classifier"} <= (
-        SHADOW_RELATION_REUSABLE_MODEL_COMPONENTS
+        GROUNDED_RELATION_REUSABLE_MODEL_COMPONENTS
     )
 
 

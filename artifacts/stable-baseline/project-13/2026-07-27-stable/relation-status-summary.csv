@@ -1,6 +1,0 @@
-verification_status,relation_type,count,graph_edges
-verification_failed,part_of,3,0
-verification_failed,,2,0
-verification_failed,located_in,2,0
-verification_failed,produces,2,0
-verification_failed,related_to,1,0

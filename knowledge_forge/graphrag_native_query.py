@@ -1,7 +1,7 @@
 """Version-locked, file-only query adapter for GraphRAG Native bundles.
 
 This module intentionally has no Database, pgvector, HugeGraph, stable, or
-enhanced-shadow dependency.  Its input is a validated immutable native bundle
+Knowledge Forge extraction dependency. Its input is a validated immutable native bundle
 and its output follows the small JSON-safe protocol consumed by the service.
 """
 

@@ -5,9 +5,9 @@ from dataclasses import replace
 
 import pytest
 
-from knowledge_forge.relation_shadow_v2 import (
+from knowledge_forge.relation_extraction import (
     PASS,
-    SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+    GROUNDED_RELATION_CLASSIFIER_PROMPT_VERSION,
     EvidenceSpan,
     RelationFreshnessDecision,
     RelationMaterializationDecision,
@@ -24,8 +24,8 @@ from knowledge_forge.relation_shadow_v2 import (
     source_batch_focused_review,
     validate_hypothesis,
 )
-from knowledge_forge.relation_shadow_runtime import ShadowRelationV2Runtime
-from tests.shadow_v2_fixtures import logical_schema, predicate_policy
+from knowledge_forge.relation_runtime import GroundedRelationRuntime
+from tests.grounded_relation_fixtures import logical_schema, predicate_policy
 
 
 OPEN_POLICY = {
@@ -318,7 +318,7 @@ def test_pairwise_classifier_positive_requires_mandatory_independent_review():
     classifier_metadata.pop("candidate_source", None)
     classifier_hypothesis = replace(
         source_hypothesis,
-        classifier_prompt_version=SHADOW_RELATION_CLASSIFIER_PROMPT_VERSION,
+        classifier_prompt_version=GROUNDED_RELATION_CLASSIFIER_PROMPT_VERSION,
         predicate_metadata=classifier_metadata,
     )
 
@@ -813,7 +813,7 @@ def test_materialized_open_edge_displays_exact_relation_not_carrier_id():
         ),
     )
 
-    rows = ShadowRelationV2Runtime(None, None)._endpoint_rows(
+    rows = GroundedRelationRuntime(None, None)._endpoint_rows(
         run_id="run-open",
         normalization=normalization,
         materialization_decisions=[decision],
@@ -848,7 +848,7 @@ def test_materialized_open_edge_displays_exact_relation_not_carrier_id():
         RuntimeError,
         match="publication endpoint is not entity-publishability eligible",
     ):
-        ShadowRelationV2Runtime(None, None)._endpoint_rows(
+        GroundedRelationRuntime(None, None)._endpoint_rows(
             run_id="run-open",
             normalization=normalization,
             materialization_decisions=[decision],
@@ -911,7 +911,7 @@ def test_materialized_schema_edge_uses_canonical_label_and_keeps_raw_expression(
         ),
     )
 
-    rows = ShadowRelationV2Runtime(None, None)._endpoint_rows(
+    rows = GroundedRelationRuntime(None, None)._endpoint_rows(
         run_id="run-schema",
         normalization=normalization,
         materialization_decisions=[decision],

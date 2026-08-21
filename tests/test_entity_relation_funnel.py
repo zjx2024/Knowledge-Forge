@@ -5,9 +5,9 @@ import pytest
 from knowledge_forge.extraction_funnel import (
     ExtractionFunnel,
     FunnelInvariantError,
-    relation_shadow_funnel,
+    relation_quality_funnel,
 )
-from knowledge_forge.policy import P1_RELATION_SHADOW_POLICY_SET
+from knowledge_forge.policy import RELATION_CANDIDATE_POLICY_SET
 from knowledge_forge.relation_pipeline import RelationCandidate, RelationPlan
 
 
@@ -92,9 +92,9 @@ def _candidate(candidate_id: str) -> RelationCandidate:
     )
 
 
-def test_relation_shadow_funnel_accounts_for_decisions_and_failed_work() -> None:
+def test_relation_quality_funnel_accounts_for_decisions_and_failed_work() -> None:
     plan = RelationPlan(
-        policy_set=P1_RELATION_SHADOW_POLICY_SET,
+        policy_set=RELATION_CANDIDATE_POLICY_SET,
         raw_pairs=4,
         blocked_pairs=0,
         candidates=[_candidate("positive"), _candidate("negative"), _candidate("failed")],
@@ -105,7 +105,7 @@ def test_relation_shadow_funnel_accounts_for_decisions_and_failed_work() -> None
             "candidate": {"candidate_id": "overflow"},
         }],
     )
-    report = relation_shadow_funnel(
+    report = relation_quality_funnel(
         run_id="run-4",
         plan=plan,
         persisted_work=[
@@ -148,15 +148,15 @@ def test_relation_shadow_funnel_accounts_for_decisions_and_failed_work() -> None
     }
 
 
-def test_relation_shadow_funnel_exposes_missing_classifier_decision() -> None:
+def test_relation_quality_funnel_exposes_missing_classifier_decision() -> None:
     plan = RelationPlan(
-        policy_set=P1_RELATION_SHADOW_POLICY_SET,
+        policy_set=RELATION_CANDIDATE_POLICY_SET,
         raw_pairs=1,
         blocked_pairs=0,
         candidates=[_candidate("missing")],
         qualified_count=1,
     )
-    report = relation_shadow_funnel(
+    report = relation_quality_funnel(
         run_id="run-5",
         plan=plan,
         persisted_work=[{

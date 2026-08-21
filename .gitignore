@@ -29,5 +29,8 @@ external/
 # Operator-created database and runtime backups.
 backups/
 
+# Evaluation exports are reproducible runtime output, not source fixtures.
+artifacts/
+
 # Front-end dependencies are restored from webui/package-lock.json.
 webui/node_modules/

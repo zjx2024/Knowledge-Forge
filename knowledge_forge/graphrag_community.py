@@ -1,4 +1,4 @@
-"""Shadow GraphRAG BYOG community detection over the publishable control graph."""
+"""GraphRAG-style BYOG community detection over the publishable KF graph."""
 
 from __future__ import annotations
 
@@ -637,7 +637,9 @@ class CommunityService:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Shadow GraphRAG community detection")
+    parser = argparse.ArgumentParser(
+        description="Knowledge Forge community detection",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     detect = subparsers.add_parser("detect", help="显式检测一个项目的正式图社区")
     detect.add_argument("--project-id", type=int, required=True)

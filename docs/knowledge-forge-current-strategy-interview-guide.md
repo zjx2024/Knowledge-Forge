@@ -2,7 +2,7 @@
 
 > 端到端技术说明、算法细节与面试手册
 >
-> 基于仓库截至 2026-08-15 的当前实现整理。本文描述的是 <code>knowledge_forge</code> 策略，不是独立的 <code>graphrag_native</code> 策略。
+> 基于仓库截至 2026-08-21 的当前实现整理。本文描述的是 <code>knowledge_forge</code> 策略，不是独立的 <code>graphrag_native</code> 策略。
 
 ## 0. 文档定位与阅读方式
 
@@ -13,11 +13,11 @@
 
 需要先说明三个边界：
 
-- 当前产品策略名是 <code>knowledge_forge</code>。数据库中部分 <code>shadow_*</code> 表名、ID 前缀和内部模块名是历史兼容名称，不代表线上仍运行一套名为 “Shadow” 的产品策略。
+- 当前产品策略名是 <code>knowledge_forge</code>。数据库中部分 <code>shadow_*</code> 表名、ID 前缀和版本字段是历史兼容名称，不代表线上仍运行一套名为 “Shadow” 的产品策略。
 - <code>graphrag_native</code> 是另一条完全独立的 GraphRAG 3.1.1 路线。它使用自己的 Parquet/LanceDB 运行包，不经过本文的实体归一、关系审核、PostgreSQL 事实快照或 HugeGraph 物化链。
-- 当前策略元数据仍是 <code>production_approved=false</code>。本文中的评测结果是工程验收证据，不应在面试中表述成经过第三方认证的生产级准确率。
+- 本文中的评测结果是项目工程验收证据，不应在面试中表述成经过第三方认证的生产级准确率。
 
-本文生成时已使用项目 <code>.venv</code> 完成代码自检：Python 编译通过，测试结果为 1163 passed、45 skipped；跳过项是测试配置中显式标记的可选集成场景。
+本文更新时已使用项目 <code>.venv</code> 完成代码自检：Python 编译通过，测试结果为 1295 passed、44 skipped；跳过项是测试配置中显式标记的可选集成场景。
 
 推荐阅读顺序：
 
@@ -3590,14 +3590,14 @@ F1        = 2PR / (P + R)
 | <code>knowledge_forge/vector_store.py</code> | 向量持久化和 hybrid 基础分数 |
 | <code>knowledge_forge/schema_evolution.py</code> | 基础逻辑 Schema、采样、增量治理 |
 | <code>knowledge_forge/grounded_context.py</code> | 当前来源上下文 facade |
-| <code>knowledge_forge/shadow_context.py</code> | 历史命名下的精确 context/source-map 实现 |
+| <code>knowledge_forge/evidence_context.py</code> | 精确 evidence context/source-map 实现 |
 | <code>knowledge_forge/grounded_entities.py</code> | 当前实体处理 facade 和来源约束语义 |
-| <code>knowledge_forge/entity_shadow.py</code> | 历史命名下的不可变实体工作流 |
+| <code>knowledge_forge/entity_runtime.py</code> | 来源约束的实体运行工作流 |
 | <code>knowledge_forge/entity_resolution.py</code> | 实体候选、归一和保守 identity resolution |
 | <code>knowledge_forge/entity_reranker.py</code> | 实体 pair reranking |
 | <code>knowledge_forge/grounded_relations.py</code> | 当前关系 facade |
-| <code>knowledge_forge/relation_shadow_runtime.py</code> | 关系运行编排和 semantic contract |
-| <code>knowledge_forge/relation_shadow_v2.py</code> | pair、proposal、hypothesis 和归一主链 |
+| <code>knowledge_forge/relation_runtime.py</code> | 关系运行编排和 semantic contract |
+| <code>knowledge_forge/relation_extraction.py</code> | pair、proposal、hypothesis 和归一主链 |
 | <code>knowledge_forge/relation_verification.py</code> | 独立有序蕴含验证 |
 | <code>knowledge_forge/relation_secondary.py</code> | 原因分流二次复核，默认关闭 |
 | <code>knowledge_forge/knowledge_forge_descriptions.py</code> | 实体/关系展示描述 |

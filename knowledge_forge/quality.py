@@ -139,13 +139,13 @@ def _multiset_relation_metrics(
     }
 
 
-def evaluate_shadow_relation_quality(
+def evaluate_relation_quality(
     *,
     gold: list[dict[str, Any]] | None,
     predicted: list[dict[str, Any]],
     snapshot_current: bool,
 ) -> dict[str, Any]:
-    """Evaluate Shadow output without treating output volume as Gold quality."""
+    """Evaluate relation output without treating output volume as Gold quality."""
 
     blocking_reasons = [] if snapshot_current else ["stale_snapshot"]
     if gold is None:

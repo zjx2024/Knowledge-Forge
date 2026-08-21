@@ -1376,12 +1376,12 @@ def test_vector_candidate_sql_keeps_json_path_during_sql_composition():
         def connection(self):
             yield connection
 
-        def _ensure_entity_shadow_hnsw_index(
+        def _ensure_grounded_entity_hnsw_index(
             self, _connection, _model_name, _dimension,
         ):
             return None
 
-    rows = TestDatabase().search_entity_shadow_vector_candidates(
+    rows = TestDatabase().search_grounded_entity_vector_candidates(
         "namespace", "embedding-model", [1.0, 0.0], 5,
     )
 

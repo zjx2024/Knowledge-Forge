@@ -1,4 +1,4 @@
-"""Reason-routed secondary relation recovery for Enhanced Shadow.
+"""Reason-routed secondary relation recovery for Knowledge Forge.
 
 The secondary pass is deliberately narrower than the primary classifier.  It
 does not re-run the same prompt with a new temperature; it asks a different

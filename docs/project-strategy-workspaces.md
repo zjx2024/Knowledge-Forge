@@ -4,16 +4,17 @@
 
 一个项目只属于一种知识图谱构建策略：
 
-- `enhanced_shadow`：用户界面名称为 **Knowledge Forge**；
+- `knowledge_forge`：用户界面名称为 **Knowledge Forge**；
 - `graphrag_native`：用户界面名称为 **GraphRAG Native**。
 
-稳定基线仍保留为历史兼容实现，但不参与新项目选择。策略不是页面筛选条件，
-也不能通过 URL 参数、构建按钮或普通 API 改变。
+历史输入键 `enhanced_shadow` 只在旧请求兼容层归一为 `knowledge_forge`，新项目和
+新构建不再写入该键。策略不是页面筛选条件，也不能通过 URL 参数、构建按钮或
+普通 API 改变。
 
 ## 生命周期
 
 1. 新项目在创建事务中同时写入项目记录和 `bound` 策略记录。
-2. 0024 迁移前的项目保持 `unassigned + stable`，首页要求用户一次性确认。
+2. 0024 迁移前且尚未绑定的项目由首页要求用户一次性确认，不根据历史查询参数猜测。
 3. 绑定通过 generation CAS 完成；绑定后应用接口和 PostgreSQL trigger 都拒绝修改。
 4. 已有其他策略产物不自动删除，只是不再出现在固定策略工作区中。
 

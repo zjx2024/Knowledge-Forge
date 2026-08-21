@@ -26,7 +26,7 @@ PostgreSQL、HugeGraph 和 Ollama，不依赖 RAGFlow 运行时。
 - 任务状态持久化到 PostgreSQL，页面切换或服务重启不会丢失任务记录。
 - 任务面板清晰区分总进度和当前步骤进度；每一步将状态与处理说明分开显示，避免长说明挤压布局。
 - 文档删除会先立即软删除并取消关联任务，使其马上从项目列表和检索结果中移除；HugeGraph、源文件和过程文件由持久化后台清理任务处理，服务重启后可继续恢复。清理完成后会再次停用该文档的知识块、向量、实体提及和关系贡献，不影响其他文档仍支持的实体。
-- 提供显式 GraphRAG 3.1.1 BYOG 社区检测 CLI；它从当前正式 control 图生成 Leiden 社区并 shadow 持久化，不会自动运行，也不参与现有检索、问答或 HugeGraph。
+- 提供 Knowledge Forge 与 GraphRAG Native 两种项目级构建策略；两者共享源文档与预处理结果，但实体、关系、社区和发布状态互相隔离。
 
 ## 架构与目录
 
@@ -193,13 +193,13 @@ python3.12 -m venv .venv
 VS Code 中使用“Python: Select Interpreter”并选择
 `<仓库根目录>/.venv/bin/python`。
 
-依赖中固定包含 `graphrag==3.1.1`。除 Stable 与增强 Shadow 外，界面还提供
-`GraphRAG Native（原生语义图与社区）`：它从当前 active revision 的已持久化结构块
+依赖中固定包含 `graphrag==3.1.1`。界面提供 `Knowledge Forge` 与
+`GraphRAG Native` 两种知识构建策略。GraphRAG Native 从当前 active revision 的已持久化结构块
 生成隔离的 GraphRAG Standard 输入，产物保存在
 `KnowledgeFiles/graphrag_native/` 的不可变 run bundle 中。该策略只支持项目级全量
 构建，不写入旧实体、关系、pgvector 或 HugeGraph；其应用内查看器、社区报告和查询
 也不依赖 Hubble。文档新增、删除或重建 revision 会使 native run 过期，必须重新构建。
-native run 内部的 READY 指针不改变项目的 Stable/增强策略选择，也不会自动发布或部署。
+native run 内部的 READY 指针不改变项目当前策略选择，也不会自动发布或部署。
 Native Standard 工作流的隔离子进程预算由 `GRAPHRAG_NATIVE_TIMEOUT_SECONDS` 控制，默认
 为 7200 秒；超时只会使该 run 失败，阶段性 staging 产物不会被标记为可查询成果。
 
@@ -216,7 +216,7 @@ retention 命令默认只列出候选；即使显式执行清理，也会拒绝 
 或仍持有 lease 的 run。
 
 完整的数据边界、状态机、API 与恢复说明见
-[GraphRAG Native 第三策略](docs/graphrag-native.md)。
+[GraphRAG Native 策略](docs/graphrag-native.md)。
 
 ### 依赖锁更新
 
@@ -479,161 +479,60 @@ Top-K 检索候选，不再将项目全部实体向量加载到 Python 中逐个
 
 Knowledge Forge 不依赖 RAGFlow；项目、文档、知识块和向量均由本项目自己的 PostgreSQL 表管理。
 
-## P0 verifier 策略升级
+## 当前知识构建架构
 
-当前关系验证策略版本为 `relation-verifier-p0-v1`，图发布策略版本为
-`relation-graph-p0-v1`。升级后首次启动会幂等执行数据库迁移：缺少当前策略版本的历史
-`rules_verified` 和 `llm_verified` 会降级为 `legacy_unverified`；非发布关系及没有有效断言
-的孤儿 relation vector 会被停用。关系候选、验证事件和断言组成单个 PostgreSQL
-“关系审计链事务”，这不代表实体、向量和外部图写入具备跨系统事务。
+### 两种项目级策略
 
-关系断言是权威数据，关系向量是可重建索引。Embedding 写入失败时，系统会写入
-`indexing_failures` 补偿记录，不会降级已经验证的断言；后续项目图重建会重试这些索引。
-数据库迁移不会在启动时静默执行耗时的 HugeGraph 全量重建。
+| 策略 | 主要产物 | 存储与查询边界 |
+| --- | --- | --- |
+| Knowledge Forge | 规范实体、已验证关系、HugeGraph 图、社区与详细报告 | PostgreSQL 是权威事实层，pgvector 提供检索索引，HugeGraph 提供可遍历副本 |
+| GraphRAG Native | GraphRAG 3.1.1 实体、关系、社区、报告与查询索引 | 每次运行保存为不可变 Parquet/LanceDB bundle，不写 KF 实体表、pgvector 或 HugeGraph |
 
-服务升级并启动后，必须为每个已有项目显式触发一次图谱重同步：
+源文档、结构块和知识块可被两种策略复用；任何新增、删除或 revision 变化都会使相关图谱进入待更新状态。两种策略必须分别完成新鲜度校验和原子发布，失败构建不会覆盖上一份可查询结果。
 
-```bash
-curl -X POST http://127.0.0.1:8011/api/projects/<PROJECT_ID>/graph
-```
+### Knowledge Forge 主链
 
-已有非空图在策略版本不匹配时会标记为 `stale`。重建任务依次进入 `rebuilding`，先清除
-项目在 HugeGraph 中的旧贡献，再从 PostgreSQL 按当前发布谓词完整重建，并比较
-PostgreSQL 发布关系数、本次写入数和 HugeGraph 实际关系数。只有三者一致才进入
-`ready` 并写入当前图策略版本；任一阶段失败均进入 `failed`。`stale`、`rebuilding` 和
-`failed` 状态下，服务端会拒绝生成 Hubble URL，直接访问 `/graph/view` 返回 HTTP 409。
+1. 复用已准备的文档结构、知识块和向量；
+2. 从活动文档快照确定项目逻辑 Schema，并仅做有证据的增量扩展；
+3. 按精确来源 span 抽取实体 occurrence，经过名称、别名、pg_trgm、pgvector、reranker 和必要的 LLM 裁决形成规范实体；
+4. 从正文、列表、表格和结构角色生成关系候选，再执行谓词绑定、端点方向检查、独立验证和发布审计；
+5. 只有携带当前策略版本、完整证据和可发布终态的关系进入项目图；
+6. PostgreSQL 快照验证通过后同步 HugeGraph，数量、端点、方向和代次一致才标记为 `ready`；
+7. 社区与详细报告在图谱发布后异步生成，不阻塞 Chunk、实体和关系检索。
 
-## P1-P3 策略、性能与回滚
+关系分类和最终验证都使用有界上下文、候选数、重试和 Token 预算。未覆盖、协议失败、证据不足和冲突均进入明确终态，不会被静默改成通用关系。表格、列表和标题层级只在解析器能够给出精确结构契约时参与确定性关系恢复。
 
-### 图代次与任务合并
+### 图代次、任务与恢复
 
-项目知识发生变化时，PostgreSQL 会递增 `graph_generation` 并把图标记为 `stale`。
-入库任务繁忙期间，后续请求只更新同一个待执行图任务的目标代次；系统在项目进入静默点后
-执行一次完整重建，因此连续入库 10 篇文档通常从 10 次全图重建降为 1 次。重建期间又产生
-新代次时，旧代次不能进入 `ready`，而会保留 pending 状态并由新代次接管。图清理、逐文档
-写入、关系数量核对或最终状态更新任一步失败，项目都会保持 `failed/stale`，可重试但不会
-暴露部分图。
+项目知识变化会递增图代次并把图标记为待更新。连续文档更新会合并到同一目标代次，避免每个文档都触发一次完整图同步。构建、社区报告、图同步和清理均使用 PostgreSQL `jobs` 与持久化工作账本；服务重启后从数据库状态恢复，不依赖进程内存。
 
-`relation_assertions` 是不可变来源事实，当前图端点由可重建的关系投影决定。实体合并、拆分、
-撤销或项目策略升级都会刷新投影、递增图代次并要求重建，原始 mention 和 assertion 不会被
-覆盖。
+实体合并、拆分和撤销保留 occurrence、assignment、redirect 与事件审计，不改写原始来源。文档删除只移除该文档的派生贡献，仍被其他文档支持的实体和关系继续保留。
 
-### 策略版本与启用门禁
+### 数据库命名兼容
 
-构建策略按实体抽取、实体归一、关系候选、关系分类、关系验证和 Schema 六个版本轴组成完整
-快照。当前生产路径继续使用 `control`；P1 关系策略与 P2 实体策略仅以隔离的 `shadow`
-namespace 运行，不写正式实体、断言、向量、搜索结果或 HugeGraph。发布顺序为
-`control -> shadow -> canary -> limited -> expanded`，每一步均记录前一快照和回滚快照。
+早期迁移创建的 `entity_shadow_*`、`shadow_relation_*`、`relation_shadow_*` 表名、索引、运行 ID 和策略版本值是现有数据的物理兼容契约，不能在普通代码清理中重命名。当前 Python 模块、类、函数和脚本统一使用 `grounded entity`、`grounded relation`、`evidence context` 与 `relation pipeline` 术语。详见 [`docs/naming-and-compatibility.md`](docs/naming-and-compatibility.md)。
 
-非 control 快照只有在以下条件全部满足后才能激活：快照覆盖全部 indexed 文档、冻结数据集
-manifest 有效、标签由人工确认、holdout 与 dev 隔离、质量和成本门禁通过，并且数据库中
-存在 `production_approved` gate。仓库内 `tests/fixtures/kg_gold` 仅用于工程验证，明确不是
-人工 Gold，不能授权生产启用。因此当前新策略状态为 `engineering_complete`，默认仍关闭。
+### 质量评估与诊断
 
-### Prompt、批处理与溢出
-
-关系分类先生成有稳定 ID 的 mention/candidate，再按项目上下文预算分批。每批 Prompt 中
-Chunk 正文只出现一次，并为输出和安全余量预留非零 Token；单个候选超过预算时会显式进入
-`deferred`，不会使用切片截断或静默丢弃。模型必须为每个 admitted candidate 返回唯一
-决策。批次中独立通过严格解析的成员可以保留，缺失、重复、非法方向或越出该 pair Schema
-子集的成员会单独重试；任何未通过成员仍然 fail-closed，不能借同批其他结果发布。相关上限由
-`RELATION_CLASSIFIER_OUTPUT_RESERVE`、`RELATION_CLASSIFIER_SAFETY_MARGIN`、
-`RELATION_CLASSIFIER_MAX_CANDIDATES`、`RELATION_MODEL_CONTEXT_MAX_CHARS` 和
-`RELATION_CLASSIFIER_CONTEXT_MAX_CHARS` 共同控制。源帧盘点仍读取完整冻结上下文；候选级
-模型只接收围绕精确端点的有界证据窗口，并保留绝对来源坐标，避免长文档把同一全文重复发送。
-`RELATION_SOURCE_BINDING_GLEANING_ROUNDS` 控制源帧到 Schema 绑定的遗漏补采轮次；补采只返回
-首轮尚未覆盖的 frame、谓词与方向组合。默认关闭这一低边际收益的全量二次调用，并由确定性
-语义短名单承担普通遗漏回收；对召回极敏感且可接受额外时延的部署可设为 `1`。新增候选仍经过
-相同的确定性和独立验证门槛。解析器已经给出严格父子、表格或标识符契约的 frame 不再重复
-发送给绑定模型；只有启用 `RELATION_SECONDARY_ENABLED` 时，绑定阶段才生成仅供二次复核的
-`review_only` 谓词候选，避免默认流程为不可发布候选支付模型成本。
-表格首行被解析为列角色元数据，其精确表头 occurrence 不允许再充当关系端点；数据行则按
-“行主键 → 对应列值”生成带完整表头/行证据的结构事实。活动 Schema 尚无该列专用谓词时，
-事实通过唯一开放原文关系载体保留列名语义，避免因旧 Schema 漏掉整列，也避免把
-`Source`、`Purpose` 等相邻表头误抽为实体关系。
-最终关系核验可跨多个来源 Chunk 有界打包，但每条 claim 都保留自己的冻结正文、绝对坐标和
-Schema 契约；`RELATION_VERIFIER_BATCH_SIZE` 和
-`RELATION_VERIFIER_BATCH_MAX_CHARS` 分别限制每批候选数和序列化请求大小；
-`RELATION_LEDGER_PERSIST_BATCH_SIZE` 仅控制候选审计账本的数据库写入批次（默认 4096，不改变抽取语义）；缺项、重复项、
-未知 ID 或协议失败会逐条回退，不会把不完整批次当作可发布结果。局部兼容恢复只允许保留
-明确的 `REJECTED/UNCERTAIN` 非发布结果；缺少反向蕴含或端点角色审计的简化 `SUPPORTED`
-始终回退到严格单条核验。`RELATION_VERIFIER_FOCUSED_REVIEW_MAX` 进一步限制每次项目构建的
-选择性单条复核预算：批量通过的语义短名单/缺少源角色投影候选需做精度确认，批量拒绝但有
-直接源帧绑定或 Schema 角色契约的候选则做召回恢复；复核仍执行完整发布核验，不会直接翻转。
-`RELATION_VERIFICATION_MODE=lean` 使用候选抽取/确定性校验加一次独立有向最终核验的两阶段
-门禁；最终核验必须同时返回精确端点证据、双向蕴含和两端 Schema 角色。旧的同模型多次角色
-复述仅保留为 `legacy_consensus` 诊断兼容模式，不再作为默认路径，因为它会线性放大长文档成本，
-却不构成独立证据。
-一次关系核验结束后，按原因分流的实验性二次证据恢复默认关闭：跨领域校准中它对已拒绝候选的
-新增有效事实收益很低，反而可能把角色重试误写成新的有向关系。只有部署方经过自己的 Gold
-回归确认收益后，才应设置 `RELATION_SECONDARY_ENABLED=true`；
-`RELATION_SECONDARY_MAX_CANDIDATES` 控制其项目级上限，二次结果仍必须通过同一独立验证和物化
-闸门。解析器已经冻结精确子项/父项、表头/单元格或标识符/主题角色的结构事实，不再调用模型
-复述版面；它们由独立确定性契约重新核对原文字节、端点、方向、结构种类及 Schema 授权后发布。
-
-实体 exact 候选按 Chunk 批量预取，命中后不调用 Embedding、reranker 或 LLM；未命中的
-身份文本按 `ENTITY_EMBEDDING_BATCH_SIZE` 批量向量化。reranker 只处理有界 Top-K，所有
-外部调用、候选数、Token、数据库语句、重试和图重建均记录操作数指标；聚合指标不包含正文
-或凭据。隔离 Shadow 构建的不可变模型调用账本会保留精确请求哈希、Prompt、原始响应和 Token
-诊断，以便区分内容拒绝、协议失败与传输重试，并受项目来源数据的同一访问边界约束。
-
-### 数据库迁移与 HNSW
-
-应用启动时幂等创建规范 alias 表、实体到来源文档映射、mention assignment、cannot-link、
-shadow、策略快照、质量门禁、rollout、图代次和审计表；旧实体的规范名/别名及来源计数可
-重复回填，不删除兼容列。历史项目应逐项目显式触发策略快照和图重建，不在启动时做破坏性
-全量重入库。
-
-pgvector 会按 Embedding 模型和维度创建 partial HNSW 索引。维度不超过
-`PGVECTOR_HNSW_MAX_DIMENSIONS` 时必须走 HNSW Top-K；索引创建失败不会写入成功缓存，
-下一次会重试。超维模型进入可观测 degraded 精确扫描模式。真实 PostgreSQL 的 exact、
-trigram、来源映射和 HNSW 查询计划可用以下命令验证：
-
-```bash
-.venv/bin/python scripts/run_disposable_postgres_tests.py tests/test_p1_postgres_plans.py
-```
-
-脚本只在临时数据库生成 10k/100k 验证数据，测试结束无论成功或失败都会终止连接并删除该
-数据库，不会污染业务库。1M 基准只在独立资源充足的环境显式设置
-`RUN_LARGE_BENCHMARKS=1` 后运行。
-
-### 实体修订与回滚
-
-人工或受门禁策略可以追加实体 merge、mention split 和 undo 事件。每次操作保留操作者、
-原因、分数、证据、操作前后 assignment 和 redirect；merge 不重写原始关系断言，split
-只移动选定 mention，undo 通过补偿事件恢复旧 assignment。修改完成后关系投影、来源计数、
-实体向量和 HugeGraph 端点均按新代次重建。cannot-link 优先于 exact/alias 规则，存在冲突
-时禁止自动合并。
-
-### 质量评估与外部 smoke
-
-工程 fixture、操作数基准和人工标注包命令：
+工程 fixture、跨领域基准和评测工具用于回归抽取完整性、实体边界、归一、谓词、方向、来源和成本：
 
 ```bash
 .venv/bin/python benchmarks/benchmark_kg_construction.py
 .venv/bin/python benchmarks/build_annotation_bundle.py --help
 .venv/bin/python benchmarks/evaluate_kg_gold.py --help
+.venv/bin/python scripts/export_relation_evaluation_bundle.py --help
+.venv/bin/python scripts/validate_relation_evaluation_bundle.py --help
 ```
 
-质量报告覆盖实体 exact/overlap span、类型 macro-F1、候选召回、pairwise/B3 聚类、严格关系
-与证据、Brier/ECE 校准、control/treatment discordant cases 和 Wilson 区间。生产报告必须
-使用独立人工确认且冻结的 Gold/holdout manifest；模型自产标签只能形成待人工审核队列。
+`artifacts/` 是可重复生成的本地输出，不提交 Git。模型生成标签只作为待复核候选；生产门禁需要独立确认的 Gold/holdout 与完整分母。默认测试不访问外部模型或图数据库，真实集成测试必须显式使用隔离数据和当前运行模型。
 
-默认 pytest 不访问外部服务。环境具备时显式运行：
+### 后续智能体
 
-```bash
-RUN_LIVE_MODEL_TESTS=1 .venv/bin/python -m pytest -q -m live_model
-RUN_HUGEGRAPH_INTEGRATION=1 .venv/bin/python -m pytest -q -m hugegraph_integration
-```
-
-模型 smoke 验证 Ollama 模型 digest/context、严格 JSON、Embedding 数量/顺序/维度/finite 和
-本地 reranker pair/score 对齐。HugeGraph smoke 只做只读图发现；purge、失败注入、409、
-重建和 retry 必须使用明确隔离物理图，不能在承载用户数据的 `knowledge_forge` 图中执行。
-fake HugeGraph 测试覆盖进程状态恢复、代次变化、数量不一致、失败重试和发布前 409。
+知识问答智能体采用一套上层流程和两个检索适配器，不为 KF 与 GR 分裂两套会话产品。完整架构、证据协议、LangGraph 边界、API、评估和从第一版到最终版的路线见 [`docs/knowledge-agent-implementation-roadmap.md`](docs/knowledge-agent-implementation-roadmap.md)。
 
 ## 验证
 
-上线前 revision、shadow snapshot、Gold/release gate、HugeGraph sentinel、迁移恢复和隔离
+上线前 revision、不可变构建快照、Gold/release gate、HugeGraph sentinel、迁移恢复和隔离
 E2E 的完整操作见 [`docs/pre-live-readiness.md`](docs/pre-live-readiness.md)。
 
 ```bash

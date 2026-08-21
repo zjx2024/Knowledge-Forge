@@ -12,7 +12,7 @@ from psycopg.conninfo import conninfo_to_dict
 from knowledge_forge.construction_strategies import (
     GRAPHRAG_NATIVE_STRATEGY,
     KNOWLEDGE_FORGE_STRATEGY,
-    LEGACY_ENHANCED_SHADOW_STRATEGY,
+    LEGACY_KNOWLEDGE_FORGE_STRATEGY_KEY,
     STABLE_STRATEGY,
     normalize_strategy,
     strategy_options,
@@ -20,8 +20,8 @@ from knowledge_forge.construction_strategies import (
 from knowledge_forge.config import Config
 from knowledge_forge.database import Database
 from knowledge_forge.migrations import MULTI_STRATEGY_CONSTRUCTION_SQL
-from knowledge_forge.policy import ENTITY_SHADOW_POLICY_SET, POLICY_AXES
-from knowledge_forge.policy import P1_RELATION_SHADOW_POLICY_SET
+from knowledge_forge.policy import ENTITY_EXTRACTION_POLICY_SET, POLICY_AXES
+from knowledge_forge.policy import RELATION_CANDIDATE_POLICY_SET
 from knowledge_forge.service import (
     GROUNDED_ENTITY_CODE_VERSION,
     _grounded_entity_freshness_policy_set,
@@ -70,7 +70,7 @@ class _StrategyDatabase:
         self.updated: list[tuple[int, str, dict]] = []
         self.invalidated: list[tuple[int, str]] = []
         self.stale: list[tuple[int, str, str]] = []
-        self.shadow_v2_readiness_checks = 0
+        self.grounded_relation_readiness_checks = 0
         self.jobs = {
             "job-knowledge_forge": {
                 "id": "job-knowledge_forge", "status": "queued", "metadata": {},
@@ -85,8 +85,8 @@ class _StrategyDatabase:
     def ensure_project_strategy_graphs(self, project_id):
         return []
 
-    def assert_shadow_relation_v2_ready(self):
-        self.shadow_v2_readiness_checks += 1
+    def assert_grounded_relation_ready(self):
+        self.grounded_relation_readiness_checks += 1
         return {"migrations": [f"00{value}" for value in range(14, 20)]}
 
     def ensure_document_strategy_builds(self, document_id, reset=False):
@@ -168,7 +168,7 @@ def test_strategy_registry_is_stable_and_rejects_unknown_values():
     ]
     with pytest.raises(ValueError, match="未知知识构建方案"):
         normalize_strategy("typo")
-    assert normalize_strategy(LEGACY_ENHANCED_SHADOW_STRATEGY) == KNOWLEDGE_FORGE_STRATEGY
+    assert normalize_strategy(LEGACY_KNOWLEDGE_FORGE_STRATEGY_KEY) == KNOWLEDGE_FORGE_STRATEGY
 
 
 def test_schema_reassessment_is_owned_by_idle_knowledge_forge_projects():
@@ -255,14 +255,14 @@ def test_enhanced_build_can_prepare_shared_content_without_stable_build():
     job_id = service.submit_ingestion(11, strategy_key=KNOWLEDGE_FORGE_STRATEGY)
 
     assert job_id == "job-knowledge_forge"
-    assert database.shadow_v2_readiness_checks == 1
+    assert database.grounded_relation_readiness_checks == 1
     assert service.executor.calls == [("_ingest_knowledge_forge_strategy", (job_id, 11))]
     assert database.updated[-1][2]["status"] == "queued"
 
 
 def test_enhanced_entry_fails_closed_when_shadow_v2_migrations_are_missing():
     class MissingMigrationDatabase(_StrategyDatabase):
-        def assert_shadow_relation_v2_ready(self):
+        def assert_grounded_relation_ready(self):
             raise RuntimeError("Shadow relation v2 数据库结构不完整")
 
     database = MissingMigrationDatabase()
@@ -1274,11 +1274,11 @@ def test_strategy_neutral_preparation_does_not_begin_graph_mutation():
     assert database.updates[0][1]["status"] == "running"
 
 
-def test_shadow_policy_constants_are_converted_before_json_serialization():
-    payload = {"relation_policy_set": dict(P1_RELATION_SHADOW_POLICY_SET)}
+def test_grounded_policy_constants_are_converted_before_json_serialization():
+    payload = {"relation_policy_set": dict(RELATION_CANDIDATE_POLICY_SET)}
 
     assert json.loads(json.dumps(payload))["relation_policy_set"] == dict(
-        P1_RELATION_SHADOW_POLICY_SET
+        RELATION_CANDIDATE_POLICY_SET
     )
 
 

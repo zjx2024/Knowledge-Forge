@@ -97,7 +97,7 @@ def _executor(monkeypatch, tmp_path):
     database = _Database()
     service = SimpleNamespace(
         db=database, ollama=SimpleNamespace(model_info=lambda _model: {"digest": "d" * 64}),
-        vectors=_Tripwire(), resolver=_Tripwire(), graph=_Tripwire(), relation_shadow=_Tripwire(),
+        vectors=_Tripwire(), resolver=_Tripwire(), graph=_Tripwire(), relation_pipeline=_Tripwire(),
     )
     executor = GraphRAGNativeExecutor(service)
     executor.runner = _Runner()

@@ -35,8 +35,8 @@ from knowledge_forge.graph_safety import GraphEndpointIdentity, HugeGraphTestGua
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIO_TESTS = (
     "tests/test_document_content_revisions.py",
-    "tests/test_relation_shadow_recovery.py",
-    "tests/test_entity_shadow_independence.py",
+    "tests/test_relation_pipeline_recovery.py",
+    "tests/test_grounded_entity_independence.py",
     "tests/test_policy_snapshot_orchestrator.py",
     "tests/test_release_gate_artifacts.py",
     "tests/test_graph_manifest_validation.py",
@@ -45,7 +45,7 @@ SCENARIO_TESTS = (
     "tests/test_p2_merge_split.py",
     "tests/test_ollama_token_contract.py",
     "tests/test_p1_postgres_plans.py",
-    "tests/test_entity_shadow_postgres_plans.py",
+    "tests/test_grounded_entity_postgres_plans.py",
     "tests/test_hugegraph_safety_guard.py",
     "tests/test_e2e_safety.py",
 )
@@ -274,7 +274,6 @@ def collect_manifest() -> dict[str, Any]:
         },
     }
     policy_snapshot = {
-        "relation_shadow": Config.relation_shadow_enabled,
         "entity_merge_threshold": Config.entity_merge_threshold,
         "schema_auto_apply": Config.schema_auto_apply,
     }
