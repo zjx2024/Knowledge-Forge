@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -218,6 +220,37 @@ def verify_postgres_sentinel(context: DisposablePostgresContext) -> None:
         raise PostgresIsolationError("PostgreSQL test sentinel expired")
 
 
+@contextmanager
+def allow_disposable_database_create_for_bootstrap(
+    context: DisposablePostgresContext,
+) -> Iterator[None]:
+    """Temporarily allow additive schema migrations in one verified test DB."""
+    verify_postgres_sentinel(context)
+    if context.database != f"kf_e2e_db_{context.run_id}":
+        raise PostgresIsolationError("bootstrap database is outside the random namespace")
+    if context.role != f"kf_e2e_role_{context.run_id}":
+        raise PostgresIsolationError("bootstrap role is outside the random namespace")
+    with psycopg.connect(context.maintenance_dsn, autocommit=True) as connection:
+        connection.execute(sql.SQL("GRANT CREATE ON DATABASE {} TO {}").format(
+            sql.Identifier(context.database), sql.Identifier(context.role),
+        ))
+    try:
+        yield
+    finally:
+        with psycopg.connect(context.maintenance_dsn, autocommit=True) as connection:
+            connection.execute(sql.SQL("REVOKE CREATE ON DATABASE {} FROM {}").format(
+                sql.Identifier(context.database), sql.Identifier(context.role),
+            ))
+            retained = connection.execute(
+                "SELECT has_database_privilege(%s,%s,'CREATE')",
+                (context.role, context.database),
+            ).fetchone()[0]
+            if retained:
+                raise PostgresIsolationError(
+                    "temporary database CREATE privilege was not revoked"
+                )
+
+
 def cleanup_disposable_schema(context: DisposablePostgresContext) -> str:
     with psycopg.connect(context.maintenance_dsn) as connection:
         database_exists = bool(connection.execute(
@@ -246,33 +279,24 @@ def cleanup_disposable_schema(context: DisposablePostgresContext) -> str:
         raise
     try:
         operations = PostgresCleanupPlan(
-            schema=context.schema, role=context.role, run_id=context.run_id,
+            database=context.database, schema=context.schema, role=context.role,
+            run_id=context.run_id,
             sentinel_verified=True,
         ).operations()
     except E2ESafetyError as exc:
         raise PostgresIsolationError(str(exc)) from exc
-    with psycopg.connect(context.target_admin_dsn, autocommit=True) as connection:
-        connection.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE usename=%s AND pid<>pg_backend_pid()", (context.role,),
-        )
+    with psycopg.connect(context.maintenance_dsn, autocommit=True) as connection:
         for operation, identifier in operations:
-            if operation == "drop_schema":
+            if operation == "drop_database":
                 connection.execute(
-                    sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(identifier))
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname=%s AND pid<>pg_backend_pid()", (identifier,),
+                )
+                connection.execute(
+                    sql.SQL("DROP DATABASE {}").format(sql.Identifier(identifier))
                 )
             elif operation == "drop_role":
                 connection.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(identifier)))
             else:
                 raise PostgresIsolationError(f"unsupported cleanup operation: {operation}")
-    if context.database != f"kf_e2e_db_{context.run_id}":
-        raise PostgresIsolationError("cleanup database is outside the owned random namespace")
-    with psycopg.connect(context.maintenance_dsn, autocommit=True) as connection:
-        connection.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname=%s AND pid<>pg_backend_pid()", (context.database,),
-        )
-        connection.execute(
-            sql.SQL("DROP DATABASE {}").format(sql.Identifier(context.database))
-        )
     return "cleaned"

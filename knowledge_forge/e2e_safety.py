@@ -232,6 +232,7 @@ def verify_execution_token(
 
 @dataclass(frozen=True)
 class PostgresCleanupPlan:
+    database: str
     schema: str
     role: str
     run_id: str
@@ -242,11 +243,17 @@ class PostgresCleanupPlan:
             raise E2ESafetyError("cleanup requires a reverified PostgreSQL sentinel")
         if not re.fullmatch(r"[a-f0-9]{16,64}", self.run_id):
             raise E2ESafetyError("cleanup run_id is not a bounded random identifier")
+        if self.database != f"kf_e2e_db_{self.run_id}":
+            raise E2ESafetyError("cleanup database is outside the owned namespace")
         if self.schema != f"kf_e2e_{self.run_id}":
             raise E2ESafetyError("cleanup schema is outside the owned namespace")
         if self.role != f"kf_e2e_role_{self.run_id}":
             raise E2ESafetyError("cleanup role is outside the owned namespace")
-        return (("drop_schema", self.schema), ("drop_role", self.role))
+        # Dropping the verified random database first also removes product-owned
+        # auxiliary schemas (for example the LangGraph checkpoint schema).
+        # The globally scoped random role can then be removed without leaving
+        # ownership dependencies behind.
+        return (("drop_database", self.database), ("drop_role", self.role))
 
 
 @dataclass(frozen=True)

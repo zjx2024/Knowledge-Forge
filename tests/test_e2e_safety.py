@@ -120,17 +120,25 @@ def test_preflight_fails_closed_when_isolation_evidence_is_missing(updates, mess
 def test_cleanup_plan_can_only_target_owned_random_schema_and_role():
     run_id = uuid.uuid4().hex
     plan = PostgresCleanupPlan(
-        schema=f"kf_e2e_{run_id}", role=f"kf_e2e_role_{run_id}",
+        database=f"kf_e2e_db_{run_id}", schema=f"kf_e2e_{run_id}",
+        role=f"kf_e2e_role_{run_id}",
         run_id=run_id, sentinel_verified=True,
     )
     assert plan.operations() == (
-        ("drop_schema", f"kf_e2e_{run_id}"),
+        ("drop_database", f"kf_e2e_db_{run_id}"),
         ("drop_role", f"kf_e2e_role_{run_id}"),
     )
     with pytest.raises(E2ESafetyError):
         PostgresCleanupPlan(
-            schema="public", role=f"kf_e2e_role_{run_id}",
+            database=f"kf_e2e_db_{run_id}", schema="public",
+            role=f"kf_e2e_role_{run_id}",
             run_id=run_id, sentinel_verified=True,
+        ).operations()
+    with pytest.raises(E2ESafetyError):
+        PostgresCleanupPlan(
+            database="knowledge_forge", schema=f"kf_e2e_{run_id}",
+            role=f"kf_e2e_role_{run_id}", run_id=run_id,
+            sentinel_verified=True,
         ).operations()
 
 
@@ -164,12 +172,14 @@ def test_postgres_sentinel_must_match_actual_identity_config_and_expiry():
     )
     with pytest.raises(E2ESafetyError):
         PostgresCleanupPlan(
-            schema=f"kf_e2e_{run_id}", role="postgres",
+            database=f"kf_e2e_db_{run_id}", schema=f"kf_e2e_{run_id}",
+            role="postgres",
             run_id=run_id, sentinel_verified=True,
         ).operations()
     with pytest.raises(E2ESafetyError):
         PostgresCleanupPlan(
-            schema=f"kf_e2e_{run_id}", role=f"kf_e2e_role_{run_id}",
+            database=f"kf_e2e_db_{run_id}", schema=f"kf_e2e_{run_id}",
+            role=f"kf_e2e_role_{run_id}",
             run_id=run_id, sentinel_verified=False,
         ).operations()
 

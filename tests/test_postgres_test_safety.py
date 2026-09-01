@@ -52,6 +52,11 @@ def test_disposable_postgres_role_is_schema_bounded_and_sentinel_is_admin_owned(
         assert row[1] == expected_schema
         assert row[2] is False
         assert row[3] is False
+        checkpoint_schema = connection.execute(
+            "SELECT pg_get_userbyid(nspowner) FROM pg_namespace "
+            "WHERE nspname='knowledge_agent'"
+        ).fetchone()
+        assert checkpoint_schema == (row[0],)
         sentinel = connection.execute(
             "SELECT run_id, schema_name, role_name, config_hash, expires_at "
             "FROM kf_e2e_sentinel"

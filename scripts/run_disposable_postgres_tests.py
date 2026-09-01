@@ -17,6 +17,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from knowledge_forge.config import Config
 from knowledge_forge.database import Database
 from knowledge_forge.postgres_test_safety import (
+    allow_disposable_database_create_for_bootstrap,
     cleanup_disposable_schema,
     inspect_postgres_identity,
     provision_disposable_schema,
@@ -49,32 +50,35 @@ def main() -> int:
         postgres = test_postgres
         postgres_maintenance_db = context.database
 
-    # The runner owns the database lifecycle, so every test selection starts
-    # from the same fully migrated schema instead of depending on test order.
-    Database(DisposableConfig).bootstrap()
-    environment = {
-        **os.environ,
-        "KNOWLEDGE_FORGE_TEST_POSTGRES_DSN": context.test_dsn,
-        # Migration-contract tests need to create additional schemas, but only
-        # inside this sentinel-bound random disposable database.
-        "KNOWLEDGE_FORGE_TEST_POSTGRES_ADMIN_DSN": context.target_admin_dsn,
-        "KNOWLEDGE_FORGE_TEST_SCHEMA": context.schema,
-        "KNOWLEDGE_FORGE_TEST_RUN_ID": context.run_id,
-        "KNOWLEDGE_FORGE_TEST_POSTGRES_IDENTITY": context.identity,
-        "KNOWLEDGE_FORGE_PRODUCTION_POSTGRES_IDENTITY": production_identity,
-    }
     report_file = tempfile.NamedTemporaryFile(
         prefix="kf-e2e-pytest-", suffix=".xml", delete=False,
     )
     report_file.close()
-    command = [
-        sys.executable, "-m", "pytest", "-q",
-        f"--junitxml={report_file.name}", *(sys.argv[1:] or []),
-    ]
-    print(f"PostgreSQL server: {server_version}")
-    print(f"pgvector: {pgvector_version}")
-    print(f"Armed disposable PostgreSQL schema: {context.safe_report()}")
     try:
+        # The application role is least-privilege during tests.  It receives
+        # database CREATE only while additive migrations establish their
+        # schemas, and the guarded context revokes that privilege on success
+        # and failure alike.
+        with allow_disposable_database_create_for_bootstrap(context):
+            Database(DisposableConfig).bootstrap()
+        environment = {
+            **os.environ,
+            "KNOWLEDGE_FORGE_TEST_POSTGRES_DSN": context.test_dsn,
+            # Migration-contract tests need to create additional schemas, but only
+            # inside this sentinel-bound random disposable database.
+            "KNOWLEDGE_FORGE_TEST_POSTGRES_ADMIN_DSN": context.target_admin_dsn,
+            "KNOWLEDGE_FORGE_TEST_SCHEMA": context.schema,
+            "KNOWLEDGE_FORGE_TEST_RUN_ID": context.run_id,
+            "KNOWLEDGE_FORGE_TEST_POSTGRES_IDENTITY": context.identity,
+            "KNOWLEDGE_FORGE_PRODUCTION_POSTGRES_IDENTITY": production_identity,
+        }
+        command = [
+            sys.executable, "-m", "pytest", "-q",
+            f"--junitxml={report_file.name}", *(sys.argv[1:] or []),
+        ]
+        print(f"PostgreSQL server: {server_version}")
+        print(f"pgvector: {pgvector_version}")
+        print(f"Armed disposable PostgreSQL schema: {context.safe_report()}")
         completed = subprocess.run(command, env=environment, check=False)
         if completed.returncode:
             return completed.returncode
