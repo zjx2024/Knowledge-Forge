@@ -95,6 +95,20 @@ class _KnowledgeForgeService(_Service):
         return KNOWLEDGE_FORGE_STRATEGY
 
 
+def test_processing_method_labels_do_not_expose_persisted_keys():
+    document = {
+        "effective_parser": "native_text",
+        "effective_chunk_strategy": "general",
+    }
+
+    assert web._processing_method_label(
+        document, include_chunking=True,
+    ) == "文本/Markdown 解析 · 通用分块"
+    assert web._processing_method_label(
+        document, include_chunking=False,
+    ) == "文本/Markdown 解析"
+
+
 class _KnowledgeForgeHttpService(_KnowledgeForgeService):
     def __init__(self):
         super().__init__()
@@ -293,17 +307,25 @@ def test_native_page_uses_native_build_route_and_not_hubble(monkeypatch):
     assert "结构化文档" in page
     assert "预处理分块" not in page
     assert "新建项目" not in page
-    assert '<a class="brand-link" href="/" aria-label="返回项目首页">' in page
-    assert ">返回项目首页</a>" not in page
+    assert '<a class="brand-link" href="/" aria-label="返回知识库首页">' in page
+    assert ">返回知识库首页</a>" not in page
+    assert 'class="workspace-global-nav"' in page
+    assert ">知识库设置</b>" in page
+    assert 'class="table-wrap document-table-wrap"' in page
+    assert 'data-label="文件"' in page
+    assert 'class="artifact-table"' in page
+    assert 'data-label="文档"' in page
     assert "源文档解析" in page
-    assert "Knowledge Forge Chunk、pgvector 或知识结构定义" in page
+    assert "Knowledge Forge 知识块、向量索引或知识结构定义" in page
     assert 'id="view-native-artifacts"' in page
     assert "GraphRAG 3.1.1 · 独立 native bundle" not in page
     assert ">文档</span>" in page
     assert ">文本单元</span>" in page
     assert ">实体</span>" in page
     assert ">关系</span>" in page
-    assert "源文档已准备" in page
+    assert ">已准备</span>" in page
+    assert "等待知识图谱构建" in page
+    assert "源文档已就绪" not in page
     assert 'id="document-media-dialog"' in page
     assert "structureBlockMediaMarkup(block)" in web.SCRIPT
     assert "chunkMediaMarkup(chunk)" in web.SCRIPT
@@ -334,6 +356,26 @@ def test_native_page_uses_native_build_route_and_not_hubble(monkeypatch):
     assert ".workspace-shell{display:flex;flex-direction:column;width:calc(100% - 16px);max-width:none;height:100dvh" in web.CSS
     assert ".workspace-layout{flex:1 1 auto;height:auto;min-height:0}" in web.CSS
     assert ".workspace-view{height:100%;min-height:0;overflow-y:auto" in web.CSS
+    assert ".document-table tbody td:before{content:attr(data-label)" in web.CSS
+    assert ".artifact-table tbody td::before{content:attr(data-label)" in web.CSS
+    assert "dialog:not(.graph-evidence-modal)" in web.CSS
+    assert "#project-settings-form{grid-template-columns:repeat(3,minmax(220px,1fr))" in web.CSS
+    assert ".settings-processing-options .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))" in web.CSS
+    assert ".workspace-nav{grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible}" in web.CSS
+    assert "@media(max-width:1100px){.workspace-body{overflow:auto}" in web.CSS
+    assert (
+        ".workspace-content .stats-actions>.construction-controls"
+        "{flex:0 0 auto;width:100%"
+    ) in web.CSS
+    assert (
+        ".workspace-settings>.section-heading"
+        "{align-items:flex-start;flex-direction:row}"
+    ) in web.CSS
+    assert (
+        ".embedded-graph-controls{display:grid;"
+        "grid-template-columns:minmax(0,1fr) auto auto"
+    ) in web.CSS
+    assert ".graph-canvas-nav{top:55px;right:10px}" in web.CSS
 
 
 def test_knowledge_forge_page_warns_when_prepared_document_is_not_in_ready_graph(
@@ -550,6 +592,9 @@ def test_task_monitor_cancels_stale_pollers_and_clamps_visual_progress():
     assert "Math.max(renderedSubtaskProgress[key]||0,reportedProgress)" in (
         web.SCRIPT
     )
+    assert "nativeProgress.execution_progress" in web.SCRIPT
+    assert "p>=30&&p<72" in web.SCRIPT
+    assert "p>=72&&p<100" in web.SCRIPT
 
 
 def test_task_panel_keeps_status_compact_and_details_in_the_step_body(monkeypatch):
@@ -665,9 +710,17 @@ def test_strategy_pages_separate_preparation_from_graph_actions(monkeypatch):
         assert 'data-stat="entities"' in graph_query
         assert 'data-stat="relations"' in graph_query
         assert '<span class="workspace-view-kicker">构建</span>' not in page
+        assert '<span class="workspace-view-kicker">文档</span>' not in page
+        assert "实体类别</span>" not in page
 
     assert "文档处理产物" in knowledge_forge_page
     assert "源文档准备产物" in native_page
+    assert "GraphRAG 文本单元" not in native_page
+    assert "文本单元设置" in native_page
+    assert "端点类型" not in knowledge_forge_page
+    assert "连接范围与方向" in knowledge_forge_page
+    assert "冻结输入" not in native_page
+    assert "可冻结的结构化文档" not in native_page
     document_panel = native_page.split('id="workspace-documents"', 1)[1].split(
         'id="workspace-build"', 1,
     )[0]
@@ -816,6 +869,16 @@ def test_knowledge_forge_graph_reads_ready_snapshot_without_hubble():
             assert _kwargs == {"input_hash": "community-input-1"}
             return {
                 "run_id": "community-run", "community_count": 2,
+                "metadata": {
+                    "community_topic_associations": [{
+                        "source_community_key": "community-main",
+                        "target_community_key": "community-single",
+                        "score": 0.93,
+                    }],
+                    "community_topic_association_metrics": {
+                        "policy_version": "fixture-topic-v1",
+                    },
+                },
                 "communities": [
                     {
                         "key": "community-main", "label": "社区 17 · L0",
@@ -858,6 +921,10 @@ def test_knowledge_forge_graph_reads_ready_snapshot_without_hubble():
     assert graph["edges"][0]["verification_status"] == "SUPPORTED"
     assert graph["community_ready"] is True
     assert graph["total_communities"] == 2
+    assert graph["community_topic_associations"][0]["score"] == 0.93
+    assert graph["community_topic_association_metrics"]["policy_version"] == (
+        "fixture-topic-v1"
+    )
     assert {group["label"] for group in graph["groups"]} == {
         "社区 0", "未连接实体",
     }
@@ -958,6 +1025,9 @@ def test_embedded_graph_loading_and_interaction_contract(monkeypatch):
     assert "onZoomChange" in renderer
     assert "zoomPercent()" in renderer
     assert "const relativeZoom = zoom / this.currentFitZoomLevel();" in renderer
+    assert "const revealAllNodeLabels = relativeZoom >= 2.2;" in renderer
+    assert "revealAllNodeLabels ? this.nodes.length" in renderer
+    assert "bounds.left > this.surface.clientWidth" in renderer
     assert "baseline * 0.25" in renderer
     assert "baseline * 8" in renderer
     assert "intersectsCanvasControls" in renderer
@@ -993,11 +1063,22 @@ def test_embedded_graph_loading_and_interaction_contract(monkeypatch):
     assert "this.graph.render(undefined, 0);" in renderer
     assert "communityAggregate=edge.kind==='community_relation'" in web.SCRIPT
     assert "汇总关系数" in web.SCRIPT
+    assert "社区间事实联系" in web.SCRIPT
+    assert "关系构成" in web.SCRIPT
+    assert "可核对关系" in web.SCRIPT
+    assert "为什么相连" in web.SCRIPT
+    assert "代表实体对应" in web.SCRIPT
     assert "entityMetricMode" in web.SCRIPT
     assert "支持证据" in web.SCRIPT
     assert "验证状态" in web.SCRIPT
     assert "outlinedPointIndices: undefined" in renderer
     assert 'data-graph-overview-scope' in ready
+    assert "overviewRelationScope:'all_communities'" in web.SCRIPT
+    assert "communityLevel:'full'" in web.SCRIPT
+    assert "const communityTopic=group=>" in web.SCRIPT
+    assert "function summaryCommunityTopic(group)" in web.SCRIPT
+    assert "const groupForNode=node=>" in web.SCRIPT
+    assert "title:communityCanvasName(group,node)" in web.SCRIPT
     assert 'data-overview-relation-scope="backbone"' in ready
     assert ">主要关系</button>" in ready
     assert ">全部关系</button>" in ready
@@ -1077,13 +1158,24 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert "GraphRAG Native" in page
     assert 'href="/projects/1/graphrag-native"' in page
     assert 'id="build-project-knowledge"' not in page
-    assert "让分散的资料成为可检索、可连接、可追溯的知识资产" in page
-    assert "宏观与细节兼顾型" in page
+    assert "把分散文档建设成可检索、可连接、可追溯的知识库" in page
+    assert "建设知识，也使用知识" in page
     assert "全局主题脉络" in page
     assert "实体归一" in page
-    assert "开放探索型" in page
     assert "Leiden 社区" in page
-    assert "知识库创建后不能切换构建方式" in page
+    assert "第一版可用" not in page
+    assert "已可使用" not in page
+    assert '<p class="hero-progress-note"' not in page
+    assert "证据约束型" not in page
+    assert "主题探索型" not in page
+    assert "质量门禁" not in page
+    assert "审计证据" not in page
+    assert "质量检查更完整" in page
+    assert "可核对的原文依据" in page
+    assert "知识库创建后不可切换" in page
+    assert "打开知识库" in page
+    assert "隔离图谱" not in page
+    assert "不自动替换稳定基线" not in page
     assert '<section class="panel strategy-overview"' in page
     assert 'id="create-strategy-key"' in page
     assert 'id="strategy-choice-help"' in page
@@ -1106,17 +1198,41 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert '<section class="panel project-list-panel"' not in page
 
 
-def test_chat_entry_is_top_level_and_not_bound_to_one_knowledge_base(monkeypatch):
+def test_chat_entry_is_top_level_and_uses_an_explicit_single_knowledge_base(monkeypatch):
     monkeypatch.setattr(web, "SERVICE", _Service())
 
     page = web.render_chat_page()
 
-    assert "跨知识库问答工作台" in page
-    assert "选择一个或多个知识库" in page
+    assert "基于当前知识库回答" in page
+    assert "选择一个知识库后即可提问" in page
+    assert 'id="agent-project"' in page
+    assert 'id="agent-query"' in page
+    assert 'id="agent-send"' in page
+    assert 'id="agent-stop"' in page
+    assert 'id="agent-sources"' in page
+    assert "/api/agent/threads" in page
+    assert "EventSource" in page
+    assert "自动选择知识库" not in page
+    assert ".agent-layout{" in web.CSS
     assert '<a class="button secondary" href="/#knowledge-bases">知识库</a>' in page
     assert '<a class="button primary" href="/chat" aria-current="page">智能问答</a>' in page
     assert 'name="project_id"' not in page
     assert 'window.KF.projectId' not in page
+    assert "第一版" not in page
+    assert "证据约束问答" not in page
+    assert 'id="agent-scope-state"' not in page
+
+
+def test_human_facing_status_page_uses_the_common_product_shell():
+    page = web.render_status_page(404, "页面不存在", "请求的页面可能已移动。")
+
+    assert "Knowledge Forge" in page
+    assert 'class="panel status-page"' in page
+    assert '<span class="status-page-code">404</span>' in page
+    assert "页面不存在" in page
+    assert "页面状态" not in page
+    assert 'href="/#knowledge-bases"' in page
+    assert ".status-page{" in web.CSS
 
 
 def test_new_project_form_defaults_to_qwen36(monkeypatch):

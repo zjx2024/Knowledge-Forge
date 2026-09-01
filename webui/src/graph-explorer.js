@@ -843,7 +843,10 @@ export class GraphExplorer {
       ];
       const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', `M ${start[0]} ${start[1]} Q ${control[0]} ${control[1]} ${end[0]} ${end[1]}`);
-      path.setAttribute('class', `kf-gpu-default-edge${hasVisualFocus && !focusLinks.has(index) ? ' is-muted' : ''}`);
+      path.setAttribute(
+        'class',
+        `kf-gpu-default-edge${edge.kind === 'community_topic_association' ? ' is-topic-association' : ''}${hasVisualFocus && !focusLinks.has(index) ? ' is-muted' : ''}`,
+      );
       if (edge.directed !== false) path.setAttribute('marker-end', 'url(#kf-default-edge-arrow)');
       edges.push(path);
     }
@@ -1189,7 +1192,10 @@ export class GraphExplorer {
       ];
       const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', `M ${start[0]} ${start[1]} Q ${control[0]} ${control[1]} ${end[0]} ${end[1]}`);
-      path.setAttribute('class', 'kf-gpu-emphasized-edge');
+      path.setAttribute(
+        'class',
+        `kf-gpu-emphasized-edge${edge.kind === 'community_topic_association' ? ' is-topic-association' : ''}`,
+      );
       if (edge.directed !== false) path.setAttribute('marker-end', 'url(#kf-emphasized-edge-arrow)');
       paths.push(path);
     }
@@ -1266,6 +1272,7 @@ export class GraphExplorer {
     // relative scale is therefore the only meaningful way to decide when a
     // reader has deliberately zoomed in far enough to reveal peripheral names.
     const relativeZoom = zoom / this.currentFitZoomLevel();
+    const revealAllNodeLabels = relativeZoom >= 2.2;
     const selected = new Set();
     const hoveredRelated = new Set();
     if (this.selectedNode >= 0) {
@@ -1293,19 +1300,21 @@ export class GraphExplorer {
       indices = this.nodes
         .map((node, index) => ({index, score: finite(node.size ?? node.member_count ?? node.degree)}))
         .sort((left, right) => right.score - left.score)
-        .slice(0, this.nodes.length <= 24 || relativeZoom >= 1.35 ? 26 : 16)
+        .slice(0, revealAllNodeLabels
+          ? this.nodes.length
+          : this.nodes.length <= 24 || relativeZoom >= 1.35 ? 26 : 16)
         .map(item => item.index);
     } else if (this.nodes.length <= 46 || relativeZoom >= 1.4) {
       // Once a reader has deliberately zoomed in, every node in the current
       // view deserves a chance to show its name.  The collision pass below
       // still prevents labels from drawing over one another, but degree must
       // not silently hide peripheral facts at high magnification.
-      const candidates = relativeZoom >= 2.2
+      const candidates = revealAllNodeLabels
         ? this.nodes.map((_node, index) => index)
         : this.graph.getSampledPoints().indices;
       indices = candidates
         .sort((left, right) => finite(this.nodes[right]?.degree ?? this.nodes[right]?.size) - finite(this.nodes[left]?.degree ?? this.nodes[left]?.size))
-        .slice(0, relativeZoom >= 2.2 ? Math.min(this.nodes.length, 180) : relativeZoom >= 1.8 ? 34 : 18);
+        .slice(0, revealAllNodeLabels ? this.nodes.length : relativeZoom >= 1.8 ? 34 : 18);
     } else {
       indices = this.nodes
         .map((node, index) => ({index, score: finite(node.degree ?? node.size ?? node.member_count)}))
@@ -1356,7 +1365,7 @@ export class GraphExplorer {
       if (overlaps && activeEdge !== index) continue;
       occupiedLabels.push(bounds);
       const label = document.createElement('span');
-      label.className = `kf-gpu-edge-label${activeEdge === index ? ' is-selected' : ''}`;
+      label.className = `kf-gpu-edge-label${edge.kind === 'community_topic_association' ? ' is-topic-association' : ''}${activeEdge === index ? ' is-selected' : ''}`;
       label.textContent = text;
       label.style.transform = `translate(${Math.round(x)}px,${Math.round(y)}px)`;
       labelEntries.push(label);
@@ -1364,8 +1373,8 @@ export class GraphExplorer {
     this.edgeLabels.replaceChildren(...labelEntries);
     const ranked = rankNodes(this.nodes);
     const defaultLabelLimit = this.mode === 'overview'
-      ? (this.nodes.length <= 24 || relativeZoom >= 2 ? 24 : relativeZoom >= 1.35 ? 16 : 7)
-      : (relativeZoom >= 2.2 ? Math.min(this.nodes.length, 180) : relativeZoom >= 1.8 ? 26 : relativeZoom >= 1.4 ? 14 : 8);
+      ? (revealAllNodeLabels ? this.nodes.length : this.nodes.length <= 24 ? 24 : relativeZoom >= 1.35 ? 16 : 7)
+      : (revealAllNodeLabels ? this.nodes.length : relativeZoom >= 1.8 ? 26 : relativeZoom >= 1.4 ? 14 : 8);
     const defaultLabels = new Set(ranked.slice(0, defaultLabelLimit).map(item => item.index));
     const labelIndices = hoveredRelated.size || selected.size
       ? indices
@@ -1375,13 +1384,21 @@ export class GraphExplorer {
     for (const index of labelIndices) {
       const node = this.nodes[index];
       const point = this.graph.spaceToScreenPosition([positions[index * 2], positions[index * 2 + 1]]);
-      const title = short(node.title || node.label || node.id, this.mode === 'overview' ? 24 : relativeZoom >= 2.2 ? 34 : 20);
+      const title = short(
+        node.title || node.label || node.id,
+        revealAllNodeLabels ? 34 : this.mode === 'overview' ? 24 : 20,
+      );
       const fontSize = hoveredRelated.has(index) ? 12 : 11;
       const width = Math.min(196, Math.max(34, title.length * (fontSize * 0.78) + 10));
       const height = fontSize + 8;
       const x = Math.round(point[0] - width / 2);
       const y = Math.round(point[1] + finite(this.pointSizes[index], 16) / 2 + 6);
       const bounds = {left: x, top: y, right: x + width, bottom: y + height};
+      // At high magnification most graph nodes may be outside the viewport.
+      // Let every visible node compete for a label without creating hundreds
+      // of off-canvas DOM elements.
+      if (bounds.right < 0 || bounds.bottom < 0
+        || bounds.left > this.surface.clientWidth || bounds.top > this.surface.clientHeight) continue;
       // Controls belong to the interaction layer, not the graph.  A selected
       // node must not be allowed to put its label beneath them either: doing
       // so produces a half-visible name and makes the control look broken.

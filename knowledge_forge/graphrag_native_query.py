@@ -39,6 +39,23 @@ class NativeQueryRequest:
     question: str
     response_type: str = "Multiple Paragraphs"
     community_level: int = 2
+    model_context_tokens: int = 0
+
+
+def _global_query_batch_tokens(model_context_tokens: int) -> int:
+    """Fit Global map batches to the configured model's real context window.
+
+    GraphRAG's 12K default creates many sequential map calls for locally hosted
+    models.  The immutable reports and prompts remain unchanged; only their
+    query-time packing size grows, with ample space retained for instructions
+    and model output.
+    """
+
+    model_limit = max(0, int(model_context_tokens or 0))
+    if model_limit <= 0:
+        return 0
+    reserve = max(4096, min(16384, model_limit // 8))
+    return max(4096, min(65536, model_limit - reserve))
 
 
 def _table(root: Path, name: str) -> pd.DataFrame:
@@ -313,6 +330,12 @@ async def _call_api(request: NativeQueryRequest, root: Path) -> tuple[Any, Any]:
     from graphrag.api import basic_search, drift_search, global_search, local_search
 
     config = load_bundle_query_config(root)
+    global_batch_tokens = _global_query_batch_tokens(
+        request.model_context_tokens
+    )
+    if request.mode == "global" and global_batch_tokens > 0:
+        config.global_search.max_context_tokens = global_batch_tokens
+        config.global_search.data_max_tokens = global_batch_tokens
     params = {"config": config, "response_type": request.response_type, "query": request.question}
     if request.mode == "global":
         # GraphRAG Global is deliberately Parquet-only.  Do not even load
@@ -404,6 +427,13 @@ def query_bundle(request: NativeQueryRequest, root: Path) -> dict[str, Any]:
         "mode": request.mode, "run_id": request.run_id, "context_records": context_records,
         "context_reference_count": len(context_records), "answer_references": [],
         "model_usage": {"status": "unavailable"},
+        "query_budget": {
+            "model_context_tokens": max(0, int(request.model_context_tokens)),
+            "global_batch_context_tokens": (
+                _global_query_batch_tokens(request.model_context_tokens)
+                if request.mode == "global" else 0
+            ),
+        },
         "latency_ms": int((time.monotonic() - started) * 1000), "warnings": warnings,
         "bundle_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     }

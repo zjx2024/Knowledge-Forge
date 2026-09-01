@@ -9,7 +9,11 @@ import pytest
 
 from knowledge_forge.graphrag_native_artifacts import NativeArtifact
 from knowledge_forge.graphrag_native_config import GraphRAGNativePromptProfileBuilder
-from knowledge_forge.graphrag_native_executor import GraphRAGNativeExecutor, NativeNoGraphUnsupported
+from knowledge_forge.graphrag_native_executor import (
+    GraphRAGNativeExecutor,
+    NativeNoGraphUnsupported,
+    NativeStandardWorkflowProgress,
+)
 from knowledge_forge.graphrag_native_inputs import NativeInputBuild, NativeInputPreflight
 from knowledge_forge.graphrag_native_runner import NativeProcessProgress
 
@@ -130,7 +134,7 @@ def test_native_executor_runs_only_native_chain_and_persists_control_plane(monke
     assert any(name == "activate" for name in names)
     progress_updates = [int(value["progress"]) for name, value in database.calls if name == "job" and "progress" in value]
     assert [72, 86, 94] == [value for value in progress_updates if value in {72, 86, 94}]
-    assert 47 in progress_updates  # 30 + round(38 * 4 / 9), inside the live index band
+    assert 32 in progress_updates  # one inner ledger owns only part of extract_graph
     assert any(
         value.get("log") == "GraphRAG Native：GraphRAG extract graph：4/9"
         for name, value in database.calls if name == "job"
@@ -140,6 +144,112 @@ def test_native_executor_runs_only_native_chain_and_persists_control_plane(monke
         value for name, value in database.calls if name == "activate"
     )
     assert activation_values["job_id"] == "job-1"
+
+
+def test_native_workflow_progress_does_not_treat_one_denominator_as_the_whole_run():
+    tracker = NativeStandardWorkflowProgress()
+
+    assert tracker.update(NativeProcessProgress(
+        stage="index", workflow="create_base_text_units",
+        workflow_state="started", elapsed_seconds=0, message="started",
+    )) == 30
+    # ``chunker`` is an inner operation of create_base_text_units.  Its 100%
+    # completes only that small milestone, not the entire Standard workflow.
+    after_chunking = tracker.update(NativeProcessProgress(
+        stage="index", workflow="chunker", completed=24, total=24,
+        workflow_state="progress", elapsed_seconds=1, message="24/24",
+    ))
+    assert 30 < after_chunking < 35
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="create_base_text_units",
+        workflow_state="completed", elapsed_seconds=1, message="completed",
+    ))
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="create_final_documents",
+        workflow_state="completed", elapsed_seconds=1, message="completed",
+    ))
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="extract_graph",
+        workflow_state="started", elapsed_seconds=1, message="started",
+    ))
+    halfway_graph = tracker.update(NativeProcessProgress(
+        stage="index", workflow="extract graph", completed=14, total=28,
+        workflow_state="progress", elapsed_seconds=2, message="14/28",
+    ))
+    assert 33 <= halfway_graph <= 36
+    assert halfway_graph < 68
+    extraction_ledger_done = tracker.update(NativeProcessProgress(
+        stage="index", workflow="extract graph", completed=28, total=28,
+        workflow_state="progress", elapsed_seconds=2, message="28/28",
+    ))
+    assert extraction_ledger_done < 40
+    halfway_descriptions = tracker.update(NativeProcessProgress(
+        stage="index", workflow="relationship description",
+        completed=272, total=544, workflow_state="progress",
+        elapsed_seconds=3, message="272/544",
+    ))
+    assert extraction_ledger_done < halfway_descriptions < 50
+    assert tracker.metadata(NativeProcessProgress(
+        stage="index", workflow="relationship description",
+        completed=272, total=544, workflow_state="progress",
+        elapsed_seconds=3, message="272/544",
+    ))["workflow_progress"] == 62
+
+    values = [halfway_graph, extraction_ledger_done, halfway_descriptions]
+    for workflow, _weight in tracker.workflow_weights:
+        values.append(tracker.update(NativeProcessProgress(
+            stage="index", workflow=workflow, workflow_state="completed",
+            elapsed_seconds=3, message="completed",
+        )))
+    assert values == sorted(values)
+    assert values[-1] == 71
+    assert tracker.metadata(NativeProcessProgress(
+        stage="index", workflow="generate_text_embeddings",
+        workflow_state="completed", elapsed_seconds=3, message="completed",
+    ))["execution_progress"] == 100
+
+
+def test_native_nested_report_and_embedding_counters_cannot_claim_workflow_completion():
+    tracker = NativeStandardWorkflowProgress()
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="create_community_reports",
+        workflow_state="started", elapsed_seconds=0, message="started",
+    ))
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="level 2 summarize communities",
+        completed=2, total=2, workflow_state="progress",
+        elapsed_seconds=1, message="2/2",
+    ))
+    assert 0 < tracker.fractions["create_community_reports"] < 0.10
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="level 1 summarize communities",
+        completed=12, total=12, workflow_state="progress",
+        elapsed_seconds=2, message="12/12",
+    ))
+    assert tracker.fractions["create_community_reports"] < 0.35
+    tracker.update(NativeProcessProgress(
+        stage="index", workflow="level 0 summarize communities",
+        completed=14, total=28, workflow_state="progress",
+        elapsed_seconds=3, message="14/28",
+    ))
+    assert tracker.fractions["create_community_reports"] < 0.70
+
+    embedding = NativeStandardWorkflowProgress()
+    embedding.update(NativeProcessProgress(
+        stage="index", workflow="generate_text_embeddings",
+        workflow_state="started", elapsed_seconds=0, message="started",
+    ))
+    embedding.update(NativeProcessProgress(
+        stage="index", workflow="generate embeddings",
+        completed=1, total=1, workflow_state="progress",
+        elapsed_seconds=1, message="1/1",
+    ))
+    assert embedding.fractions["generate_text_embeddings"] == 0
+    embedding.update(NativeProcessProgress(
+        stage="index", workflow="generate_text_embeddings",
+        workflow_state="completed", elapsed_seconds=2, message="completed",
+    ))
+    assert embedding.fractions["generate_text_embeddings"] == 1
 
 
 def test_native_executor_lease_renewal_failure_stops_before_publication(monkeypatch, tmp_path):

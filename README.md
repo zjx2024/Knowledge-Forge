@@ -1,7 +1,7 @@
 # Knowledge Forge
 
-Knowledge Forge 是一个通用、多项目的知识库与知识图谱构建平台。它直接使用
-PostgreSQL、HugeGraph 和 Ollama，不依赖 RAGFlow 运行时。
+Knowledge Forge 是一个通用、多项目的知识库、知识图谱与证据约束问答平台。它直接使用
+PostgreSQL、HugeGraph、Ollama 和独立 reranker 服务，不依赖 RAGFlow 运行时。
 
 ## 核心能力
 
@@ -27,6 +27,7 @@ PostgreSQL、HugeGraph 和 Ollama，不依赖 RAGFlow 运行时。
 - 任务面板清晰区分总进度和当前步骤进度；每一步将状态与处理说明分开显示，避免长说明挤压布局。
 - 文档删除会先立即软删除并取消关联任务，使其马上从项目列表和检索结果中移除；HugeGraph、源文件和过程文件由持久化后台清理任务处理，服务重启后可继续恢复。清理完成后会再次停用该文档的知识块、向量、实体提及和关系贡献，不影响其他文档仍支持的实体。
 - 提供 Knowledge Forge 与 GraphRAG Native 两种项目级构建策略；两者共享源文档与预处理结果，但实体、关系、社区和发布状态互相隔离。
+- 提供显式单知识库智能问答：Knowledge Forge 融合当前知识块、实体、关系和已完成社区报告，并在多社区或关系稀疏问题上使用有界社区联系导航补召回；GraphRAG Native 只读取当前已验证的不可变 Bundle。通用检索计划按事实、实体、关系、过程、比较、全局、来源和图表问题动态分配文本/实体/关系/社区候选，并在最终上下文中按实际槽位缩放配额、自动回填。候选经 RRF 与内部 reranker 重排后，只把来源完整的证据交给一次回答生成，并由服务器逐项核验引用。多轮追问先由 LangGraph 语境子图补全为独立检索问题；无法唯一解析的指代会先请求澄清，不会带着猜测进入检索。
 
 ## 架构与目录
 
@@ -39,7 +40,9 @@ knowledge-forge/
 │   ├── media/<项目目录>/<文档>/   # PDF/DOCX 内嵌图片及视觉分析缓存
 │   └── .trash/                   # 软删除文件
 ├── deploy/hugegraph/             # 独立物理图配置
-├── docs/IMPLEMENTATION_PLAN.md   # 架构基线与实施阶段
+├── docs/PROJECT_STATUS.md        # 当前产品能力、边界与下一阶段
+├── docs/knowledge-agent-implementation-roadmap.md
+│                                # 智能体架构、实现状态与阶段路线
 ├── tests/
 ├── AGENTS.md                     # 持续开发约束
 ├── .env.example
@@ -52,7 +55,7 @@ knowledge-forge/
 - PostgreSQL + pgvector：元数据、章节、知识块、HNSW 向量索引、Schema 版本、实体、提及、关系断言和任务。
 - HugeGraph：可遍历的文档、知识块、规范实体和实体关系。
 - Ollama：模型发现、向量生成、逻辑 Schema 评估和结构化图谱抽取。
-- Reranker HTTP 服务：独立加载交叉编码器，为实体归一候选提供有界相关度重排。
+- Reranker HTTP 服务：独立加载交叉编码器，为实体归一候选和智能体检索候选提供有界相关度重排。
 
 ## 前置条件
 
@@ -166,6 +169,10 @@ cd /home/kdfy/zjx-projects/knowledge-forge
 sudo ./deploy/init_hugegraph_graph.sh hugegraph hugegraph/hugegraph:latest
 curl http://127.0.0.1:8080/graphs
 ```
+
+这里的 `8080` 是 Docker 示例端口。已有部署应始终使用 `.env` 中的
+`HUGEGRAPH_HOST/HUGEGRAPH_PORT`；本仓库当前本机部署使用 `127.0.0.1:8081`，不能把示例端口
+当成运行实例的固定地址。
 
 正常结果应包含：
 
@@ -526,9 +533,56 @@ Knowledge Forge 不依赖 RAGFlow；项目、文档、知识块和向量均由�
 
 `artifacts/` 是可重复生成的本地输出，不提交 Git。模型生成标签只作为待复核候选；生产门禁需要独立确认的 Gold/holdout 与完整分母。默认测试不访问外部模型或图数据库，真实集成测试必须显式使用隔离数据和当前运行模型。
 
-### 后续智能体
+### 智能问答
 
-知识问答智能体采用一套上层流程和两个检索适配器，不为 KF 与 GR 分裂两套会话产品。完整架构、证据协议、LangGraph 边界、API、评估和从第一版到最终版的路线见 [`docs/knowledge-agent-implementation-roadmap.md`](docs/knowledge-agent-implementation-roadmap.md)。
+首页“智能问答”进入统一工作台。当前版本由用户明确选择一个知识库，不自动跨库，也不引入循环工具调用或长期记忆。KF 与 GR 共享会话、证据、引用、停止和反馈协议，但各自只读取所属策略的当前成果。
+
+每轮问题先进入 LangGraph 问题控制子图：高置信度的智能体身份或能力问题直接分流；普通问题从 PostgreSQL 读取同一知识库、同一会话中已经完成的消息，再按当前本地模型的 Token 上下文预算保留最近完整轮次，并把更早内容压缩为滚动摘要。预算会先扣除系统提示、JSON Schema、当前问题、模型输出、安全余量以及一次结构化输出修复的空间；短消息可以保留更多轮，长消息会更早触发压缩，不再固定保留 8 条。结构化 LLM 随后判断问题是否独立、能否补全或必须澄清。补全后的问题只用于召回、重排和答案组织；历史回答仅用于识别“它、前者、上述方法”等指代，永远不作为知识证据。原始问题、独立问题、解析引用、Token 窗口指标和分支结果均保存在运行审计元数据中。
+
+问答运行采用访问、输入、对话、检索、执行和输出六层策略协议。LLM 只承担多轮语义解析和边界证据对齐；项目权限、KF/GR 工具白名单、调用上限、快照新鲜度、来源有效性和声明引用完整性由代码强制执行。越界或没有直接证据的问题不会用通用知识补答，歧义问题不会带着猜测进入检索。每层结果写入运行审计，并在“执行过程”中显示安全摘要，不暴露系统提示或隐藏思维链。
+
+LangGraph 使用官方 PostgreSQL checkpointer，并把执行状态隔离在 `knowledge_agent` schema。`agent_messages` 仍是会话事实的权威来源，checkpoint 只保存有界窗口、滚动摘要和流程位置；归档会话时会清理对应 checkpoint。第一轮没有历史时不会额外调用语境模型，后续轮次最多调用一次语境解析模型。
+
+问答运行、阶段、工具调用、证据、逐项引用、SSE 事件和反馈均持久化到 PostgreSQL。每条回答都可展开“执行过程”：运行中实时显示问题理解、检索选择、证据检查、补充检索、回答与引用核验等阶段，以及实际调用的检索、reranker 和回答工具；每个步骤或工具还可继续展开，查看其白名单化的输入范围、结果计数、模型、耗时和约束。召回、重排、充分性检查和回答阶段会列出最终进入上下文的具体证据；引用核验阶段只列出最终实际引用的证据，并区分“生成依据”与“最终引用”。证据卡提供类型、标题、文件、页码/章节和有界摘录，点击后复用授权来源详情查看完整原文、图片和表格。历史会话刷新后仍可从运行台账恢复。该视图是现有结构化台账的确定性安全投影，不增加 LLM 调用，也不暴露隐藏思维链、系统提示词、原始工具载荷或未验证草稿。Local、Global、Basic 只在 GraphRAG Native 知识库中显示；Knowledge Forge 始终使用自身的动态混合检索规划。浏览器使用不可读的能力 Cookie 隔离会话；来源只暴露受控下载地址。服务重启会把未完成回答标记为失败，不会盲目续写旧快照答案。
+
+主要接口：
+
+```text
+GET    /api/agent/knowledge-bases
+GET    /api/agent/threads?project_id={project_id}
+POST   /api/agent/threads
+GET    /api/agent/threads/{thread_id}
+DELETE /api/agent/threads/{thread_id}
+POST   /api/agent/threads/{thread_id}/messages
+GET    /api/agent/runs/{run_id}
+GET    /api/agent/runs/{run_id}/trace
+GET    /api/agent/runs/{run_id}/events
+POST   /api/agent/runs/{run_id}/cancel
+POST   /api/agent/runs/{run_id}/feedback
+GET    /api/agent/evidence/{evidence_id}
+```
+
+运行上限通过 `KNOWLEDGE_AGENT_*` 环境变量配置；每次运行会固化自己的候选数、语境解析、证据上下文、输出和调用次数预算。多轮语境窗口先取知识库配置与 Ollama 实际 runner 上下文的较小值，再按本轮完整提示的估算 Token 从 `KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MIN_BUDGET_TOKENS` 起，以 `*_GROWTH_STEP_TOKENS` 为阶梯扩容；动态上限同时受 `*_MAX_BUDGET_TOKENS` 和 `*_MODEL_RATIO` 约束。默认在 qwen3.6 的 262144 Token runner 上按需使用 8192～32768 Token，完整历史能放入动态窗口时不会提前压缩，超过上限后才由 `KNOWLEDGE_AGENT_CONTEXT_RECENT_TOKEN_RATIO` 划分最近原始轮次与增量压缩空间，`KNOWLEDGE_AGENT_CONTEXT_SUMMARY_MAX_TOKENS` 限制滚动摘要。旧的 `KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_BUDGET_TOKENS` 仅作为兼容配置：当新最大值未设置时继续充当上限。`*_MIN_RECENT_TURNS`、`*_RECENT_MAX_MESSAGES`、`*_BOOTSTRAP_MESSAGES` 和字符上限只承担极端输入及数据库读取保护，不再决定日常压缩时机。模型上下文上限低于 `KNOWLEDGE_AGENT_MIN_CONTEXT_TOKENS` 的知识库不会进入问答队列。无答案判断不会采用相对排序分单独决策，而是联合交叉编码器绝对相关度、Embedding 相似度和问题要点覆盖率；三个门槛可分别通过 `KNOWLEDGE_AGENT_WEAK_RERANK_THRESHOLD`、`KNOWLEDGE_AGENT_WEAK_SEMANTIC_THRESHOLD` 和 `KNOWLEDGE_AGENT_WEAK_ASPECT_THRESHOLD` 校准。
+
+问答范围由前后两道独立门禁控制。身份、能力、使用方式和简单问候等智能体交互问题先由高精度通用规则识别；其余问题在完成多轮指代补全后，由当前项目 LLM 结合知识库名称、说明和文档范围做一次只分类、不作答的检索前语义路由。高置信度的知识库外问题直接返回范围说明，不再执行召回和 reranker；低置信度、范围资料不足或分类异常时保留检索，以免降低知识问题召回率。进入检索的问题在召回与重排后还要确认问题和证据属于同一知识范围：强交叉编码器相关度，或同时满足语义相关与问题要点覆盖的结果可直接通过；边界结果再次由结构化模型核验。无关或无直接支持的问题不进入事实回答模型，也不使用通用知识补答。检索前跳过门槛由 `KNOWLEDGE_AGENT_INPUT_SCOPE_CONFIDENCE_THRESHOLD` 配置，证据范围门槛与 Token 上限通过 `KNOWLEDGE_AGENT_SCOPE_*` 配置。
+
+Knowledge Forge 社区导航由 `KNOWLEDGE_AGENT_COMMUNITY_NAVIGATION_ENABLED` 控制，默认最多扩展 3 个社区联系、回取 8 条底层关系。它只在多社区、关系稀疏或可靠社区报告种子场景启动，不增加 LLM/Embedding 调用；任何候选都必须再次通过当前关系快照和来源门禁。
+
+动态检索计划不额外调用模型：它用通用中英文问题形态选择意图和证据族预算，但始终给各证据族保留安全下限。带明确编号的图表问题会从当前文档 revision 中恢复对应 Chunk 和媒体来源；证据不足时最多执行一次缺口驱动的补充计划，随后必须回答、限定回答或拒答。GR 自动模式对单文档总结使用 Local，对真正的多文档/项目级总结使用 Global；用户显式指定 Basic/Local/Global 时保持原选择。Global 查询依据项目模型的实际上下文窗口调整社区报告批次，不修改不可变 Bundle。
+
+验证工程基准文件并调用真实 HTTP/Ollama 链路：
+
+```bash
+.venv/bin/python benchmarks/knowledge_agent_v1/validate.py
+.venv/bin/python benchmarks/knowledge_agent_v1/evaluate.py \
+  --project-id PROJECT_ID --assert-acceptance
+```
+
+当前冻结的 28 题中英双语工程校准集（含 4 题无答案）在 2026-08-24 的真实链路验收中通过全部门禁：任务、引用解析、声明引用完整和拒答均为 100%，答案要点召回为 92.43%，跨项目证据为 0。该数值只用于当前固定语料的回归校准，不作为开放领域效果承诺。
+
+当前智能体持久化由两个不可变迁移共同提供：`0035_knowledge_agent_v1` 建立会话、运行、消息、步骤、工具、证据、引用、事件与反馈账本；`0036_knowledge_agent_context_runtime` 为 LangGraph PostgreSQL checkpointer 建立隔离 schema。当前版本仍是显式单知识库问答，下一阶段从显式多选知识库及跨库证据隔离开始。
+
+完整架构、证据协议、LangGraph 边界、评估门槛和后续阶段见 [`docs/knowledge-agent-implementation-roadmap.md`](docs/knowledge-agent-implementation-roadmap.md)。
 
 ## 验证
 
@@ -540,7 +594,8 @@ E2E 的完整操作见 [`docs/pre-live-readiness.md`](docs/pre-live-readiness.md
 .venv/bin/python -m pytest -q
 .venv/bin/python scripts/run_disposable_postgres_tests.py
 curl http://127.0.0.1:8011/health
-curl http://127.0.0.1:8080/graphs
+# 按当前 .env 中的 HUGEGRAPH_HOST/HUGEGRAPH_PORT 替换；本机当前为 127.0.0.1:8081
+curl http://127.0.0.1:8081/graphs
 ```
 
 当前自动化测试的通过数量以本机执行结果为准。Docker 首次构建需要本机已有

@@ -1,0 +1,26 @@
+{
+  "dataset": "knowledge-agent-v1",
+  "version": "v1",
+  "level": "engineering_calibration",
+  "status": "single_expert_authored",
+  "base_questions_path": "../knowledge_forge_hybrid_rag_v1/questions.json",
+  "probes_path": "probes.json",
+  "expected_counts": {
+    "base_questions": 24,
+    "probes": 4,
+    "languages": {
+      "en": 14,
+      "zh-CN": 14
+    },
+    "unanswerable": 4
+  },
+  "acceptance": {
+    "minimum_terminal_success_rate": 0.95,
+    "minimum_citation_parse_rate": 1.0,
+    "minimum_claim_citation_completeness": 0.95,
+    "minimum_answer_atom_recall": 0.75,
+    "minimum_no_answer_refusal_rate": 0.85,
+    "maximum_cross_project_evidence": 0
+  },
+  "notes": "Targets require calibration on a correctly ingested frozen corpus; they are not claims of general benchmark performance."
+}

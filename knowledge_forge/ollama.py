@@ -10,7 +10,7 @@ import math
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 import requests
 
@@ -28,6 +28,10 @@ class OllamaBudgetError(ValueError):
 
 class OllamaProtocolError(RuntimeError):
     """Ollama returned an incomplete, truncated, or diagnostically unsafe result."""
+
+
+class OllamaCancelled(RuntimeError):
+    """A caller closed a streaming model request at a safe cancellation point."""
 
 
 class TokenEstimator(Protocol):
@@ -210,6 +214,7 @@ class OllamaClient:
         max_output_tokens: int | None = None,
         safety_margin_tokens: int | None = None,
         images: Iterable[bytes] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
         ) -> dict[str, Any]:
         increment("ollama_logical_calls")
         self.last_raw_response_text = ""
@@ -239,7 +244,7 @@ class OllamaClient:
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "stream": False,
+            "stream": bool(cancel_check),
             "think": False,
             "keep_alive": Config.ollama_keep_alive,
             "options": {
@@ -262,11 +267,17 @@ class OllamaClient:
                 image_count=len(encoded_images),
             )
             increment("estimated_prompt_tokens", estimate)
+            if cancel_check and cancel_check():
+                raise OllamaCancelled("Ollama 请求已由调用方终止")
             response = self._request(
-                "post", f"{self.base_url}/api/chat", json=body, timeout=self.timeout
+                "post", f"{self.base_url}/api/chat", json=body,
+                timeout=self.timeout, **({"stream": True} if cancel_check else {}),
             )
             response.raise_for_status()
-            payload = response.json()
+            payload = (
+                self._consume_streaming_chat(response, cancel_check)
+                if cancel_check else response.json()
+            )
             self._validate_response_protocol(payload, estimate)
             prompt_eval_count = int(payload.get("prompt_eval_count") or 0)
             self.last_call_diagnostics = OllamaCallDiagnostics(
@@ -331,6 +342,45 @@ class OllamaClient:
             self.last_parsed_json_response = last_parsed_candidate
             return last_parsed_candidate
         raise RuntimeError(f"Ollama JSON response invalid after retry: {parse_error}")
+
+    @staticmethod
+    def _consume_streaming_chat(
+        response: Any, cancel_check: Callable[[], bool],
+    ) -> dict[str, Any]:
+        """Collect an Ollama NDJSON response while permitting transport close."""
+
+        fragments: list[str] = []
+        final: dict[str, Any] = {}
+        try:
+            for raw in response.iter_lines(decode_unicode=True):
+                if cancel_check():
+                    response.close()
+                    raise OllamaCancelled("Ollama 请求已由调用方终止")
+                if not raw:
+                    continue
+                text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                try:
+                    item = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise OllamaProtocolError("Ollama 流式响应包含非法 JSON") from exc
+                if not isinstance(item, dict):
+                    raise OllamaProtocolError("Ollama 流式响应不是对象")
+                content = str((item.get("message") or {}).get("content") or "")
+                if content:
+                    fragments.append(content)
+                final = item
+            if cancel_check():
+                raise OllamaCancelled("Ollama 请求已由调用方终止")
+        finally:
+            response.close()
+        if not final:
+            raise OllamaProtocolError("Ollama 流式响应为空")
+        final = dict(final)
+        final["message"] = {
+            **dict(final.get("message") or {}),
+            "content": "".join(fragments),
+        }
+        return final
 
     @staticmethod
     def _request(method: str, url: str, **kwargs: Any):

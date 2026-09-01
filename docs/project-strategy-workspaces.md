@@ -1,26 +1,29 @@
-# 项目与知识图谱策略固定关联
+# 知识库与知识构建策略固定关联
+
+> 更新时间：2026-09-01
 
 ## 目标
 
-一个项目只属于一种知识图谱构建策略：
+一个知识库（数据库内部仍使用 `project`）只属于一种知识构建策略：
 
 - `knowledge_forge`：用户界面名称为 **Knowledge Forge**；
 - `graphrag_native`：用户界面名称为 **GraphRAG Native**。
 
-历史输入键 `enhanced_shadow` 只在旧请求兼容层归一为 `knowledge_forge`，新项目和
+历史输入键 `enhanced_shadow` 只在旧请求兼容层归一为 `knowledge_forge`，新知识库和
 新构建不再写入该键。策略不是页面筛选条件，也不能通过 URL 参数、构建按钮或
 普通 API 改变。
 
 ## 生命周期
 
-1. 新项目在创建事务中同时写入项目记录和 `bound` 策略记录。
-2. 0024 迁移前且尚未绑定的项目由首页要求用户一次性确认，不根据历史查询参数猜测。
+1. 新知识库在创建事务中同时写入项目记录和 `bound` 策略记录。
+2. 0024 迁移前且尚未绑定的知识库由首页要求用户一次性确认，不根据历史查询参数猜测。
 3. 绑定通过 generation CAS 完成；绑定后应用接口和 PostgreSQL trigger 都拒绝修改。
 4. 已有其他策略产物不自动删除，只是不再出现在固定策略工作区中。
 
 ## 页面与路由
 
-- `/`：公共项目首页，只负责项目创建、项目选择和旧项目首次确认。
+- `/`：产品首页，提供“知识库”和“智能问答”两个入口；知识库弹窗负责创建、选择和旧知识库首次确认。
+- `/chat`：统一智能问答工作台，当前由用户明确选择一个可问答知识库。
 - `/projects/{id}/knowledge-forge`：Knowledge Forge 专属工作区。
 - `/projects/{id}/graphrag-native`：GraphRAG Native 专属工作区。
 
@@ -34,7 +37,7 @@
 源文件 → 结构块 → Chunk → pgvector → 逻辑 Schema → 实体/关系抽取与归一
 → 隔离图物化。
 
-项目设置包括解析器、分块策略、模型、上下文预算和单 Chunk 上限。
+知识库设置包括解析器、分块策略、模型、知识语言、上下文预算和单 Chunk 上限。
 
 ### GraphRAG Native
 
@@ -56,6 +59,15 @@ workflow → TextUnits、原生实体/关系、社区、社区报告、GraphML �
 
 LanceDB 不开放文件浏览；查询仍通过受控 Native query worker 完成。所有查看接口
 只读取当前 fresh、独立验证通过的 immutable bundle。
+
+## 统一智能问答边界
+
+- 当前一条会话绑定一个明确选择的知识库和其固定策略，不自动跨库；
+- Knowledge Forge 问答适配器只读取当前 revision、当前图快照及已完成社区报告；
+- GraphRAG Native 问答适配器只读取当前 READY 且来源 fresh 的 immutable bundle；
+- 两种策略统一输出带项目、策略、快照和来源的证据，但不混用实体、关系、社区 ID 或内部得分；
+- Basic/Local/Global 只属于 GraphRAG Native；Knowledge Forge 使用自己的动态混合检索计划；
+- 下一阶段的多知识库能力必须先增加逐库授权、快照隔离和跨库证据分组，不能绕过固定策略绑定。
 
 ## 兼容与安全
 

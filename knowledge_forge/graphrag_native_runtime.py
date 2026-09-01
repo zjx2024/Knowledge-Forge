@@ -265,6 +265,7 @@ class GraphRAGNativeRuntime:
             storage_path = str(document.get("storage_path") or "").strip()
             result[input_document_id] = {
                 "document_id": document_id,
+                "revision_id": str(row.get("revision_id") or ""),
                 "filename": str(
                     document.get("original_filename") or row.get("input_title") or ""
                 ),
@@ -667,6 +668,10 @@ class GraphRAGNativeRuntime:
             "protocol_version": QUERY_PROTOCOL_VERSION, "bundle_root": str(root),
             "run_id": str(run["run_id"]), "mode": mode, "question": str(question),
         }
+        project = self.service.db.get_project(project_id)
+        payload["model_context_tokens"] = max(
+            0, int((project or {}).get("model_max_tokens") or 0)
+        )
         try:
             environment = dict(os.environ)
             # GraphRAG's OpenAI adapter validates a non-empty API key even

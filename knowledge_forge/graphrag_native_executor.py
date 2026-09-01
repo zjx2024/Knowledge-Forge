@@ -51,6 +51,210 @@ class NativeBuildCancelled(RuntimeError):
     """The durable job requested cancellation before bundle publication."""
 
 
+class NativeStandardWorkflowProgress:
+    """Monotonic progress for GraphRAG's ordered Standard workflow.
+
+    GraphRAG reports an independent ``completed/total`` denominator for each
+    internal operation.  Treating any one of those denominators as the whole
+    Standard pipeline makes the first short operation move the public job to
+    the end of its execution band.  Keep the upstream signals intact, but
+    place them inside stable workflow milestones for the pinned 3.1.1
+    Standard pipeline.
+
+    The weights are observability-only.  They never select a workflow, skip a
+    model call, alter GraphRAG settings, or participate in bundle validation.
+    Expensive model-backed extraction and reporting deliberately own most of
+    the band; deterministic table transforms own only small milestones.
+    """
+
+    lower_bound = 30
+    upper_bound = 71
+    workflow_weights: tuple[tuple[str, float], ...] = (
+        ("create_base_text_units", 0.03),
+        ("create_final_documents", 0.01),
+        ("extract_graph", 0.43),
+        ("finalize_graph", 0.04),
+        ("extract_covariates", 0.01),
+        ("create_communities", 0.05),
+        ("create_final_text_units", 0.03),
+        ("create_community_reports", 0.30),
+        ("generate_text_embeddings", 0.10),
+    )
+    workflow_labels = {
+        "create_base_text_units": "生成文本单元",
+        "create_final_documents": "整理文档索引",
+        "extract_graph": "抽取实体与关系",
+        "finalize_graph": "整理实体关系图",
+        "extract_covariates": "整理声明与属性",
+        "create_communities": "识别主题社区",
+        "create_final_text_units": "关联文本与图谱",
+        "create_community_reports": "生成社区报告",
+        "generate_text_embeddings": "生成检索向量",
+    }
+    operation_labels = {
+        "chunker": "生成文本单元",
+        "extract_graph": "抽取实体与关系",
+        "relationship_description": "生成实体与关系描述",
+        "generate_embeddings": "生成检索向量",
+    }
+
+    def __init__(self, previous: int = lower_bound) -> None:
+        self.previous = max(
+            self.lower_bound, min(self.upper_bound, int(previous)),
+        )
+        self.active_workflow = ""
+        self.fractions = {name: 0.0 for name, _weight in self.workflow_weights}
+        self.operation_fractions: dict[tuple[str, str], float] = {}
+
+    @staticmethod
+    def _normalize_workflow(value: str) -> str:
+        return "_".join(str(value or "").strip().lower().replace("-", " ").split())
+
+    def _known_workflow(self, value: str) -> str:
+        normalized = self._normalize_workflow(value)
+        return normalized if normalized in self.fractions else ""
+
+    def _event_workflow(self, event: NativeProcessProgress) -> str:
+        direct = self._known_workflow(event.workflow)
+        if direct:
+            return direct
+        # Progress records often name an inner operation (for example
+        # ``chunker``) rather than the enclosing workflow.  Attribute that
+        # denominator only to the workflow whose explicit start event was
+        # observed; never guess from an arbitrary operation name.
+        return self.active_workflow
+
+    def weighted_fraction(self) -> float:
+        return max(0.0, min(1.0, sum(
+            self.fractions[name] * weight
+            for name, weight in self.workflow_weights
+        )))
+
+    def _operation_fraction(self, workflow: str) -> float:
+        """Aggregate known independent counters inside one workflow.
+
+        GraphRAG reuses ``n/total`` for multiple operations.  In particular,
+        ``extract_graph`` first reports text-unit extraction and then a much
+        larger description-summarization ledger; community reports separately
+        report each hierarchy level.  These counters must not overwrite one
+        another or individually claim the complete enclosing workflow.
+        """
+
+        def value(operation: str) -> float:
+            return self.operation_fractions.get((workflow, operation), 0.0)
+        if workflow == "create_base_text_units":
+            return value("chunker")
+        if workflow == "extract_graph":
+            # Fresh local runs show description summarization dominating the
+            # second half of elapsed time.  Reserve it explicitly so a
+            # completed text-unit extraction ledger cannot claim that graph
+            # extraction itself is complete.
+            return 0.25 * value("extract_graph") + 0.75 * value(
+                "relationship_description"
+            )
+        if workflow == "create_community_reports":
+            # GraphRAG emits higher hierarchy levels first and level 0 last.
+            # A geometric allocation works for any hierarchy depth without
+            # hard-coding the number of communities in a particular project.
+            progress = 0.0
+            prefix = "level_"
+            suffix = "_summarize_communities"
+            for (owner, operation), fraction in self.operation_fractions.items():
+                if owner != workflow or not (
+                    operation.startswith(prefix) and operation.endswith(suffix)
+                ):
+                    continue
+                level_text = operation[len(prefix):-len(suffix)]
+                if not level_text.isdigit():
+                    continue
+                level = int(level_text)
+                progress += 0.65 * (0.35 ** level) * fraction
+            return min(1.0, progress)
+        # ``generate embeddings`` restarts its denominator for every batch
+        # and field.  Without a trustworthy aggregate denominator, hold this
+        # short workflow at its milestone until GraphRAG emits completion.
+        return 0.0
+
+    def update(self, event: NativeProcessProgress) -> int:
+        state = str(event.workflow_state or "")
+        direct = self._known_workflow(event.workflow)
+        if state == "started":
+            self.active_workflow = direct
+        elif state == "completed":
+            if direct:
+                self.fractions[direct] = 1.0
+                if self.active_workflow == direct:
+                    self.active_workflow = ""
+        elif (
+            event.completed is not None
+            and event.total is not None
+            and int(event.total) > 0
+        ):
+            workflow = self._event_workflow(event)
+            if workflow:
+                operation = self._normalize_workflow(event.workflow)
+                fraction = max(0.0, min(
+                    1.0,
+                    float(event.completed) / float(event.total),
+                ))
+                self.operation_fractions[(workflow, operation)] = max(
+                    self.operation_fractions.get((workflow, operation), 0.0),
+                    fraction,
+                )
+                self.fractions[workflow] = max(
+                    self.fractions[workflow],
+                    self._operation_fraction(workflow),
+                )
+        value = self.lower_bound + round(
+            (self.upper_bound - self.lower_bound) * self.weighted_fraction(),
+        )
+        self.previous = max(
+            self.previous, min(self.upper_bound, int(value)),
+        )
+        return self.previous
+
+    def metadata(self, event: NativeProcessProgress) -> dict[str, Any]:
+        workflow = self._event_workflow(event)
+        operation = self._normalize_workflow(event.workflow)
+        level_match = (
+            operation.startswith("level_")
+            and operation.endswith("_summarize_communities")
+        )
+        if level_match:
+            level = operation[len("level_"):-len("_summarize_communities")]
+            label = f"生成第 {level} 层社区报告"
+        else:
+            label = self.operation_labels.get(
+                operation,
+                self.workflow_labels.get(workflow, "GraphRAG 标准流程"),
+            )
+        if (
+            event.completed is not None
+            and event.total is not None
+            and int(event.total) > 0
+        ):
+            detail = f"{label} {int(event.completed)}/{int(event.total)}"
+        elif str(event.workflow_state or "") == "completed" and workflow:
+            detail = f"{label}已完成"
+        else:
+            detail = f"正在{label}" if workflow else "GraphRAG 标准流程正在运行"
+        workflow_fraction = self.fractions.get(workflow, 0.0)
+        operation_fraction = self.operation_fractions.get(
+            (workflow, operation), 0.0,
+        )
+        return {
+            "schema_version": "graphrag-native-progress-v2",
+            "phase": "standard_workflow",
+            "workflow": workflow,
+            "operation": operation,
+            "detail": detail,
+            "workflow_progress": round(workflow_fraction * 100),
+            "operation_progress": round(operation_fraction * 100),
+            "execution_progress": round(self.weighted_fraction() * 100),
+            "overall_progress": self.previous,
+        }
+
+
 class GraphRAGNativeExecutor:
     """Explicit project-wide executor for the third construction strategy."""
 
@@ -191,22 +395,6 @@ class GraphRAGNativeExecutor:
             path.unlink()
         elif path.exists():
             shutil.rmtree(path)
-
-    @staticmethod
-    def _workflow_progress_value(event: NativeProcessProgress, previous: int) -> int:
-        """Map a CLI's generic ``completed/total`` signal into the index band.
-
-        The runner may report several GraphRAG workflows, each with its own
-        denominator.  The UI must never move backwards or claim that final
-        bundle validation has happened, so live workflow events stay strictly
-        inside the 30–68 execution band.  Executor-owned validation starts at
-        72 only after the CLI exits successfully.
-        """
-
-        if event.completed is None or event.total is None or event.total <= 0:
-            return int(previous)
-        fraction = max(0.0, min(1.0, float(event.completed) / float(event.total)))
-        return max(int(previous), min(68, 30 + max(1, round(38 * fraction))))
 
     @staticmethod
     def _remove_generated_env_file(root: Path) -> None:
@@ -680,7 +868,7 @@ class GraphRAGNativeExecutor:
             self._assert_not_cancelled(job_id)
             self.service.db.update_graphrag_native_run(run_id, owner=owner, state="RUNNING")
             self.service.db.update_job(job_id, progress=30, log="GraphRAG Native：执行 Standard workflow")
-            workflow_progress = 30
+            workflow_tracker = NativeStandardWorkflowProgress()
             last_lease_renewal = time.monotonic()
             lease_failure: Exception | None = None
 
@@ -709,7 +897,6 @@ class GraphRAGNativeExecutor:
                 return True
 
             def report_workflow_progress(event: NativeProcessProgress) -> None:
-                nonlocal workflow_progress
                 renew_native_lease()
                 if lease_failure is not None:
                     return
@@ -721,10 +908,13 @@ class GraphRAGNativeExecutor:
                     or self._job_cancel_requested(current_job)
                 ):
                     return
-                workflow_progress = self._workflow_progress_value(event, workflow_progress)
+                workflow_progress = workflow_tracker.update(event)
                 self.service.db.update_job(
                     job_id, status="running", progress=workflow_progress,
                     log="GraphRAG Native：" + event.message,
+                    metadata={
+                        "native_progress": workflow_tracker.metadata(event),
+                    },
                 )
 
             index_result = self.runner.index(
@@ -746,6 +936,16 @@ class GraphRAGNativeExecutor:
             self.service.db.update_job(
                 job_id, progress=72,
                 log="GraphRAG Native：知识提取完成，开始检查构建结果",
+                metadata={
+                    "native_progress": {
+                        "schema_version": "graphrag-native-progress-v2",
+                        "phase": "validation",
+                        "detail": "正在检查图谱结构与问答索引",
+                        "execution_progress": 100,
+                        "phase_progress": 0,
+                        "overall_progress": 72,
+                    },
+                },
             )
             self.service.db.update_graphrag_native_run(
                 run_id, owner=owner, state="EXECUTION_COMPLETE",
@@ -773,6 +973,16 @@ class GraphRAGNativeExecutor:
             self.service.db.update_job(
                 job_id, progress=86,
                 log="GraphRAG Native：图谱结构与问答索引已检查，正在保存审计记录",
+                metadata={
+                    "native_progress": {
+                        "schema_version": "graphrag-native-progress-v2",
+                        "phase": "validation",
+                        "detail": "正在保存构建审计记录",
+                        "execution_progress": 100,
+                        "phase_progress": 50,
+                        "overall_progress": 86,
+                    },
+                },
             )
             # Post-index evidence is generated after the first structural
             # report.  Run the independent validator again so its credential
@@ -786,6 +996,16 @@ class GraphRAGNativeExecutor:
             self.service.db.update_job(
                 job_id, progress=94,
                 log="GraphRAG Native：最终检查通过，正在发布知识图谱成果",
+                metadata={
+                    "native_progress": {
+                        "schema_version": "graphrag-native-progress-v2",
+                        "phase": "publication",
+                        "detail": "正在发布已通过检查的知识图谱成果",
+                        "execution_progress": 100,
+                        "phase_progress": 79,
+                        "overall_progress": 94,
+                    },
+                },
             )
             self._assert_not_cancelled(job_id)
             final_root.parent.mkdir(parents=True, exist_ok=True)
@@ -813,6 +1033,14 @@ class GraphRAGNativeExecutor:
                     "run_id": run_id,
                     "source_snapshot_hash": inputs.source_snapshot_hash,
                     "output_language": output_language,
+                    "native_progress": {
+                        "schema_version": "graphrag-native-progress-v2",
+                        "phase": "completed",
+                        "detail": "知识图谱成果已发布",
+                        "execution_progress": 100,
+                        "phase_progress": 100,
+                        "overall_progress": 100,
+                    },
                 },
             )
         except Exception as exc:

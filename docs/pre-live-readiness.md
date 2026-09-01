@@ -1,5 +1,8 @@
 # 上线前检查与恢复门禁
 
+> 更新时间：2026-09-01
+> 适用范围：Knowledge Forge 构建、GraphRAG Native 构建及统一单知识库问答智能体
+
 本文是当前 Knowledge Forge 服务的运维检查清单。产品提供两种相互隔离的项目级构建
 策略：`knowledge_forge` 与 `graphrag_native`。历史实验中的 control/shadow/canary 名称
 不再作为当前产品策略或发布流程。
@@ -11,6 +14,8 @@
 - HugeGraph 的 `knowledge_forge` 物理图只承载 Knowledge Forge 策略发布后的可导航投影。
 - GraphRAG Native 的算法事实保存在不可变的 run-local Parquet、GraphML 与 LanceDB
   bundle；PostgreSQL 只保存控制面元数据。
+- 智能体会话、运行、消息、步骤、工具、证据、引用、事件和反馈保存在 PostgreSQL；
+  LangGraph checkpoint 位于隔离的 `knowledge_agent` schema，不替代 `agent_messages`。
 - 文档重入库追加 revision。失败 revision 不得覆盖最后一个成功的 active revision。
 - 删除文档采用软删除；仍有其他文档支持的事实不得随单个文档删除。
 
@@ -21,7 +26,9 @@
 3. 检查 PostgreSQL、pgvector、Ollama/Embedding、reranker、HugeGraph 的健康与认证。
 4. 检查所有运行中的 `graphrag_native_build`。只要存在运行中的 Native 构建，就不得
    重启 `knowledge-forge.service`；应等待完成，或在用户明确授权后安全取消。
-5. 查看迁移计划和状态；已应用迁移不可原地修改，只能追加 forward-fix migration。
+5. 检查运行中的智能体回答。服务重启不会续写未完成的模型响应，这些运行会明确失败关闭；
+   已完成会话、证据和引用可以恢复。需要连续回答时应先等待完成或由用户停止。
+6. 查看迁移计划和状态；已应用迁移不可原地修改，只能追加 forward-fix migration。
 
 ```bash
 .venv/bin/python scripts/manage_migrations.py plan
@@ -48,6 +55,11 @@
 
 测试数据库、schema、role 和 sentinel 必须随机隔离，测试结束只清理本轮创建的资源。
 不得把 fixture 结果描述为真实模型质量结论。
+
+当前智能体至少需要以下迁移全部处于 `applied`：
+
+- `0035_knowledge_agent_v1`：会话、运行、消息、步骤、工具、证据、引用、事件和反馈账本；
+- `0036_knowledge_agent_context_runtime`：隔离的 LangGraph PostgreSQL checkpoint schema。
 
 ## 4. Knowledge Forge 构建门禁
 
@@ -86,11 +98,28 @@
 
 ```bash
 curl --fail http://127.0.0.1:8011/health
-curl --fail http://127.0.0.1:8080/graphs
+# 在已经加载部署环境变量的 shell 中执行；默认示例端口是 8080，当前本机 .env 为 8081
+curl --fail "http://${HUGEGRAPH_HOST:-127.0.0.1}:${HUGEGRAPH_PORT:-8080}/graphs"
+curl --fail --cookie-jar /tmp/knowledge-forge-agent.cookies \
+  http://127.0.0.1:8011/api/agent/knowledge-bases
 ```
 
 只读检查不等于构建验证。修改上传、预处理、构建、查询或模型调用后，必须额外执行对应的
 真实入口。出现 stale lease、迁移缺口、模型响应不完整、任务假成功或来源丢失时，不得发布。
+
+智能体相关修改必须通过隔离知识库走真实公共 HTTP/SSE 入口，并至少核对：
+
+1. 创建会话、提交问题、SSE 到达终态，`agent_runs` 与 assistant message 状态一致；
+2. 知识问题至少有一条通过服务端校验的声明引用，证据属于当前项目和当前快照；
+3. 来源详情可恢复文件、页码/章节以及存在时的图片或表格；
+4. 同一会话追问能够生成正确的独立检索问题，失败或取消轮次不进入后续语境；
+5. 知识库外问题受控拒答，歧义指代请求澄清，智能体能力问题不触发知识检索；
+6. KF 运行只调用 KF 检索工具，GR 运行只调用 Native 检索工具；
+7. 刷新或重启后已完成会话、执行轨迹和证据仍可读取，未完成回答明确失败关闭；
+8. 运行元数据包含访问、输入、对话、检索、执行和输出六层策略决定。
+
+本地模型链路必须使用项目当前配置的 Ollama LLM、Embedding 和独立 reranker HTTP 服务，
+不能用 mock、旧运行结果或另一知识库的证据代替真实验收。
 
 ## 7. 网络与凭据
 
@@ -105,5 +134,8 @@ curl --fail http://127.0.0.1:8080/graphs
 - Knowledge Forge 新图代次失败时保留上一份已验证代次，但不得把旧代次冒充当前来源已更新。
 - GraphRAG Native 新 run 失败时不激活半成品；来源已变化时，旧 READY bundle 必须以 stale
   拒绝查询。
+- 智能体已完成消息和引用从 PostgreSQL 恢复；LangGraph checkpoint 只恢复有界语境状态。
+  服务中断时正在生成的答案必须标记失败，不得把不完整模型文本发布为已完成回答。
+- 归档智能体会话时同时清理其 LangGraph checkpoint；不得删除其他会话或知识库的 checkpoint。
 - 物理删除 bundle、项目数据或图数据需要精确目标与用户授权；优先使用软删除和可恢复操作。
 - 修复完成后重新执行本清单，记录 commit、配置哈希、迁移状态、真实任务 ID 和验证结果。

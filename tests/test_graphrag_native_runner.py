@@ -95,6 +95,9 @@ def test_index_forwards_only_structural_workflow_progress(tmp_path):
         "GraphRAG workflow 完成：extract_graph",
     ]
     assert events[1].completed == 1 and events[1].total == 9
+    assert [event.workflow_state for event in events] == [
+        "started", "progress", "completed",
+    ]
     assert all("secret source text" not in event.message for event in events)
 
 

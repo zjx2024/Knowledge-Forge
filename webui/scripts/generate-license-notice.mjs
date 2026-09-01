@@ -21,7 +21,8 @@ for (const [packagePath, metadata] of Object.entries(lock.packages || {})) {
     version: manifest.version || metadata.version || 'unknown',
     license: manifest.license || metadata.license || 'SEE PACKAGE',
     repository: typeof manifest.repository === 'string'
-      ? manifest.repository : manifest.repository?.url || '',
+      ? manifest.repository
+      : (manifest.repository && manifest.repository.url) || '',
     text: licenseFile ? fs.readFileSync(path.join(directory, licenseFile), 'utf8').trim() : '',
   });
 }

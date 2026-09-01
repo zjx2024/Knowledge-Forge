@@ -11,8 +11,11 @@ from knowledge_forge.graphrag_community import (
 )
 from knowledge_forge.knowledge_forge_communities import (
     COMMUNITY_NARRATIVE_VERSION,
+    COMMUNITY_TOPIC_ASSOCIATION_VERSION,
     KnowledgeForgeCommunityService,
+    build_community_topic_associations,
     build_knowledge_forge_byog,
+    community_topic_embedding_keys,
     enrich_community_descriptions,
 )
 from knowledge_forge.knowledge_forge_descriptions import (
@@ -142,6 +145,122 @@ def test_strategy_community_service_persists_browser_ready_memberships():
     assert "该社区主要介绍" in result["communities"][0]["description"]
     assert "该社区包含" not in result["communities"][0]["description"]
     assert result["communities"][1]["entity_keys"] == ["entity-c"]
+    assert result["metadata"]["community_topic_associations"] == []
+    assert result["metadata"]["community_topic_association_metrics"][
+        "policy_version"
+    ] == COMMUNITY_TOPIC_ASSOCIATION_VERSION
+
+
+def _topic_association_fixture():
+    communities = [
+        {
+            "key": "g1", "level": 0, "size": 2, "relationship_count": 1,
+            "entity_keys": ["a", "b"],
+        },
+        {
+            "key": "g2", "level": 0, "size": 2, "relationship_count": 1,
+            "entity_keys": ["c", "d"],
+        },
+        {
+            "key": "g3", "level": 0, "size": 2, "relationship_count": 1,
+            "entity_keys": ["e", "f"],
+        },
+    ]
+    relations = [
+        {
+            "source_canonical_key": "a", "target_canonical_key": "b",
+            "document_id": 10,
+        },
+        {
+            "source_canonical_key": "c", "target_canonical_key": "d",
+            "document_id": 10,
+        },
+        {
+            "source_canonical_key": "e", "target_canonical_key": "f",
+            "document_id": 20,
+        },
+    ]
+    embeddings = [
+        {"canonical_key": "a", "model_name": "fixture", "embedding": [1, 0, 0]},
+        {"canonical_key": "b", "model_name": "fixture", "embedding": [0.98, 0.08, 0]},
+        {"canonical_key": "c", "model_name": "fixture", "embedding": [0.97, 0.16, 0]},
+        {"canonical_key": "d", "model_name": "fixture", "embedding": [0.95, 0.22, 0]},
+        # g3 is moderately similar, but it comes from a different document and
+        # must clear the deliberately stricter cross-document threshold.
+        {"canonical_key": "e", "model_name": "fixture", "embedding": [0.72, 0.69, 0]},
+        {"canonical_key": "f", "model_name": "fixture", "embedding": [0.70, 0.71, 0]},
+    ]
+    return communities, relations, embeddings
+
+
+def test_topic_associations_are_sparse_navigation_links_with_strict_cross_document_gate():
+    communities, relations, embeddings = _topic_association_fixture()
+
+    associations, metrics = build_community_topic_associations(
+        communities, relation_rows=relations, embedding_rows=embeddings,
+    )
+
+    assert community_topic_embedding_keys(communities, relations) == [
+        "a", "b", "c", "d", "e", "f",
+    ]
+    assert [
+        (item["source_community_key"], item["target_community_key"])
+        for item in associations
+    ] == [("g1", "g2")]
+    assert associations[0]["kind"] == "community_topic_association"
+    assert associations[0]["policy_version"] == COMMUNITY_TOPIC_ASSOCIATION_VERSION
+    assert associations[0]["shared_document_count"] == 1
+    assert associations[0]["score"] > 0.82
+    assert "mutual_nearest" in associations[0]["selection_reasons"]
+    assert associations[0]["representative_entity_matches"]
+    assert {
+        associations[0]["representative_entity_matches"][0]["source_entity_key"],
+        associations[0]["representative_entity_matches"][0]["target_entity_key"],
+    }.issubset({"a", "b", "c", "d"})
+    assert associations[0]["explanation_version"] == (
+        COMMUNITY_TOPIC_ASSOCIATION_VERSION
+    )
+    assert metrics["selected_associations"] == 1
+    assert metrics["explained_associations"] == 1
+    assert metrics["embedded_communities"] == 3
+
+
+def test_topic_association_never_duplicates_an_existing_factual_bridge():
+    communities, relations, embeddings = _topic_association_fixture()
+    relations.append({
+        "source_canonical_key": "b", "target_canonical_key": "c",
+        "document_id": 10,
+    })
+
+    associations, metrics = build_community_topic_associations(
+        communities, relation_rows=relations, embedding_rows=embeddings,
+    )
+
+    assert not any({
+        item["source_community_key"], item["target_community_key"],
+    } == {"g1", "g2"} for item in associations)
+    assert metrics["skipped_existing_fact_pairs"] == 1
+
+
+def test_topic_association_excludes_metadata_only_actor_communities():
+    communities, relations, embeddings = _topic_association_fixture()
+    for row in embeddings:
+        row["name"] = row["canonical_key"]
+        row["primary_type"] = (
+            "Person" if row["canonical_key"] in {"a", "b"} else "Technology"
+        )
+
+    associations, metrics = build_community_topic_associations(
+        communities, relation_rows=relations, embedding_rows=embeddings,
+    )
+
+    assert metrics["metadata_only_communities"] == 1
+    assert not any(
+        "g1" in {
+            item["source_community_key"], item["target_community_key"],
+        }
+        for item in associations
+    )
 
 
 def test_community_description_explains_the_topic_instead_of_repeating_counts():

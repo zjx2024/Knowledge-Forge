@@ -1,6 +1,6 @@
 # Knowledge Forge 命名与兼容边界
 
-> 更新时间：2026-08-21
+> 更新时间：2026-09-01
 
 ## 当前术语
 
@@ -12,6 +12,10 @@
 | relation pipeline | 旧兼容构建路径中的有界候选分类流水线 | `relation_pipeline.py` |
 | Knowledge Forge | 当前项目级知识图谱构建策略，键为 `knowledge_forge` | `construction_strategies.py` |
 | GraphRAG Native | 独立 GraphRAG 3.1.1 项目级策略，键为 `graphrag_native` | `graphrag_native_*` |
+| knowledge agent | 两种构建策略之上的统一只读问答层；当前显式绑定一个知识库 | `knowledge_forge/agent/` |
+| evidence item | 统一查询证据，绑定项目、策略、快照、来源和运行级稳定键 | `agent/contracts.py` |
+| conversation context | 只用于指代消解的最近轮次与滚动摘要，不是回答证据 | `agent/context.py` |
+| layered policy | 访问、输入、对话、检索、执行和输出六层确定性决策协议 | `agent/policy.py` |
 
 新代码、函数、脚本、日志和文档应使用这些名称，不再创建包含 `shadow` 的新应用层标识。
 
@@ -35,6 +39,8 @@
 3. 不为美化命名改变不可变 Prompt/策略版本；语义改变必须创建新版本并按新鲜度规则重建。
 4. `enhanced_shadow` 只作为旧请求输入别名归一到 `knowledge_forge`，新记录不得继续写该策略键。
 5. 测试中出现旧名称时，应明确是在验证物理兼容合同，而不是继续传播旧产品术语。
+6. 智能体新代码不得把 KF/GR 内部 ID 或得分当成跨策略公共标识；必须先转换为统一证据协议。
+7. LangGraph checkpoint 是有界流程状态，`agent_messages` 才是完整会话事实来源；两者不能互相改名或替代。
 
 ## 已完成迁移
 
@@ -44,3 +50,4 @@
 - 测试文件与夹具按当前能力命名；
 - 旧一次性 pilot 和未使用的原型入口已删除；
 - `artifacts/` 改为可重复生成且不进入 Git。
+- 统一问答模块直接采用 `agent`、`evidence`、`citation`、`context` 和 `policy` 命名，没有引入新的 `shadow` 应用层标识。

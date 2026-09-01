@@ -1,6 +1,13 @@
 import base64
+import json
 
-from knowledge_forge.ollama import EffectiveModelContext, OllamaClient
+import pytest
+
+from knowledge_forge.ollama import (
+    EffectiveModelContext,
+    OllamaCancelled,
+    OllamaClient,
+)
 
 
 def ready(client, monkeypatch, *, context=32768):
@@ -38,6 +45,86 @@ def test_embed_can_use_a_separate_runtime_without_rerouting_generation(monkeypat
     assert client.embed(["source"], "bge-m3") == [[0.25, 0.75]]
     assert calls[0][1] == "http://embedding.test/api/embed"
     assert client.base_url == "http://generation.test"
+
+
+def test_json_chat_collects_streamed_json_when_cancellation_is_enabled(monkeypatch):
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, decode_unicode=True):
+            assert decode_unicode is True
+            yield json.dumps({"message": {"content": '{"ok":'}, "done": False})
+            yield json.dumps({
+                "message": {"content": " true}"}, "done": True,
+                "done_reason": "stop", "prompt_eval_count": 12,
+                "eval_count": 4,
+            })
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    calls = []
+    monkeypatch.setattr(
+        "knowledge_forge.ollama.requests.post",
+        lambda url, **kwargs: calls.append((url, kwargs)) or response,
+    )
+
+    result = ready(OllamaClient("http://ollama.test"), monkeypatch).json_chat(
+        model="test", system="system", prompt="prompt",
+        schema={"type": "object", "required": ["ok"]},
+        cancel_check=lambda: False,
+    )
+
+    assert result == {"ok": True}
+    assert response.closed is True
+    assert calls[0][1]["stream"] is True
+    assert calls[0][1]["json"]["stream"] is True
+
+
+def test_json_chat_closes_stream_transport_as_soon_as_cancelled(monkeypatch):
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, decode_unicode=True):
+            yield json.dumps({"message": {"content": '{"ok":'}, "done": False})
+            yield json.dumps({
+                "message": {"content": " true}"}, "done": True,
+                "done_reason": "stop", "prompt_eval_count": 12,
+                "eval_count": 4,
+            })
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    monkeypatch.setattr(
+        "knowledge_forge.ollama.requests.post",
+        lambda _url, **_kwargs: response,
+    )
+    checks = 0
+
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    with pytest.raises(OllamaCancelled, match="终止"):
+        ready(OllamaClient("http://ollama.test"), monkeypatch).json_chat(
+            model="test", system="system", prompt="prompt",
+            schema={"type": "object", "required": ["ok"]},
+            cancel_check=cancelled,
+        )
+
+    assert response.closed is True
 
 
 def test_parse_json_preserves_array_for_domain_normalization():

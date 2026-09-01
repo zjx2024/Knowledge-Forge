@@ -8,4 +8,6 @@ openpyxl>=3.1.0
 xlrd>=2.0.1
 hugegraph-python==1.5.0
 graphrag==3.1.1
+langgraph==1.2.11
+langgraph-checkpoint-postgres==3.1.2
 pytest>=7.0

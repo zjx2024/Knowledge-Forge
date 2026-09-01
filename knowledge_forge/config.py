@@ -317,6 +317,205 @@ class Config:
     reranker_queue_timeout = max(
         1, int(os.getenv("RERANKER_QUEUE_TIMEOUT", "180")),
     )
+    # The knowledge agent remains a bounded read-only workflow. Candidate and
+    # evidence-context limits are independent: the cross-encoder may compare a
+    # wider recall set, while only a provenance-complete subset enters the LLM.
+    agent_enabled = os.getenv(
+        "KNOWLEDGE_AGENT_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    agent_max_workers = max(
+        1, min(8, int(os.getenv("KNOWLEDGE_AGENT_MAX_WORKERS", "2"))),
+    )
+    agent_candidate_limit = max(
+        10, min(100, int(os.getenv("KNOWLEDGE_AGENT_CANDIDATE_LIMIT", "40"))),
+    )
+    agent_dynamic_retrieval_enabled = os.getenv(
+        "KNOWLEDGE_AGENT_DYNAMIC_RETRIEVAL_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    agent_supplemental_retrieval_enabled = os.getenv(
+        "KNOWLEDGE_AGENT_SUPPLEMENTAL_RETRIEVAL_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    agent_supplemental_candidate_limit = max(
+        4, min(32, int(os.getenv(
+            "KNOWLEDGE_AGENT_SUPPLEMENTAL_CANDIDATE_LIMIT", "16",
+        ))),
+    )
+    # Community links are a bounded recall router for Knowledge Forge agent
+    # queries.  They may select additional communities, but only verified
+    # source relations returned by the immutable fact snapshot become
+    # EvidenceItems; aggregate and semantic navigation edges never do.
+    agent_community_navigation_enabled = os.getenv(
+        "KNOWLEDGE_AGENT_COMMUNITY_NAVIGATION_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    agent_community_navigation_max_communities = max(
+        1, min(8, int(os.getenv(
+            "KNOWLEDGE_AGENT_COMMUNITY_NAVIGATION_MAX_COMMUNITIES", "3",
+        ))),
+    )
+    agent_community_navigation_max_relations = max(
+        1, min(24, int(os.getenv(
+            "KNOWLEDGE_AGENT_COMMUNITY_NAVIGATION_MAX_RELATIONS", "8",
+        ))),
+    )
+    agent_context_max_items = max(
+        3, min(30, int(os.getenv("KNOWLEDGE_AGENT_CONTEXT_MAX_ITEMS", "12"))),
+    )
+    agent_context_budget_tokens = max(
+        1024, int(os.getenv("KNOWLEDGE_AGENT_CONTEXT_BUDGET_TOKENS", "6000")),
+    )
+    # Multi-turn context is a separate, non-evidence budget.  The resolver
+    # sizes its raw-history window from the selected local model's verified
+    # token budget; message counts below are only database/memory safeguards.
+    # A reserved share remains available for incrementally compacting older
+    # complete turns into the rolling LangGraph summary.
+    agent_context_recent_token_ratio = max(
+        0.35, min(0.80, float(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RECENT_TOKEN_RATIO", "0.60",
+        ))),
+    )
+    agent_context_min_recent_turns = max(
+        1, min(6, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_MIN_RECENT_TURNS", "2",
+        ))),
+    )
+    agent_context_recent_max_messages = max(
+        4, min(100, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RECENT_MAX_MESSAGES", "40",
+        ))),
+    )
+    agent_context_bootstrap_messages = max(
+        agent_context_recent_max_messages,
+        min(500, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_BOOTSTRAP_MESSAGES", "200",
+        ))),
+    )
+    # Character ceilings are last-resort persistence guards only.  Prompt
+    # admission and summary truncation use the conservative token estimator.
+    agent_context_history_max_chars = max(
+        4000, min(100000, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_HISTORY_MAX_CHARS", "40000",
+        ))),
+    )
+    agent_context_summary_max_chars = max(
+        500, min(6000, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_SUMMARY_MAX_CHARS", "1800",
+        ))),
+    )
+    agent_context_summary_max_tokens = max(
+        128, min(1200, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_SUMMARY_MAX_TOKENS", "512",
+        ))),
+    )
+    # Context resolution uses a demand-sized request window.  Short
+    # conversations stay at the minimum while longer histories may grow in
+    # bounded steps, up to both a share of the verified runner context and an
+    # explicit application ceiling.  The former fixed-budget environment
+    # variable remains a backwards-compatible ceiling for existing
+    # deployments when the new maximum is not configured.
+    _agent_context_resolution_legacy_budget = os.getenv(
+        "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_BUDGET_TOKENS", "",
+    ).strip()
+    agent_context_resolution_min_budget_tokens = max(
+        4096, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MIN_BUDGET_TOKENS", "8192",
+        )),
+    )
+    agent_context_resolution_max_budget_tokens = max(
+        agent_context_resolution_min_budget_tokens,
+        int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MAX_BUDGET_TOKENS",
+            _agent_context_resolution_legacy_budget or "32768",
+        )),
+    )
+    agent_context_resolution_model_ratio = max(
+        0.10, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MODEL_RATIO", "0.50",
+        ))),
+    )
+    agent_context_resolution_growth_step_tokens = max(
+        512, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_GROWTH_STEP_TOKENS", "4096",
+        )),
+    )
+    agent_context_resolution_max_output_tokens = max(
+        256, min(1600, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MAX_OUTPUT_TOKENS", "700",
+        ))),
+    )
+    # Ollama's structured-output repair keeps the first malformed response in
+    # the second request.  Reserve extra estimator space so a valid first
+    # admission cannot fail locally before that bounded repair request.
+    agent_context_resolution_repair_overhead_tokens = max(
+        64, min(1024, int(os.getenv(
+            "KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_REPAIR_OVERHEAD_TOKENS", "256",
+        ))),
+    )
+    agent_max_output_tokens = max(
+        256, int(os.getenv("KNOWLEDGE_AGENT_MAX_OUTPUT_TOKENS", "1400")),
+    )
+    agent_min_context_tokens = max(
+        4096, int(os.getenv("KNOWLEDGE_AGENT_MIN_CONTEXT_TOKENS", "8192")),
+    )
+    agent_max_question_chars = max(
+        128, min(20000, int(os.getenv("KNOWLEDGE_AGENT_MAX_QUESTION_CHARS", "4000"))),
+    )
+    agent_sse_poll_seconds = max(
+        0.05, min(2.0, float(os.getenv("KNOWLEDGE_AGENT_SSE_POLL_SECONDS", "0.20"))),
+    )
+    agent_sse_max_seconds = max(
+        60, min(3600, int(os.getenv("KNOWLEDGE_AGENT_SSE_MAX_SECONDS", "900"))),
+    )
+    # Fail-closed no-answer gate.  These are absolute, independently
+    # inspectable signals rather than the relative RRF rank (whose best item
+    # is always 1.0 even when every candidate is unrelated).  A result is
+    # rejected only when all three signals are weak, which preserves semantic
+    # paraphrases that are strong in either embeddings or the cross-encoder.
+    agent_weak_rerank_threshold = max(
+        0.0, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_WEAK_RERANK_THRESHOLD", "0.01",
+        ))),
+    )
+    agent_weak_semantic_threshold = max(
+        0.0, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_WEAK_SEMANTIC_THRESHOLD", "0.45",
+        ))),
+    )
+    agent_weak_aspect_threshold = max(
+        0.0, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_WEAK_ASPECT_THRESHOLD", "0.15",
+        ))),
+    )
+    # Clear cross-encoder or combined semantic/term alignment can pass the
+    # answer-scope gate without another model call.  Borderline retrieval is
+    # classified by the configured project LLM and fails closed on errors.
+    agent_scope_strong_rerank_threshold = max(
+        0.0, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_SCOPE_STRONG_RERANK_THRESHOLD", "0.50",
+        ))),
+    )
+    agent_scope_strong_semantic_threshold = max(
+        0.0, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_SCOPE_STRONG_SEMANTIC_THRESHOLD", "0.65",
+        ))),
+    )
+    agent_scope_strong_aspect_threshold = max(
+        0.0, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_SCOPE_STRONG_ASPECT_THRESHOLD", "0.20",
+        ))),
+    )
+    agent_scope_context_tokens = max(
+        2048, int(os.getenv("KNOWLEDGE_AGENT_SCOPE_CONTEXT_TOKENS", "8192")),
+    )
+    agent_scope_max_output_tokens = max(
+        128, min(800, int(os.getenv(
+            "KNOWLEDGE_AGENT_SCOPE_MAX_OUTPUT_TOKENS", "256",
+        ))),
+    )
+    agent_input_scope_confidence_threshold = max(
+        0.5, min(1.0, float(os.getenv(
+            "KNOWLEDGE_AGENT_INPUT_SCOPE_CONFIDENCE_THRESHOLD", "0.85",
+        ))),
+    )
     entity_reranker_model_path = os.getenv("ENTITY_RERANKER_MODEL_PATH", "/models/entity-reranker")
     entity_reranker_device = os.getenv("ENTITY_RERANKER_DEVICE", "auto").strip().lower()
     entity_reranker_batch_size = max(1, int(os.getenv("ENTITY_RERANKER_BATCH_SIZE", "4")))

@@ -117,7 +117,185 @@ _TAIL_PREPOSITION = re.compile(
     r"\b(?:for|of|to|from|within|inside|into|as|with)\s+",
     re.IGNORECASE,
 )
+
+
+def _is_cjk_layout_character(value: str) -> bool:
+    """Return whether ``value`` belongs to a script normally written unspaced."""
+
+    if not value:
+        return False
+    codepoint = ord(value)
+    return bool(
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x3040 <= codepoint <= 0x30FF
+    )
+
+
+def _layout_surface_parts(value: str) -> tuple[list[str], list[str]]:
+    """Split a source surface into visible characters and inner whitespace."""
+
+    characters: list[str] = []
+    separators: list[str] = []
+    pending = ""
+    for character in str(value or ""):
+        if character.isspace():
+            pending += character
+            continue
+        if characters:
+            separators.append(pending)
+        characters.append(character)
+        pending = ""
+    return characters, separators
+
+
+def layout_equivalent_surface_occurrences(
+    content: str,
+    surface: str,
+    *,
+    max_inner_whitespace: int = 16,
+) -> list[tuple[int, int]]:
+    """Find exact-name repeats whose only difference is renderer whitespace.
+
+    This is deliberately narrower than ordinary normalization.  Every visible
+    source character must be identical and in the same order; only whitespace
+    between CJK/Kana characters or a parser-confirmed soft newline may differ.
+    Pure Latin word spaces therefore keep their lexical meaning (``New York``
+    is not silently equated with ``NewYork``), while PDF forms such as
+    ``联邦学习``/``联邦 学习`` and ``federated\nlearning`` remain recoverable.
+    The returned spans always refer to the immutable source text.
+    """
+
+    source = str(content or "")
+    seed = str(surface or "")
+    characters, seed_separators = _layout_surface_parts(seed)
+    if len(characters) < 2 or not source:
+        return []
+
+    ascii_word = all(
+        character.isascii() and (character.isalnum() or character == "_")
+        for character in characters
+    )
+    results: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        left = source.find(characters[0], search_from)
+        if left < 0:
+            break
+        search_from = left + 1
+        cursor = left + 1
+        candidate_separators: list[str] = []
+        valid = True
+        for character in characters[1:]:
+            separator_start = cursor
+            while cursor < len(source) and source[cursor].isspace():
+                cursor += 1
+            candidate_separators.append(source[separator_start:cursor])
+            if cursor >= len(source) or source[cursor] != character:
+                valid = False
+                break
+            cursor += 1
+        if not valid:
+            continue
+        right = cursor
+        candidate_surface = source[left:right]
+        if candidate_surface == seed:
+            continue
+        if sum(len(value) for value in candidate_separators) > max_inner_whitespace:
+            continue
+
+        changed = False
+        for index, (expected, observed) in enumerate(zip(
+            seed_separators, candidate_separators,
+        )):
+            if expected == observed:
+                continue
+            changed = True
+            adjacent_cjk = (
+                _is_cjk_layout_character(characters[index])
+                or _is_cjk_layout_character(characters[index + 1])
+            )
+            newline_offsets = [
+                left
+                + 1
+                + sum(
+                    1 + len(value)
+                    for value in candidate_separators[:index]
+                )
+                + offset
+                for offset, value in enumerate(observed)
+                if value == "\n"
+            ]
+            soft_newline = bool(newline_offsets) and all(
+                is_soft_wrap_newline(source, offset)
+                for offset in newline_offsets
+            )
+            if newline_offsets and not soft_newline:
+                valid = False
+                break
+            # A newline present in the seed was already accepted as part of an
+            # exact model span.  It may safely map to the same visible sequence
+            # elsewhere; newly crossed source newlines must pass the parser's
+            # conservative soft-wrap test.
+            if not (
+                adjacent_cjk
+                or soft_newline
+                or "\n" in expected
+                or "\r" in expected
+            ):
+                valid = False
+                break
+            if "\n\n" in observed or "\r\n\r\n" in observed:
+                valid = False
+                break
+        if not valid or not changed:
+            continue
+        if ascii_word:
+            before = source[left - 1] if left else ""
+            after = source[right] if right < len(source) else ""
+            if (
+                (before and (before.isalnum() or before == "_"))
+                or (after and (after.isalnum() or after == "_"))
+            ):
+                continue
+        results.append((left, right))
+    return results
+
+
 _RELATIVE_CLAUSE = re.compile(r"\s+(?:that|which|who|where)\b", re.IGNORECASE)
+LAYOUT_MENTION_COVERAGE_POLICY_VERSION = "entity-layout-mention-coverage-v2"
+
+
+def layout_recovery_seed_rejection_reason(
+    surface: str, entity_type: str,
+) -> str:
+    """Reject only short, low-information seeds from automatic expansion."""
+
+    visible = "".join(
+        character for character in str(surface or "")
+        if not character.isspace()
+    )
+    lexical_length = sum(character.isalnum() for character in visible)
+    if lexical_length >= 4:
+        return ""
+    kind = str(entity_type or "GenericEntity")
+    if lexical_length >= 2 and kind in {"Person", "Organization", "Location"}:
+        return ""
+    if lexical_length >= 2 and any(
+        character.isdigit() or (
+            character.isascii() and character.isupper()
+        )
+        for character in visible
+    ):
+        return ""
+    if (
+        lexical_length >= 3
+        and visible.isascii()
+        and kind in {"Organization", "Product", "Technology"}
+    ):
+        return ""
+    return "short_low_information_layout_seed"
 
 
 def non_referential_surface_reason(surface: str) -> str:
@@ -925,6 +1103,7 @@ class SpanMention:
     publishability_protected: bool = False
     publishability_features: tuple[str, ...] = ()
     publishability_policy_version: str = ""
+    recovery_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -1007,6 +1186,149 @@ class SpanFirstEntityExtractor:
                     continue
             values.append((left, right))
         return values
+
+    def audit_layout_coverage(
+        self,
+        *,
+        content: str,
+        mentions: Iterable[SpanMention],
+        type_assertions: Iterable[TypeAssertion],
+        chunk_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Audit missing layout-equivalent occurrences without changing output.
+
+        The audit starts only from mentions that already passed exact-span and
+        publishability validation.  Candidate source positions are then run
+        through the same structural and publishability gates as ordinary
+        mentions.  Its result is safe to persist as observability metadata and
+        can later drive a bounded recovery pass without adding an LLM call.
+        """
+
+        source = str(content or "")
+        mention_values = sorted(
+            list(mentions),
+            key=lambda item: (item.start, item.end, item.mention_id),
+        )
+        recovered_mentions = [
+            {
+                "mention_id": item.mention_id,
+                "surface": item.surface,
+                "normalized_surface": item.normalized_surface,
+                "start": item.start,
+                "end": item.end,
+                "recovery_kind": item.recovery_kind,
+            }
+            for item in mention_values
+            if item.recovery_kind
+        ]
+        type_by_mention = {
+            item.mention_id: item for item in type_assertions
+        }
+        occupied = [(item.start, item.end) for item in mention_values]
+        candidates: dict[tuple[int, int, str], dict[str, Any]] = {}
+        overlap_skipped = 0
+        for mention in mention_values:
+            assertion = type_by_mention.get(mention.mention_id)
+            entity_type = str(
+                (assertion.entity_type if assertion else "")
+                or "GenericEntity"
+            )
+            seed_reason = layout_recovery_seed_rejection_reason(
+                mention.surface, entity_type,
+            )
+            for left, right in layout_equivalent_surface_occurrences(
+                source, mention.surface,
+            ):
+                if any(
+                    existing_left < right and left < existing_right
+                    for existing_left, existing_right in occupied
+                ):
+                    overlap_skipped += 1
+                    continue
+                candidate_surface = source[left:right]
+                raw = {
+                    "name": candidate_surface,
+                    "surface": candidate_surface,
+                    "type": entity_type,
+                    "mention_start": left,
+                    "mention_end": right,
+                    "confidence": mention.confidence,
+                    "deterministic_layout_coverage": True,
+                    "seed_mention_id": mention.mention_id,
+                }
+                reason = seed_reason or self._reject_reason(
+                    candidate_surface, chunk_metadata, raw,
+                    start=left, end=right,
+                )
+                publishability = None
+                if not reason:
+                    publishability = classify_mention_publishability(
+                        surface=candidate_surface,
+                        entity_type=entity_type,
+                        content=source,
+                        start=left,
+                        end=right,
+                        chunk_metadata=chunk_metadata,
+                        raw=raw,
+                    )
+                    if publishability.decision == PUBLISHABILITY_REJECTED:
+                        reason = publishability.reason
+                row = {
+                    "seed_mention_id": mention.mention_id,
+                    "seed_surface": mention.surface,
+                    "surface": candidate_surface,
+                    "normalized_surface": normalize_name(candidate_surface),
+                    "start": left,
+                    "end": right,
+                    "entity_type": entity_type,
+                    "confidence": mention.confidence,
+                    "decision": "rejected" if reason else "eligible",
+                    "reason": reason,
+                    "publishability": (
+                        {
+                            "decision": publishability.decision,
+                            "reason": publishability.reason,
+                            "score": publishability.score,
+                            "protected": publishability.protected,
+                            "features": list(publishability.features),
+                            "policy_version": publishability.policy_version,
+                        }
+                        if publishability is not None else {}
+                    ),
+                }
+                key = (left, right, row["normalized_surface"])
+                existing = candidates.get(key)
+                if existing is None or (
+                    float(row["confidence"]), str(row["seed_mention_id"])
+                ) > (
+                    float(existing["confidence"]),
+                    str(existing["seed_mention_id"]),
+                ):
+                    candidates[key] = row
+        rows = sorted(
+            candidates.values(),
+            key=lambda item: (
+                int(item["start"]), int(item["end"]),
+                str(item["normalized_surface"]),
+            ),
+        )
+        eligible = [item for item in rows if item["decision"] == "eligible"]
+        rejected = [item for item in rows if item["decision"] == "rejected"]
+        reasons: dict[str, int] = {}
+        for item in rejected:
+            reason = str(item.get("reason") or "unknown")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        return {
+            "policy_version": LAYOUT_MENTION_COVERAGE_POLICY_VERSION,
+            "candidate_count": len(rows),
+            "eligible_count": len(eligible),
+            "rejected_count": len(rejected),
+            "recovered_count": len(recovered_mentions),
+            "overlap_skipped": overlap_skipped,
+            "rejection_reasons": dict(sorted(reasons.items())),
+            "recovered_mentions": recovered_mentions,
+            "candidates": rows,
+        }
 
     @staticmethod
     def _coordinated_item_span(
@@ -1280,7 +1602,7 @@ class SpanFirstEntityExtractor:
                 recovered.append(candidate)
         return recovered
 
-    def _recover_exact_repeated_occurrences(
+    def _recover_repeated_occurrences(
         self,
         *,
         content: str,
@@ -1341,8 +1663,22 @@ class SpanFirstEntityExtractor:
                 end=source_span[1],
             ):
                 continue
-            for left, right in self._surface_occurrences(content, surface):
-                key = (surface, left, right)
+            occurrence_candidates = [
+                (left, right, "")
+                for left, right in self._surface_occurrences(content, surface)
+            ]
+            if not layout_recovery_seed_rejection_reason(
+                surface, str(raw.get("type") or "GenericEntity"),
+            ):
+                occurrence_candidates.extend(
+                    (left, right, "layout_whitespace_variant")
+                    for left, right in layout_equivalent_surface_occurrences(
+                        content, surface,
+                    )
+                )
+            for left, right, recovery_kind in occurrence_candidates:
+                candidate_surface = content[left:right]
+                key = (candidate_surface, left, right)
                 if key in known or key in recovered:
                     continue
                 if any(
@@ -1352,19 +1688,25 @@ class SpanFirstEntityExtractor:
                 ):
                     continue
                 candidate = dict(raw)
+                candidate["name"] = candidate_surface
+                candidate["surface"] = candidate_surface
                 candidate["mention_start"] = left
                 candidate["mention_end"] = right
                 candidate["evidence_start"] = left
                 candidate["evidence_end"] = right
-                candidate["evidence_text"] = content[left:right]
-                candidate["recovered_exact_occurrence"] = True
+                candidate["evidence_text"] = candidate_surface
+                if recovery_kind:
+                    candidate["recovered_layout_occurrence"] = True
+                    candidate["recovery_kind"] = recovery_kind
+                else:
+                    candidate["recovered_exact_occurrence"] = True
                 for field_name in (
                     "source_anchor", "block_key", "source_start",
                     "source_end", "source_base",
                 ):
                     candidate.pop(field_name, None)
                 if self._reject_reason(
-                    surface,
+                    candidate_surface,
                     chunk_metadata,
                     candidate,
                     start=left,
@@ -1488,7 +1830,7 @@ class SpanFirstEntityExtractor:
         seen: set[str] = set()
         expanded_entities = [
             repair_soft_wrapped_entity_span(content, raw)
-            for raw in self._recover_exact_repeated_occurrences(
+            for raw in self._recover_repeated_occurrences(
                 content=content,
                 raw_entities=raw_entities,
                 chunk_metadata=chunk_metadata,
@@ -1584,6 +1926,7 @@ class SpanFirstEntityExtractor:
                 publishability_protected=publishability.protected,
                 publishability_features=publishability.features,
                 publishability_policy_version=publishability.policy_version,
+                recovery_kind=str(raw.get("recovery_kind") or ""),
             )
             result.mentions.append(mention)
             result.type_assertions.append(TypeAssertion(
@@ -1592,6 +1935,11 @@ class SpanFirstEntityExtractor:
                 confidence=confidence,
                 evidence=surface,
                 policy_version=self.policy_version,
+                source=(
+                    "deterministic_layout_repeat"
+                    if raw.get("recovered_layout_occurrence") is True
+                    else "model"
+                ),
             ))
             for alias in raw.get("alias_spans") or []:
                 alias_surface = str(alias.get("surface") or "")

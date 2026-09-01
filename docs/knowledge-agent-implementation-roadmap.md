@@ -1,7 +1,7 @@
 # Knowledge Forge 知识库智能体完整实现方案与阶段路线
 
-> 状态：目标架构与实施基线
-> 更新时间：2026-08-21
+> 状态：阶段 0、第一版和第二版单知识库范围已实现；第三版多知识库范围尚未开始
+> 更新时间：2026-09-01
 > 适用范围：Knowledge Forge 与 GraphRAG Native 两种知识构建策略
 > 核心原则：一套智能体、统一证据协议、多个检索适配器；回答必须可追溯，知识不足时明确拒答或说明限制。
 
@@ -42,15 +42,13 @@ Knowledge Forge 当前已经具备：
 
 ### 2.2 当前仍缺少的智能体能力
 
-- 统一的问答 API、会话和消息模型；
-- 两种构建策略之上的统一检索结果协议；
-- 知识库选择、问题分类和检索路由；
-- 跨通道融合与统一 rerank；
-- 证据充分性判定和有限次数检索修正；
-- 答案级引用校验、冲突提示和拒答策略；
-- 多轮指代消解与受控会话记忆；
-- 智能体运行轨迹、Token、延迟和质量评估；
-- 权限过滤、提示注入隔离和工具调用策略。
+单知识库问答所需的统一 API、会话、证据协议、动态检索、融合重排、充分性判断、一次补检索、引用校验、拒答、多轮语境与运行审计已经实现。后续范围主要是：
+
+- 用户显式多选知识库与授权范围内的自动知识库选择；
+- 跨知识库问题分解、并行检索、比较和冲突组织；
+- GR DRIFT 的高成本探索分支及更细的并发/成本治理；
+- 路由、召回、引用和拒答质量的持续评估与线上观测；
+- 经用户明确授权的长期偏好，以及高风险流程的人工确认。
 
 ### 2.3 明确不做的事情
 
@@ -82,6 +80,7 @@ Knowledge Forge 当前已经具备：
   │    ├─ Chunk 向量/关键词
   │    ├─ 实体召回
   │    ├─ 一至两跳关系
+  │    ├─ 受控社区联系导航
   │    └─ 社区报告
   ├─ GraphRAG Native 适配器
   │    ├─ Basic
@@ -162,33 +161,37 @@ project_score =
 
 ### 6.1 问题类型
 
-路由器输出受约束 JSON，而不是自由文本：
+当前路由器输出受约束且可审计的检索计划，而不是自由文本：
 
 ```json
 {
-  "intent": "fact|entity|relation|global_summary|comparison|procedure|follow_up",
-  "scope": "local|global|cross_project",
-  "entities": [],
-  "time_constraints": [],
-  "needs_graph": true,
-  "needs_community_reports": false,
-  "needs_raw_text": true,
-  "ambiguities": [],
-  "query_variants": []
+  "protocol": "knowledge-agent-retrieval-plan-v1",
+  "activation": "active",
+  "intent": "fact_lookup|entity_explanation|relation_explanation|procedure|comparison|global_summary|source_lookup|visual_lookup|ambiguous",
+  "scope": "local|multi_entity|global",
+  "family_limits": {"text": 16, "entity": 6, "relation": 12, "community": 6},
+  "native_mode": "basic|local|global",
+  "retry_allowed": true,
+  "referenced_terms": [],
+  "reason_codes": ["cue:procedure"]
 }
 ```
 
+计划由通用的中英文问法特征和知识范围确定性生成，不再额外调用 LLM。低置信度问题回到带安全下限的均衡计划，任何一次分类都只调整各证据族预算，不会直接关闭文本、实体、关系或社区证据族。原始问题、独立检索问题、计划和实际执行配额都写入运行审计。
+
 ### 6.2 路由优先级
 
-路由采用“确定性规则优先、模型补充”的方式：
+多轮语境模型先把追问补全为独立问题；检索路由本身采用确定性规则：
 
 - 包含明确实体名、编号、接口、条款或局部关系：KF 实体/关系或 GR Local；
-- “整体、主要主题、共同问题、全局趋势、总结全部文档”：社区报告或 GR Global；
+- “整体、主要主题、共同问题、全局趋势、总结全部文档”：提高社区证据预算；GR 对真正的多文档/项目级总结使用 Global，单文档总结自动使用 Local；
 - “为什么、如何、步骤、条件”：Chunk + 关系，必要时补社区上下文；
 - 比较两个对象：分别检索对象证据，再做交集/差异组织；
 - 模糊代词或省略：先用会话上下文改写，不直接扩大到所有知识库；
 - 纯文本查找：优先 KF Chunk 或 GR Basic；
 - 复杂探索问题：后续版本才允许 DRIFT 或查询分解。
+
+对“图 1 / Figure 2 / 表 3 / Table 4”一类带明确编号的视觉问题，KF 还会从当前文档 revision 中做一次有界的精确编号恢复。该通道只恢复已有 Chunk 及其图片/表格来源，不调用 LLM 或 Embedding，也不能绕过活动文档、来源和快照门禁。
 
 ### 6.3 策略路由不是固定映射
 
@@ -244,8 +247,9 @@ class EvidenceItem(TypedDict):
 1. Chunk：pgvector HNSW + 词面匹配；
 2. 实体：名称/别名词面召回 + 规范实体向量；
 3. 关系：实体种子、一跳关系、邻居二跳关系；
-4. 社区：已完成报告的标题、摘要和全文向量；
-5. 来源：文档、页码、章节、图片、表格。
+4. 社区联系：在必要时从事实桥或内容导航关联选择少量相邻社区，再回取底层关系；
+5. 社区：已完成报告的标题、摘要和全文向量；
+6. 来源：文档、页码、章节、图片、表格。
 
 当前 Chunk/实体混合分数为：
 
@@ -284,13 +288,68 @@ relation_graph_score =
 - 全局总结问题且报告覆盖不足：答案必须说明覆盖范围；
 - 报告引用的关系仍需回溯到原文，不能只引用报告文本。
 
+### 8.3 社区联系导航二级召回
+
+社区联系用于扩大候选范围，不新增一种可引用事实。当前实现分为两类路由信号：
+
+1. **跨社区事实桥**：两个社区之间确实存在已验证实体关系。全局图中的聚合线只负责说明关系数量和构成，智能体最终读取的是其底层关系断言。
+2. **内容导航关联**：两个没有事实桥的社区在代表实体向量上高度相近。该关联只能帮助选择下一个社区，永远不能作为答案证据。
+
+导航不是每次查询都执行。系统先完成原有 Chunk、实体、两跳关系和社区报告召回，随后在以下任一条件成立时启动有界二级召回：
+
+- 查询映射到多个叶子社区；
+- 首轮返回的关系少于 4 条；
+- 没有可靠实体种子，但命中了绝对相关度不低于 0.50 的社区报告。
+
+实体种子必须是查询中的明确名称，或实体混合分数不低于 0.48。没有可靠实体或报告种子时不使用社区导航，避免从任意社区开始扩散。
+
+事实桥路由分数为：
+
+```text
+S_fact_link = clip₀¹(
+    0.50 × S_seed
+  + 0.25 × log(1 + fact_count) / log(9)
+  + 0.15 × S_relation_lexical
+  + 0.10 × I(target_is_also_a_seed)
+)
+```
+
+内容导航路由分数为：
+
+```text
+S_topic_link = min(0.90,
+    0.45 × S_seed
+  + 0.40 × S_association
+  + 0.15 × S_representative_name_lexical
+)
+```
+
+目标社区中的真实关系再按以下分数选择：
+
+```text
+S_routed_relation = clip₀¹(
+    0.76 × S_link
+  + 0.24 × S_relation_lexical
+  + 0.12 × I(touches_representative_entity)
+)
+```
+
+最后执行四层约束：
+
+1. 默认最多选择 3 个社区联系、8 条关系，可由 `KNOWLEDGE_AGENT_COMMUNITY_NAVIGATION_MAX_COMMUNITIES` 和 `KNOWLEDGE_AGENT_COMMUNITY_NAVIGATION_MAX_RELATIONS` 调整；
+2. 每个联系先保留一条关系，再填充剩余预算，避免一个大社区耗尽候选；
+3. 所有关系 ID 必须重新通过当前 namespace、当前 relation run、`ELIGIBLE` membership、独立 `SUPPORTED` 验证、活动文档/Chunk 和来源完整性查询；
+4. 只有通过上述门禁的底层关系才能以 `relation` 证据进入 RRF 和 reranker；聚合边、内容导航边及其相似度均不创建 `EvidenceItem`。
+
+该流程复用查询已有结果，不新增 LLM 或 Embedding 调用。导航失败会记录为降级并继续使用原有检索，不会导致问答不可用。每次运行保存触发原因、种子社区、实际使用的联系、通过门禁的关系数及 `synthetic_evidence_count=0`，便于评估它是否真正改善召回。
+
 ## 9. GraphRAG Native 检索适配器
 
 | 模式 | 适用问题 | 智能体使用策略 |
 | --- | --- | --- |
 | Basic | 文本事实、基线问答 | 低成本文本通道，可与 KF Chunk 对齐 |
 | Local | 特定实体、关系和局部事实 | 实体型/关系型问题优先 |
-| Global | 整体主题、全库总结 | 只在全局问题且报告完整时启用 |
+| Global | 整体主题、全库总结 | 自动模式只用于真正的多文档/项目级总结；用户显式选择时保持 Global |
 | DRIFT | 需要从宏观主题逐步深入的探索问题 | 后续版本启用，设置严格轮次和 Token 上限 |
 
 GraphRAG Native 当前查询本身会调用 LLM 生成答案。接入统一智能体时有两种方式：
@@ -299,6 +358,8 @@ GraphRAG Native 当前查询本身会调用 LLM 生成答案。接入统一智�
 2. 若某模式无法返回足够细粒度上下文，则保留原答案并明确标记为 `derived_answer`，统一答案生成器不得把它伪装成原文。
 
 最终推荐第一种：统一智能体负责最后答案，保证两种策略具有一致的引用、拒答和风格。
+
+GR 自动模式会结合当前知识范围选择查询方式：来源范围只有一篇文档，或问题明确点名一篇文档时，“总结全文”使用 Local，避免为单文档启动项目级社区报告 Map/Reduce；多文档全局问题仍使用 Global。显式 Basic/Local/Global 始终优先，不会被自动策略改写。Global 查询会依据项目模型的实际上下文窗口调整报告批次，只改变查询时打包大小，不修改不可变 Bundle、社区报告或 Prompt；例如 262144 Token 的当前模型将批次上下文限制为 65536 Token，并保留指令与输出空间。
 
 ## 10. 多路召回融合与重排
 
@@ -311,6 +372,8 @@ dedup_key = project_id + snapshot_ref + source_type + source_record_id + span
 ```
 
 同一原文被 Chunk、关系和社区报告重复召回时，合并 `retrieval_channels`，但保留关系或报告提供的结构语义。
+
+社区导航命中的底层关系仍使用 `relation` 类型，只额外记录 `community_navigation` 召回通道；若它同时被普通图检索命中，则按稳定关系 ID 合并，不重复占用证据集合。
 
 ### 10.2 RRF 初步融合
 
@@ -360,6 +423,9 @@ marginal_utility(d) = final_score(d)
 - 关键关系证据必须连同端点名称、谓词、方向和原文；
 - 图片和表格只传描述、必要结构和可点击引用，不把二进制放入 Prompt；
 - 所有证据必须来自同一已验证快照，禁止跨代混合。
+- 上下文长度只作为预算内的小幅成本惩罚，不能让短而无关的片段挤掉高相关的报告或关系；模型未产出可校验声明时必须失败关闭，禁止把排名第一的原文直接包装成答案。
+
+检索计划会在两个位置执行：先对宽候选池按意图预留证据族名额，再在最终回答上下文中按实际可用槽位等比例缩放并再次预留。某个证据族没有足够候选时，空位按全局最终排名回填，因此动态计划不会因为图谱陈旧、社区稀疏或单一 Native 表而缩小实际召回。最终执行记录包含 `available_by_family`、`reserved_by_family`、`selected_by_family` 和 `backfilled`。
 
 ## 11. 证据充分性、冲突与检索循环
 
@@ -379,6 +445,17 @@ sufficiency =
 
 每项保留原始值。阈值必须用本项目问答评估集校准。
 
+实现时另设一个保守的“联合弱匹配”硬门槛：仅当交叉编码器绝对相关度、Embedding 相似度和问题要点覆盖率同时低于校准值时，直接判为 `INSUFFICIENT`。RRF 是候选集内的相对排序，最佳候选即使完全无关也可能得到 1.0，因此不得用 RRF 单独证明答案存在。
+
+充分性只回答“这些证据够不够”，不能代替“问题是否属于当前知识库”的范围判断。当前实现另有 `knowledge-agent-query-scope-v1` 门禁：
+
+1. 对智能体身份、能力、使用方式和简单问候执行高精度全句交互意图识别，命中后不检索，只返回统一角色说明；
+2. 普通知识问题完成召回与重排后，交叉编码器强相关或“Embedding 强相关且问题要点有覆盖”时直接进入回答；
+3. 边界候选由项目 LLM 执行一次结构化 `knowledge / out_of_scope / unsupported / agent_meta` 分类。模型只读取问题、知识库元信息和有界证据摘录，不生成答案；
+4. `out_of_scope`、`unsupported`、模型异常或非法输出均失败关闭，清除回答上下文中的选中标记，不调用事实回答模型，也不展示无关证据作为引用。
+
+这样既避免用固定领域词表限定知识库，又避免 Embedding 对“系统、方法、作用、能做什么”等泛化表达产生的偶然近邻越过回答边界。
+
 ### 11.2 处理结果
 
 - `SUFFICIENT`：生成答案；
@@ -387,7 +464,7 @@ sufficiency =
 - `CONFLICTING_EVIDENCE`：展示冲突来源，不擅自裁定；
 - `INSUFFICIENT`：明确说明当前知识库没有足够依据。
 
-第一版禁止无限循环。最终版默认最多 2 个检索回合、每回合有限工具数，并由总 Token、时间和工具调用预算共同终止。
+当前实现禁止无限循环。首次证据为 `INSUFFICIENT` 或 `RETRYABLE_GAP` 时，最多执行一次针对缺口的补充计划：优先复用首次宽召回中尚未进入排名池的候选；确有必要时，KF 最多改写一次词面查询，GR 最多切换一次 Native 模式。补检索计划将 `retry_allowed=false`，因此第二次充分性判断后只能回答、限定回答或拒答，不会再次循环。
 
 ## 12. 答案生成与引用
 
@@ -400,10 +477,11 @@ sufficiency =
 ```json
 {
   "answer": "...",
+  "answerability": "supported|partial|insufficient|conflict",
   "claims": [
     {
       "text": "...",
-      "evidence_ids": ["ev-..."],
+      "citations": ["E1"],
       "status": "supported|qualified|conflicting"
     }
   ],
@@ -411,6 +489,8 @@ sufficiency =
   "follow_up_questions": []
 }
 ```
+
+模型只看到本轮短证据键（`E1`、`E2`……），服务端在输出后把它们映射回不可伪造的 run-scoped `evidence_id`。这样既降低本地模型复制长哈希的格式失败率，也不放宽引用校验；未引用已给短键或引用未知键的声明仍会被删除。
 
 ### 12.2 引用校验
 
@@ -441,11 +521,11 @@ sufficiency =
 - 两者在 Prompt 中使用不同标签和优先级；
 - 删除会话或用户时可独立清理，不影响项目知识。
 
-## 14. LangGraph 的引入边界
+## 14. LangGraph 与分层管控的边界
 
-### 14.1 第一版不强制使用
+### 14.1 不把整条问答链机械迁入 LangGraph
 
-第一版是固定有界流程：校验权限 → 检索 → 融合 → 生成 → 引用校验。普通 Python 服务更简单、可测、容易定位问题，不需要为了框架而引入 LangGraph。
+知识问答的主体仍是固定有界流程：校验权限 → 问题理解 → 检索 → 融合 → 证据判断 → 生成 → 引用校验。需要持久状态、语义消歧和条件分支的部分交给 LangGraph；工具白名单、项目隔离、证据门禁和输出契约继续由确定性 Python 代码执行。这样既能获得状态图的可恢复性，又不会把数据库权限、引用完整性等硬约束交给模型决定。
 
 ### 14.2 从第二阶段开始使用的原因
 
@@ -460,7 +540,59 @@ sufficiency =
 
 LangGraph 官方持久化机制以 `thread_id` 管理检查点，可用于故障恢复、人工介入和会话记忆；中断恢复可能重新执行节点，因此产生副作用的步骤仍必须幂等。Knowledge Forge 生产环境应使用 PostgreSQL 持久化 checkpointer，不使用内存 checkpointer。
 
-### 14.3 建议状态
+### 14.3 当前问题路由子图
+
+当前 `knowledge_forge/agent/context.py` 中的状态图为：
+
+```text
+START
+  → input_rail
+      ├─ agent_meta → agent_meta → END
+      └─ knowledge → load_context → resolve_context → dialog_rail
+                         ├─ clarify → clarify → END
+                         └─ ready → finalize_input_route
+                                      ├─ agent_meta → agent_meta → END
+                                      ├─ out_of_scope → out_of_scope → END
+                                      └─ knowledge → knowledge → END
+```
+
+- `input_rail` 只识别高置信度的智能体身份、能力和使用方式问题，避免为这类问题读取会话或检索知识库；
+- `load_context` 按模型实际 Token 窗口加载最近完整轮次和滚动摘要；
+- `resolve_context` 使用结构化 LLM 判断问题独立、指代已解析或存在歧义，历史内容只用于理解，不成为回答证据；
+- `dialog_rail` 对歧义问题转入澄清，对可解析问题继续；
+- `finalize_input_route` 使用补全后的独立问题，对照知识库名称、说明和文档范围执行结构化语义路由；只有高置信度知识库外问题才跳过检索，低置信度或模型异常继续检索并交由后置证据门禁复核。
+
+状态图之后仍进入有界的问答主流程，不允许模型自由选择任意工具：
+
+```text
+authorize
+  → question_control_graph
+  → plan_retrieval
+  → retrieve → fuse_and_rerank
+  → scope_and_evidence_gate
+      ├─ agent_meta / out_of_scope / unsupported → policy_response
+      ├─ insufficient → controlled_refusal
+      └─ sufficient / qualified → grounded_answer
+  → citation_and_output_gate
+  → persist_and_stream
+```
+
+### 14.4 六层策略协议
+
+每轮运行将决策写入 `agent_runs.metadata.policy_control`，协议版本为 `knowledge-agent-layered-policy-v1`。这些记录是可审计决策，不包含模型隐藏思维链。
+
+| 层 | 决策依据 | 可执行动作 | 硬约束 |
+|---|---|---|---|
+| 访问层 | 会话能力、项目、构建策略 | allow / deny | 项目与策略隔离；未授权不能进入检索 |
+| 输入层 | 当前问题、独立问题与知识库范围资料 | allow / route | 智能体元问题和高置信度越界问题不进入知识检索；不确定时保留召回 |
+| 对话层 | 历史状态和结构化语境解析 | allow / clarify / skip | 歧义时先澄清，不猜测指代 |
+| 检索层 | 问题范围、来源有效性和证据充分性 | allow / qualify / refuse / skip | 越界或证据不足不生成知识声明 |
+| 执行层 | 当前构建策略的工具白名单 | allow / deny / skip | KF 与 GR 检索器不能串用；工具均为当前只读问答能力 |
+| 输出层 | 回答类型、声明和引用 | allow / deny | 知识声明必须有通过服务端核验的引用；策略响应不得夹带无依据事实 |
+
+语义与确定性职责保持分开：LLM 负责多轮指代解析、检索前知识范围分类以及边界证据的语义对齐；代码负责高置信度门槛、失败降级、权限、工具范围、调用上限、快照新鲜度、来源有效性、引用映射和最终发布。检索计划当前采用可审计的确定性分类与预算，不依赖模型自由规划；后续只有离线评估证明收益时才增加受约束的模型规划分支。
+
+### 14.5 建议的完整状态
 
 ```python
 class AgentState(TypedDict):
@@ -481,7 +613,7 @@ class AgentState(TypedDict):
     errors: list[dict]
 ```
 
-### 14.4 建议节点
+### 14.6 后续多知识库阶段的建议节点
 
 ```text
 START
@@ -529,34 +661,43 @@ START
 
 ## 16. API 设计
 
-第一版：
+当前单知识库接口：
 
 ```text
+GET    /api/agent/knowledge-bases
+GET    /api/agent/threads?project_id={project_id}
 POST   /api/agent/threads
 GET    /api/agent/threads/{thread_id}
+DELETE /api/agent/threads/{thread_id}
 POST   /api/agent/threads/{thread_id}/messages
 GET    /api/agent/runs/{run_id}
+GET    /api/agent/runs/{run_id}/trace       # 安全的执行过程投影
 POST   /api/agent/runs/{run_id}/cancel
 GET    /api/agent/runs/{run_id}/events      # SSE
 POST   /api/agent/runs/{run_id}/feedback
 GET    /api/agent/evidence/{evidence_id}
 ```
 
-消息请求必须包括显式模式：
+创建会话时由服务端校验并固化一个知识库：
 
 ```json
 {
-  "question": "...",
-  "project_selection": {
-    "mode": "fixed|selected|automatic",
-    "project_ids": [1]
-  },
-  "response_language": "project|zh|en",
-  "diagnostic_mode": false
+  "project_id": 1
 }
 ```
 
-SSE 事件只发送阶段、增量答案和安全元数据，不泄露隐藏 Prompt、数据库凭据或完整模型原始响应。
+提交消息时使用当前线程的知识库；`mode` 只对 GraphRAG Native 生效，Knowledge Forge 固定使用自身的动态混合检索：
+
+```json
+{
+  "query": "...",
+  "mode": "auto|basic|local|global"
+}
+```
+
+第三版显式多选不能直接把 `project_ids` 塞入现有消息请求。它需要新增版本化请求合同、逐库授权和快照集合，并保留现有单知识库线程的兼容语义。
+
+SSE 事件只发送阶段、增量答案和安全元数据，不泄露隐藏 Prompt、数据库凭据或完整模型原始响应。`/trace` 从已授权运行的 `agent_run_steps`、`agent_tool_calls` 和运行摘要构造轻量视图；浏览器运行中轮询该接口，历史轮次只在用户展开时读取。接口不返回原始请求/响应载荷、模型 scratchpad、文件路径或候选答案。
 
 ## 17. Web 产品设计
 
@@ -567,12 +708,12 @@ SSE 事件只发送阶段、增量答案和安全元数据，不泄露隐藏 Pro
 - 展示流式回答、引用卡片、页码、章节和媒体；
 - 点击引用打开原文片段，图片和表格可放大；
 - 显示“本次使用：知识块/实体关系/社区报告”；
+- 每轮回答提供可折叠执行过程，实时展示安全的处理摘要与实际工具调用，刷新后可恢复；
 - 提供停止生成、复制、反馈和重新检索。
 
 ### 17.2 后续版本
 
 - 多知识库选择器与自动选择解释；
-- 可折叠检索轨迹，不展示内部思维链；
 - 冲突证据并列视图；
 - 会话历史和受控长期偏好；
 - 管理员查看延迟、成本、失败分类和评估趋势。
@@ -685,6 +826,7 @@ reranker 故障 → 使用 RRF
 
 - 用户固定选择一个项目；
 - KF 默认使用 Chunk + 实体 + 关系 + 已完成社区报告；
+- KF 在多社区或首轮关系稀疏时，允许执行一次有界社区导航召回，但不形成工具循环；
 - GR 允许显式选择 Basic/Local/Global，普通入口由简单规则选择；
 - RRF + 有界 reranker；
 - 一次答案生成和一次引用校验；
@@ -708,7 +850,9 @@ reranker 故障 → 使用 RRF
 - 节点级状态、重试、取消和恢复；
 - 用户可查看实际使用的知识库与来源。
 
-完成标准：服务重启后可恢复未完成会话运行；追问评估优于无会话基线；工具调用次数受预算约束。
+完成标准：服务重启后可恢复会话和已完成轮次，未完成模型输出明确失败关闭；追问评估优于无会话基线；工具调用次数受预算约束。
+
+当前进度（2026-08-31）：会话、消息、来源恢复和 LangGraph `input_rail → load_context → resolve_context → dialog_rail → knowledge/agent_meta/clarify` 问题控制子图已经落地；官方 PostgreSQL checkpointer 保存有界最近消息、滚动摘要、独立检索问题和流程位置。历史回答只用于指代解析，不进入 `EvidenceItem`。问答主流程增加访问、输入、对话、检索、执行和输出六层策略协议：智能体元问题提前分流，歧义问题先澄清，KF/GR 工具按策略白名单隔离，越界或无直接支持的问题受控拒答，知识声明必须通过服务端引用门禁。每轮决策连同确定性问题分类、KF/GR 动态检索计划、候选池与最终上下文双层证据族配额、编号图表精确恢复、GR 单文档/全局成本路由和至多一次补检索一起进入运行审计。用户可展开查看安全投影后的阶段、工具和具体证据，但不会看到模型隐藏思维链。已完成运行和会话可在刷新或重启后恢复；服务中断时正在生成的回答会明确失败关闭，不会盲目续写旧模型输出。第二版的单知识库范围已完成，自动多知识库选择和复杂问题分解归入第三版。
 
 ### 第三版：多知识库选择与复杂问题分解
 
@@ -761,17 +905,20 @@ knowledge_forge/
 │   ├── contracts.py          # State、Evidence、Source、API Schema
 │   ├── authorization.py      # 用户与项目访问范围
 │   ├── project_router.py     # 知识库选择
-│   ├── query_planner.py      # 问题理解与检索计划
+│   ├── planning.py           # 问题形态与动态检索计划
 │   ├── retrieval/
 │   │   ├── knowledge_forge.py
 │   │   ├── graphrag_native.py
 │   │   └── source_context.py
 │   ├── fusion.py             # 去重、RRF、rerank、预算选择
 │   ├── sufficiency.py        # 充分性和冲突
+│   ├── scope.py              # 智能体意图与知识库回答范围门禁
+│   ├── policy.py             # 六层策略决策、工具白名单与输出门禁
 │   ├── answer.py             # 结构化答案生成
 │   ├── citations.py          # 确定性引用校验
-│   ├── workflow.py           # V1 固定流程
-│   └── graph.py              # V2+ LangGraph 编排
+│   ├── context.py            # LangGraph 多轮语境与上下文压缩
+│   ├── trace.py              # 面向用户的安全执行审计投影
+│   └── workflow.py           # 有界问答流程与动态分支
 ├── database.py               # 仅持久化，不放智能体决策
 ├── service.py                # 应用编排入口
 └── web.py                    # HTTP/SSE 与展示
@@ -781,19 +928,49 @@ knowledge_forge/
 
 ## 23. 实施顺序与当前建议
 
-建议下一轮从“阶段 0 + 第一版”开始，先交付单项目、固定流程、证据可引用问答。不要立即引入多智能体、自动跨库和 DRIFT 循环。
+阶段 0、第一版和第二版的单知识库范围已经落地。下一轮应从第三版的“显式多选知识库”开始，先建立跨库授权、快照隔离、并行检索和冲突展示，再用评估结果决定是否开放自动知识库选择与 DRIFT。不要直接引入多智能体或无界工具循环。
 
-第一版稳定后，再根据真实评估结果决定：
+后续重点验证：
 
-- 是否需要 LangGraph；
-- 哪些问题确实受益于社区报告或 GR Global；
 - 自动知识库选择是否比用户显式选择更有价值；
-- 一次改写能否带来足够召回收益；
-- reranker 是否应同时服务 Chunk、关系和报告。
+- 多文档全局问题使用社区报告或 GR Global 的质量/延迟收益；
+- 一次补充检索在开放问题集上的 Recall/Precision 净收益；
+- 动态证据族预算在不同领域、语言与文档结构上的稳定性；
+- DRIFT 是否能在严格成本上限内显著改善复杂探索问题。
 
 每个新增节点都必须证明质量收益或可靠性价值，否则保持简单流程。
 
-## 24. 参考依据
+## 24. 已实现状态
+
+阶段 0 与第一版已经按本路线落地：
+
+- 统一 `SnapshotRef`、`SourceRef` 和 `EvidenceItem`；证据 ID 按运行隔离，稳定键绑定项目、快照、记录和内容摘要；
+- KF 适配器只读取当前来源，图谱不新鲜时只使用当前 revision 的 Chunk 与向量；GR 适配器只读取当前 READY Native Bundle，并同时核对 run、source snapshot 和运行清单摘要；
+- 实现多通道加权 RRF、独立 HTTP cross-encoder reranker、确定性降级排序、类型/文档配额和 Token 预算选择；
+- 实现证据充分性、冲突和歧义状态；联合交叉编码器绝对相关度、Embedding 相似度和问题要点覆盖率识别无答案，确定拒答时不调用 LLM；
+- 答案只执行一次有界结构化生成；模型使用 `E1/E2` 短证据键，服务端映射回运行级证据 ID；GraphRAG 原回答仅作为不可引用草稿；服务器删除未知、无引用或非法声明，并重新生成引用编号；
+- PostgreSQL 新增会话、运行、消息、步骤、工具调用、证据、声明引用、SSE 事件和反馈账本，外键约束保证引用与证据属于同一运行；
+- 实现显式单知识库 HTTP API、能力会话隔离、可重放 SSE、安全停止、来源详情和反馈；
+- 实现真实问答工作台，支持 KF 与 GR 模式差异、历史消息、停止、复制、重新检索、来源文件/页码/图片/表格查看；
+- 实现每轮可折叠执行过程：轻量授权接口只投影阶段、决策、工具名称、状态、计数和耗时；每个步骤或工具可继续展开查看白名单化的输入范围与结果摘要。证据相关阶段额外读取至多 24 条已选证据的 500 字有界摘要，显示文件、页码/章节并可进入独立授权详情；生成依据与最终引用明确区分，完整证据正文和消息记录不进入轮询接口。运行中实时更新，历史展开后按需恢复，原始 Prompt、工具载荷和隐藏思维链不进入浏览器；KF 不展示共享计划对象中的 GraphRAG Native 查询方式，Basic/Local/Global 只对 GR 知识库可见；
+- 固化 28 题中英文工程校准集（含 4 题无答案探针）及真实 HTTP 评估脚本；
+- 第一版问答主体保持普通 Python 固定编排；第二版已为多轮语境和问题分支加入 LangGraph，但没有把检索、数据库访问和发布门禁改成模型自主工具循环。当前仍未加入自动多知识库选择、DRIFT 工具循环或长期记忆。
+- 2026-08-26 增加 Knowledge Forge 社区导航二级召回：事实桥和内容相近关联只负责选路，最终候选必须还原为带原文来源的已验证关系；普通局部查询在首轮关系充分时不执行扩展。
+- 2026-08-28 完成 `knowledge-agent-retrieval-plan-v1` 动态检索：按事实、实体、关系、过程、比较、全局、来源和图表问题调整文本/实体/关系/社区预算；候选池和最终上下文均执行可缩放配额并自动回填。KF 对明确编号的图表增加当前 revision 内的精确恢复；证据不足时最多执行一次补充计划。GR 自动模式将单文档总结路由到 Local，多文档全局总结保留 Global，显式模式不被覆盖；Global 按实际模型上下文进行查询批次打包。
+
+实现代码以 `knowledge_forge/agent/` 为边界；`0035_knowledge_agent_v1` 建立会话、运行、消息、步骤、工具调用、证据、引用、SSE 事件和反馈账本，`0036_knowledge_agent_context_runtime` 为官方 PostgreSQL checkpointer 建立隔离的 `knowledge_agent` schema。2026-08-24 在冻结的 28 题双语工程校准集上通过全部门禁：任务成功率、引用解析率、声明引用完整率和无答案拒答率均为 100%，答案要点召回率为 92.43%，跨项目证据为 0；同时完成 KF、GraphRAG Native、SSE、停止、反馈与来源详情的真实 HTTP/模型链路验证。该结果用于工程回归，不代表开放领域通用质量结论。
+
+2026-08-26 的社区导航增量通过完整测试集（1347 passed，45 项按环境跳过），并通过真实公共 HTTP 问答入口验证：运行在当前 KF 快照上触发多社区导航，选中的内容关联最终解析为 2 条带来源的已验证关系，`synthetic_evidence_count=0`，reranker 正常过滤未进入最终上下文的弱相关扩展。随后在正确的 10 文档冻结语料上重跑全部 28 题，任务、引用解析、声明引用完整、无答案拒答仍为 100%，答案要点召回率仍为 92.43%，跨项目证据为 0，全部门禁通过。该结果证明当前基准未回退；社区导航对更广开放问题集的 Recall/Precision 净收益仍应通过后续配对评估持续校准。
+
+2026-08-28 开始第二版的多轮语境增量：新增 `knowledge_forge/agent/context.py`，以 LangGraph `StateGraph` 编排读取上下文、结构化解析和条件分支；以会话 `thread_id` 连接官方 PostgreSQL checkpointer，并在独立 `knowledge_agent` schema 中保存执行状态。上下文已从固定“最近 8 条”升级为本地模型 Token 预算窗口：先为系统提示、Schema、当前问题、输出、安全余量以及结构化输出修复请求预留 Token，再动态保留最近完整轮次，较早轮次按水位压缩到受 Token 上限约束的滚动摘要；消息数量和字符数仅作为极端输入保护。语境请求不再固定使用 8192 Token：系统先交叉验证知识库配置与 Ollama 当前 runner 上下文，再按完整提示需求以 4096 Token 为阶梯在 8192～32768 Token 范围内扩容，同时默认不超过实际模型窗口的 50%；完整历史能放入动态窗口时保持原文，只有超过动态上限或极端消息保护线时才压缩。每轮将项目配置上限、runner 有效上限、动态天花板、估算需求、最终预算与 `minimum/expanded/capped` 原因写入运行元数据。失败或取消的轮次不会进入语义上下文。第一轮独立问题不调用语境解析模型；当知识库范围资料可用时，检索前最多调用一次 qwen3.6 结构化范围分类。常规后续轮次最多另调用一次结构化语境解析；本地模型常见字段别名由代码归一，单数指代被解析为多个候选时由确定性规则改走澄清分支。独立问题用于范围路由、检索和 rerank，原问题继续用于展示与审计，历史文本不成为回答证据。
+
+同日的真实公共 HTTP/Ollama 多轮验收覆盖 KF 与 GR：KF 连续四轮正确处理定义、加密共享机制、“它”指向加密共享的比较问题，以及“图1”A/B/C 精确视觉问题，最终证据同时保留文本、实体、关系、页码和图片；一个带不存在设备编号的问题触发一次候选池补充后确定性拒答。GR 自动模式的单文档全文总结以 Local 完成，后续文档外数量问题正确补全文件范围并回答“未给出”；显式 Global 保持 Global，以 65536 Token 查询批次在 116 秒完成，未再触发旧路径的 300 秒超时。上述结果用于当前两份真实文档的工程验收，不替代跨领域基准评估。
+
+2026-08-31 完成 `knowledge-agent-layered-policy-v1`：LangGraph 问题控制子图增加输入预检、语境门禁和 `knowledge / agent_meta / clarify` 条件路由；问答主流程增加访问、检索、执行和输出策略检查。全量回归为 1406 passed、45 skipped。真实公共 HTTP/Ollama 验收覆盖 Knowledge Forge 能力问题提前分流、知识问题有引用回答、同会话“它”补全为独立问题、文档外烹饪问题受控拒答，以及 GraphRAG Native Local 有引用回答；KF 与 GR 只调用各自允许的检索器。每轮持久化六层决策，执行过程可见其安全摘要，知识声明仍由服务端引用校验决定是否发布。
+
+2026-09-01 将当前维护文档统一到上述实现，并重新执行完整回归：1412 passed、45 skipped，Python 编译与文档本地链接/格式检查通过。这里新增的 6 项测试来自当前工作树中后续补充的回归覆盖，不改写 2026-08-31 分层管控验收当时的历史计数。
+
+## 25. 参考依据
 
 - LangGraph Persistence：<https://docs.langchain.com/oss/python/langgraph/persistence>
 - LangGraph Interrupts：<https://docs.langchain.com/oss/python/langgraph/interrupts>

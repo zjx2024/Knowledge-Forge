@@ -24,6 +24,9 @@ def main() -> int:
             question=str(payload.get("question") or ""),
             response_type=str(payload.get("response_type") or "Multiple Paragraphs"),
             community_level=int(payload.get("community_level") or 2),
+            model_context_tokens=max(
+                0, int(payload.get("model_context_tokens") or 0)
+            ),
         )
         print(json.dumps(query_bundle(request, Path(str(payload.get("bundle_root") or ""))), ensure_ascii=False))
         return 0

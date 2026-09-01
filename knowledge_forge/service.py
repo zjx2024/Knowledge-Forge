@@ -105,6 +105,9 @@ from .graph_retrieval import (
 from .graph_safety import GraphMutationContext
 from .media import DocumentMediaService
 from .ollama import OllamaClient
+from .agent.authorization import session_key_hash
+from .agent.trace import build_public_execution_trace
+from .agent.workflow import KnowledgeAgentWorkflow
 from .observability import recorded_job
 from .policy import (
     ENTITY_EXTRACTION_POLICY_SET,
@@ -218,6 +221,7 @@ def _chunk_source_payload(chunk: dict[str, Any] | None) -> dict[str, Any]:
         "document_id": int(chunk.get("document_id") or 0),
         "filename": str(chunk.get("original_filename") or ""),
         "document_url": str(chunk.get("storage_path") or ""),
+        "revision_id": str(chunk.get("revision_id") or ""),
         "mime_type": str(chunk.get("mime_type") or ""),
         "section_title": str(chunk.get("section_title") or ""),
         "pages": list(metadata.get("pages") or []),
@@ -335,11 +339,11 @@ def _public_community_report_run(run: dict[str, Any] | None) -> dict[str, Any] |
 # by the currently advertised graph, so a code-only upgrade cannot silently
 # keep serving an older entity snapshot.
 GROUNDED_ENTITY_CODE_VERSION = (
-    "knowledge-forge-grounded-entity-v48-unicode-identity-publication"
+    "knowledge-forge-grounded-entity-v50-bounded-layout-mention-coverage"
 )
-# The exact model request/response contract did not change with the v41
-# deterministic publication projection. Keep the previous semantic version in
-# the raw extraction cache key so a policy-only rebuild reuses model output.
+# The exact model request/response contract did not change with the v50
+# deterministic occurrence recovery. Keep the previous semantic version in
+# the raw extraction cache key so this code-only rebuild reuses model output.
 GROUNDED_ENTITY_MODEL_EXTRACTION_CONTRACT_VERSION = (
     "knowledge-forge-grounded-entity-v40-soft-wrap-suffix-recovery"
 )
@@ -508,6 +512,11 @@ class KnowledgeForgeService:
         self.community_report_generator = KnowledgeForgeCommunityReportGenerator(
             self.ollama,
         )
+        self.agent = KnowledgeAgentWorkflow(self)
+        self.agent_executor = ThreadPoolExecutor(
+            max_workers=Config.agent_max_workers,
+            thread_name_prefix="knowledge-forge-agent",
+        )
 
     def _mark_graphrag_native_source_changed(self, project_id: int, reason: str) -> None:
         """Invalidate only the immutable native pointer after source mutation."""
@@ -611,6 +620,9 @@ class KnowledgeForgeService:
 
     def recover_interrupted_jobs(self) -> int:
         recovered = 0
+        recover_agent = getattr(self.db, "recover_interrupted_agent_runs", None)
+        if callable(recover_agent):
+            recovered += int(recover_agent() or 0)
         for job in self.db.list_recoverable_jobs():
             job_id = str(job["id"])
             metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
@@ -2474,6 +2486,24 @@ class KnowledgeForgeService:
             [dict(item) for item in community_run.get("communities") or []]
             if community_run else []
         )
+        community_run_metadata = (
+            dict(community_run.get("metadata") or {}) if community_run else {}
+        )
+        community_topic_associations = [
+            dict(item)
+            for item in community_run_metadata.get(
+                "community_topic_associations", []
+            )
+            if isinstance(item, dict)
+            and str(item.get("source_community_key") or "")
+            and str(item.get("target_community_key") or "")
+        ]
+        raw_topic_metrics = community_run_metadata.get(
+            "community_topic_association_metrics", {}
+        )
+        community_topic_association_metrics = (
+            dict(raw_topic_metrics) if isinstance(raw_topic_metrics, dict) else {}
+        )
         community_items = enrich_community_descriptions(
             community_items, snapshot=snapshot,
             knowledge_language=graph_knowledge_language,
@@ -2783,6 +2813,10 @@ class KnowledgeForgeService:
                 )
             ),
             "community_report_run_id": str(report_run.get("run_id") or ""),
+            "community_topic_associations": community_topic_associations,
+            "community_topic_association_metrics": (
+                community_topic_association_metrics
+            ),
             "total_communities": int(
                 community_run.get("community_count") if community_run else 0
             ),
@@ -4160,6 +4194,14 @@ class KnowledgeForgeService:
                     raw_entities=raw_entities,
                     chunk_metadata=self._metadata(extraction_chunk.get("metadata")),
                 )
+                layout_mention_coverage = extractor.audit_layout_coverage(
+                    content=str(chunk.get("content") or ""),
+                    mentions=normalized.mentions,
+                    type_assertions=normalized.type_assertions,
+                    chunk_metadata=self._metadata(
+                        extraction_chunk.get("metadata")
+                    ),
+                )
                 endpoint_candidate_spans = {
                     (
                         int(item.get("mention_start")),
@@ -4201,6 +4243,7 @@ class KnowledgeForgeService:
                         "publishability_features": list(
                             item.publishability_features
                         ),
+                        "occurrence_recovery": item.recovery_kind,
                         "endpoint_candidate": (
                             int(item.start), int(item.end)
                         ) in endpoint_candidate_spans,
@@ -4270,6 +4313,7 @@ class KnowledgeForgeService:
                         "endpoint_candidate": bool(
                             (int(item.start), int(item.end)) in endpoint_candidate_spans
                         ),
+                        "recovery_kind": item.recovery_kind,
                     }
                     prepared_mentions.append((item, type_assertion, mention))
 
@@ -4280,6 +4324,7 @@ class KnowledgeForgeService:
                 # canonicals.  This is structural and independent of language,
                 # entity type, predicate, or document domain.
                 prepared_mentions.sort(key=lambda value: (
+                    bool(value[0].recovery_kind),
                     int(value[0].start), int(value[0].end),
                     str(value[0].mention_id),
                 ))
@@ -4368,6 +4413,10 @@ class KnowledgeForgeService:
                     "mention_publishability": dict(Counter(
                         item.filter_decision for item in normalized.mentions
                     )),
+                    "layout_mentions_recovered": sum(
+                        item.recovery_kind == "layout_whitespace_variant"
+                        for item in normalized.mentions
+                    ),
                     "publishability_rejections": dict(Counter(
                         str(item.get("reason") or "unknown")
                         for item in normalized.rejected
@@ -4382,6 +4431,7 @@ class KnowledgeForgeService:
                     "endpoint_coverage": dict(
                         endpoint_coverage.get("_diagnostics") or {}
                     ),
+                    "layout_mention_coverage": layout_mention_coverage,
                     "relation_endpoints": 0,
                 }
                 output_hash = hashlib.sha256(
@@ -4411,6 +4461,9 @@ class KnowledgeForgeService:
 
         publishability_before_relations = (
             self._audit_grounded_entity_publishability(namespace_id)
+        )
+        layout_mention_coverage = (
+            self.db.grounded_entity_layout_coverage_summary(namespace_id)
         )
         relation_v2 = self._run_grounded_relation_namespace(
             namespace_id=namespace_id,
@@ -4460,6 +4513,7 @@ class KnowledgeForgeService:
                 "before_relations": publishability_before_relations,
                 "after_relations": publishability_after_relations,
             },
+            "layout_mention_coverage": layout_mention_coverage,
             "grounded_context": grounded_context.summary,
             "structure_artifact_hash": grounded_context.artifact_hash,
         }
@@ -8577,7 +8631,10 @@ class KnowledgeForgeService:
                 metadata={"stage": "failed", "document_name": document.get("original_filename", "")},
             )
 
-    def search(self, project_id: int, query: str, top_k: int | None = None) -> dict[str, Any]:
+    def search(
+        self, project_id: int, query: str, top_k: int | None = None, *,
+        allow_report_scheduling: bool = True,
+    ) -> dict[str, Any]:
         project = self.db.get_project(project_id)
         if not project: raise LookupError("项目不存在")
         query = (query or "").strip()
@@ -8599,9 +8656,10 @@ class KnowledgeForgeService:
             Config.knowledge_forge_community_reports_enabled
             and community_run_id and community_input_hash
         ):
-            self._schedule_knowledge_forge_community_reports(
-                project_id, reference=reference,
-            )
+            if allow_report_scheduling:
+                self._schedule_knowledge_forge_community_reports(
+                    project_id, reference=reference,
+                )
             report_state = self.db.get_knowledge_forge_community_report_state(
                 project_id=project_id,
                 community_run_id=community_run_id,
@@ -8702,7 +8760,7 @@ class KnowledgeForgeService:
             for item in seed_entities if item.get("canonical_key")
         }
         current_report_run = report_state.get("run") or {}
-        if current_report_run and seed_scores:
+        if allow_report_scheduling and current_report_run and seed_scores:
             self._activate_deferred_knowledge_forge_reports(
                 project_id=project_id,
                 run_id=str(current_report_run["run_id"]),
@@ -8969,11 +9027,321 @@ class KnowledgeForgeService:
             "graph_retrieval": {
                 "policy_version": GRAPH_RETRIEVAL_POLICY_VERSION,
                 "seed_entity_count": len(seed_scores),
+                "seed_entities": [
+                    {
+                        "canonical_key": str(
+                            item.get("canonical_key") or ""
+                        ),
+                        "score": float(
+                            seed_scores.get(
+                                str(item.get("canonical_key") or ""), 0.0,
+                            )
+                        ),
+                        "query_surface_match": bool(
+                            item.get("query_surface_match")
+                        ),
+                    }
+                    for item in seed_entities
+                    if str(item.get("canonical_key") or "")
+                ],
                 "expanded_entity_count": max(0, len(entity_hops) - len(seed_scores)),
                 "candidate_relation_count": len(relations),
                 "maximum_hops": 2,
             },
         }
+
+    # ------------------------------------------------------------------
+    # Knowledge-agent v1 public service boundary.
+
+    def agent_knowledge_bases(self) -> dict[str, Any]:
+        """List explicit single-knowledge-base scopes and their real readiness."""
+
+        items: list[dict[str, Any]] = []
+        for project in self.db.list_projects():
+            project_id = int(project["id"])
+            selection = self.db.get_project_construction_strategy_selection(project_id) or {}
+            if str(selection.get("association_status") or "") != "bound":
+                continue
+            strategy = str(selection.get("selected_strategy") or "")
+            queryable = False
+            status_key = "unavailable"
+            status_label = "暂不可问答"
+            details: dict[str, Any] = {}
+            if strategy == KNOWLEDGE_FORGE_STRATEGY:
+                try:
+                    source = self.db.agent_project_source_snapshot(project_id)
+                    queryable = bool(
+                        int(source.get("chunk_count") or 0) > 0
+                        and int(source.get("embedding_count") or 0) > 0
+                    )
+                    graph_current = False
+                    try:
+                        self._current_knowledge_forge_snapshot_reference(project_id)
+                        graph_current = True
+                    except GraphNotReadyError:
+                        graph_current = False
+                    graph = self.db.get_project_strategy_graph(
+                        project_id, KNOWLEDGE_FORGE_STRATEGY,
+                    ) or {}
+                    if queryable and graph_current:
+                        status_key, status_label = "ready_hybrid", "可问答 · 原文与图谱"
+                    elif queryable and str(graph.get("status") or "") == GRAPH_STALE:
+                        status_key, status_label = "ready_text_stale_graph", "图谱待更新 · 暂用原文"
+                    elif queryable:
+                        status_key, status_label = "ready_text", "可问答 · 仅原文"
+                    else:
+                        status_key, status_label = "needs_preparation", "需完成文档预处理"
+                    details = {
+                        "document_count": int(source.get("document_count") or 0),
+                        "chunk_count": int(source.get("chunk_count") or 0),
+                        "embedding_count": int(source.get("embedding_count") or 0),
+                        "graph_current": graph_current,
+                    }
+                except Exception as exc:
+                    details = {"error": str(exc)}
+            elif strategy == GRAPHRAG_NATIVE_STRATEGY:
+                try:
+                    native = self.graphrag_native_runtime.status(project_id)
+                    queryable = bool(native.get("fresh"))
+                    if queryable:
+                        status_key, status_label = "ready_native", "可问答 · GraphRAG"
+                    elif native.get("run"):
+                        status_key, status_label = "needs_native_rebuild", "需重新构建 GraphRAG 成果"
+                    else:
+                        status_key, status_label = "needs_native_build", "需构建 GraphRAG 成果"
+                    details = {
+                        "run_id": str((native.get("run") or {}).get("run_id") or ""),
+                        "fresh": bool(native.get("fresh")),
+                        "reason": str(
+                            native.get("stale_reason")
+                            or native.get("unavailable_reason") or ""
+                        ),
+                    }
+                except Exception as exc:
+                    details = {"error": str(exc)}
+            model_context_tokens = int(
+                project.get("model_max_tokens") or self.DEFAULT_MODEL_MAX_TOKENS
+            )
+            details["model_context_tokens"] = model_context_tokens
+            details["minimum_agent_context_tokens"] = Config.agent_min_context_tokens
+            if queryable and model_context_tokens < Config.agent_min_context_tokens:
+                queryable = False
+                status_key = "context_budget_too_small"
+                status_label = (
+                    "需将知识库上下文上限提高到至少 "
+                    f"{Config.agent_min_context_tokens:,} Token"
+                )
+            items.append({
+                "id": project_id, "name": str(project.get("name") or ""),
+                "description": str(project.get("description") or ""),
+                "strategy": strategy, "queryable": queryable,
+                "status": status_key, "status_label": status_label,
+                "knowledge_language": str(project.get("knowledge_language") or "auto"),
+                "updated_at": project.get("updated_at"), "details": details,
+            })
+        return {
+            "items": items,
+            "queryable_count": sum(1 for item in items if item["queryable"]),
+            "total": len(items),
+            "scope_policy": "single_project_explicit_v1",
+        }
+
+    def create_agent_thread(
+        self, project_id: int, *, session_key: str,
+    ) -> dict[str, Any]:
+        if not Config.agent_enabled:
+            raise RuntimeError("智能问答当前未启用")
+        project = self.db.get_project(int(project_id))
+        if not project:
+            raise LookupError("知识库不存在")
+        strategy = self._assert_project_strategy(int(project_id))
+        readiness = next(
+            (item for item in self.agent_knowledge_bases()["items"]
+             if int(item["id"]) == int(project_id)),
+            None,
+        )
+        if not readiness or not readiness["queryable"]:
+            raise GraphNotReadyError(
+                str((readiness or {}).get("status_label") or "知识库尚不可问答")
+            )
+        thread_id = "ath_" + uuid.uuid4().hex
+        return self.db.create_agent_thread(
+            thread_id=thread_id, project_id=int(project_id),
+            strategy_key=strategy, session_key_hash=session_key_hash(session_key),
+            metadata={"protocol": "knowledge-agent-v1"},
+        )
+
+    def list_agent_threads(
+        self, project_id: int, *, session_key: str, limit: int = 100,
+    ) -> dict[str, Any]:
+        if not Config.agent_enabled:
+            raise RuntimeError("智能问答当前未启用")
+        project = self.db.get_project(int(project_id))
+        if not project:
+            raise LookupError("知识库不存在")
+        rows = self.db.list_agent_threads(
+            project_id=int(project_id),
+            session_key_hash=session_key_hash(session_key),
+            limit=limit,
+        )
+        return {
+            "items": rows,
+            "total": len(rows),
+            "project_id": int(project_id),
+        }
+
+    def get_agent_thread(self, thread_id: str, *, session_key: str) -> dict[str, Any]:
+        row = self.db.get_agent_thread_payload(
+            str(thread_id), session_key_hash=session_key_hash(session_key),
+        )
+        if not row:
+            raise PermissionError("问答会话不存在或无权访问")
+        return row
+
+    def archive_agent_thread(
+        self, thread_id: str, *, session_key: str,
+    ) -> dict[str, Any]:
+        if not Config.agent_enabled:
+            raise RuntimeError("智能问答当前未启用")
+        archived = self.db.archive_agent_thread(
+            str(thread_id), session_key_hash=session_key_hash(session_key),
+        )
+        try:
+            self.agent.context.delete_thread(str(thread_id))
+        except Exception as exc:
+            LOGGER.warning(
+                "Archived agent thread but checkpoint cleanup failed thread=%s error=%s",
+                thread_id, type(exc).__name__,
+            )
+        return archived
+
+    def submit_agent_message(
+        self, thread_id: str, *, session_key: str, query: str,
+        requested_mode: str = "auto",
+    ) -> dict[str, Any]:
+        if not Config.agent_enabled:
+            raise RuntimeError("智能问答当前未启用")
+        query = sanitize_unicode_data(str(query or "")).strip()
+        if not query:
+            raise ValueError("请输入问题")
+        if len(query) > Config.agent_max_question_chars:
+            raise ValueError(f"问题不能超过 {Config.agent_max_question_chars} 个字符")
+        requested_mode = str(requested_mode or "auto").strip().lower()
+        if requested_mode not in {"auto", "basic", "local", "global"}:
+            raise ValueError("问答方式只能是自动、Basic、Local 或 Global")
+        thread = self.db.get_agent_thread(
+            str(thread_id), session_key_hash=session_key_hash(session_key),
+        )
+        if not thread:
+            raise PermissionError("问答会话不存在或无权访问")
+        if (
+            str(thread.get("strategy_key") or "") == KNOWLEDGE_FORGE_STRATEGY
+            and requested_mode != "auto"
+        ):
+            raise ValueError("Knowledge Forge 第一版使用固定混合检索，不接受 GraphRAG 问答方式")
+        readiness = next(
+            (item for item in self.agent_knowledge_bases()["items"]
+             if int(item["id"]) == int(thread["project_id"])),
+            None,
+        )
+        if not readiness or not readiness["queryable"]:
+            raise GraphNotReadyError(
+                str((readiness or {}).get("status_label") or "知识库尚不可问答")
+            )
+        run_id = "arun_" + uuid.uuid4().hex
+        message_id = "amsg_" + uuid.uuid4().hex
+        run = self.db.create_agent_run(
+            run_id=run_id, message_id=message_id, thread_id=str(thread_id),
+            session_key_hash=session_key_hash(session_key), query=query,
+            requested_mode=requested_mode,
+            budget={
+                "candidate_limit": Config.agent_candidate_limit,
+                "context_max_items": Config.agent_context_max_items,
+                "context_budget_tokens": Config.agent_context_budget_tokens,
+                "max_output_tokens": Config.agent_max_output_tokens,
+                "max_question_chars": Config.agent_max_question_chars,
+                # The primary pass is mandatory.  When the bounded
+                # supplemental policy is enabled it may make at most one
+                # additional adapter call and one additional reranker pass.
+                # Freeze the real upper bound in the run ledger so audit data
+                # never understates what the workflow is allowed to execute.
+                "maximum_retrieval_calls": (
+                    2 if Config.agent_supplemental_retrieval_enabled else 1
+                ),
+                "maximum_supplemental_attempts": (
+                    1 if Config.agent_supplemental_retrieval_enabled else 0
+                ),
+                "maximum_context_resolution_calls": 1,
+                "maximum_input_scope_calls": 1,
+                "maximum_reranker_calls": (
+                    2 if Config.agent_supplemental_retrieval_enabled else 1
+                ),
+                "maximum_answer_generations": 1,
+                "maximum_citation_validation_passes": 1,
+            },
+        )
+        self.agent_executor.submit(self.agent.run, run_id)
+        return {
+            "run_id": run_id, "message_id": message_id,
+            "thread_id": str(thread_id), "status": str(run["status"]),
+            "events_url": f"/api/agent/runs/{run_id}/events",
+        }
+
+    def get_agent_run(self, run_id: str, *, session_key: str) -> dict[str, Any]:
+        row = self.db.get_agent_run_payload(
+            str(run_id), session_key_hash=session_key_hash(session_key),
+        )
+        if not row:
+            raise PermissionError("问答任务不存在或无权访问")
+        row["execution_trace"] = build_public_execution_trace(row)
+        return row
+
+    def get_agent_run_trace(
+        self, run_id: str, *, session_key: str,
+    ) -> dict[str, Any]:
+        row = self.db.get_agent_run_trace_payload(
+            str(run_id), session_key_hash=session_key_hash(session_key),
+        )
+        if not row:
+            raise PermissionError("问答任务不存在或无权访问")
+        return build_public_execution_trace(row)
+
+    def agent_events(
+        self, run_id: str, *, session_key: str, after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        return self.db.list_agent_events(
+            str(run_id), session_key_hash=session_key_hash(session_key),
+            after_id=after_id,
+        )
+
+    def cancel_agent_run(self, run_id: str, *, session_key: str) -> dict[str, Any]:
+        return self.db.request_agent_run_cancellation(
+            str(run_id), session_key_hash=session_key_hash(session_key),
+        )
+
+    def get_agent_evidence(
+        self, evidence_id: str, *, session_key: str,
+    ) -> dict[str, Any]:
+        row = self.db.get_agent_evidence(
+            str(evidence_id), session_key_hash=session_key_hash(session_key),
+        )
+        if not row:
+            raise PermissionError("问答证据不存在或无权访问")
+        return row
+
+    def record_agent_feedback(
+        self, run_id: str, *, session_key: str, rating: int,
+        comment: str = "", action: str = "answer_rating",
+    ) -> dict[str, Any]:
+        if int(rating) not in {-1, 0, 1}:
+            raise ValueError("反馈评分只能是 -1、0 或 1")
+        return self.db.record_agent_feedback(
+            feedback_id="afb_" + uuid.uuid4().hex,
+            run_id=str(run_id), session_key_hash=session_key_hash(session_key),
+            rating=int(rating), comment=sanitize_unicode_data(str(comment or "")),
+            action=str(action or "answer_rating"),
+            metadata={"protocol": "knowledge-agent-v1"},
+        )
 
     def health(self) -> dict[str, Any]:
         self.db.list_projects()
@@ -8982,4 +9350,9 @@ class KnowledgeForgeService:
         return {"status": "ok", "postgres": "reachable", "ollama_models": ollama_models,
                 "hugegraph": Config.hugegraph_graph, "hugegraph_ready": Config.hugegraph_graph in graphs,
                 "vector_backend": "pgvector-hnsw",
-                "entity_reranker": self.resolver.reranker.diagnostics()}
+                "entity_reranker": self.resolver.reranker.diagnostics(),
+                "knowledge_agent": {
+                    "enabled": Config.agent_enabled,
+                    "protocol": "knowledge-agent-v1",
+                    "workers": Config.agent_max_workers,
+                }}

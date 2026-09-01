@@ -46,6 +46,7 @@ class NativeProcessProgress:
     completed: int | None = None
     total: int | None = None
     heartbeat: bool = False
+    workflow_state: str = ""
 
 
 class GraphRAGNativeRunner:
@@ -109,6 +110,7 @@ class GraphRAGNativeRunner:
                     stage=stage, workflow=workflow,
                     message=f"GraphRAG workflow 开始：{workflow}",
                     elapsed_seconds=elapsed_seconds,
+                    workflow_state="started",
                 ))
                 continue
             completed = re.search(r"Workflow completed:\s*([A-Za-z0-9_]+)", line)
@@ -118,6 +120,7 @@ class GraphRAGNativeRunner:
                     stage=stage, workflow=workflow,
                     message=f"GraphRAG workflow 完成：{workflow}",
                     elapsed_seconds=elapsed_seconds,
+                    workflow_state="completed",
                 ))
                 continue
             # GraphRAG's logger prefix itself contains separators such as
@@ -137,6 +140,7 @@ class GraphRAGNativeRunner:
                         completed=current, total=total,
                         message=f"GraphRAG {workflow}：{current}/{total}",
                         elapsed_seconds=elapsed_seconds,
+                        workflow_state="progress",
                     ))
         return next_offset, events
 

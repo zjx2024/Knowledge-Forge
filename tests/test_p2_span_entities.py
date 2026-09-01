@@ -3,11 +3,162 @@ from __future__ import annotations
 from knowledge_forge.span_entities import (
     SpanFirstEntityExtractor,
     entity_boundary_reason,
+    layout_equivalent_surface_occurrences,
     policy_relation_endpoint_candidates,
     structured_list_item_endpoint_candidates,
     structured_relation_endpoint_candidates,
     structured_section_label_endpoint_candidates,
 )
+
+
+def test_layout_coverage_finds_cjk_renderer_whitespace_variant():
+    content = "联邦学习用于训练；FedDIS 是基于联邦 学习的框架。"
+    start = content.index("联邦 学习")
+
+    assert layout_equivalent_surface_occurrences(
+        content, "联邦学习",
+    ) == [(start, start + len("联邦 学习"))]
+
+
+def test_layout_coverage_preserves_semantic_latin_word_spaces():
+    content = "New York and NewYork are separate source spellings."
+
+    assert layout_equivalent_surface_occurrences(content, "New York") == []
+
+
+def test_layout_coverage_does_not_cross_structural_cjk_newline():
+    content = "任务管理\n知识图谱"
+
+    assert layout_equivalent_surface_occurrences(content, "管理知识") == []
+
+
+def test_layout_coverage_audit_reuses_structure_and_publishability_gates():
+    content = (
+        "# 主题 分析\n"
+        "章节ID: 主题 分析\n"
+        "正文包含主题分析，并说明主题 分析的作用。"
+    )
+    seed_start = content.index("主题分析")
+    extractor = SpanFirstEntityExtractor("entity-layout-audit-test")
+    normalized = extractor.normalize(
+        project_scope="p",
+        document_key="d",
+        chunk_key="c",
+        content=content,
+        raw_entities=[{
+            "name": "主题分析",
+            "type": "Technology",
+            "mention_start": seed_start,
+            "mention_end": seed_start + len("主题分析"),
+            "confidence": 0.9,
+        }],
+        chunk_metadata={
+            "chunk_role": "child",
+            "structural_spans": [{
+                "start": 2,
+                "end": 7,
+                "source_role": "heading",
+            }],
+        },
+    )
+
+    audit = extractor.audit_layout_coverage(
+        content=content,
+        mentions=normalized.mentions,
+        type_assertions=normalized.type_assertions,
+        chunk_metadata={
+            "chunk_role": "child",
+            "structural_spans": [{
+                "start": 2,
+                "end": 7,
+                "source_role": "heading",
+            }],
+        },
+    )
+
+    assert audit["candidate_count"] == 2
+    assert audit["eligible_count"] == 0
+    assert audit["rejected_count"] == 2
+    assert audit["recovered_count"] == 1
+    assert audit["rejection_reasons"] == {
+        "renderer_metadata_line": 1,
+        "structural_node": 1,
+    }
+    assert [item.surface for item in normalized.mentions] == [
+        "主题分析", "主题 分析",
+    ]
+    recovered = normalized.mentions[1]
+    assert recovered.normalized_surface == "主题分析"
+    assert recovered.recovery_kind == "layout_whitespace_variant"
+    assert normalized.type_assertions[1].source == (
+        "deterministic_layout_repeat"
+    )
+
+
+def test_layout_repeat_recovery_does_not_create_nested_partial_mention():
+    content = "联邦学习可用于训练，联邦 学习框架负责协调。"
+    exact_start = content.index("联邦学习")
+    framework_start = content.index("联邦 学习框架")
+    extractor = SpanFirstEntityExtractor("entity-layout-recovery-test")
+
+    result = extractor.normalize(
+        project_scope="p",
+        document_key="d",
+        chunk_key="c",
+        content=content,
+        raw_entities=[
+            {
+                "name": "联邦学习",
+                "type": "Technology",
+                "mention_start": exact_start,
+                "mention_end": exact_start + len("联邦学习"),
+            },
+            {
+                "name": "联邦 学习框架",
+                "type": "Product",
+                "mention_start": framework_start,
+                "mention_end": framework_start + len("联邦 学习框架"),
+            },
+        ],
+        chunk_metadata={},
+    )
+
+    assert [(item.surface, item.recovery_kind) for item in result.mentions] == [
+        ("联邦学习", ""),
+        ("联邦 学习框架", ""),
+    ]
+
+
+def test_layout_repeat_does_not_expand_short_generic_seed():
+    content = "模型用于训练，模 型负责生成结果。"
+    seed_start = content.index("模型")
+    extractor = SpanFirstEntityExtractor("entity-layout-recovery-test")
+
+    result = extractor.normalize(
+        project_scope="p",
+        document_key="d",
+        chunk_key="c",
+        content=content,
+        raw_entities=[{
+            "name": "模型",
+            "type": "Product",
+            "mention_start": seed_start,
+            "mention_end": seed_start + len("模型"),
+        }],
+        chunk_metadata={},
+    )
+    audit = extractor.audit_layout_coverage(
+        content=content,
+        mentions=result.mentions,
+        type_assertions=result.type_assertions,
+        chunk_metadata={},
+    )
+
+    assert [item.surface for item in result.mentions] == ["模型"]
+    assert audit["eligible_count"] == 0
+    assert audit["rejection_reasons"] == {
+        "short_low_information_layout_seed": 1,
+    }
 
 
 def test_structured_relation_line_adds_exact_endpoints_but_not_predicate():

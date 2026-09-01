@@ -1,5 +1,7 @@
 # GraphRAG Native 策略
 
+> 更新时间：2026-09-01
+
 `graphrag_native` 是 Knowledge Forge 产品当前两种项目级构建策略之一。它从当前
 active document revision 的已持久化结构块生成 GraphRAG 3.1.1 `standard` 输入，
 所有算法事实保留在 run-local Parquet、GraphML 与 LanceDB 中。
@@ -10,10 +12,12 @@ native 的 `READY` 只代表 native 的内部 active-run 指针可查询；不�
 
 ## 运行与状态
 
-1. 先完成项目全部文档的预处理。
-2. 在“构建方案”中选择 `GraphRAG Native`，执行项目级构建。
+1. 先完成知识库全部文档的预处理。
+2. 创建知识库时选择 `GraphRAG Native`，随后在其工作区执行知识库级完整构建。
 3. executor 在新的 staging 目录运行 `graphrag init`、配置/连通性 dry-run 与标准 index。
 4. 独立 bundle validator 验证 Parquet、原生关系端点、社区/报告闭包、LanceDB、日志、hash 与凭据扫描后，才可能把 native run 标为 `READY`。
+
+新建知识库时可选择中文、英文或随文档的知识语言；该设置控制后续 Native 构建的生成语言。修改已有知识库的语言不会改写当前 bundle，只在下一次完整构建生效。
 
 文档上传、删除或任何新的 active revision 都会让 native snapshot 变为 stale。旧 bundle
 即使仍存在，也不能回答当前文档状态；新构建失败也不会回退到 Knowledge Forge 策略。
@@ -37,6 +41,17 @@ native 的 `READY` 只代表 native 的内部 active-run 指针可查询；不�
 查询使用单请求子进程中的锁版本 GraphRAG 3.1.1 Python API。`local`、`global`、`drift` 与 `basic` 都只读当前 native bundle；短 ID 必须唯一映射回同一 run 的 native ID 和 source map，否则失败关闭。
 
 其中 `global` 只重新校验并读取 `entities`、`communities`、`community_reports` 三张 Parquet 表，不打开 LanceDB，也不读取 Local/DRIFT 专属的关系或 TextUnit 输入。其他模式只读取各自 GraphRAG 3.1.1 所需的同 run 文件。
+
+统一智能问答入口位于 `/chat`。会话仍只绑定一个明确选择的知识库：
+
+- 用户显式选择 Basic/Local/Global 时保持该模式；
+- 自动模式对实体、关系和普通局部问题使用 Local，对真正的多文档全局总结使用 Global，单文档全文总结使用 Local；
+- DRIFT 仍可在 Native 知识库工作区作为显式高成本诊断查询使用；统一 `/chat` 当前只提供 Auto、Basic、Local 和 Global，不把 DRIFT 纳入普通自动模式或工具循环；
+- Native 原回答只能作为不可引用候选草稿，统一回答仍必须映射到同一 bundle 的 source map 和证据；
+- 查询期间若 active run、来源快照或 bundle manifest 变化，本轮失败关闭，不发布旧快照回答；
+- Native 检索不会回退到 Knowledge Forge 的 Chunk、pgvector、实体关系或 HugeGraph。
+
+会话、多轮语境、SSE、证据、声明引用和反馈由统一智能体 PostgreSQL 账本管理；Native 算法事实仍只存在于不可变 bundle 中。
 
 ## 验证、导出与恢复
 

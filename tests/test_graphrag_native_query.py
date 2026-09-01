@@ -8,12 +8,20 @@ import pytest
 from knowledge_forge.graphrag_native_query import (
     GraphRAGNativeQueryError,
     NativeQueryRequest,
+    _global_query_batch_tokens,
     assert_query_response_clean,
     assert_graphrag_query_api_contract,
     load_bundle_query_config,
     query_bundle,
     serialize_context,
 )
+
+
+def test_global_query_batch_budget_uses_model_window_with_safe_caps():
+    assert _global_query_batch_tokens(0) == 0
+    assert _global_query_batch_tokens(8192) == 4096
+    assert _global_query_batch_tokens(32768) == 28672
+    assert _global_query_batch_tokens(262144) == 65536
 
 
 def _tables():

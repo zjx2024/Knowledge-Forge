@@ -3567,7 +3567,8 @@ class Database:
             return {}
         with self.connection() as conn:
             rows = conn.execute(
-                """SELECT chunk.id,chunk.document_id,chunk.content,chunk.metadata,
+                """SELECT chunk.id,chunk.document_id,chunk.revision_id,
+                          chunk.content,chunk.metadata,
                           section.title AS section_title,
                           document.original_filename,document.storage_path,
                           document.mime_type
@@ -9552,6 +9553,52 @@ class Database:
                 "SELECT * FROM entity_shadow_namespaces WHERE id=%s", (namespace_id,),
             ).fetchone()
 
+    def list_grounded_entity_embeddings(
+        self, namespace_id: str, canonical_keys: list[str],
+    ) -> list[dict[str, Any]]:
+        """Read a bounded set of vectors from one immutable entity snapshot.
+
+        Community navigation reuses the exact embedding model recorded on the
+        namespace.  It must not silently mix models or generate fresh vectors
+        during graph publication.
+        """
+
+        keys = sorted({str(key) for key in canonical_keys if str(key)})
+        if not keys:
+            return []
+        if len(keys) > 10_000:
+            raise ValueError("社区主题关联请求的实体向量超过安全上限")
+        with self.connection() as conn:
+            namespace = conn.execute(
+                """SELECT status,snapshot_complete,embedding_model
+                   FROM entity_shadow_namespaces WHERE id=%s""",
+                (namespace_id,),
+            ).fetchone()
+            if not namespace:
+                raise LookupError("实体快照 namespace 不存在")
+            if (
+                str(namespace.get("status") or "") != "ready"
+                or not bool(namespace.get("snapshot_complete"))
+            ):
+                raise RuntimeError("实体快照尚未就绪，不能读取社区主题向量")
+            model_name = str(namespace.get("embedding_model") or "")
+            if not model_name:
+                return []
+            return conn.execute(
+                """SELECT embedding.canonical_key,embedding.model_name,
+                          embedding.embedding,embedding.dimension,
+                          canonical.name,canonical.primary_type
+                   FROM entity_shadow_embeddings embedding
+                   JOIN entity_shadow_canonicals canonical
+                     ON canonical.namespace_id=embedding.namespace_id
+                    AND canonical.canonical_key=embedding.canonical_key
+                   WHERE embedding.namespace_id=%s
+                     AND embedding.model_name=%s
+                     AND embedding.canonical_key=ANY(%s)
+                   ORDER BY embedding.canonical_key""",
+                (namespace_id, model_name, keys),
+            ).fetchall()
+
     def seed_grounded_entity_work_items(
         self,
         namespace_id: str,
@@ -9669,6 +9716,58 @@ class Database:
                    FROM entity_shadow_work_items WHERE namespace_id=%s""",
                 (namespace_id,),
             ).fetchone()
+
+    def grounded_entity_layout_coverage_summary(
+        self, namespace_id: str,
+    ) -> dict[str, Any]:
+        """Aggregate the persisted, read-only mention coverage observations."""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT chunk_id,output_json->'layout_mention_coverage' AS audit
+                   FROM entity_shadow_work_items
+                   WHERE namespace_id=%s AND status='completed'
+                     AND output_json ? 'layout_mention_coverage'
+                   ORDER BY document_id,chunk_id""",
+                (namespace_id,),
+            ).fetchall()
+        candidate_count = eligible_count = rejected_count = overlap_skipped = 0
+        recovered_count = 0
+        rejection_reasons: Counter[str] = Counter()
+        chunks_with_candidates = chunks_with_eligible = 0
+        policy_versions: set[str] = set()
+        for row in rows:
+            audit = row.get("audit") if isinstance(row.get("audit"), dict) else {}
+            candidates = int(audit.get("candidate_count") or 0)
+            eligible = int(audit.get("eligible_count") or 0)
+            candidate_count += candidates
+            eligible_count += eligible
+            rejected_count += int(audit.get("rejected_count") or 0)
+            recovered_count += int(audit.get("recovered_count") or 0)
+            overlap_skipped += int(audit.get("overlap_skipped") or 0)
+            chunks_with_candidates += int(candidates > 0)
+            chunks_with_eligible += int(eligible > 0)
+            version = str(audit.get("policy_version") or "").strip()
+            if version:
+                policy_versions.add(version)
+            rejection_reasons.update({
+                str(reason): int(count or 0)
+                for reason, count in dict(
+                    audit.get("rejection_reasons") or {}
+                ).items()
+            })
+        return {
+            "audited_chunks": len(rows),
+            "chunks_with_candidates": chunks_with_candidates,
+            "chunks_with_eligible": chunks_with_eligible,
+            "candidate_count": candidate_count,
+            "eligible_count": eligible_count,
+            "rejected_count": rejected_count,
+            "recovered_count": recovered_count,
+            "overlap_skipped": overlap_skipped,
+            "rejection_reasons": dict(sorted(rejection_reasons.items())),
+            "policy_versions": sorted(policy_versions),
+        }
 
     def complete_grounded_entity_work(
         self,
@@ -10977,6 +11076,72 @@ class Database:
                 (str(pass_id),),
             ).fetchone()
 
+    def list_agent_knowledge_forge_community_relation_candidates(
+        self,
+        namespace_id: str,
+        relation_run_id: str,
+        entity_keys: list[str],
+        *,
+        scope: str,
+        limit: int = 120,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded, lightweight relation index for community routing.
+
+        This is not an evidence endpoint.  It only helps the Knowledge Forge
+        agent choose relation IDs from the current immutable snapshot.  Every
+        selected ID is subsequently re-read through
+        :meth:`search_knowledge_forge_relations`, whose evidence joins and
+        source checks remain the publication gate.
+        """
+
+        if scope not in {"cross", "internal"}:
+            raise ValueError("community relation scope must be cross or internal")
+        keys = sorted({str(value) for value in entity_keys if str(value)})[:5_000]
+        if not keys:
+            return []
+        membership_clause = (
+            "((endpoint.source_canonical_key=ANY(%s::text[])) <> "
+            "(endpoint.target_canonical_key=ANY(%s::text[])))"
+            if scope == "cross"
+            else "(endpoint.source_canonical_key=ANY(%s::text[]) "
+            "AND endpoint.target_canonical_key=ANY(%s::text[]))"
+        )
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT endpoint.relation_key AS id,
+                          endpoint.source_canonical_key,source.name AS source_name,
+                          endpoint.relation_type,
+                          endpoint.target_canonical_key,target.name AS target_name,
+                          endpoint.document_id,endpoint.chunk_id,
+                          endpoint.evidence_text,endpoint.metadata
+                   FROM entity_shadow_relation_endpoints endpoint
+                   JOIN entity_shadow_canonicals source
+                     ON source.namespace_id=endpoint.namespace_id
+                    AND source.canonical_key=endpoint.source_canonical_key
+                   JOIN entity_shadow_canonicals target
+                     ON target.namespace_id=endpoint.namespace_id
+                    AND target.canonical_key=endpoint.target_canonical_key
+                   JOIN shadow_relation_normalized_facts fact
+                     ON fact.id=endpoint.relation_key
+                    AND fact.subject_canonical_id=endpoint.source_canonical_key
+                    AND fact.predicate=endpoint.relation_type
+                    AND fact.object_canonical_id=endpoint.target_canonical_key
+                    AND fact.is_review_only=FALSE
+                   JOIN shadow_relation_fact_memberships membership
+                     ON membership.fact_id=fact.id AND membership.run_id=%s
+                    AND membership.status='ELIGIBLE'
+                   WHERE endpoint.namespace_id=%s
+                     AND endpoint.metadata->>'shadow_relation_v2_run_id'=%s
+                     AND """ + membership_clause + """
+                   ORDER BY endpoint.relation_key
+                   LIMIT %s""",
+                (
+                    str(relation_run_id), str(namespace_id),
+                    str(relation_run_id), keys, keys,
+                    max(1, min(500, int(limit))),
+                ),
+            ).fetchall()
+
     def search_knowledge_forge_relations(
         self,
         namespace_id: str,
@@ -10985,14 +11150,16 @@ class Database:
         *,
         chunk_ids: list[int] | None = None,
         canonical_keys: list[str] | None = None,
+        relation_keys: list[str] | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Search verified facts, optionally fanning out from entity seeds.
 
-        ``canonical_keys`` is deliberately bounded by the caller and only
-        matches relation endpoints in the immutable namespace.  This gives the
-        retrieval layer a project-local graph traversal primitive without
-        loading the complete graph or consulting legacy/HugeGraph state.
+        ``canonical_keys`` and ``relation_keys`` are deliberately bounded and
+        only match the immutable namespace.  The latter lets an upstream
+        community navigator name candidate facts, but those IDs still pass
+        this method's eligible-membership, independent-verification, active
+        document and active chunk joins before they can become evidence.
         """
 
         query = str(query or "").strip()
@@ -11003,18 +11170,23 @@ class Database:
         canonical_keys = sorted({
             str(value) for value in (canonical_keys or []) if str(value)
         })[:50]
+        relation_keys = sorted({
+            str(value) for value in (relation_keys or []) if str(value)
+        })[:50]
         chunk_clause = (
             " OR endpoint.chunk_id=ANY(%s)"
             if chunk_ids else ""
         )
         params: list[Any] = [
             canonical_keys, canonical_keys,
+            relation_keys,
             pattern, pattern, pattern, pattern, pattern, pattern,
             query, query, query, query, query, query,
             relation_run_id, relation_run_id,
             namespace_id, relation_run_id,
             pattern, pattern, pattern, pattern, pattern, pattern,
             canonical_keys, canonical_keys,
+            relation_keys,
         ]
         if chunk_ids:
             params.append(chunk_ids)
@@ -11032,6 +11204,7 @@ class Database:
                    document.original_filename,document.storage_path,chunk.chunk_key,
                    CASE WHEN endpoint.source_canonical_key=ANY(%s::text[])
                           OR endpoint.target_canonical_key=ANY(%s::text[])
+                          OR endpoint.relation_key=ANY(%s::text[])
                         THEN 1 ELSE 0 END AS seed_match,
                    GREATEST(
                      CASE WHEN source.name ILIKE %s THEN 1.0 ELSE 0.0 END,
@@ -11106,7 +11279,8 @@ class Database:
                        OR endpoint.metadata->>'display_relation_label' ILIKE %s
                        OR endpoint.metadata->>'source_relation_expression' ILIKE %s
                        OR endpoint.source_canonical_key=ANY(%s::text[])
-                       OR endpoint.target_canonical_key=ANY(%s::text[])"""
+                       OR endpoint.target_canonical_key=ANY(%s::text[])
+                       OR endpoint.relation_key=ANY(%s::text[])"""
                 + chunk_clause
                 + """)
                    ORDER BY seed_match DESC,lexical_score DESC,
@@ -13060,3 +13234,975 @@ class Database:
                 AND d.is_deleted=FALSE AND COALESCE(projection.publishable,TRUE)=TRUE AND """ + clause,
                 (project_id,ids,*policy_params)
             ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Knowledge-agent v1 control plane.  These methods intentionally live in
+    # the PostgreSQL boundary: the agent consumes current facts but never
+    # mutates a graph, schema, document revision or embedding.
+
+    def agent_project_source_snapshot(self, project_id: int) -> dict[str, Any]:
+        """Return a deterministic digest of current active document revisions."""
+
+        with self.connection() as conn:
+            project = conn.execute(
+                "SELECT * FROM projects WHERE id=%s AND is_deleted=FALSE",
+                (int(project_id),),
+            ).fetchone()
+            if not project:
+                raise LookupError("知识库不存在")
+            documents = conn.execute(
+                """SELECT document.id,document.active_revision_id,
+                          revision.source_hash,revision.manifest_hash,
+                          document.original_filename
+                   FROM documents document
+                   LEFT JOIN document_content_revisions revision
+                     ON revision.revision_id=document.active_revision_id
+                   WHERE document.project_id=%s AND document.is_deleted=FALSE
+                   ORDER BY document.id""",
+                (int(project_id),),
+            ).fetchall()
+            counts = conn.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM chunks chunk
+                       JOIN documents document ON document.id=chunk.document_id
+                        AND document.active_revision_id=chunk.revision_id
+                      WHERE chunk.project_id=%s AND chunk.is_deleted=FALSE
+                        AND document.is_deleted=FALSE) AS chunks,
+                     (SELECT COUNT(*) FROM vector_embeddings vector
+                       JOIN documents document ON document.id=vector.document_id
+                        AND document.active_revision_id=vector.revision_id
+                      WHERE vector.project_id=%s AND vector.object_type='chunk'
+                        AND vector.model_name=%s AND vector.is_deleted=FALSE
+                        AND document.is_deleted=FALSE) AS embeddings""",
+                (
+                    int(project_id), int(project_id),
+                    str(project.get("embedding_model") or self.config.default_embedding_model),
+                ),
+            ).fetchone()
+        material = [{
+            "document_id": int(row["id"]),
+            "revision_id": str(row.get("active_revision_id") or ""),
+            "source_hash": str(row.get("source_hash") or ""),
+            "manifest_hash": str(row.get("manifest_hash") or ""),
+        } for row in documents]
+        digest = hashlib.sha256(
+            self._canonical_json(material).encode("utf-8")
+        ).hexdigest()
+        return {
+            "project_id": int(project_id),
+            "source_hash": digest,
+            "documents": material,
+            "document_count": len(material),
+            "chunk_count": int((counts or {}).get("chunks") or 0),
+            "embedding_count": int((counts or {}).get("embeddings") or 0),
+            "embedding_model": str(
+                project.get("embedding_model") or self.config.default_embedding_model
+            ),
+        }
+
+    def agent_entity_sources(
+        self, namespace_id: str, canonical_keys: list[str], *, limit_per_entity: int = 3,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Resolve grounded canonical entities back to exact current mentions."""
+
+        keys = list(dict.fromkeys(str(value) for value in canonical_keys if str(value)))[:100]
+        if not keys:
+            return {}
+        with self.connection() as conn:
+            rows = conn.execute(
+                """WITH ranked AS (
+                     SELECT assignment.canonical_key,mention.evidence_text,
+                            mention.evidence_start,mention.evidence_end,
+                            mention.revision_id,mention.document_id,mention.chunk_id,
+                            chunk.content,chunk.metadata,section.title AS section_title,
+                            document.original_filename,document.storage_path,
+                            document.mime_type,
+                            ROW_NUMBER() OVER (
+                              PARTITION BY assignment.canonical_key
+                              ORDER BY mention.confidence DESC,mention.document_id,
+                                       mention.chunk_id,mention.evidence_start
+                            ) AS source_rank
+                       FROM entity_shadow_assignments assignment
+                       JOIN entity_shadow_mentions mention
+                         ON mention.namespace_id=assignment.namespace_id
+                        AND mention.mention_key=assignment.mention_key
+                       JOIN chunks chunk ON chunk.id=mention.chunk_id
+                        AND chunk.revision_id=mention.revision_id
+                       LEFT JOIN sections section ON section.id=chunk.section_id
+                       JOIN documents document ON document.id=mention.document_id
+                        AND document.active_revision_id=mention.revision_id
+                      WHERE assignment.namespace_id=%s
+                        AND assignment.canonical_key=ANY(%s::text[])
+                        AND document.is_deleted=FALSE AND chunk.is_deleted=FALSE
+                   ) SELECT * FROM ranked WHERE source_rank<=%s
+                     ORDER BY canonical_key,source_rank""",
+                (str(namespace_id), keys, max(1, min(10, int(limit_per_entity)))),
+            ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {key: [] for key in keys}
+        for row in rows:
+            grouped.setdefault(str(row["canonical_key"]), []).append(row)
+        return grouped
+
+    def agent_page_media_assets(
+        self, project_id: int, document_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        """Load current media-bearing chunks for exact-page source enrichment.
+
+        This is a presentation/provenance lookup only.  It never changes
+        retrieval scores or treats a nearby image as an additional graph fact.
+        The agent adapter is responsible for attaching an asset only when an
+        evidence item explicitly refers to a visual on the same source page.
+        """
+
+        ids = sorted({int(value) for value in document_ids if int(value) > 0})[:200]
+        if not ids:
+            return []
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT chunk.document_id,chunk.revision_id,chunk.chunk_index,
+                          chunk.metadata
+                     FROM chunks chunk
+                     JOIN documents document ON document.id=chunk.document_id
+                      AND document.active_revision_id=chunk.revision_id
+                    WHERE chunk.project_id=%s AND chunk.document_id=ANY(%s)
+                      AND chunk.is_deleted=FALSE AND document.is_deleted=FALSE
+                      AND jsonb_typeof(chunk.metadata->'media_assets')='array'
+                      AND jsonb_array_length(chunk.metadata->'media_assets')>0
+                    ORDER BY chunk.document_id,chunk.chunk_index,chunk.id""",
+                (int(project_id), ids),
+            ).fetchall()
+
+    def agent_visual_reference_chunks(
+        self,
+        project_id: int,
+        patterns: list[str],
+        *,
+        query: str = "",
+        limit: int = 48,
+    ) -> list[dict[str, Any]]:
+        """Load current chunks that may contain a numbered visual reference.
+
+        ``patterns`` are deliberately coarse recall surfaces produced by the
+        agent adapter.  The adapter performs the exact figure/table identifier
+        comparison before admitting a row as evidence.
+        """
+
+        surfaces = list(dict.fromkeys(
+            str(value)[:120] for value in patterns if str(value).strip()
+        ))[:24]
+        if not surfaces:
+            return []
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT chunk.id,chunk.document_id,chunk.revision_id,
+                          chunk.content,chunk.metadata,
+                          section.title AS section_title,
+                          document.original_filename,document.storage_path,
+                          document.mime_type
+                     FROM chunks chunk
+                     JOIN documents document ON document.id=chunk.document_id
+                      AND document.active_revision_id=chunk.revision_id
+                     LEFT JOIN sections section ON section.id=chunk.section_id
+                    WHERE chunk.project_id=%s AND chunk.is_deleted=FALSE
+                      AND document.is_deleted=FALSE
+                      AND (
+                        chunk.content ILIKE ANY(%s::text[])
+                        OR chunk.metadata::text ILIKE ANY(%s::text[])
+                      )
+                    ORDER BY
+                      CASE WHEN strpos(
+                        lower(%s), lower(document.original_filename)
+                      )>0 THEN 0 ELSE 1 END,
+                      document.id,chunk.chunk_index,chunk.id
+                    LIMIT %s""",
+                (
+                    int(project_id), surfaces, surfaces, str(query or ""),
+                    max(1, min(64, int(limit))),
+                ),
+            ).fetchall()
+
+    def agent_conversation_context(
+        self, run_id: str, *, limit: int = 24,
+    ) -> dict[str, Any]:
+        """Read prior completed messages for one project-isolated agent turn.
+
+        The current user message is already persisted when a run is queued, so
+        it is excluded by run ID.  Failed or cancelled turns are excluded as
+        well: their user text remains auditable, but it must not silently enter
+        the semantic conversation context without a completed assistant turn.
+        """
+
+        # The caller performs token-aware admission.  This is only a bounded
+        # database bootstrap ceiling so a newly restored long thread can feed
+        # several incremental compaction batches without loading unbounded
+        # rows into memory.
+        bounded_limit = max(2, min(500, int(limit)))
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT id,thread_id,project_id FROM agent_runs WHERE id=%s",
+                (str(run_id),),
+            ).fetchone()
+            if not run:
+                raise LookupError("问答任务不存在")
+            total = conn.execute(
+                """SELECT COUNT(*)::integer AS count
+                     FROM agent_messages message
+                     JOIN agent_runs prior ON prior.id=message.run_id
+                    WHERE message.thread_id=%s AND message.project_id=%s
+                      AND message.run_id<>%s AND message.status='completed'
+                      AND prior.status='completed'""",
+                (
+                    str(run["thread_id"]), int(run["project_id"]),
+                    str(run_id),
+                ),
+            ).fetchone()
+            rows = conn.execute(
+                """SELECT message.id,message.run_id,message.role,
+                          message.content,message.created_at
+                     FROM agent_messages message
+                     JOIN agent_runs prior ON prior.id=message.run_id
+                    WHERE message.thread_id=%s AND message.project_id=%s
+                      AND message.run_id<>%s AND message.status='completed'
+                      AND prior.status='completed'
+                    ORDER BY message.created_at DESC,message.id DESC
+                    LIMIT %s""",
+                (
+                    str(run["thread_id"]), int(run["project_id"]),
+                    str(run_id), bounded_limit,
+                ),
+            ).fetchall()
+            documents = conn.execute(
+                """SELECT id,original_filename
+                     FROM documents
+                    WHERE project_id=%s AND is_deleted=FALSE
+                    ORDER BY id LIMIT 50""",
+                (int(run["project_id"]),),
+            ).fetchall()
+        rows.reverse()
+        count = int((total or {}).get("count") or 0)
+        return {
+            "thread_id": str(run["thread_id"]),
+            "project_id": int(run["project_id"]),
+            "items": rows,
+            "total": count,
+            "truncated": count > len(rows),
+            "knowledge_scope": {
+                "document_count": len(documents),
+                "documents": [
+                    {
+                        "document_id": int(item["id"]),
+                        "filename": str(item.get("original_filename") or ""),
+                    }
+                    for item in documents
+                ],
+                "document_list_truncated": len(documents) >= 50,
+            },
+        }
+
+    def create_agent_thread(
+        self, *, thread_id: str, project_id: int, strategy_key: str,
+        session_key_hash: str, title: str = "", metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            project = conn.execute(
+                "SELECT 1 FROM projects WHERE id=%s AND is_deleted=FALSE",
+                (int(project_id),),
+            ).fetchone()
+            if not project:
+                raise LookupError("知识库不存在")
+            return conn.execute(
+                """INSERT INTO agent_threads(
+                       id,project_id,strategy_key,session_key_hash,title,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    str(thread_id), int(project_id), str(strategy_key),
+                    str(session_key_hash), str(title or "")[:200],
+                    self._json(metadata),
+                ),
+            ).fetchone()
+
+    def list_agent_threads(
+        self, *, project_id: int, session_key_hash: str, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List one browser capability's conversations without loading transcripts."""
+
+        bounded_limit = max(1, min(100, int(limit)))
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT thread.id,thread.project_id,thread.strategy_key,
+                          thread.title,thread.status,thread.metadata,
+                          thread.created_at,thread.updated_at,
+                          (SELECT COUNT(*)::integer
+                             FROM agent_messages message
+                            WHERE message.thread_id=thread.id) AS message_count,
+                          COALESCE((
+                            SELECT LEFT(message.content,240)
+                              FROM agent_messages message
+                             WHERE message.thread_id=thread.id
+                             ORDER BY message.created_at DESC,message.id DESC
+                             LIMIT 1
+                          ),'') AS last_message_preview,
+                          COALESCE((
+                            SELECT run.id
+                              FROM agent_runs run
+                             WHERE run.thread_id=thread.id
+                               AND run.status IN ('queued','running')
+                             ORDER BY run.created_at DESC,run.id DESC
+                             LIMIT 1
+                          ),'') AS active_run_id
+                     FROM agent_threads thread
+                    WHERE thread.project_id=%s
+                      AND thread.session_key_hash=%s
+                      AND thread.status='active'
+                    ORDER BY thread.updated_at DESC,thread.id DESC
+                    LIMIT %s""",
+                (int(project_id), str(session_key_hash), bounded_limit),
+            ).fetchall()
+
+    def get_agent_thread(
+        self, thread_id: str, *, session_key_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        params: list[Any] = [str(thread_id)]
+        clause = ""
+        if session_key_hash is not None:
+            clause = " AND session_key_hash=%s"
+            params.append(str(session_key_hash))
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM agent_threads WHERE id=%s" + clause,
+                tuple(params),
+            ).fetchone()
+
+    def get_agent_thread_payload(
+        self, thread_id: str, *, session_key_hash: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            thread = conn.execute(
+                """SELECT * FROM agent_threads
+                   WHERE id=%s AND session_key_hash=%s AND status='active'""",
+                (str(thread_id), str(session_key_hash)),
+            ).fetchone()
+            if not thread:
+                return None
+            messages = conn.execute(
+                """SELECT * FROM agent_messages WHERE thread_id=%s
+                   ORDER BY created_at,id""",
+                (str(thread_id),),
+            ).fetchall()
+            runs = conn.execute(
+                """SELECT * FROM agent_runs WHERE thread_id=%s
+                   ORDER BY created_at,id""",
+                (str(thread_id),),
+            ).fetchall()
+            return {**dict(thread), "messages": messages, "runs": runs}
+
+    def archive_agent_thread(
+        self, thread_id: str, *, session_key_hash: str,
+    ) -> dict[str, Any]:
+        """Soft-delete an owned conversation while preserving its audit ledger."""
+
+        with self.connection() as conn:
+            thread = conn.execute(
+                """SELECT * FROM agent_threads
+                   WHERE id=%s AND session_key_hash=%s AND status='active'
+                   FOR UPDATE""",
+                (str(thread_id), str(session_key_hash)),
+            ).fetchone()
+            if not thread:
+                raise PermissionError("问答会话不存在或无权访问")
+            active = conn.execute(
+                """SELECT 1 FROM agent_runs
+                   WHERE thread_id=%s AND status IN ('queued','running')
+                   LIMIT 1""",
+                (str(thread_id),),
+            ).fetchone()
+            if active:
+                raise RuntimeError("该会话正在生成回答，请先停止回答再删除")
+            return conn.execute(
+                """UPDATE agent_threads SET status='archived',updated_at=NOW()
+                   WHERE id=%s RETURNING *""",
+                (str(thread_id),),
+            ).fetchone()
+
+    def create_agent_run(
+        self, *, run_id: str, message_id: str, thread_id: str,
+        session_key_hash: str, query: str, requested_mode: str,
+        budget: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            thread = conn.execute(
+                """SELECT * FROM agent_threads
+                   WHERE id=%s AND session_key_hash=%s AND status='active'
+                   FOR UPDATE""",
+                (str(thread_id), str(session_key_hash)),
+            ).fetchone()
+            if not thread:
+                raise PermissionError("问答会话不存在或无权访问")
+            active = conn.execute(
+                """SELECT id FROM agent_runs WHERE thread_id=%s
+                   AND status IN ('queued','running') FOR UPDATE""",
+                (str(thread_id),),
+            ).fetchone()
+            if active:
+                raise RuntimeError("当前会话已有问题正在处理")
+            run = conn.execute(
+                """INSERT INTO agent_runs(
+                       id,thread_id,project_id,strategy_key,requested_mode,query,budget)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    str(run_id), str(thread_id), int(thread["project_id"]),
+                    str(thread["strategy_key"]), str(requested_mode), str(query),
+                    self._json(budget),
+                ),
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO agent_messages(
+                       id,thread_id,run_id,project_id,role,status,content)
+                   VALUES(%s,%s,%s,%s,'user','completed',%s)""",
+                (
+                    str(message_id), str(thread_id), str(run_id),
+                    int(thread["project_id"]), str(query),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                   VALUES(%s,%s,'queued',%s::jsonb)""",
+                (str(run_id), int(thread["project_id"]), self._json({"status": "queued"})),
+            )
+            conn.execute(
+                """UPDATE agent_threads
+                      SET title=CASE WHEN btrim(title)='' THEN %s ELSE title END,
+                          updated_at=NOW()
+                    WHERE id=%s""",
+                (str(query).strip()[:80], str(thread_id)),
+            )
+            return run
+
+    def get_agent_run(
+        self, run_id: str, *, session_key_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        params: list[Any] = [str(run_id)]
+        clause = ""
+        if session_key_hash is not None:
+            clause = " AND thread.session_key_hash=%s AND thread.status='active'"
+            params.append(str(session_key_hash))
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT run.* FROM agent_runs run
+                   JOIN agent_threads thread ON thread.id=run.thread_id
+                   WHERE run.id=%s""" + clause,
+                tuple(params),
+            ).fetchone()
+
+    def get_agent_run_payload(
+        self, run_id: str, *, session_key_hash: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT run.* FROM agent_runs run
+                   JOIN agent_threads thread ON thread.id=run.thread_id
+                   WHERE run.id=%s AND thread.session_key_hash=%s
+                     AND thread.status='active'""",
+                (str(run_id), str(session_key_hash)),
+            ).fetchone()
+            if not run:
+                return None
+            steps = conn.execute(
+                "SELECT * FROM agent_run_steps WHERE run_id=%s ORDER BY sequence",
+                (str(run_id),),
+            ).fetchall()
+            tools = conn.execute(
+                "SELECT * FROM agent_tool_calls WHERE run_id=%s ORDER BY started_at,id",
+                (str(run_id),),
+            ).fetchall()
+            evidence = conn.execute(
+                """SELECT evidence_id,project_id,strategy_key,snapshot_ref,
+                          evidence_type,title,content,source_refs,
+                          fused_score,rerank_score,provenance_valid,rank,selected
+                   FROM agent_evidence WHERE run_id=%s
+                   ORDER BY selected DESC,rank,evidence_id""",
+                (str(run_id),),
+            ).fetchall()
+            citations = conn.execute(
+                """SELECT * FROM agent_claim_citations WHERE run_id=%s
+                   ORDER BY claim_index,citation_index,evidence_id""",
+                (str(run_id),),
+            ).fetchall()
+            messages = conn.execute(
+                """SELECT * FROM agent_messages WHERE run_id=%s
+                   ORDER BY created_at,id""",
+                (str(run_id),),
+            ).fetchall()
+            return {
+                **dict(run), "steps": steps, "tool_calls": tools,
+                "evidence": evidence, "citations": citations,
+                "messages": messages,
+            }
+
+    def get_agent_run_trace_payload(
+        self, run_id: str, *, session_key_hash: str,
+    ) -> dict[str, Any] | None:
+        """Read only the lightweight execution ledger for one owned run.
+
+        The browser polls this endpoint while an answer is running.  It reads
+        only bounded summaries for selected evidence; full evidence bodies,
+        source payloads and message transcripts remain behind their dedicated
+        authorized endpoints.
+        """
+
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT run.* FROM agent_runs run
+                   JOIN agent_threads thread ON thread.id=run.thread_id
+                   WHERE run.id=%s AND thread.session_key_hash=%s
+                     AND thread.status='active'""",
+                (str(run_id), str(session_key_hash)),
+            ).fetchone()
+            if not run:
+                return None
+            steps = conn.execute(
+                "SELECT * FROM agent_run_steps WHERE run_id=%s ORDER BY sequence",
+                (str(run_id),),
+            ).fetchall()
+            tools = conn.execute(
+                "SELECT * FROM agent_tool_calls WHERE run_id=%s ORDER BY started_at,id",
+                (str(run_id),),
+            ).fetchall()
+            evidence_summaries = conn.execute(
+                """SELECT evidence.evidence_id,evidence.evidence_type,
+                          evidence.title,LEFT(evidence.content,500) AS excerpt,
+                          evidence.rank,evidence.rerank_score,
+                          COALESCE(evidence.source_refs->0->>'filename','') AS filename,
+                          COALESCE(evidence.source_refs->0->>'page_label','') AS page_label,
+                          COALESCE(evidence.source_refs->0->>'section_title','') AS section_title,
+                          (SELECT MIN(citation.citation_index)
+                             FROM agent_claim_citations citation
+                            WHERE citation.run_id=evidence.run_id
+                              AND citation.evidence_id=evidence.evidence_id)
+                            AS citation_index
+                     FROM agent_evidence evidence
+                    WHERE evidence.run_id=%s AND evidence.selected IS TRUE
+                      AND evidence.provenance_valid IS TRUE
+                    ORDER BY evidence.rank,evidence.evidence_id
+                    LIMIT 24""",
+                (str(run_id),),
+            ).fetchall()
+            return {
+                **dict(run), "steps": steps, "tool_calls": tools,
+                "evidence_summaries": evidence_summaries,
+            }
+
+    def start_agent_run(self, run_id: str) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE agent_runs SET status='running',stage='authorizing',
+                          started_at=NOW(),updated_at=NOW()
+                   WHERE id=%s AND status='queued' AND cancellation_requested=FALSE
+                   RETURNING *""",
+                (str(run_id),),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                       VALUES(%s,%s,'status',%s::jsonb)""",
+                    (str(run_id), int(row["project_id"]), self._json({"status": "running", "stage": "authorizing"})),
+                )
+                return row
+            current = conn.execute(
+                "SELECT * FROM agent_runs WHERE id=%s", (str(run_id),),
+            ).fetchone()
+            if not current:
+                raise LookupError("问答任务不存在")
+            return current
+
+    def update_agent_run(
+        self, run_id: str, *, stage: str | None = None,
+        snapshot_ref: dict[str, Any] | None = None,
+        retrieval_summary: dict[str, Any] | None = None,
+        sufficiency: dict[str, Any] | None = None,
+        model_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        assignments = ["updated_at=NOW()"]
+        params: list[Any] = []
+        for key, value in (
+            ("stage", stage), ("model_name", model_name),
+        ):
+            if value is not None:
+                assignments.append(f"{key}=%s")
+                params.append(str(value))
+        for key, value in (
+            ("snapshot_ref", snapshot_ref),
+            ("retrieval_summary", retrieval_summary),
+            ("sufficiency", sufficiency), ("metadata", metadata),
+        ):
+            if value is not None:
+                assignments.append(f"{key}=%s::jsonb")
+                params.append(self._json(value))
+        params.append(str(run_id))
+        with self.connection() as conn:
+            row = conn.execute(
+                f"UPDATE agent_runs SET {','.join(assignments)} WHERE id=%s RETURNING *",
+                tuple(params),
+            ).fetchone()
+            if not row:
+                raise LookupError("问答任务不存在")
+            return row
+
+    def record_agent_step(
+        self, *, run_id: str, project_id: int, sequence: int,
+        step_type: str, status: str, input_summary: dict[str, Any] | None = None,
+        output_summary: dict[str, Any] | None = None, error_message: str = "",
+    ) -> dict[str, Any]:
+        completed = status in {"completed", "failed", "cancelled", "degraded"}
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO agent_run_steps(
+                       run_id,project_id,sequence,step_type,status,input_summary,
+                       output_summary,error_message,completed_at)
+                   VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,
+                          CASE WHEN %s THEN NOW() ELSE NULL END)
+                   ON CONFLICT(run_id,sequence) DO UPDATE SET
+                     step_type=EXCLUDED.step_type,status=EXCLUDED.status,
+                     input_summary=EXCLUDED.input_summary,
+                     output_summary=EXCLUDED.output_summary,
+                     error_message=EXCLUDED.error_message,
+                     completed_at=EXCLUDED.completed_at
+                   RETURNING *""",
+                (
+                    str(run_id), int(project_id), int(sequence), str(step_type),
+                    str(status), self._json(input_summary), self._json(output_summary),
+                    str(error_message)[:2000], completed,
+                ),
+            ).fetchone()
+
+    def start_agent_tool_call(
+        self, *, call_id: str, run_id: str, project_id: int,
+        tool_name: str, request_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            return conn.execute(
+                """INSERT INTO agent_tool_calls(
+                       id,run_id,project_id,tool_name,status,request_summary)
+                   VALUES(%s,%s,%s,%s,'running',%s::jsonb) RETURNING *""",
+                (
+                    str(call_id), str(run_id), int(project_id), str(tool_name),
+                    self._json(request_summary),
+                ),
+            ).fetchone()
+
+    def finish_agent_tool_call(
+        self, call_id: str, *, status: str,
+        response_summary: dict[str, Any] | None = None, error_message: str = "",
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE agent_tool_calls SET status=%s,response_summary=%s::jsonb,
+                          error_message=%s,completed_at=NOW()
+                   WHERE id=%s RETURNING *""",
+                (
+                    str(status), self._json(response_summary),
+                    str(error_message)[:2000], str(call_id),
+                ),
+            ).fetchone()
+            if not row:
+                raise LookupError("问答工具调用不存在")
+            return row
+
+    def persist_agent_evidence(self, run_id: str, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT project_id,status FROM agent_runs WHERE id=%s FOR UPDATE",
+                (str(run_id),),
+            ).fetchone()
+            if not run or run["status"] != "running":
+                raise RuntimeError("问答任务不接受证据写入")
+            count = 0
+            for row in rows:
+                if int(row.get("project_id") or 0) != int(run["project_id"]):
+                    raise ValueError("问答证据跨知识库")
+                conn.execute(
+                    """INSERT INTO agent_evidence(
+                         evidence_id,run_id,project_id,evidence_type,strategy_key,
+                         snapshot_ref,title,content,entity_keys,relation_keys,
+                         source_refs,retrieval_channels,raw_scores,fused_score,
+                         rerank_score,provenance_score,provenance_valid,rank,
+                         selected,metadata)
+                       VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb,
+                              %s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                    (
+                        str(row["evidence_id"]), str(run_id), int(row["project_id"]),
+                        str(row["evidence_type"]), str(row["strategy_key"]),
+                        self._json(row["snapshot_ref"]), str(row.get("title") or ""),
+                        str(row.get("content") or ""), list(row.get("entity_keys") or []),
+                        list(row.get("relation_keys") or []), self._json(row.get("source_refs") or []),
+                        list(row.get("retrieval_channels") or []), self._json(row.get("raw_scores") or {}),
+                        float(row.get("fused_score") or 0), float(row.get("rerank_score") or 0),
+                        float(row.get("provenance_score") or 0), bool(row.get("provenance_valid")),
+                        int(row.get("rank") or 0), bool(row.get("selected")),
+                        self._json(row.get("metadata") or {}),
+                    ),
+                )
+                count += 1
+            return count
+
+    def append_agent_event(
+        self, run_id: str, event_type: str, payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT project_id FROM agent_runs WHERE id=%s", (str(run_id),),
+            ).fetchone()
+            if not run:
+                raise LookupError("问答任务不存在")
+            return conn.execute(
+                """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                   VALUES(%s,%s,%s,%s::jsonb) RETURNING *""",
+                (
+                    str(run_id), int(run["project_id"]), str(event_type),
+                    self._json(payload),
+                ),
+            ).fetchone()
+
+    def list_agent_events(
+        self, run_id: str, *, session_key_hash: str, after_id: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            owned = conn.execute(
+                """SELECT 1 FROM agent_runs run JOIN agent_threads thread
+                     ON thread.id=run.thread_id
+                   WHERE run.id=%s AND thread.session_key_hash=%s
+                     AND thread.status='active'""",
+                (str(run_id), str(session_key_hash)),
+            ).fetchone()
+            if not owned:
+                raise PermissionError("问答任务不存在或无权访问")
+            return conn.execute(
+                """SELECT * FROM agent_run_events
+                   WHERE run_id=%s AND id>%s ORDER BY id LIMIT %s""",
+                (str(run_id), max(0, int(after_id)), max(1, min(500, int(limit)))),
+            ).fetchall()
+
+    def agent_run_cancel_requested(self, run_id: str) -> bool:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT cancellation_requested,status FROM agent_runs WHERE id=%s",
+                (str(run_id),),
+            ).fetchone()
+            return bool(
+                not row or row.get("cancellation_requested")
+                or row.get("status") in {"cancelled", "failed"}
+            )
+
+    def request_agent_run_cancellation(
+        self, run_id: str, *, session_key_hash: str,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            owned = conn.execute(
+                """SELECT run.* FROM agent_runs run
+                   JOIN agent_threads thread ON thread.id=run.thread_id
+                   WHERE run.id=%s AND thread.session_key_hash=%s
+                     AND thread.status='active'
+                   FOR UPDATE OF run""",
+                (str(run_id), str(session_key_hash)),
+            ).fetchone()
+            if not owned:
+                raise PermissionError("问答任务不存在或无权访问")
+            if owned["status"] in {"completed", "failed", "cancelled"}:
+                return owned
+            row = conn.execute(
+                """UPDATE agent_runs run SET cancellation_requested=TRUE,
+                          status=CASE WHEN run.status='queued' THEN 'cancelled' ELSE run.status END,
+                          stage=CASE WHEN run.status='queued' THEN 'cancelled' ELSE run.stage END,
+                          completed_at=CASE WHEN run.status='queued' THEN NOW() ELSE run.completed_at END,
+                          updated_at=NOW()
+                   WHERE run.id=%s AND run.status IN ('queued','running')
+                   RETURNING run.*""",
+                (str(run_id),),
+            ).fetchone()
+            if not row:
+                return owned
+            conn.execute(
+                """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                   VALUES(%s,%s,%s,%s::jsonb)""",
+                (
+                    str(run_id), int(row["project_id"]),
+                    "cancelled" if row["status"] == "cancelled" else "cancellation_requested",
+                    self._json({"status": str(row["status"])}),
+                ),
+            )
+            return row
+
+    def complete_agent_run(
+        self, *, run_id: str, message_id: str, answer_text: str,
+        answer_json: dict[str, Any], citations: list[dict[str, Any]],
+        effective_mode: str, stream_events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                "SELECT * FROM agent_runs WHERE id=%s FOR UPDATE", (str(run_id),),
+            ).fetchone()
+            if not run:
+                raise LookupError("问答任务不存在")
+            if run.get("cancellation_requested"):
+                raise JobCancellationRequested("问答任务已请求终止")
+            if run["status"] != "running":
+                raise RuntimeError("问答任务不在运行状态")
+            conn.execute(
+                """INSERT INTO agent_messages(
+                       id,thread_id,run_id,project_id,role,status,content,metadata)
+                   VALUES(%s,%s,%s,%s,'assistant','completed',%s,%s::jsonb)""",
+                (
+                    str(message_id), str(run["thread_id"]), str(run_id),
+                    int(run["project_id"]), str(answer_text),
+                    self._json({"answer": answer_json}),
+                ),
+            )
+            for citation in citations:
+                conn.execute(
+                    """INSERT INTO agent_claim_citations(
+                         run_id,project_id,message_id,claim_index,claim_text,
+                         evidence_id,citation_index,status)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        str(run_id), int(run["project_id"]), str(message_id),
+                        int(citation["claim_index"]), str(citation["claim_text"]),
+                        str(citation["evidence_id"]), int(citation["citation_index"]),
+                        str(citation["status"]),
+                    ),
+                )
+            completed = conn.execute(
+                """UPDATE agent_runs SET status='completed',stage='completed',
+                          effective_mode=%s,answer_json=%s::jsonb,answer_text=%s,
+                          completed_at=NOW(),updated_at=NOW()
+                   WHERE id=%s RETURNING *""",
+                (
+                    str(effective_mode), self._json(answer_json),
+                    str(answer_text), str(run_id),
+                ),
+            ).fetchone()
+            for event in stream_events or []:
+                conn.execute(
+                    """INSERT INTO agent_run_events(
+                         run_id,project_id,event_type,payload)
+                       VALUES(%s,%s,%s,%s::jsonb)""",
+                    (
+                        str(run_id), int(run["project_id"]),
+                        str(event.get("event_type") or "answer_delta"),
+                        self._json(event.get("payload") or {}),
+                    ),
+                )
+            conn.execute(
+                """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                   VALUES(%s,%s,'completed',%s::jsonb)""",
+                (
+                    str(run_id), int(run["project_id"]),
+                    self._json({"status": "completed", "message_id": str(message_id)}),
+                ),
+            )
+            conn.execute(
+                "UPDATE agent_threads SET updated_at=NOW() WHERE id=%s",
+                (str(run["thread_id"]),),
+            )
+            return completed
+
+    def terminate_agent_run(
+        self, run_id: str, *, status: str, error_message: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"failed", "cancelled"}:
+            raise ValueError("非法问答终止状态")
+        with self.connection() as conn:
+            row = conn.execute(
+                """UPDATE agent_runs SET status=%s,stage=%s,error_message=%s,
+                          completed_at=NOW(),updated_at=NOW()
+                   WHERE id=%s AND status IN ('queued','running') RETURNING *""",
+                (str(status), str(status), str(error_message)[:4000], str(run_id)),
+            ).fetchone()
+            changed = bool(row)
+            if not row:
+                row = conn.execute(
+                    "SELECT * FROM agent_runs WHERE id=%s", (str(run_id),),
+                ).fetchone()
+            if not row:
+                raise LookupError("问答任务不存在")
+            if changed and row["status"] == status:
+                conn.execute(
+                    """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                       VALUES(%s,%s,%s,%s::jsonb)""",
+                    (
+                        str(run_id), int(row["project_id"]), str(status),
+                        self._json({"status": status, "error": str(error_message)[:1000]}),
+                    ),
+                )
+            return row
+
+    def get_agent_evidence(
+        self, evidence_id: str, *, session_key_hash: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT evidence.* FROM agent_evidence evidence
+                   JOIN agent_runs run ON run.id=evidence.run_id
+                   JOIN agent_threads thread ON thread.id=run.thread_id
+                   WHERE evidence.evidence_id=%s
+                     AND thread.session_key_hash=%s
+                     AND thread.status='active'""",
+                (str(evidence_id), str(session_key_hash)),
+            ).fetchone()
+
+    def record_agent_feedback(
+        self, *, feedback_id: str, run_id: str, session_key_hash: str,
+        rating: int, comment: str, action: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.connection() as conn:
+            run = conn.execute(
+                """SELECT run.* FROM agent_runs run JOIN agent_threads thread
+                     ON thread.id=run.thread_id
+                   WHERE run.id=%s AND thread.session_key_hash=%s
+                     AND thread.status='active'""",
+                (str(run_id), str(session_key_hash)),
+            ).fetchone()
+            if not run:
+                raise PermissionError("问答任务不存在或无权访问")
+            return conn.execute(
+                """INSERT INTO agent_feedback(
+                       id,run_id,project_id,session_key_hash,rating,comment,action,metadata)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT(run_id,session_key_hash,action) DO UPDATE SET
+                     rating=EXCLUDED.rating,comment=EXCLUDED.comment,
+                     metadata=EXCLUDED.metadata,updated_at=NOW()
+                   RETURNING *""",
+                (
+                    str(feedback_id), str(run_id), int(run["project_id"]),
+                    str(session_key_hash), int(rating), str(comment)[:2000],
+                    str(action)[:100], self._json(metadata),
+                ),
+            ).fetchone()
+
+    def recover_interrupted_agent_runs(self) -> int:
+        """Fail closed after process loss; a queued/running answer is never resumed blindly."""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                """UPDATE agent_runs SET status='failed',stage='failed',
+                          error_message='服务重启中断了本次问答，请重新检索',
+                          completed_at=NOW(),updated_at=NOW()
+                   WHERE status IN ('queued','running') RETURNING id,project_id"""
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """INSERT INTO agent_run_events(run_id,project_id,event_type,payload)
+                       VALUES(%s,%s,'failed',%s::jsonb)""",
+                    (
+                        str(row["id"]), int(row["project_id"]),
+                        self._json({
+                            "status": "failed",
+                            "error": "服务重启中断了本次问答，请重新检索",
+                        }),
+                    ),
+                )
+            return len(rows)

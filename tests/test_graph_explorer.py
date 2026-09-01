@@ -48,6 +48,70 @@ def test_overview_aggregates_bidirectional_cross_group_edges_once():
     assert view["isolated_entities"] == 1
 
 
+def test_overview_explains_cross_community_fact_aggregate_with_sources():
+    payload = _payload()
+    cross_edges = {
+        edge["id"]: edge for edge in payload["edges"] if edge["id"] in {"bc", "ca"}
+    }
+    cross_edges["bc"].update({
+        "predicate_label": "依赖",
+        "evidence_text": "Beta 依赖 Gamma。",
+        "evidence_count": 1,
+        "document_id": 10,
+        "source_info": {
+            "document_id": 10,
+            "filename": "alpha.pdf",
+            "page_label": "第 3 页",
+            "media_assets": [{"url": "/media/a.png", "title": "图 1"}],
+        },
+    })
+    cross_edges["ca"].update({
+        "predicate_label": "使用",
+        "evidence_text": "Gamma 使用 Alpha。",
+        "evidence_count": 1,
+        "document_id": 11,
+        "source_info": {
+            "document_id": 11,
+            "filename": "beta.docx",
+            "page_label": "第 7 页",
+        },
+    })
+    payload["edges"].append({
+        "id": "bd", "source": "b", "target": "d",
+        "predicate_label": "依赖", "evidence_text": "Beta 也依赖 Delta。",
+        "document_id": 10,
+        "source_info": {
+            "document_id": 10, "filename": "alpha.pdf", "page_label": "第 4 页",
+        },
+    })
+
+    view = build_graph_explorer_view(
+        payload, mode="overview", overview_relation_scope="all",
+    )
+    edge = view["edges"][0]
+
+    assert edge["label"] == "主要为依赖 · 2/3"
+    assert edge["predicate_counts"] == [
+        {"label": "依赖", "count": 2},
+        {"label": "使用", "count": 1},
+    ]
+    assert edge["predicate_type_count"] == 2
+    assert edge["entity_pair_count"] == 3
+    assert edge["document_count"] == 2
+    assert edge["evidence_count"] == 3
+    assert edge["direction_counts"] == {
+        "source_to_target": 2, "target_to_source": 1,
+    }
+    assert {item["predicate_label"] for item in edge["relation_examples"]} == {
+        "依赖", "使用",
+    }
+    assert any(
+        item["source_info"].get("media_assets")
+        for item in edge["relation_examples"]
+    )
+    assert not any(key.startswith("_") for key in edge)
+
+
 def test_community_and_neighbour_views_are_bounded_and_exact():
     community = build_graph_explorer_view(
         _payload(), mode="community", community_key="g2", limit=20,
@@ -254,6 +318,90 @@ def test_all_relationship_communities_scope_includes_internal_only_groups():
     assert view["hidden_internal_only_communities"] == 0
     internal_node = next(item for item in view["nodes"] if item["group"] == "g4")
     assert internal_node["community_report"]["summary"] == "报告"
+
+
+def test_all_community_scope_adds_topic_navigation_without_changing_fact_views():
+    payload = _payload()
+    payload["nodes"].extend([
+        {"id": "f", "title": "Foxtrot", "group": "g4", "degree": 1},
+        {"id": "g", "title": "Golf", "group": "g4", "degree": 1},
+    ])
+    payload["edges"].append({"id": "fg", "source": "f", "target": "g"})
+    payload["groups"].append({
+        "key": "g4", "label": "内部社区", "size": 2,
+        "relationship_count": 1,
+    })
+    payload["community_topic_associations"] = [{
+        "id": "topic-g2-g4",
+        "source_community_key": "g2",
+        "target_community_key": "g4",
+        "score": 0.91,
+        "threshold": 0.82,
+        "shared_document_count": 1,
+        "lexical_support": True,
+        "selection_reasons": ["mutual_nearest"],
+        "representative_entity_matches": [{
+            "source_entity_key": "c", "source_entity_name": "Gamma",
+            "target_entity_key": "f", "target_entity_name": "Foxtrot",
+            "score": 0.93,
+        }],
+        "kind": "community_topic_association",
+    }]
+    payload["community_topic_association_metrics"] = {
+        "policy_version": "fixture-v1",
+    }
+
+    backbone = build_graph_explorer_view(payload, mode="overview")
+    factual = build_graph_explorer_view(
+        payload, mode="overview", overview_relation_scope="all",
+    )
+    complete = build_graph_explorer_view(
+        payload, mode="overview", overview_relation_scope="all_communities",
+    )
+
+    assert all(
+        edge["kind"] != "community_topic_association"
+        for edge in backbone["edges"] + factual["edges"]
+    )
+    topic = next(
+        edge for edge in complete["edges"]
+        if edge["kind"] == "community_topic_association"
+    )
+    assert {topic["source"], topic["target"]} == {
+        "community:g2", "community:g4",
+    }
+    assert topic["directed"] is False
+    assert topic["label"] == "内容相近 91%"
+    assert topic["evidence_text"] == ""
+    assert "count" not in topic
+    assert topic["selection_reasons"] == ["mutual_nearest"]
+    assert topic["representative_entity_matches"][0]["source_entity_name"] == "Gamma"
+    assert topic["shared_document_count"] == 1
+    assert topic["lexical_support"] is True
+    assert complete["total_cross_community_relationships"] == 1
+    assert complete["visible_cross_community_relationships"] == 1
+    assert complete["total_topic_associations"] == 1
+    assert complete["visible_topic_associations"] == 1
+    assert complete["community_topic_association_metrics"]["policy_version"] == (
+        "fixture-v1"
+    )
+
+
+def test_topic_navigation_does_not_draw_a_second_line_over_a_factual_bridge():
+    payload = _payload()
+    payload["community_topic_associations"] = [{
+        "source_community_key": "g1",
+        "target_community_key": "g2",
+        "score": 0.99,
+    }]
+
+    view = build_graph_explorer_view(
+        payload, mode="overview", overview_relation_scope="all_communities",
+    )
+
+    assert len(view["edges"]) == 1
+    assert view["edges"][0]["kind"] == "community_relation"
+    assert view["visible_topic_associations"] == 0
 
 
 def test_overview_does_not_present_isolated_type_fallback_as_a_community():

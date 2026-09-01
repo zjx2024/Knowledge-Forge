@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import re
+import time
 import threading
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -39,6 +40,7 @@ from .knowledge_language import (
     KNOWLEDGE_LANGUAGE_OPTIONS,
     normalize_knowledge_language,
 )
+from .agent.authorization import new_session_key, validate_session_key
 
 
 LOGGER = logging.getLogger(__name__)
@@ -70,6 +72,17 @@ def _named_options(options: dict[str, str], selected: str = "", *, include_auto:
         f'<option value="{_esc(key)}"{" selected" if key == selected else ""}>{_esc(label)}</option>'
         for key, label in options.items() if include_auto or key != "auto"
     )
+
+
+def _processing_method_label(item: dict, *, include_chunking: bool) -> str:
+    """Present persisted parser/chunk keys using the same labels as settings."""
+
+    parser = str(item.get("effective_parser") or "").strip()
+    chunking = str(item.get("effective_chunk_strategy") or "").strip()
+    labels = [PARSER_OPTIONS.get(parser, parser)] if parser else []
+    if include_chunking and chunking:
+        labels.append(CHUNK_STRATEGY_OPTIONS.get(chunking, chunking))
+    return " · ".join(label for label in labels if label)
 
 
 def _knowledge_language_options(selected: str = CHINESE) -> str:
@@ -111,10 +124,10 @@ STRATEGY_UI = {
         "query_navigation_hint": "构建、浏览与检索",
         "preparation_label": "预处理文档",
         "preparation_log_label": "查看预处理日志",
-        "preparation_title": "生成结构块、Chunk 分片、向量索引和知识结构定义，不抽取实体关系，也不更新知识图谱",
-        "build_label": "构建项目图谱",
+        "preparation_title": "生成结构块、知识块、向量索引和知识结构定义，不抽取实体关系，也不更新知识图谱",
+        "build_label": "构建知识图谱",
         "build_ready_title": "基于已完成预处理的文档抽取实体关系并构建知识图谱",
-        "build_not_ready_title": "请先预处理文档，完成结构块、Chunk、向量和知识结构定义后再构建知识",
+        "build_not_ready_title": "请先预处理文档，完成结构块、知识块、向量和知识结构定义后再构建知识",
         "job_log_label": "查看图谱构建日志",
         "viewer_label": "查看知识图谱",
         "task_title": "知识库构建",
@@ -129,19 +142,19 @@ STRATEGY_UI = {
         "task_descriptions": {
             "structure": "读取源文档并恢复标题、正文、表格等结构。",
             "chunking": "生成可检索知识块并写入向量索引。",
-            "schema_base": "确认项目允许的实体类别与关系规则。",
+            "schema_base": "确认知识库允许的实体类别与关系规则。",
             "extraction": "从知识块识别实体、关系及其原文证据。",
-            "graph_sync": "发布当前项目可浏览的知识图谱。",
+            "graph_sync": "发布当前知识库可浏览的知识图谱。",
         },
         "stat_labels": {"documents": "文档", "chunks": "知识块", "entities": "实体", "relations": "关系"},
         "prepared_stage": "已完成预处理，等待知识构建",
         "pending_stage": "等待文档预处理与知识构建",
-        "chunk_action_label": "Chunk 分片",
+        "chunk_action_label": "知识块",
         "show_schema_controls": True,
     },
     KNOWLEDGE_FORGE_STRATEGY: {
         "workspace_title": "Knowledge Forge 构建",
-        "workspace_description": "复用已准备的文档和知识结构，完成实体归一、关系核验并发布可追溯的项目图谱。",
+        "workspace_description": "复用已准备的文档和知识结构，完成实体归一、关系核验并发布可追溯的知识图谱。",
         "preparation_workspace_title": "Knowledge Forge 文档预处理",
         "preparation_workspace_description": "解析源文档，生成结构块、知识块、向量索引和知识结构，供后续图谱构建复用。",
         "preparation_navigation_label": "文档预处理",
@@ -151,11 +164,11 @@ STRATEGY_UI = {
         "preparation_label": "预处理文档",
         "preparation_log_label": "查看预处理日志",
         "preparation_title": "生成供后续图谱构建复用的结构块、知识块、向量索引和知识结构",
-        "build_label": "构建项目图谱",
-        "build_ready_title": "基于已完成预处理的结果抽取实体关系并构建项目图谱",
+        "build_label": "构建知识图谱",
+        "build_ready_title": "基于已完成预处理的结果抽取实体关系并构建知识图谱",
         "build_not_ready_title": "请先预处理全部文档，完成可复用的结构块、知识块、向量和知识结构后再构建图谱",
         "job_log_label": "查看图谱构建日志",
-        "viewer_label": "查看项目图谱",
+        "viewer_label": "查看知识图谱",
         "task_title": "Knowledge Forge 构建",
         "task_profile": "entity_graph",
         "task_labels": {
@@ -163,36 +176,36 @@ STRATEGY_UI = {
             "chunking": "复用知识块与向量",
             "schema_base": "确认知识结构",
             "extraction": "抽取并核验关系",
-            "graph_sync": "发布项目图谱",
+            "graph_sync": "发布知识图谱",
         },
         "task_descriptions": {
             "structure": "读取或复用文档结构，确保后续处理使用同一版本。",
             "chunking": "生成可检索知识块和向量；已有结果会直接复用。",
-            "schema_base": "冻结实体类别、关系语义、方向和发布规则。",
+            "schema_base": "确认实体类别、关系语义、方向和发布规则。",
             "extraction": "识别实体并归一别名，生成候选关系后逐条核验原文证据。",
-            "graph_sync": "把规范实体和通过验证的关系发布到当前项目图谱。",
+            "graph_sync": "把规范实体和通过验证的关系发布到当前知识库图谱。",
         },
         "stat_labels": {"documents": "文档", "chunks": "知识块", "entities": "规范实体", "relations": "已验证关系"},
         "prepared_stage": "预处理已就绪，等待图谱构建",
         "pending_stage": "等待文档预处理与图谱构建",
-        "chunk_action_label": "预处理 Chunk",
+        "chunk_action_label": "知识块",
         "show_schema_controls": True,
     },
     GRAPHRAG_NATIVE_STRATEGY: {
         "workspace_title": "GraphRAG Native 知识图谱构建",
         "workspace_description": "从已准备的文档中识别实体和关系，并生成主题社区与摘要。构建完成后可直接浏览图谱或进行知识问答。",
         "preparation_workspace_title": "GraphRAG Native 源文档准备",
-        "preparation_workspace_description": "解析并冻结 GraphRAG 使用的结构化文档；文本单元、知识图谱和社区在下一页构建。",
+        "preparation_workspace_description": "解析源文档并固定本次构建使用的结构化版本；文本单元、知识图谱和社区在下一页生成。",
         "preparation_navigation_label": "源文档准备",
-        "preparation_navigation_hint": "解析、冻结与过程产物",
+        "preparation_navigation_hint": "解析、版本固定与过程产物",
         "query_navigation_label": "语义图谱与问答",
         "query_navigation_hint": "构建、浏览与问答",
         "preparation_label": "准备源文档",
         "preparation_log_label": "查看源文档准备日志",
-        "preparation_title": "解析并冻结结构化源文档；不会生成 Knowledge Forge 知识块、pgvector 或知识结构定义。",
+        "preparation_title": "解析并固定本次使用的结构化源文档；不会生成 Knowledge Forge 知识块、向量索引或知识结构定义。",
         "build_label": "构建知识图谱",
         "build_ready_title": "从已准备的源文档构建实体关系、主题社区和问答索引",
-        "build_not_ready_title": "请先准备全部源文档，生成可冻结的结构化文档后再构建知识图谱",
+        "build_not_ready_title": "请先准备全部源文档，生成本次构建使用的结构化文档后再构建知识图谱",
         "job_log_label": "查看知识图谱构建日志",
         "viewer_label": "查看知识图谱",
         "task_title": "GraphRAG Native 构建",
@@ -205,15 +218,15 @@ STRATEGY_UI = {
             "graph_sync": "验证并发布知识图谱成果",
         },
         "task_descriptions": {
-            "structure": "冻结本次使用的源文档版本，创建隔离运行目录。",
+            "structure": "固定本次构建使用的源文档版本，并创建独立运行目录。",
             "chunking": "检查 GraphRAG 版本、设置和提示模板是否完整。",
             "schema_base": "确认文本生成与向量模型可用且维度一致。",
             "extraction": "运行 GraphRAG 标准流程，生成文本单元、实体关系、社区、报告和向量检索数据。",
-            "graph_sync": "独立校验全部产物，通过后发布不可变的知识图谱成果。",
+            "graph_sync": "校验全部构建成果，通过后发布知识图谱。",
         },
         "stat_labels": {"documents": "文档", "chunks": "文本单元", "entities": "实体", "relations": "关系"},
-        "prepared_stage": "源文档已就绪，等待 GraphRAG Native 构建",
-        "pending_stage": "等待源文档准备",
+        "prepared_stage": "等待知识图谱构建",
+        "pending_stage": "需要先准备源文档",
         "chunk_action_label": "结构化文档",
         "show_schema_controls": False,
     },
@@ -362,6 +375,9 @@ def _document_rows(documents: list[dict], strategy_key: str) -> str:
     ui = _strategy_ui(strategy_key)
     for item in documents:
         document_id = int(item["id"])
+        processing_method = _processing_method_label(
+            item, include_chunking=strategy_key != GRAPHRAG_NATIVE_STRATEGY,
+        )
         stable_ready = bool(item.get("active_revision_id")) and item.get("status") == "indexed"
         if strategy_key == STABLE_STRATEGY:
             status = str(item.get("strategy_status") or "uploaded")
@@ -377,24 +393,24 @@ def _document_rows(documents: list[dict], strategy_key: str) -> str:
         error = "" if strategy_key == GRAPHRAG_NATIVE_STRATEGY else str(item.get("strategy_error_message") or "")
         status_label = STATUS_NAMES.get(status, status)
         if strategy_key == GRAPHRAG_NATIVE_STRATEGY:
-            status_label = "源文档已准备" if stable_ready else "待准备"
+            status_label = "已准备" if stable_ready else "待准备"
         # Strategy-owned process artifacts live on the second workspace page;
         # document management is limited to source-file lifecycle actions.
         process_actions = ""
         rows.append(
-            f"""<tr><td><strong>{_esc(item['original_filename'])}</strong></td>
-            <td>{item['file_size_bytes']/1024:.1f} KB</td><td>
+            f"""<tr><td data-label="文件"><strong>{_esc(item['original_filename'])}</strong></td>
+            <td data-label="大小">{item['file_size_bytes']/1024:.1f} KB</td><td data-label="状态">
               <span class="status status-{_esc(status)}" data-document-status="{document_id}">{_esc(status_label)}</span>
               <small data-stage-label="{document_id}">{_esc(stage)}</small>
-              {f'<small>{_esc(item.get("effective_parser"))} · {_esc(item.get("effective_chunk_strategy"))}</small>' if item.get('effective_parser') else ''}
+              {f'<small>{_esc(processing_method)}</small>' if processing_method else ''}
               {f'<small class="failure">{_esc(error)}</small>' if error else ''}
-            </td><td>{_time(item.get('strategy_updated_at') or item['updated_at'])}</td>
-            <td class="actions">{process_actions}
+            </td><td data-label="更新时间">{_time(item.get('strategy_updated_at') or item['updated_at'])}</td>
+            <td class="actions" data-label="操作">{process_actions}
               <a class="button small secondary" href="/api/documents/{document_id}/download">下载</a>
               <button class="icon-button danger" title="删除文档" data-delete="{document_id}">×</button>
             </td></tr>"""
         )
-    return "".join(rows) or '<tr><td colspan="5" class="empty">该项目尚未上传文档。</td></tr>'
+    return "".join(rows) or '<tr class="document-empty-row"><td colspan="5" class="empty">该知识库尚未上传文档。</td></tr>'
 
 
 def _schema_item(item: object) -> dict[str, object]:
@@ -563,7 +579,7 @@ def _knowledge_structure_details(
     relations = [_schema_item(item) for item in data.get("relation_types", [])]
     entity_cards = "".join(
         f"""<article class="definition-card"><div class="definition-card-head">
-          <strong>{_esc(_schema_name_zh(item.get("name")))}</strong><span>实体类别</span></div>
+          <strong>{_esc(_schema_name_zh(item.get("name")))}</strong></div>
           <p>{_esc(_schema_ui_zh(item.get("description_zh") or item.get("description"), "暂无类别说明"))}</p></article>"""
         for item in entities
     ) or '<div class="empty-state compact-empty">当前版本未定义实体类别。</div>'
@@ -583,7 +599,7 @@ def _knowledge_structure_details(
       <div class="section-heading"><div>
         <div class="knowledge-structure-title"><h2>知识结构定义</h2>
           <span class="schema-version-badge">当前版本 v{_esc(schema.get("version") or "")}</span></div>
-        <p>定义项目允许识别的实体类别、关系语义、端点类型与方向；构建时据此约束抽取和验证。</p></div>
+        <p>定义知识库允许识别的实体类别、关系语义、连接范围与方向；构建时据此约束抽取和验证。</p></div>
         {reassess_button}</div>
       <section class="definition-group"><div class="definition-group-heading"><h3>实体类别</h3><span>{len(entities)} 类</span></div>
         <div class="definition-grid entity-definition-grid">{entity_cards}</div></section>
@@ -599,21 +615,20 @@ def _knowledge_forge_process_artifacts(documents: list[dict]) -> str:
         quality = item.get("parse_quality") if isinstance(item.get("parse_quality"), dict) else {}
         block_count = int(quality.get("block_count") or 0)
         chunk_count = int(item.get("prepared_chunk_count") or 0)
-        parser = str(item.get("effective_parser") or "等待预处理")
-        chunk_strategy = str(item.get("effective_chunk_strategy") or "等待预处理")
+        processing_method = _processing_method_label(item, include_chunking=True)
         rows.append(
-            f"""<tr><td><strong>{_esc(item['original_filename'])}</strong>
-              <small>{_esc(parser)} · {_esc(chunk_strategy)}</small></td>
-            <td><b class="artifact-count">{block_count}</b><small>结构块</small></td>
-            <td><b class="artifact-count">{chunk_count}</b><small>知识块</small></td>
-            <td class="artifact-actions">
+            f"""<tr><td data-label="文档"><strong>{_esc(item['original_filename'])}</strong>
+              <small>{_esc(processing_method or '等待预处理')}</small></td>
+            <td data-label="结构解析"><b class="artifact-count">{block_count}</b><small>结构块</small></td>
+            <td data-label="知识分块"><b class="artifact-count">{chunk_count}</b><small>知识块</small></td>
+            <td class="artifact-actions" data-label="查看列表">
               <button class="button small secondary" type="button" data-view-structure="{document_id}"
                 {"disabled" if not item.get("structure_ready_at") else ""}>查看结构块列表</button>
               <button class="button small secondary" type="button" data-view-chunks="{document_id}"
                 {"disabled" if not item.get("chunks_ready_at") else ""}>查看知识块列表</button>
             </td></tr>"""
         )
-    body = "".join(rows) or '<tr><td colspan="4" class="empty">上传并预处理文档后，这里会集中展示结构块和知识块。</td></tr>'
+    body = "".join(rows) or '<tr class="artifact-empty-row"><td colspan="4" class="empty">上传并预处理文档后，这里会集中展示结构块和知识块。</td></tr>'
     return f"""<div class="workspace-section process-artifacts">
       <div class="section-heading"><div><h2>文档处理产物</h2>
         <p>集中查看每份文档的结构块与知识块，无需返回文档管理页面。</p></div></div>
@@ -630,24 +645,24 @@ def _graphrag_native_process_artifacts(documents: list[dict]) -> str:
         document_id = int(item["id"])
         quality = item.get("parse_quality") if isinstance(item.get("parse_quality"), dict) else {}
         block_count = int(quality.get("block_count") or 0)
-        parser = str(item.get("effective_parser") or "等待准备")
+        parser = _processing_method_label(item, include_chunking=False)
         ready = bool(item.get("structure_ready_at"))
         rows.append(
-            f"""<tr><td><strong>{_esc(item['original_filename'])}</strong>
-              <small>{_esc(parser)}</small></td>
-            <td><b class="artifact-count">{block_count}</b><small>源结构块</small></td>
-            <td><span class="status {'status-indexed' if ready else ''}">{'已冻结' if ready else '待准备'}</span></td>
-            <td class="artifact-actions">
+            f"""<tr><td data-label="文档"><strong>{_esc(item['original_filename'])}</strong>
+              <small>{_esc(parser or '等待准备')}</small></td>
+            <td data-label="结构解析"><b class="artifact-count">{block_count}</b><small>源结构块</small></td>
+            <td data-label="准备状态"><span class="status {'status-indexed' if ready else ''}">{'已准备' if ready else '待准备'}</span></td>
+            <td class="artifact-actions" data-label="查看过程文件">
               <button class="button small secondary" type="button" data-view-structure="{document_id}"
                 {"disabled" if not ready else ""}>查看源结构</button>
               <button class="button small secondary" type="button" data-view-native-documents="{document_id}"
                 {"disabled" if not ready else ""}>查看结构化文档</button>
             </td></tr>"""
         )
-    body = "".join(rows) or '<tr><td colspan="4" class="empty">上传并准备源文档后，这里会展示 GraphRAG 的冻结输入。</td></tr>'
+    body = "".join(rows) or '<tr class="artifact-empty-row"><td colspan="4" class="empty">上传并准备源文档后，这里会展示 GraphRAG 本次使用的构建输入。</td></tr>'
     return f"""<div class="workspace-section process-artifacts native-process-artifacts">
       <div class="section-heading"><div><h2>源文档准备产物</h2>
-        <p>集中查看源结构与冻结的结构化文档；文本单元和图谱产物在“语义图谱与问答”页查看。</p></div></div>
+        <p>集中查看源结构与本次构建使用的结构化文档；文本单元和图谱产物在“语义图谱与问答”页查看。</p></div></div>
       <div class="table-wrap"><table class="artifact-table"><thead><tr><th>文档与解析方式</th>
         <th>结构解析</th><th>准备状态</th><th>查看过程文件</th></tr></thead><tbody>{body}</tbody></table></div>
     </div>"""
@@ -920,10 +935,9 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
         if status == "bound" and strategy_key in {
             KNOWLEDGE_FORGE_STRATEGY, GRAPHRAG_NATIVE_STRATEGY,
         }:
-            strategy = _strategy_ui(strategy_key)
             action = (
                 f'<a class="button primary" href="{_workspace_path(project_id, strategy_key)}">'
-                f'进入 {_esc(strategy["workspace_title"])}</a>'
+                '打开知识库</a>'
             )
             badge = _esc(
                 next(
@@ -940,10 +954,10 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
             )
             action = f"""<form method="post" action="/projects/{project_id}/strategy" class="bind-form">
               <input type="hidden" name="expected_generation" value="{generation}">
-              <select name="strategy_key" aria-label="选择 {_esc(project['name'])} 的知识图谱策略" required>{choices}</select>
-              <button class="button primary" type="submit">确认并进入</button>
+              <select name="strategy_key" aria-label="选择 {_esc(project['name'])} 的知识构建方式" required>{choices}</select>
+              <button class="button primary" type="submit">选择并打开</button>
             </form>"""
-            badge = "待确认策略"
+            badge = "待选择构建方式"
         cards.append(f"""<article class="project-card" data-project-card
           data-project-search="{_esc(' '.join((str(project.get('name') or ''), str(project.get('description') or ''), badge)))}"><div><h3>{_esc(project['name'])}</h3>
           <p>{_esc(project.get('description') or '暂无知识库说明')}</p>
@@ -965,76 +979,80 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
       {notice}
       <section class="panel home-hero" aria-labelledby="home-introduction-title">
         <div class="hero-layout"><div class="hero-copy">
-          <span class="hero-kicker">从原始文档到可解释知识</span>
-          <h2 id="home-introduction-title">让分散的资料成为可检索、可连接、可追溯的知识资产</h2>
-          <p>Knowledge Forge 面向需要长期积累和使用文档知识的团队。你可以导入 PDF、Word、表格、Markdown
-          和文本资料，由系统完成结构解析、语义组织、实体关系构建与知识查询。</p>
-          <p>平台提供两条彼此独立、定位不同的构建路线：Knowledge Forge 将知识库级宏观上下文、
-          全局实体先验和局部语义范围候选补充融入实体归一与关系核验，兼顾主题脉络、细节召回和原文证据；
-          GraphRAG Native 则运行独立的 GraphRAG 标准工作流，生成原生社区、摘要和问答索引。每个知识库固定选择一种路线，
-          让数据边界和运行结果始终清晰。</p>
+          <span class="hero-kicker">从文档建设知识，再让知识参与回答</span>
+          <h2 id="home-introduction-title">把分散文档建设成可检索、可连接、可追溯的知识库</h2>
+          <p>导入 PDF、Word、表格、Markdown 和文本资料，系统保留章节、页码、图表和来源，
+          再完成知识块索引、实体关系组织与知识图谱构建。</p>
+          <p>多个知识库在同一入口中独立管理；需要使用知识时，可进入智能问答工作台选择相应知识范围。</p>
+          <div class="hero-actions">
+            <button class="button primary" type="button" data-open-knowledge-bases>管理知识库</button>
+            <a class="button secondary" href="/chat">进入智能问答</a>
+          </div>
         </div>
         <div class="hero-points" aria-label="平台能力">
           <div><b>多格式解析</b><span>保留章节、表格、页码和来源结构</span></div>
-          <div><b>知识可追溯</b><span>实体、关系和回答可回看原文依据</span></div>
-          <div><b>宏观与细节</b><span>从全局主题脉络逐步查看可核验的关系证据</span></div>
-          <div><b>本地化运行</b><span>使用本机 PostgreSQL、Ollama 与图数据</span></div>
+          <div><b>结构化知识</b><span>组织知识块、实体、关系、社区与图谱</span></div>
+          <div><b>原文可追溯</b><span>检索结果和图谱事实均可回看来源</span></div>
+          <div><b>私有化部署</b><span>模型、向量与图数据保留在自有环境</span></div>
         </div></div>
         <ol class="home-flow" aria-label="知识构建流程">
-          <li><b>1</b><span><strong>导入资料</strong><small>汇集知识库文档</small></span></li>
-          <li><b>2</b><span><strong>解析结构</strong><small>理解章节与内容边界</small></span></li>
-          <li><b>3</b><span><strong>构建知识</strong><small>形成实体、关系与主题网络</small></span></li>
-          <li><b>4</b><span><strong>检索探索</strong><small>查询、审计并持续迭代</small></span></li>
+          <li><b>1</b><span><strong>导入文档</strong><small>集中管理多格式资料</small></span></li>
+          <li><b>2</b><span><strong>文档预处理</strong><small>解析结构并建立向量索引</small></span></li>
+          <li><b>3</b><span><strong>构建知识库</strong><small>形成实体、关系与主题网络</small></span></li>
+          <li><b>4</b><span><strong>检索与问答</strong><small>依据原文和图谱使用知识</small></span></li>
         </ol>
       </section>
+      <section class="panel product-overview" aria-labelledby="product-overview-title">
+        <div class="section-heading"><div><span class="section-kicker">两项核心能力</span>
+          <h2 id="product-overview-title">建设知识，也使用知识</h2>
+          <p>知识库负责沉淀和治理资料，智能问答负责在授权范围内检索、组合并引用这些知识。</p>
+        </div></div>
+        <div class="product-entry-grid">
+          <article class="product-entry-card knowledge-entry"><div class="product-entry-index">01</div><div>
+            <div class="product-entry-heading"><h3>知识库</h3></div>
+            <p>创建和管理多个知识库，完成文档预处理、向量索引、实体关系抽取、社区报告和图谱浏览。</p>
+            <button class="text-action" type="button" data-open-knowledge-bases>查看知识库 <b aria-hidden="true">→</b></button>
+          </div></article>
+          <article class="product-entry-card chat-product-entry"><div class="product-entry-index">02</div><div>
+            <div class="product-entry-heading"><h3>智能问答</h3></div>
+            <p>选择一个知识库后提问，系统结合原文与图谱内容生成回答、标注引用，并在依据不足时明确说明。</p>
+            <a class="text-action" href="/chat">进入问答工作台 <b aria-hidden="true">→</b></a>
+          </div></article>
+        </div>
+      </section>
       <section class="panel strategy-overview" aria-labelledby="strategy-overview-title">
-        <div class="section-heading strategy-heading"><div><span class="section-kicker">创建知识库前先做选择</span>
-          <h2 id="strategy-overview-title">两种知识构建方式，分别适合什么场景？</h2>
-          <p>它们共享同一个知识库入口，但准备、构建、存储和查询链路互不混用。Knowledge Forge 融合宏观主题先验与细节证据核验，
-          GraphRAG Native 保留原生标准产物链；下面的差异会直接影响最终图谱的形态。</p>
+        <div class="section-heading strategy-heading"><div><span class="section-kicker">新建知识库时选择</span>
+          <h2 id="strategy-overview-title">两种构建方式，服务不同的知识目标</h2>
+          <p>每个知识库固定使用一种构建方式。选择只影响该知识库的处理、存储和查询链路，不影响其他知识库。</p>
         </div></div>
         <div class="strategy-intro-grid">
           <article class="strategy-explainer strategy-kf">
             <div class="strategy-card-head"><span class="strategy-mark">KF</span><div>
-              <span class="strategy-tag">宏观与细节兼顾型</span><h3>Knowledge Forge</h3>
+              <h3>Knowledge Forge</h3>
             </div></div>
-            <p class="strategy-lead">在知识库级上下文中发现主题和实体联系，再用原文证据核验受控关系，强调“这是谁、是什么关系、方向是否正确、证据在哪里”。</p>
-            <div class="strategy-path">结构块 → Chunk 与向量 → 宏观上下文 → Schema → 实体归一 → 关系核验 → 隔离图谱</div>
-            <dl class="strategy-details">
-              <div><dt>得到什么</dt><dd>知识库级主题脉络、规范实体、明确谓词与方向、关系事实、原文证据跨度，以及可审计的处理记录。</dd></div>
-              <div><dt>主要特点</dt><dd>借鉴 GraphRAG 的全局上下文和局部语义范围召回，同时保留实体别名归一、关系分类、方向核验与 Schema 约束。</dd></div>
-              <div><dt>查询与存储</dt><dd>PostgreSQL、pgvector 与独立知识图谱协同，支持主要关系、社区总览、实体邻域和证据回溯。</dd></div>
-            </dl>
-            <div class="strategy-fit"><b>更适合</b><ul>
-              <li>既要理解跨文档主题，又要保留细粒度关系</li>
-              <li>在意实体去重、关系方向和原文证据</li>
-              <li>要建设可治理、可复核的领域知识图谱</li>
-            </ul></div>
-            <p class="strategy-tradeoff"><b>需要知道：</b>质量门禁和模型步骤更多，构建通常更慢；Knowledge Forge 结果默认保留为独立构建结果，不自动替换稳定基线。</p>
+            <p class="strategy-lead">在整个知识库范围内归一实体、核验关系与方向，并让图谱事实保留可回看的原文依据。</p>
+            <ul class="strategy-summary-list">
+              <li><b>得到</b><span>规范实体、明确关系、主题社区、详细报告与来源证据</span></li>
+              <li><b>适合</b><span>需要细粒度关系、实体去重和关系审计的知识库</span></li>
+              <li><b>特点</b><span>质量检查更完整，构建时间通常更长</span></li>
+            </ul>
           </article>
           <article class="strategy-explainer strategy-native">
             <div class="strategy-card-head"><span class="strategy-mark">GR</span><div>
-              <span class="strategy-tag">开放探索型</span><h3>GraphRAG Native</h3>
+              <h3>GraphRAG Native</h3>
             </div></div>
-            <p class="strategy-lead">采用 GraphRAG 3.1.1 标准工作流，从文本单元生成语义实体、描述型关系、社区和社区报告。</p>
-            <div class="strategy-path">结构化文档 → 文本单元 → 实体关系 → 社区 → 报告与向量检索</div>
-            <dl class="strategy-details">
-              <div><dt>得到什么</dt><dd>语义网络、关系描述、Leiden 社区、社区摘要、GraphML 和可独立审计的完整成果包。</dd></div>
-              <div><dt>主要特点</dt><dd>更关注文档中“哪些概念彼此相关、形成哪些主题群”，支持跨文档的整体结构发现。</dd></div>
-              <div><dt>如何使用</dt><dd>可按具体对象提问、总结全局主题、深入分析某个主题，或根据原文查找事实。</dd></div>
-            </dl>
-            <div class="strategy-fit"><b>更适合</b><ul>
-              <li>希望快速探索一批资料的主题与联系</li>
-              <li>重视社区发现、全局摘要和开放式问答</li>
-              <li>希望直接使用标准 GraphRAG 构建成果</li>
-            </ul></div>
-            <p class="strategy-tradeoff"><b>需要知道：</b>关系主要是自然语言语义描述，不受知识库谓词 Schema 严格约束；相近实体也可能保留为不同节点。</p>
+            <p class="strategy-lead">采用 GraphRAG 3.1.1 标准工作流，从文本单元生成语义实体、描述型关系、社区与社区报告。</p>
+            <ul class="strategy-summary-list">
+              <li><b>得到</b><span>语义网络、Leiden 社区、社区报告与原生查询成果</span></li>
+              <li><b>适合</b><span>快速理解跨文档主题、社区结构和整体联系</span></li>
+              <li><b>特点</b><span>保留标准 GraphRAG 成果，关系语义更加开放</span></li>
+            </ul>
           </article>
         </div>
         <div class="choice-guide"><b>快速判断</b>
-          <span>需要全局主题脉络，同时要求实体归一、受控关系和审计证据，选择 <strong>Knowledge Forge</strong>。</span>
-          <span>需要快速理解主题网络、社区和全局脉络，选择 <strong>GraphRAG Native</strong>。</span>
-          <em>知识库创建后不能切换构建方式；如果两种结果都需要，请分别创建两个知识库。</em>
+          <span>重视实体归一、明确关系和可核对的原文依据，选择 <strong>Knowledge Forge</strong>。</span>
+          <span>重视社区发现、全局主题和标准 GraphRAG 查询，选择 <strong>GraphRAG Native</strong>。</span>
+          <em>需要同时保留两种结果时，请分别创建两个知识库。</em>
         </div>
       </section>
       <dialog id="project-list-dialog" class="project-list-dialog" aria-labelledby="project-list-title">
@@ -1083,9 +1101,10 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
         }});
         if(projectCount)projectCount.textContent=query?'找到 '+visible+' 个知识库':'';
       }}
-      document.querySelector('#open-project-list')?.addEventListener('click',()=>{{
-        projectDialog.showModal();projectSearch?.focus();filterProjects();
-      }});
+      document.querySelectorAll('#open-project-list,[data-open-knowledge-bases]').forEach(button=>
+        button.addEventListener('click',()=>{{
+          projectDialog.showModal();projectSearch?.focus();filterProjects();
+        }}));
       if(location.hash==='#knowledge-bases'){{
         projectDialog.showModal();projectSearch?.focus();filterProjects();
       }}
@@ -1105,24 +1124,201 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
 
 
 def render_chat_page() -> str:
-    """Top-level, project-independent home for the forthcoming QA agent."""
+    """Top-level single-knowledge-base question answering workspace."""
 
-    knowledge_base_count = len(SERVICE.db.list_projects())
+    template = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>智能问答 · Knowledge Forge</title><style>__CSS__</style></head><body>
+      <main class="shell home-shell agent-shell"><header class="home-header"><div>
+        <h1>Knowledge Forge</h1><p>通用知识库与知识图谱构建平台</p></div>
+        <nav class="home-primary-actions" aria-label="主要功能">
+          <a class="button secondary" href="/#knowledge-bases">知识库</a>
+          <a class="button primary" href="/chat" aria-current="page">智能问答</a>
+        </nav></header>
+        <section class="panel agent-workbench" aria-labelledby="agent-title">
+          <header class="agent-heading"><div><span class="section-kicker">智能问答</span>
+            <h2 id="agent-title">基于当前知识库回答</h2>
+            <p>选择一个知识库后即可提问。回答会标注实际引用的来源；依据不足时会直接说明。</p>
+          </div></header>
+          <section class="agent-scope-bar" aria-label="问答知识范围">
+            <label><span>知识库</span><select id="agent-project"><option value="">正在读取知识库…</option></select></label>
+            <label id="agent-mode-field" hidden><span>问答方式</span>
+              <select id="agent-mode"><option value="auto">自动选择（推荐）</option><option value="basic">原文检索（Basic）</option>
+                <option value="local">实体与关系（Local）</option><option value="global">全局主题（Global）</option></select></label>
+          </section>
+          <div class="agent-layout">
+            <aside class="agent-thread-pane" aria-label="历史会话">
+              <div class="agent-thread-heading"><div><h3>历史会话</h3>
+                <span id="agent-thread-count">选择知识库</span></div>
+                <button class="button secondary" id="agent-new-thread" type="button" disabled>新对话</button></div>
+              <div class="agent-thread-list" id="agent-thread-list">
+                <p class="agent-thread-empty">选择知识库后显示历史会话。</p>
+              </div>
+            </aside>
+            <section class="agent-conversation" aria-label="问答对话">
+              <div class="agent-message-list" id="agent-messages" aria-live="polite">
+                <div class="agent-empty" id="agent-empty"><span>KF</span><h3>选择知识库后开始提问</h3>
+                  <p>回答只使用当前选择的知识库。生成回答后，可在右侧查看引用的原文和图谱依据。</p></div>
+              </div>
+              <div class="agent-composer">
+                <textarea id="agent-query" rows="3" maxlength="4000" disabled placeholder="输入需要基于知识库回答的问题；Shift + Enter 换行"></textarea>
+                <div class="agent-composer-footer"><span id="agent-composer-hint">先选择知识库</span>
+                  <div><button class="button secondary agent-stop" id="agent-stop" type="button" hidden>停止回答</button>
+                    <button class="button primary" id="agent-send" type="button" disabled>发送</button></div></div>
+              </div>
+            </section>
+            <aside class="agent-source-pane" aria-label="本次回答来源">
+              <div class="agent-source-heading"><h3>回答依据</h3>
+                <span id="agent-source-count">0</span></div>
+              <label class="agent-source-turn" id="agent-source-turn-field" hidden>
+                <span>查看回答</span><select id="agent-source-turn"></select></label>
+              <div class="agent-source-content" id="agent-source-content">
+                <p id="agent-source-empty">生成回答后，这里会列出实际使用的原文和图谱依据。</p>
+                <div id="agent-sources" class="agent-source-list"></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </main>
+      <dialog id="agent-evidence-dialog" class="agent-evidence-dialog"><div class="dialog-heading"><div>
+        <h2 id="agent-evidence-title">来源详情</h2><p id="agent-evidence-subtitle"></p></div>
+        <button class="icon-button" id="agent-evidence-close" type="button" aria-label="关闭">×</button></div>
+        <div class="agent-evidence-body" id="agent-evidence-body"></div></dialog>
+      <script>
+      (()=>{
+        const $=selector=>document.querySelector(selector);
+        const state={bases:[],base:null,threads:[],turns:[],threadId:'',selectedTurnId:'',runId:'',stream:null,traceTimer:null,busy:false,loadingThreads:false,loadGeneration:0,sourceSwitchToken:0,lastQuery:'',assistant:null};
+        const projectSelect=$('#agent-project'),modeField=$('#agent-mode-field'),modeSelect=$('#agent-mode');
+        const messages=$('#agent-messages'),empty=$('#agent-empty'),query=$('#agent-query'),send=$('#agent-send'),stop=$('#agent-stop');
+        const threadList=$('#agent-thread-list'),threadCount=$('#agent-thread-count'),newThread=$('#agent-new-thread');
+        const hint=$('#agent-composer-hint'),sourcePane=$('.agent-source-pane'),sourceContent=$('#agent-source-content'),sourceList=$('#agent-sources'),sourceEmpty=$('#agent-source-empty'),sourceCount=$('#agent-source-count');
+        const sourceTurnField=$('#agent-source-turn-field'),sourceTurn=$('#agent-source-turn');
+        const dialog=$('#agent-evidence-dialog'),dialogTitle=$('#agent-evidence-title'),dialogSubtitle=$('#agent-evidence-subtitle'),dialogBody=$('#agent-evidence-body');
+        const text=(tag,value,className='')=>{const node=document.createElement(tag);if(className)node.className=className;node.textContent=String(value??'');return node};
+        const formatType=value=>({chunk:'原文知识块',entity:'实体依据',relation:'关系依据',community_report:'社区报告',native_context:'GraphRAG 上下文'}[value]||'知识依据');
+        const threadKey=id=>'knowledge-forge.agent.thread.'+id;
+        const selectedProjectKey='knowledge-forge.agent.project';
+        const evidenceKey=id=>'knowledge-forge.agent.evidence.'+id;
+        function syncRoute(){const url=new URL(location.href);if(state.base?.id)url.searchParams.set('project',String(state.base.id));else url.searchParams.delete('project');if(state.threadId)url.searchParams.set('thread',state.threadId);else url.searchParams.delete('thread');history.replaceState(null,'',url.pathname+url.search)}
+        function setBusy(value){state.busy=Boolean(value);const locked=state.busy||state.loadingThreads;send.disabled=locked||!state.base?.queryable||!query.value.trim();stop.hidden=!state.busy;projectSelect.disabled=locked;modeSelect.disabled=locked;query.disabled=locked||!state.base?.queryable;newThread.disabled=locked||!state.base?.queryable;threadList.querySelectorAll('button').forEach(button=>button.disabled=locked||button.dataset.blocked==='true');hint.textContent=state.busy?'正在检索并核验依据…':state.loadingThreads?'正在读取历史会话…':state.base?.queryable?'回答只使用当前所选知识库':'先选择可问答的知识库'}
+        function resetSourceTransition(){state.sourceSwitchToken+=1;sourceContent.getAnimations().forEach(animation=>animation.cancel());for(const name of ['height','overflow','opacity','transform','will-change'])sourceContent.style.removeProperty(name)}
+        function resetTurns(){state.turns=[];state.selectedTurnId='';sourceTurn.replaceChildren();sourceTurnField.hidden=true;resetSourceTransition();renderSources([],'生成回答后，这里会列出实际使用的原文和图谱依据。')}
+        function stopTracePolling(){if(state.traceTimer){clearInterval(state.traceTimer);state.traceTimer=null}}
+        function clearConversation(){stopTracePolling();messages.replaceChildren(empty);empty.hidden=Boolean(state.base?.queryable);state.assistant=null;resetTurns()}
+        function createExecutionTrace(runId='',live=false){
+          const root=document.createElement('details');root.className='agent-execution-trace';root.dataset.runId=runId;root.open=Boolean(live);
+          const summary=document.createElement('summary'),label=text('span','执行过程','agent-trace-summary-label'),status=text('span',live?'等待开始':'展开查看','agent-trace-summary-status');summary.append(label,status);
+          const body=document.createElement('div');body.className='agent-trace-body';body.append(text('p',live?'正在记录本轮处理步骤与工具调用…':'展开后读取本轮处理步骤与工具调用。','agent-trace-placeholder'));
+          root.append(summary,body);const view={root,summary,label,status,body,data:null,loading:false,loaded:false};
+          root.addEventListener('toggle',()=>{if(!root.open)return;const turn=state.turns.find(item=>item.runId===root.dataset.runId);if(turn)refreshExecutionTrace(turn)});
+          return view;
+        }
+        function addMessage(role,content,answerData=null,actionContext={}){empty.hidden=true;const card=document.createElement('article');card.className='agent-message '+role;const roleLabel=role==='user'?'你':actionContext.turnNumber?'Knowledge Forge · 第 '+actionContext.turnNumber+' 轮':'Knowledge Forge';card.append(text('span',roleLabel,'agent-message-role'));let trace=null;if(role==='assistant'){trace=createExecutionTrace(actionContext.runId||'',Boolean(actionContext.liveTrace));card.append(trace.root)}const body=text('div',content,'agent-message-body');card.append(body);if(role==='assistant'){const actions=document.createElement('div');actions.className='agent-message-actions';const copy=text('button','复制');copy.type='button';copy.addEventListener('click',async()=>{await navigator.clipboard.writeText(body.textContent||'');copy.textContent='已复制';setTimeout(()=>copy.textContent='复制',1200)});const retry=text('button','重新检索');retry.type='button';retry.addEventListener('click',()=>{query.value=actionContext.query||state.lastQuery||'';submitQuestion()});const up=text('button','有帮助');up.type='button';up.addEventListener('click',()=>sendFeedback(1,up,actionContext.runId));const down=text('button','需改进');down.type='button';down.addEventListener('click',()=>sendFeedback(-1,down,actionContext.runId));actions.append(copy,retry,up,down);card.append(actions);if(answerData?.source_cards)card.dataset.sources=JSON.stringify(answerData.source_cards)}messages.append(card);messages.scrollTop=messages.scrollHeight;return {card,body,trace}}
+        async function sendFeedback(rating,button,runId=''){const target=runId||state.runId;if(!target)return;try{const response=await fetch('/api/agent/runs/'+target+'/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rating})});if(!response.ok)throw Error();button.textContent='已记录';button.disabled=true}catch(_error){button.textContent='提交失败'}}
+        function formatTraceDuration(value){const milliseconds=Math.max(0,Number(value)||0);if(!milliseconds)return '';if(milliseconds<1000)return milliseconds+' ms';const seconds=milliseconds/1000;if(seconds<60)return (seconds<10?seconds.toFixed(1):Math.round(seconds))+' 秒';const minutes=Math.floor(seconds/60),rest=Math.round(seconds%60);return minutes+' 分'+(rest?rest+' 秒':'')}
+        function traceStatusLabel(value){return ({queued:'等待开始',running:'执行中',completed:'已完成',degraded:'已降级完成',failed:'失败',cancelled:'已停止'}[value]||'处理中')}
+        function appendTraceFacts(target,items){const facts=Array.isArray(items)?items.filter(item=>item?.label&&item?.value):[];if(!facts.length)return false;const list=document.createElement('dl');list.className='agent-trace-facts';for(const item of facts){list.append(text('dt',item.label),text('dd',item.value))}target.append(list);return true}
+        function appendTraceEvidence(target,title,items){const evidence=Array.isArray(items)?items.filter(item=>item?.evidence_id):[];if(!evidence.length)return false;const section=document.createElement('section');section.className='agent-trace-evidence';section.append(text('h5',title||'本步使用的具体证据'));const list=document.createElement('div');for(const item of evidence){const card=document.createElement('button');card.type='button';card.className='agent-trace-evidence-card';const head=document.createElement('span');head.className='agent-trace-evidence-head';const marker=Number(item.citation_index||0)?'〔'+item.citation_index+'〕 ':'';head.append(text('b',marker+(item.title||'知识依据')),text('small',(item.type_label||formatType(item.evidence_type))+(item.cited?' · 最终引用':' · 生成依据')));card.append(head);if(item.location)card.append(text('span',item.location,'agent-trace-evidence-location'));if(item.excerpt)card.append(text('p',item.excerpt));card.addEventListener('click',event=>{event.stopPropagation();openEvidence(item.evidence_id)});list.append(card)}section.append(list);target.append(section);return true}
+        function renderExecutionTrace(view,data){
+          if(!view||!data)return;view.data=data;view.loaded=true;view.root.classList.toggle('is-running',['queued','running'].includes(data.status));view.root.classList.toggle('is-failed',data.status==='failed');
+          const counts=[];if(Number(data.step_count||0))counts.push(data.step_count+' 个步骤');if(Number(data.tool_count||0))counts.push(data.tool_count+' 次工具调用');const duration=formatTraceDuration(data.duration_ms);
+          if(['queued','running'].includes(data.status)){view.status.textContent=(data.current_label||'正在处理')+(counts.length?' · '+counts.join(' · '):'')}else{view.status.textContent=(counts.length?counts.join(' · '):traceStatusLabel(data.status))+(duration?' · '+duration:'')}
+          const expandedItems=new Set([...view.body.querySelectorAll('.agent-trace-item-detail[open]')].map(node=>node.dataset.traceKey));
+          view.body.replaceChildren();
+          if(['queued','running'].includes(data.status)){const current=document.createElement('div');current.className='agent-trace-current';current.append(text('i',''),text('span',data.current_label||'正在处理'));view.body.append(current)}
+          const decisions=Array.isArray(data.decisions)?data.decisions:[];
+          if(decisions.length){const section=document.createElement('section');section.className='agent-trace-decisions';section.append(text('h4','本轮处理摘要'));const grid=document.createElement('div');for(const item of decisions){const card=document.createElement('div');card.append(text('b',item.title||'处理决定'),text('p',item.detail||''));grid.append(card)}section.append(grid);view.body.append(section)}
+          const items=Array.isArray(data.items)?data.items:[];
+          if(items.length){const section=document.createElement('section');section.className='agent-trace-timeline';section.append(text('h4','步骤与工具调用'));const list=document.createElement('ol');for(const item of items){const row=document.createElement('li');row.className='agent-trace-item '+(item.kind==='tool'?'is-tool ':'is-step ')+'status-'+(item.status||'running');const marker=text('span','', 'agent-trace-marker');marker.setAttribute('aria-hidden','true');const facts=Array.isArray(item.details)?item.details.filter(fact=>fact?.label&&fact?.value):[],evidence=Array.isArray(item.evidence)?item.evidence.filter(value=>value?.evidence_id):[],expandable=Boolean(facts.length||evidence.length),content=document.createElement(expandable?'details':'div'),head=document.createElement(expandable?'summary':'div');head.className='agent-trace-item-head';const heading=document.createElement('span');heading.className='agent-trace-item-heading';heading.append(text('strong',item.title||'执行步骤'));if(item.detail)heading.append(text('p',item.detail));if(item.kind==='tool'&&item.technical_name)heading.append(text('code',item.technical_name));const meta=document.createElement('span');meta.className='agent-trace-item-meta';meta.append(text('small',traceStatusLabel(item.status)));const itemDuration=formatTraceDuration(item.duration_ms);if(itemDuration)meta.append(text('small',itemDuration));if(expandable)meta.append(text('i','展开','agent-trace-expand-label'));head.append(heading,meta);content.append(head);if(expandable){content.className='agent-trace-item-detail';content.dataset.traceKey=item.key||'';content.open=expandedItems.has(item.key||'');const panel=document.createElement('div');panel.className='agent-trace-item-panel';appendTraceFacts(panel,facts);appendTraceEvidence(panel,item.evidence_title,evidence);content.append(panel)}row.append(marker,content);list.append(row)}section.append(list);view.body.append(section)}
+          if(!decisions.length&&!items.length)view.body.append(text('p','执行台账正在建立，请稍候…','agent-trace-placeholder'));
+          view.body.append(text('p',data.disclosure||'这里展示可审计的处理摘要，不包含模型隐藏推理或未验证草稿。','agent-trace-disclosure'));
+        }
+        async function refreshExecutionTrace(turn,{force=false}={}){if(!turn?.runId||!turn.trace||(!force&&turn.trace.settled))return;const view=turn.trace;if(view.loading){if(force)view.pendingRefresh=true;return}view.loading=true;view.root.dataset.runId=turn.runId;try{const response=await fetch('/api/agent/runs/'+encodeURIComponent(turn.runId)+'/trace'),data=await response.json();if(!response.ok)throw Error(data.error||'执行过程读取失败');if(!view.root.isConnected)return;renderExecutionTrace(view,data);turn.status=data.status||turn.status;view.settled=['completed','failed','cancelled'].includes(data.status);if(view.settled&&turn.runId===state.runId)stopTracePolling()}catch(error){if(view.root.isConnected&&!view.loaded){view.status.textContent='暂时无法读取';view.body.replaceChildren(text('p',error.message||'执行过程读取失败','agent-trace-placeholder'))}}finally{view.loading=false;if(view.pendingRefresh){view.pendingRefresh=false;setTimeout(()=>refreshExecutionTrace(turn,{force:true}),0)}}}
+        function startTracePolling(turn){stopTracePolling();if(!turn?.runId||!turn.trace)return;refreshExecutionTrace(turn,{force:true});if(['completed','failed','cancelled'].includes(turn.status))return;state.traceTimer=setInterval(()=>refreshExecutionTrace(turn,{force:true}),1200)}
+        function sourceCardMedia(refs){const assets=[],seen=new Set();for(const ref of refs||[]){for(const asset of ref.media_assets||[]){const url=String(asset?.url||'').trim();if(!url||seen.has(url))continue;seen.add(url);assets.push(asset)}}if(!assets.length)return null;const gallery=document.createElement('span');gallery.className='agent-source-card-media';for(const asset of assets.slice(0,2)){const image=document.createElement('img');image.src=asset.url;image.alt=asset.description||asset.title||'原文图片';image.loading='lazy';gallery.append(image)}if(assets.length>2)gallery.append(text('small','另有 '+(assets.length-2)+' 张'));return gallery}
+        function renderSources(items,emptyMessage='本轮回答没有可展示的依据。'){sourceList.replaceChildren();sourceCount.textContent=String(items?.length||0);sourceEmpty.hidden=Boolean(items?.length);sourceEmpty.textContent=emptyMessage;for(const item of items||[]){const button=document.createElement('button');button.type='button';button.className='agent-source-card';const head=document.createElement('span');head.className='agent-source-card-head';head.append(text('b','〔'+item.citation_index+'〕 '+(item.title||'来源')),text('small',formatType(item.evidence_type)));button.append(head);const refs=item.source_refs||[],ref=refs[0]||{},location=text('span',[ref.filename,ref.page_label,ref.section_title].filter(Boolean).join(' · ')||'查看来源位置');location.className='agent-source-card-location';button.append(location);const media=sourceCardMedia(refs);if(media)button.append(media);button.append(text('p',item.excerpt||''));button.addEventListener('click',()=>openEvidence(item.evidence_id));sourceList.append(button)}}
+        function displayTurnSources(turn,{animate=false}={}){const emptyMessage=['queued','running'].includes(turn.status)?'本轮回答的依据正在生成。':turn.status==='failed'?'本轮回答未生成可用依据。':'本轮回答没有可展示的依据。',items=turn.sourceCards||[],reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;resetSourceTransition();const token=state.sourceSwitchToken;renderSources(items,emptyMessage);if(!animate||reduced)return;sourceContent.style.willChange='opacity, transform';const transition=sourceContent.animate([{opacity:.72,transform:'translateY(3px)'},{opacity:1,transform:'translateY(0)'}],{duration:170,easing:'cubic-bezier(.2,.75,.25,1)'});transition.finished.catch(()=>{}).then(()=>{if(token===state.sourceSwitchToken)sourceContent.style.removeProperty('will-change')})}
+        function turnLabel(turn,index){const question=String(turn.query||'本轮问题').replace(/\\s+/g,' ').trim();return '第 '+(index+1)+' 轮 · '+(question.length>28?question.slice(0,28)+'…':question)}
+        function renderTurnPicker(){sourceTurnField.hidden=!state.turns.length;sourceTurn.replaceChildren(...state.turns.map((turn,index)=>new Option(turnLabel(turn,index),turn.runId)));if(state.selectedTurnId)sourceTurn.value=state.selectedTurnId}
+        function bindTurnCard(turn){if(turn.trace)turn.trace.root.dataset.runId=turn.runId;if(!turn.card||turn.card.dataset.turnBound==='true')return;turn.card.dataset.turnBound='true';turn.card.dataset.runId=turn.runId;turn.card.classList.add('agent-turn-selectable');turn.card.addEventListener('click',event=>{if(!event.target.closest('button,details,a,input,select'))selectTurn(turn.runId)})}
+        function upsertTurn(values){if(!values?.runId)return null;let turn=state.turns.find(item=>item.runId===values.runId);if(turn)Object.assign(turn,values);else{turn={runId:values.runId,query:values.query||'',sourceCards:values.sourceCards||[],status:values.status||'completed',card:values.card||null,trace:values.trace||null};state.turns.push(turn)}bindTurnCard(turn);renderTurnPicker();return turn}
+        function selectTurn(runId,{persist=true,animate=true}={}){const turn=state.turns.find(item=>item.runId===runId);if(!turn)return false;const changed=Boolean(state.selectedTurnId&&state.selectedTurnId!==turn.runId);state.selectedTurnId=turn.runId;renderTurnPicker();messages.querySelectorAll('.agent-message.assistant').forEach(card=>card.classList.toggle('evidence-selected',card.dataset.runId===turn.runId));displayTurnSources(turn,{animate:animate&&changed});if(changed&&animate)sourcePane.scrollTo({top:0,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});if(persist&&state.threadId)localStorage.setItem(evidenceKey(state.threadId),turn.runId);return true}
+        function restoreTurnSelection(){const stored=state.threadId?localStorage.getItem(evidenceKey(state.threadId))||'':'';const explicit=Boolean(stored&&state.turns.some(turn=>turn.runId===stored));const target=explicit?stored:(state.turns.at(-1)?.runId||'');if(target)selectTurn(target,{animate:false});return explicit}
+        async function openEvidence(evidenceId){dialogTitle.textContent='来源详情';dialogSubtitle.textContent='正在读取…';dialogBody.replaceChildren();dialog.showModal();try{const response=await fetch('/api/agent/evidence/'+encodeURIComponent(evidenceId)),data=await response.json();if(!response.ok)throw Error(data.error||'来源读取失败');dialogTitle.textContent=data.title||'来源详情';dialogSubtitle.textContent=formatType(data.evidence_type);dialogBody.append(text('p',data.content,'agent-evidence-content'));for(const ref of data.source_refs||[]){const section=document.createElement('section');section.className='agent-evidence-source';section.append(text('h3',ref.filename||'原文件'));section.append(text('p',[ref.page_label,ref.section_title].filter(Boolean).join(' · ')||'文件来源'));if(ref.quote)section.append(text('blockquote',ref.quote));if(ref.document_url){const link=text('a','打开原文件');link.href=ref.document_url;link.target='_blank';link.rel='noopener';section.append(link)}if(ref.table?.text){section.append(text('h4',ref.table.title||'表格'),text('pre',ref.table.text))}for(const asset of ref.media_assets||[]){if(!asset.url)continue;const link=document.createElement('a');link.href=asset.url;link.target='_blank';link.rel='noopener';link.className='agent-evidence-image';const image=document.createElement('img');image.src=asset.url;image.alt=asset.description||asset.title||'原文图片';link.append(image);section.append(link)}dialogBody.append(section)}}catch(error){dialogSubtitle.textContent='读取失败';dialogBody.append(text('p',error.message||'来源读取失败','failure'))}}
+        function formatThreadTime(value){const date=new Date(value||'');if(Number.isNaN(date.getTime()))return '';const now=new Date(),sameDay=date.toDateString()===now.toDateString();if(sameDay)return date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});if(date.getFullYear()===now.getFullYear())return date.toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit'});return date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'})}
+        function renderThreadList(message=''){
+          threadList.replaceChildren();
+          threadCount.textContent=state.base?(state.threads.length+' 个会话'):'选择知识库';
+          if(message||!state.base||!state.threads.length){threadList.append(text('p',message||(!state.base?'选择知识库后显示历史会话。':'暂无历史会话。'),'agent-thread-empty'));return}
+          for(const item of state.threads){
+            const row=document.createElement('div');row.className='agent-thread-row';
+            const button=document.createElement('button');button.type='button';button.className='agent-thread-item'+(String(item.id)===state.threadId?' active':'');button.dataset.threadId=item.id;button.setAttribute('aria-current',String(item.id)===state.threadId?'true':'false');
+            const title=text('strong',String(item.title||'').trim()||'新对话');button.append(title);
+            const preview=String(item.last_message_preview||'').replace(/\\s+/g,' ').trim();if(preview&&preview!==String(item.title||'').trim())button.append(text('span',preview,'agent-thread-preview'));
+            const meta=document.createElement('small');const count=Number(item.message_count||0);meta.append(text('span',formatThreadTime(item.updated_at)||'刚刚'));if(count)meta.append(text('span',count+' 条消息'));if(item.active_run_id)meta.append(text('span','回答中','agent-thread-running'));button.append(meta);
+            button.disabled=state.busy||state.loadingThreads;button.addEventListener('click',()=>{if(button.dataset.threadId!==state.threadId)loadThread(button.dataset.threadId)});
+            const remove=text('button','删除','agent-thread-delete');remove.type='button';remove.dataset.deleteThread=item.id;remove.dataset.blocked=String(Boolean(item.active_run_id));remove.setAttribute('aria-label','删除会话：'+(String(item.title||'').trim()||'新对话'));remove.title=item.active_run_id?'回答生成期间不能删除，请先停止回答':'删除会话';remove.disabled=state.busy||state.loadingThreads||Boolean(item.active_run_id);remove.addEventListener('click',()=>deleteThread(item.id));row.append(button,remove);threadList.append(row);
+          }
+        }
+        async function deleteThread(threadId){if(state.busy||state.loadingThreads)return;const item=state.threads.find(thread=>thread.id===threadId);if(!item)return;const title=String(item.title||'').trim()||'新对话';if(!confirm('删除会话“'+title+'”？\\n\\n该会话将从历史列表移除。'))return;state.loadingThreads=true;renderThreadList();setBusy(false);let nextId='';try{const response=await fetch('/api/agent/threads/'+encodeURIComponent(threadId),{method:'DELETE'}),data=await response.json();if(!response.ok)throw Error(data.error||'会话删除失败');state.threads=state.threads.filter(thread=>thread.id!==threadId);localStorage.removeItem(evidenceKey(threadId));if(localStorage.getItem(threadKey(state.base.id))===threadId)localStorage.removeItem(threadKey(state.base.id));if(state.threadId===threadId){state.threadId='';state.runId='';clearConversation();nextId=state.threads[0]?.id||''}syncRoute()}
+          catch(error){alert(error.message||'会话删除失败')}
+          finally{state.loadingThreads=false;renderThreadList();setBusy(false)}
+          if(nextId)await loadThread(nextId)
+        }
+        function renderHistory(history,runs=[]){clearConversation();state.lastQuery='';const runStatus=new Map(runs.map(run=>[run.id,run.status]));let previousQuery='',turnNumber=0;for(const item of history){if(item.role==='user'){previousQuery=item.content;state.lastQuery=item.content;addMessage('user',item.content)}else if(item.role==='assistant'){turnNumber+=1;const answer=item.metadata?.answer||{},runId=item.run_id||'',message=addMessage('assistant',item.content,answer,{runId,query:previousQuery,turnNumber});upsertTurn({runId,query:previousQuery,sourceCards:answer.source_cards||[],status:runStatus.get(runId)||'completed',card:message.card,trace:message.trace})}}return restoreTurnSelection()}
+        async function fetchThreadList(){const response=await fetch('/api/agent/threads?project_id='+encodeURIComponent(state.base.id)),data=await response.json();if(!response.ok)throw Error(data.error||'历史会话读取失败');state.threads=Array.isArray(data.items)?data.items:[];renderThreadList();return state.threads}
+        async function refreshThreadList(){if(!state.base?.id)return;try{await fetchThreadList()}catch(_error){}}
+        async function createThread(){
+          if(!state.base?.queryable||state.busy)return '';
+          state.loadingThreads=true;renderThreadList('正在新建会话…');setBusy(state.busy);
+          try{const response=await fetch('/api/agent/threads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:state.base.id})}),data=await response.json();if(!response.ok)throw Error(data.error||'无法创建问答会话');const item={...data.thread,message_count:0,last_message_preview:'',active_run_id:''};state.threads=[item,...state.threads.filter(existing=>existing.id!==item.id)];state.threadId=item.id;state.runId='';localStorage.setItem(threadKey(state.base.id),state.threadId);clearConversation();syncRoute();return state.threadId}
+          finally{state.loadingThreads=false;renderThreadList();setBusy(false)}
+        }
+        async function loadThread(threadId){
+          if(!threadId||state.busy)return;const generation=++state.loadGeneration,baseId=String(state.base?.id||'');state.loadingThreads=true;renderThreadList();setBusy(false);let activeRun=null;
+          try{const response=await fetch('/api/agent/threads/'+encodeURIComponent(threadId)),payload=await response.json();if(!response.ok)throw Error(payload.error||'会话读取失败');if(generation!==state.loadGeneration||baseId!==String(state.base?.id||''))return;state.threadId=String(threadId);state.runId='';localStorage.setItem(threadKey(state.base.id),state.threadId);syncRoute();const explicitTurn=renderHistory(payload.messages||[],payload.runs||[]);activeRun=(payload.runs||[]).slice().reverse().find(item=>['queued','running'].includes(item.status))||null;if(activeRun){state.runId=activeRun.id;state.lastQuery=activeRun.query||state.lastQuery;state.assistant=addMessage('assistant','正在恢复本次回答…',null,{runId:activeRun.id,query:state.lastQuery,turnNumber:state.turns.length+1,liveTrace:true});upsertTurn({runId:activeRun.id,query:state.lastQuery,sourceCards:[],status:activeRun.status,card:state.assistant.card,trace:state.assistant.trace});if(!explicitTurn)selectTurn(activeRun.id,{animate:false})}}
+          catch(error){if(generation===state.loadGeneration){state.threadId='';localStorage.removeItem(threadKey(state.base.id));clearConversation();renderThreadList(error.message||'会话读取失败')}}
+          finally{if(generation===state.loadGeneration){state.loadingThreads=false;renderThreadList();setBusy(Boolean(activeRun));if(activeRun)connectEvents('/api/agent/runs/'+activeRun.id+'/events')}}
+        }
+        async function ensureThread(){if(state.threadId)return state.threadId;return createThread()}
+        async function loadThreads(preferredThread=''){
+          if(!state.base?.queryable)return;state.loadingThreads=true;renderThreadList('正在读取历史会话…');setBusy(false);
+          try{await fetchThreadList();const stored=localStorage.getItem(threadKey(state.base.id))||'',selected=state.threads.some(item=>item.id===preferredThread)?preferredThread:state.threads.some(item=>item.id===stored)?stored:(state.threads[0]?.id||'');state.loadingThreads=false;if(selected)await loadThread(selected);else await createThread()}
+          catch(error){state.loadingThreads=false;state.threads=[];renderThreadList(error.message||'历史会话读取失败');setBusy(false)}
+        }
+        function updateCurrentThread(queryText){const item=state.threads.find(thread=>thread.id===state.threadId);if(!item)return;if(!String(item.title||'').trim())item.title=queryText.slice(0,80);item.last_message_preview=queryText;item.message_count=Number(item.message_count||0)+1;item.updated_at=new Date().toISOString();state.threads=[item,...state.threads.filter(thread=>thread.id!==item.id)];renderThreadList()}
+        function terminal(kind,payload={}){state.stream?.close();state.stream=null;stopTracePolling();state.busy=false;const turn=upsertTurn({runId:state.runId,status:kind});if(turn){refreshExecutionTrace(turn,{force:true});if(state.selectedTurnId===turn.runId)selectTurn(turn.runId,{animate:false})}setBusy(false);if(kind==='failed'&&state.assistant){state.assistant.body.textContent='本次问答失败：'+(payload.error||'请稍后重试');state.assistant.card.classList.add('failed')}else if(kind==='cancelled'&&state.assistant){state.assistant.body.textContent=state.assistant.body.textContent||'本次回答已停止。';state.assistant.card.classList.add('cancelled')}messages.scrollTop=messages.scrollHeight;refreshThreadList()}
+        function connectEvents(url){state.stream?.close();const activeTurn=state.turns.find(item=>item.runId===state.runId);if(activeTurn)startTracePolling(activeTurn);const stream=new EventSource(url);state.stream=stream;for(const name of ['queued','status','progress','evidence','cancellation_requested'])stream.addEventListener(name,event=>{const data=JSON.parse(event.data||'{}');const turn=state.turns.find(item=>item.runId===state.runId);if(turn)refreshExecutionTrace(turn,{force:true});if(name==='progress')hint.textContent=({authorizing:'正在确认知识范围…',resolving_context:'正在理解本轮语境…',retrieving:'正在检索证据…',ranking:'正在融合与重排…',assessing:'正在判断证据是否充分…',supplementing:'正在补充检索…',reranking:'正在重排补充证据…',reassessing:'正在再次检查证据…',answering:'正在组织回答…',validating_citations:'正在核验引用…'}[data.stage]||'正在处理…')});stream.addEventListener('answer_start',event=>{const data=JSON.parse(event.data||'{}');state.assistant.body.textContent='';state.assistant.card.dataset.messageId=data.message_id||''});stream.addEventListener('answer_delta',event=>{const data=JSON.parse(event.data||'{}');state.assistant.body.textContent+=(data.delta||'');messages.scrollTop=messages.scrollHeight});stream.addEventListener('sources',event=>{const data=JSON.parse(event.data||'{}'),turn=upsertTurn({runId:state.runId,sourceCards:data.items||[],status:'running'});state.assistant.card.dataset.sources=JSON.stringify(data.items||[]);if(turn&&state.selectedTurnId===turn.runId)selectTurn(turn.runId,{animate:false})});stream.addEventListener('completed',event=>terminal('completed',JSON.parse(event.data||'{}')));stream.addEventListener('failed',event=>terminal('failed',JSON.parse(event.data||'{}')));stream.addEventListener('cancelled',event=>terminal('cancelled',JSON.parse(event.data||'{}')));stream.addEventListener('error',event=>{if(event.data)terminal('failed',JSON.parse(event.data||'{}'))});stream.onerror=async()=>{if(!state.busy)return;try{const response=await fetch('/api/agent/runs/'+state.runId),run=await response.json();if(['completed','failed','cancelled'].includes(run.status))terminal(run.status,{error:run.error_message})}catch(_error){}}}
+        function selectedBaseStrategy(){return String(state.base?.strategy||state.base?.strategy_key||'')}
+        function selectedBaseIsNative(){return selectedBaseStrategy()==='graphrag_native'}
+        async function submitQuestion(){const value=query.value.trim();if(!value||state.busy||state.loadingThreads||!state.base?.queryable)return;let threadId='';try{threadId=await ensureThread()}catch(error){hint.textContent=error.message||'无法创建问答会话';return}if(!threadId)return;const turnContext={query:value,runId:'',turnNumber:state.turns.length+1,liveTrace:true};state.lastQuery=value;addMessage('user',value);state.assistant=addMessage('assistant','正在检索可核验依据…',null,turnContext);query.value='';setBusy(true);try{const response=await fetch('/api/agent/threads/'+threadId+'/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:value,mode:selectedBaseIsNative()?modeSelect.value:'auto'})}),data=await response.json();if(!response.ok)throw Error(data.error||'问题提交失败');state.runId=data.run_id;turnContext.runId=data.run_id;upsertTurn({runId:data.run_id,query:value,sourceCards:[],status:'queued',card:state.assistant.card,trace:state.assistant.trace});selectTurn(data.run_id);updateCurrentThread(value);connectEvents(data.events_url)}catch(error){state.assistant.body.textContent='问题提交失败：'+(error.message||'请稍后重试');state.assistant.card.classList.add('failed');if(state.assistant.trace){state.assistant.trace.status.textContent='提交失败';state.assistant.trace.body.replaceChildren(text('p','任务没有进入执行流程。','agent-trace-placeholder'))}state.busy=false;setBusy(false);refreshThreadList()}}
+        function baseOptionLabel(item){const status=String(item.status_label||'').replace(/^可问答 *· */,'');return item.name+(status?'（'+status+'）':'')}
+        async function chooseBase(){const preferredThread=new URL(location.href).searchParams.get('thread')||'';++state.loadGeneration;state.stream?.close();state.stream=null;state.runId='';state.threadId='';state.threads=[];state.base=state.bases.find(item=>String(item.id)===projectSelect.value)||null;if(state.base?.id)localStorage.setItem(selectedProjectKey,String(state.base.id));else localStorage.removeItem(selectedProjectKey);const native=selectedBaseIsNative();modeField.hidden=!native;if(!native)modeSelect.value='auto';clearConversation();renderThreadList();query.value='';syncRoute();setBusy(false);if(state.base?.queryable)await loadThreads(preferredThread)}
+        async function loadBases(){try{const response=await fetch('/api/agent/knowledge-bases'),data=await response.json();if(!response.ok)throw Error(data.error||'知识库读取失败');state.bases=data.items||[];projectSelect.replaceChildren(new Option(data.queryable_count?'选择一个知识库':'当前没有可用于问答的知识库',''));for(const item of state.bases){const option=new Option(baseOptionLabel(item),String(item.id));option.disabled=!item.queryable;projectSelect.append(option)}const requested=new URL(location.href).searchParams.get('project')||localStorage.getItem(selectedProjectKey)||'',candidate=state.bases.find(item=>String(item.id)===requested&&item.queryable);if(candidate){projectSelect.value=String(candidate.id);await chooseBase()}}catch(error){projectSelect.replaceChildren(new Option(error.message||'知识库读取失败',''))}}
+        projectSelect.addEventListener('change',chooseBase);sourceTurn.addEventListener('change',()=>selectTurn(sourceTurn.value));newThread.addEventListener('click',async()=>{++state.loadGeneration;try{await createThread();query.focus()}catch(error){renderThreadList(error.message||'无法创建问答会话')}});query.addEventListener('input',()=>setBusy(state.busy));query.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();submitQuestion()}});send.addEventListener('click',submitQuestion);stop.addEventListener('click',async()=>{if(!state.runId)return;stop.disabled=true;stop.textContent='正在停止…';try{await fetch('/api/agent/runs/'+state.runId+'/cancel',{method:'POST'});}finally{stop.disabled=false;stop.textContent='停止回答'}});$('#agent-evidence-close').addEventListener('click',()=>dialog.close());dialog.addEventListener('click',event=>{if(event.target===dialog)dialog.close()});loadBases();renderThreadList();setBusy(false);
+      })();
+      </script></body></html>"""
+    return template.replace("__CSS__", CSS)
+
+
+def render_status_page(status: int, title: str, message: str) -> str:
+    """Render a consistent human-facing status page for browser routes."""
+
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
-      <title>智能问答 · Knowledge Forge</title><style>{CSS}</style></head><body>
+      <title>{_esc(title)} · Knowledge Forge</title><style>{CSS}</style></head><body>
       <main class="shell home-shell"><header class="home-header"><div><h1>Knowledge Forge</h1>
       <p>通用知识库与知识图谱构建平台</p></div>
       <nav class="home-primary-actions" aria-label="主要功能">
-        <a class="button secondary" href="/#knowledge-bases">知识库</a>
-        <a class="button primary" href="/chat" aria-current="page">智能问答</a>
+        <a class="button primary" href="/#knowledge-bases">知识库</a>
+        <a class="button secondary" href="/chat">智能问答</a>
       </nav></header>
-      <section class="panel chat-entry" aria-labelledby="chat-entry-title">
-        <span class="section-kicker">智能问答</span>
-        <h2 id="chat-entry-title">跨知识库问答工作台</h2>
-        <p>在这里选择一个或多个知识库，由智能体统一检索原文、实体、关系与社区报告，并给出可追溯的回答。</p>
-        <div class="chat-entry-status"><b>{knowledge_base_count} 个知识库</b>
-          <span>当前已建立独立入口；跨知识库问答编排将在智能体实现阶段接入。</span></div>
+      <section class="panel status-page" aria-labelledby="status-page-title">
+        <span class="status-page-code">{int(status)}</span>
+        <div class="status-page-copy"><h2 id="status-page-title">{_esc(title)}</h2><p>{_esc(message)}</p>
+          <div class="status-page-actions"><a class="button primary" href="/">返回首页</a>
+            <a class="button secondary" href="/#knowledge-bases">查看知识库</a></div>
+        </div>
       </section></main></body></html>"""
 
 
@@ -1184,6 +1380,7 @@ def _embedded_graph_browser(
         .graph-provenance{{color:#718398;font-size:11px}}
         .kf-gpu-graph-edge-labels{{position:absolute;inset:0;z-index:1;overflow:hidden;pointer-events:none}}
         .kf-gpu-edge-label{{position:absolute;left:0;top:0;max-width:130px;padding:2px 5px;border:1px solid rgba(144,169,193,.7);border-radius:9px;background:rgba(255,255,255,.92);color:#315d89;font-size:10px;font-weight:700;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transform:translate(-50%,-50%)}}
+        .kf-gpu-edge-label.is-topic-association{{border-style:dashed;border-color:#9aafc2;color:#536f89}}
         .kf-gpu-edge-label.is-selected{{border-color:#e27619;background:#fff3dc;color:#8f4c0c}}
         .kf-gpu-default-edge.is-muted{{opacity:.08}}.kf-gpu-default-node.is-muted{{opacity:.28}}
         .kf-gpu-graph-surface{{z-index:0}}.embedded-graph-canvas .kf-gpu-default-edges,.embedded-graph-canvas .kf-gpu-emphasized-edges{{min-width:0;min-height:0;background:transparent}}.kf-gpu-default-edges{{z-index:10}}.kf-gpu-default-nodes{{z-index:11}}.kf-gpu-emphasized-edges{{z-index:12}}.kf-gpu-emphasized-nodes{{z-index:13}}.kf-gpu-node-rings{{z-index:14}}.kf-gpu-graph-edge-labels{{z-index:15}}.kf-gpu-graph-labels{{z-index:16}}.kf-gpu-graph-tooltip{{z-index:17}}.graph-canvas-scope,.graph-canvas-nav{{z-index:30}}.graph-canvas-overlay{{z-index:40}}
@@ -1258,7 +1455,7 @@ def _embedded_graph_browser(
         .graph-evidence-modal-body{{max-height:calc(88vh - 60px);padding:16px;overflow:auto}}
         .graph-evidence-modal-body img{{display:block;max-width:100%;height:auto;margin:auto}}
         .graph-evidence-modal-body pre{{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}}
-        @media(max-width:980px){{.embedded-graph-layout{{grid-template-columns:1fr}}.graph-pane-resizer{{display:none}}}}
+        @media(max-width:1100px){{.embedded-graph-layout{{grid-template-columns:1fr}}.graph-pane-resizer{{display:none}}}}
       </style>
       <div class="section-heading"><div><h2>{_esc(title)}</h2><p>{_esc(description)}</p></div>
         <div class="embedded-graph-tabs" role="tablist" aria-label="图谱浏览方式">
@@ -1282,6 +1479,7 @@ def _embedded_graph_browser(
           <div class="graph-reading-key" aria-label="图谱阅读说明">
             <span><i class="graph-key-dot"></i>圆点：实体或社区；圆点越大，关联越多</span>
             <span><i class="graph-key-line"></i>连线：{_esc(relationship_label)}</span>
+            <span data-graph-topic-key hidden><i class="graph-key-topic-line"></i>虚线：内容相近的社区</span>
           </div>
           <div class="embedded-graph-layout">
             <div class="embedded-graph-canvas">
@@ -1294,7 +1492,7 @@ def _embedded_graph_browser(
                 <span class="graph-scope-help">
                   <button class="graph-scope-help-trigger" type="button" aria-label="查看全局关系范围说明"
                     aria-describedby="graph-overview-scope-help">?</button>
-                  <span class="graph-scope-help-tip" id="graph-overview-scope-help" role="tooltip">主要关系显示社区间较有代表性的联系；全部关系显示所有跨社区联系；全部关系社区还会显示只有内部关系的社区。</span>
+                  <span class="graph-scope-help-tip" id="graph-overview-scope-help" role="tooltip">主要关系显示社区间较有代表性的事实联系；全部关系显示所有跨社区事实联系；全部关系社区还会显示只有内部关系的社区，并用虚线标出内容相近的导航关联。虚线不代表原文事实。</span>
                 </span>
               </div>
               <div class="graph-canvas-scope" role="group" aria-label="社区关系范围" data-graph-community-scope hidden>
@@ -1367,9 +1565,9 @@ def render_page(
         binding = _project_binding(int(current["id"]))
         if binding is not None:
             if str(binding.get("association_status") or "") != "bound":
-                raise ValueError("项目尚未绑定知识图谱策略")
+                raise ValueError("知识库尚未绑定知识图谱构建方式")
             if str(binding.get("selected_strategy") or "") != strategy_key:
-                raise ValueError("工作区与项目绑定的知识图谱策略不一致")
+                raise ValueError("工作区与知识库绑定的构建方式不一致")
         if strategy_key == KNOWLEDGE_FORGE_STRATEGY:
             SERVICE.db.ensure_project_strategy_graphs(int(current["id"]))
     native_status = None
@@ -1463,9 +1661,9 @@ def render_page(
             <div id="processing-selects" class="form-grid compact">
               <label>解析器<select name="requested_parser" form="document-upload-form">{_named_options(PARSER_OPTIONS,'auto')}</select></label>
               <input type="hidden" name="requested_strategy" value="auto" form="document-upload-form">
-              <div class="native-config-note"><b>文本单元设置</b><span>GraphRAG 3.1.1 在知识图谱构建中使用固定、可审计的 900 tokens / 100 overlap / o200k_base。</span></div>
+              <div class="native-config-note"><b>文本单元设置</b><span>GraphRAG 3.1.1 固定使用 900 Token、100 Token 重叠和 o200k_base 分词器。</span></div>
             </div>
-            <p id="processing-hint" class="muted">这里只生成源结构；不会生成 Knowledge Forge Chunk、pgvector 或知识结构定义。</p>
+            <p id="processing-hint" class="muted">这里只生成源结构；不会生成 Knowledge Forge 知识块、向量索引或知识结构定义。</p>
           </div>
         </div>"""
     )
@@ -1581,13 +1779,11 @@ def render_page(
             <input name="chunk_max_tokens" type="number" min="64" step="1" required value="{int(current.get('chunk_max_tokens') or 512)}">
             <small id="chunk-token-limit-hint" class="field-help">正在读取 LLM 与 Embedding 的共同上限...</small></label>"""
             if strategy_key == KNOWLEDGE_FORGE_STRATEGY
-            else f"""<input name="chunk_max_tokens" type="hidden" value="{int(current.get('chunk_max_tokens') or 512)}">
-            <div class="native-config-note"><b>GraphRAG 文本单元</b>
-            <span>由 GraphRAG 3.1.1 在运行中生成：900 tokens，100 overlap，o200k_base；不读取 Knowledge Forge 单切片设置。</span></div>"""
+            else f"""<input name="chunk_max_tokens" type="hidden" value="{int(current.get('chunk_max_tokens') or 512)}">"""
         )
         settings_section = f"""
-        <div class="workspace-settings"><div class="section-heading"><div><h2>项目设置</h2>
-          <p>设置当前项目使用的模型、知识语言与上下文预算；不会修改 Ollama 全局上下文。</p></div>
+        <div class="workspace-settings"><div class="section-heading"><div><h2>知识库设置</h2>
+          <p>设置当前知识库使用的模型、知识语言与上下文预算；不会修改 Ollama 全局上下文。</p></div>
           <button id="sync-models" class="icon-button refresh-button" type="button"
             title="从 Ollama 同步可用模型" aria-label="从 Ollama 同步可用模型">↻</button></div>
         <p id="model-sync-status" class="model-sync-status" role="status" hidden></p>
@@ -1597,11 +1793,11 @@ def render_page(
           <label>知识语言<select name="knowledge_language" required
             data-original-value="{_esc(current.get('knowledge_language') or DOCUMENT_LANGUAGE)}">{_knowledge_language_options(str(current.get('knowledge_language') or DOCUMENT_LANGUAGE))}</select>
             <small class="field-help">更改不会改写当前知识库或图谱，将从下一次知识构建生效。</small></label>
-          <label>项目上下文 Token 上限
+          <label>知识库上下文 Token 上限
             <input name="model_max_tokens" type="number" min="1024" step="1" required value="{int(current.get('model_max_tokens') or 32768)}">
             <small id="model-token-limit-hint" class="field-help">正在读取当前 LLM 的上下文上限...</small></label>
           {chunk_setting}
-          <div class="form-actions"><button class="button primary" type="submit">保存项目设置</button></div></form>
+          <div class="form-actions"><button class="button primary" type="submit">保存知识库设置</button></div></form>
         {processing_options}</div>"""
     job_hidden = "" if active_job_id else " hidden"
     notice = _notice(*message) if message else ""
@@ -1647,15 +1843,20 @@ def render_page(
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>{_esc(current['name'] if current else 'Knowledge Forge')} · Knowledge Forge</title><style>{CSS}</style></head>
     <body class="workspace-body"><main class="shell workspace-shell">
-    <header class="workspace-brand-header"><a class="brand-link" href="/" aria-label="返回项目首页"><h1>Knowledge Forge</h1>
-      <p>通用知识库与知识图谱构建平台</p></a></header>{notice}
+    <header class="workspace-brand-header"><a class="brand-link" href="/" aria-label="返回知识库首页"><h1>Knowledge Forge</h1>
+      <p>通用知识库与知识图谱构建平台</p></a>
+      <nav class="workspace-global-nav" aria-label="全局功能">
+        <a class="button secondary is-current" href="/#knowledge-bases" aria-current="page">知识库</a>
+        <a class="button secondary" href="/chat">智能问答</a>
+      </nav></header>{notice}
     <div class="workspace-layout">
-      <aside class="workspace-sidebar" aria-label="项目工作区导航">
+      <aside class="workspace-sidebar" aria-label="知识库工作区导航">
         <div class="workspace-project-summary"><div class="workspace-project-title">
-          <h2 title="{_esc(current['name'] if current else '项目不存在')}">{_esc(current['name'] if current else '项目不存在')}</h2>
+          <div><span class="workspace-context-label">当前知识库</span>
+          <h2 title="{_esc(current['name'] if current else '知识库不存在')}">{_esc(current['name'] if current else '知识库不存在')}</h2></div>
           <span class="workspace-strategy-badge">{_esc(strategy_label)}</span>
         </div></div>
-        <nav class="workspace-nav" aria-label="项目功能">
+        <nav class="workspace-nav" aria-label="知识库功能">
           <button class="workspace-nav-item" type="button" data-workspace-target="documents"
             aria-controls="workspace-documents" aria-selected="true"><span>01</span><b>文档管理</b><small>上传与文件列表</small></button>
           <button class="workspace-nav-item" type="button" data-workspace-target="build"
@@ -1663,14 +1864,14 @@ def render_page(
           <button class="workspace-nav-item" type="button" data-workspace-target="query"
             aria-controls="workspace-query" aria-selected="false"><span>03</span><b>{_esc(query_navigation_label)}</b><small>{_esc(ui['query_navigation_hint'])}</small></button>
           <button class="workspace-nav-item" type="button" data-workspace-target="settings"
-            aria-controls="workspace-settings" aria-selected="false"><span>04</span><b>项目设置</b><small>模型与上下文</small></button>
+            aria-controls="workspace-settings" aria-selected="false"><span>04</span><b>知识库设置</b><small>模型与上下文</small></button>
         </nav>
       </aside>
       <div class="workspace-content">
         <section id="workspace-documents" class="workspace-view" data-workspace-panel="documents"
           role="tabpanel" aria-label="文档管理">
-          <div class="section-heading workspace-view-heading"><div><span class="workspace-view-kicker">文档</span>
-            <h2>上传与管理项目资料</h2><p>上传源文件并查看处理状态；解析与分块方式统一在项目设置中调整。</p></div></div>
+          <div class="section-heading workspace-view-heading"><div>
+            <h2>上传与管理知识库资料</h2><p>上传源文件并查看处理状态；解析与分块方式统一在知识库设置中调整。</p></div></div>
           <form id="document-upload-form" action="/upload" method="post" enctype="multipart/form-data" class="upload-form processing-form">
             <input type="hidden" name="project_id" value="{_esc(current['id'] if current else '')}">
             <input type="hidden" name="strategy_key" value="{_esc(strategy_key)}">
@@ -1680,8 +1881,8 @@ def render_page(
             <p class="upload-help">支持多文件上传，单个文件最大 {Config.upload_max_bytes // (1024 * 1024)} MB。</p>
           </form>
           <div class="workspace-section" {'' if current else 'hidden'}><div class="section-heading"><div>
-            <h2>项目文档</h2><p>源文件、处理状态和来源链接</p></div></div>
-            <div class="table-wrap"><table><thead><tr><th>文件</th><th>大小</th><th>状态</th><th>更新时间</th>
+            <h2>知识库文档</h2><p>源文件、处理状态和来源链接</p></div></div>
+            <div class="table-wrap document-table-wrap"><table class="document-table"><thead><tr><th>文件</th><th>大小</th><th>状态</th><th>更新时间</th>
               <th class="actions">操作</th></tr></thead><tbody>{rows}</tbody></table></div>
           </div>
         </section>
@@ -1699,7 +1900,7 @@ def render_page(
           {retrieval_section}
         </section>
         <section id="workspace-settings" class="workspace-view" data-workspace-panel="settings"
-          role="tabpanel" aria-label="项目设置" hidden>
+          role="tabpanel" aria-label="知识库设置" hidden>
           {settings_section}
         </section>
       </div>
@@ -1732,7 +1933,7 @@ def render_page(
         <button id="structure-next" class="button small secondary" type="button">下一页</button></div></div>
       <div class="dialog-actions"><button class="button secondary" type="button" data-close-structure>关闭</button></div>
     </dialog>
-    <dialog id="chunk-dialog" class="structure-dialog"><div class="dialog-heading"><div><h2>Chunk 分片</h2><p id="chunk-summary">正在读取分块结果...</p></div>
+    <dialog id="chunk-dialog" class="structure-dialog"><div class="dialog-heading"><div><h2>知识块</h2><p id="chunk-summary">正在读取分块结果...</p></div>
       <button class="icon-button" type="button" data-close-chunks aria-label="关闭">×</button></div>
       <div id="chunk-error" class="job-log-error" hidden></div>
       <div id="chunk-tools" class="structure-tools" hidden>
@@ -1758,7 +1959,7 @@ def render_page(
       <div id="native-artifact-error" class="job-log-error" hidden></div>
       <div id="native-artifact-tools" class="structure-tools">
         <select id="native-artifact-kind" aria-label="选择 GraphRAG Native 产物">
-          <option value="documents">冻结的结构化文档</option>
+          <option value="documents">本次构建使用的结构化文档</option>
           <option value="source-map">原文位置映射</option>
           <option value="text-units">文本单元</option>
           <option value="entities">实体</option>
@@ -1770,7 +1971,7 @@ def render_page(
       <pre id="native-artifact-content" class="artifact-content"></pre>
       <div class="dialog-actions"><button class="button secondary" type="button" data-close-native-artifacts>关闭</button></div>
     </dialog>
-    </main><script src="/static/graph-explorer.js?v=20260821-graph-ui-37"></script><script>window.KF={{projectId:{int(current['id']) if current else 0},strategyKey:{json.dumps(strategy_key)},taskProfile:{json.dumps(ui['task_profile'])},taskLabels:{json.dumps(ui['task_labels'], ensure_ascii=False)},activeJob:{str(bool(active_job_id)).lower()},activeJobKind:{json.dumps(active_job_kind)},docling:{str(docling_available()).lower()}}};{SCRIPT}</script></body></html>"""
+    </main><script src="/static/graph-explorer.js?v=20260826-graph-ui-39-topic-links"></script><script>window.KF={{projectId:{int(current['id']) if current else 0},strategyKey:{json.dumps(strategy_key)},taskProfile:{json.dumps(ui['task_profile'])},taskLabels:{json.dumps(ui['task_labels'], ensure_ascii=False)},activeJob:{str(bool(active_job_id)).lower()},activeJobKind:{json.dumps(active_job_kind)},docling:{str(docling_available()).lower()}}};{SCRIPT}</script></body></html>"""
 
 
 def _render_native_graph_view(project_id: int) -> str:
@@ -1987,7 +2188,7 @@ load();
 :root{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#172033;background:#f4f7fb}body{margin:0}.page{max-width:1480px;margin:0 auto;padding:28px}.top{display:flex;justify-content:space-between;gap:20px;align-items:start;flex-wrap:wrap}.top h1{margin:0;font-size:25px}.top p{color:#536981;margin:.4rem 0 0}.tabs,.controls{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.tab,button{font:inherit}.tab,.controls button{border:1px solid #c5d4e5;border-radius:6px;background:#fff;padding:8px 12px;color:#294764;cursor:pointer}.tab.active{background:#2677d8;border-color:#2677d8;color:#fff}.controls{margin:18px 0}.controls input,.controls select{border:1px solid #b9cade;border-radius:6px;padding:9px 10px;font:inherit;background:#fff}.controls input{min-width:260px;flex:1}.controls label{display:flex;align-items:center;gap:6px;color:#435b75}.network-layout{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:16px}.card{background:#fff;border:1px solid #d7e2ee;border-radius:9px;box-shadow:0 8px 20px rgba(25,53,84,.05)}.graph-card{min-height:740px;overflow:auto}.graph-card svg{display:block;width:100%;min-width:880px;min-height:720px;background:linear-gradient(145deg,#fbfdff,#eef5fb)}.community-label{font-size:13px;font-weight:700}.community-trigger{cursor:pointer}.community-trigger rect{fill:#fff;fill-opacity:.9;stroke:#c6d5e4}.community-trigger:hover rect,.community-trigger:focus rect{fill:#eef6ff;stroke:#2677d8}.community-trigger:focus{outline:none}.native-edge{stroke:#7f94aa;stroke-opacity:.72;cursor:pointer}.native-edge.dim,.native-node.dim{opacity:.12}.native-node{cursor:pointer}.native-node circle{stroke:#fff;stroke-width:2}.native-node.selected circle{stroke:#142b45;stroke-width:4}.node-label{font-size:10px;text-anchor:middle;fill:#273e57;pointer-events:none}.side{padding:17px;min-height:280px}.side h3{margin:0 0 12px}.side h4{margin:18px 0 8px}.side dl{margin:0;display:grid;grid-template-columns:88px 1fr;gap:8px;font-size:13px}.side dt{color:#64778a;font-weight:700}.side dd{margin:0;overflow-wrap:anywhere;line-height:1.45}.side code,.audit code{display:inline-block;max-width:100%;overflow-wrap:anywhere;font-size:11px;color:#465c73}.neighbour-list{padding-left:18px;margin:0}.neighbour-list button{padding:0;border:0;background:transparent;color:#1766b5;text-align:left;cursor:pointer;font-size:12px}.summary{color:#60758b;font-size:13px;margin:0 0 12px}.communities{margin-top:18px;padding:17px}.communities h2,.audit h2{font-size:18px;margin:0 0 6px}.community-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(245px,1fr));gap:10px}.community-card{border:1px solid #d6e2ed;background:#fff;border-radius:7px;padding:12px;text-align:left;cursor:pointer;color:#243d57}.community-card.active{border-color:#2677d8;box-shadow:0 0 0 2px #d8eaff}.community-card b,.community-card small,.community-card em{display:block}.community-card small{color:#6a7f94;margin:5px 0}.community-card em{font-size:12px;color:#526a81;font-style:normal;line-height:1.4}.community-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.audit{margin-top:18px;padding:17px;overflow:auto}.audit table{border-collapse:collapse;width:100%;min-width:980px}.audit th,.audit td{padding:10px;border-bottom:1px solid #e0e8f0;vertical-align:top;text-align:left}.audit th{background:#f5f8fc}.audit td:nth-child(2){max-width:460px;line-height:1.35}@media(max-width:900px){.page{padding:16px}.network-layout{grid-template-columns:1fr}.graph-card{min-height:520px}.controls input{min-width:180px}.top{flex-direction:column}.graph-card svg{min-width:760px}}
 </style></head><body><main class="page"><header class="top"><div><h1>GraphRAG Native 知识图谱浏览</h1><p>运行编号：<code>"""
         + _esc(run["run_id"])
-        + """</code> · GraphRAG """
+    + """</code> · GraphRAG """
         + _esc(run.get("graphrag_version"))
         + """ · 浏览当前有效的知识图谱、社区与证据。</p></div><div class="tabs"><button class="tab active" type="button" data-native-tab="network">图谱连接</button><button class="tab" type="button" data-native-tab="audit">关系审计表</button></div></header><p id="loading">正在加载实体、关系与社区…</p><section id="viewer" hidden><div class="controls"><input id="entity-filter" type="search" placeholder="输入实体、类型或描述"><button id="apply-filter" type="button">检索</button><select id="community-filter" aria-label="按社区筛选"></select><label><input id="toggle-isolates" type="checkbox" checked>显示孤立实体</label><button id="reset-graph" type="button">重置视图</button></div><section id="network-panel"><div class="network-layout"><div class="card graph-card"><svg id="native-network" viewBox="0 0 1200 760" role="img"><defs><marker id="native-arrow" markerWidth="8" markerHeight="8" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7f94aa"></path></marker></defs><g id="community-groups"></g><g id="edge-layer"></g><g id="node-layer"></g></svg></div><aside id="selection-details" class="card side"></aside></div><p id="network-count" class="summary"></p><section class="card communities"><h2>GraphRAG 社区</h2><p class="summary">社区由 Leiden 聚类和社区报告生成；点击卡片可筛选图中的成员和关系。</p><div id="community-list" class="community-grid"></div></section></section><section id="audit-panel" class="card audit" hidden><h2>关系审计表</h2><p id="audit-summary" class="summary"></p><table><thead><tr><th>源实体</th><th>关系描述</th><th>目标实体</th><th>权重</th><th>文本单元证据</th></tr></thead><tbody id="audit-rows"></tbody></table></section></section></main><script>"""
         + script.replace("__PROJECT_ID__", str(int(project_id)))
@@ -2014,8 +2215,100 @@ class AppHandler(BaseHTTPRequestHandler):
         if cache_control: self.send_header("Cache-Control", cache_control)
         self.end_headers(); self.wfile.write(payload)
 
-    def _json(self, status: int, data: Any) -> None:
-        self._respond(status, json.dumps(data, ensure_ascii=False, default=str), "application/json; charset=utf-8")
+    def _json(self, status: int, data: Any, *, cookie: str = "") -> None:
+        self._respond(
+            status, json.dumps(data, ensure_ascii=False, default=str),
+            "application/json; charset=utf-8", cookie=cookie,
+            cache_control="no-store",
+        )
+
+    def _agent_session(self, *, create: bool = False) -> tuple[str, str]:
+        header = str(self.headers.get("X-KF-Agent-Session") or "").strip()
+        cookie = SimpleCookie(self.headers.get("Cookie"))
+        item = cookie.get("knowledge_forge_agent_session")
+        value = header or (str(item.value) if item else "")
+        try:
+            return validate_session_key(value), ""
+        except PermissionError:
+            if not create:
+                raise
+        value = new_session_key()
+        return value, (
+            "knowledge_forge_agent_session=" + value
+            + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+        )
+
+    def _request_data(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0:
+            return {}
+        if length > Config.reranker_max_body_bytes:
+            raise ValueError("请求内容过大")
+        raw = self.rfile.read(length)
+        content_type = str(self.headers.get("Content-Type") or "").lower()
+        if "application/json" in content_type:
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("请求 JSON 必须是对象")
+            return value
+        return {
+            key: values[0] for key, values in
+            parse_qs(raw.decode("utf-8", "ignore")).items()
+        }
+
+    def _agent_sse(self, run_id: str, *, session_key: str, after_id: int) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        cursor = max(0, int(after_id))
+        deadline = time.monotonic() + Config.agent_sse_max_seconds
+        heartbeat = time.monotonic()
+        terminal = {"completed", "failed", "cancelled"}
+        try:
+            while time.monotonic() < deadline:
+                rows = SERVICE.agent_events(
+                    run_id, session_key=session_key, after_id=cursor,
+                )
+                for row in rows:
+                    cursor = int(row["id"])
+                    event_type = str(row.get("event_type") or "message")
+                    payload = json.dumps(
+                        row.get("payload") or {}, ensure_ascii=False, default=str,
+                    )
+                    block = (
+                        f"id: {cursor}\n"
+                        f"event: {event_type}\n"
+                        f"data: {payload}\n\n"
+                    ).encode("utf-8")
+                    self.wfile.write(block)
+                    self.wfile.flush()
+                    if event_type in terminal:
+                        self.close_connection = True
+                        return
+                if time.monotonic() - heartbeat >= 15:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    heartbeat = time.monotonic()
+                time.sleep(Config.agent_sse_poll_seconds)
+            payload = json.dumps({"reconnect": True}, ensure_ascii=False)
+            self.wfile.write(f"event: timeout\ndata: {payload}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            return
+        except Exception as exc:
+            try:
+                payload = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                self.wfile.write(f"event: error\ndata: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+            return
 
     def _redirect(self, target: str, project_id: int | None = None) -> None:
         self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", target)
@@ -2066,6 +2359,101 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/chat":
             self._respond(200, render_chat_page())
+            return
+        if parsed.path == "/api/agent/knowledge-bases":
+            try:
+                self._json(200, SERVICE.agent_knowledge_bases())
+            except Exception as exc:
+                self._json(503, {"ok": False, "error": str(exc)})
+            return
+        if parsed.path == "/api/agent/threads":
+            try:
+                params = parse_qs(parsed.query)
+                project_id = int(params.get("project_id", ["0"])[0] or 0)
+                limit = int(params.get("limit", ["100"])[0] or 100)
+                if project_id <= 0:
+                    raise ValueError("请选择知识库")
+                session_key, cookie = self._agent_session(create=True)
+                self._json(
+                    200,
+                    SERVICE.list_agent_threads(
+                        project_id, session_key=session_key, limit=limit,
+                    ),
+                    cookie=cookie,
+                )
+            except (TypeError, ValueError, LookupError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(503, {"ok": False, "error": str(exc)})
+            return
+        match = re.fullmatch(r"/api/agent/threads/(ath_[0-9a-f]{32})", parsed.path)
+        if match:
+            try:
+                session_key, _cookie = self._agent_session()
+                self._json(200, SERVICE.get_agent_thread(
+                    match.group(1), session_key=session_key,
+                ))
+            except PermissionError as exc:
+                self._json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            return
+        match = re.fullmatch(
+            r"/api/agent/runs/(arun_[0-9a-f]{32})/events", parsed.path,
+        )
+        if match:
+            try:
+                session_key, _cookie = self._agent_session()
+                SERVICE.get_agent_run(match.group(1), session_key=session_key)
+                params = parse_qs(parsed.query)
+                last_event = str(self.headers.get("Last-Event-ID") or "")
+                after = params.get("after", [last_event or "0"])[0]
+                self._agent_sse(
+                    match.group(1), session_key=session_key,
+                    after_id=int(after or 0),
+                )
+            except PermissionError as exc:
+                self._json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            return
+        match = re.fullmatch(
+            r"/api/agent/runs/(arun_[0-9a-f]{32})/trace", parsed.path,
+        )
+        if match:
+            try:
+                session_key, _cookie = self._agent_session()
+                self._json(200, SERVICE.get_agent_run_trace(
+                    match.group(1), session_key=session_key,
+                ))
+            except PermissionError as exc:
+                self._json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            return
+        match = re.fullmatch(r"/api/agent/runs/(arun_[0-9a-f]{32})", parsed.path)
+        if match:
+            try:
+                session_key, _cookie = self._agent_session()
+                self._json(200, SERVICE.get_agent_run(
+                    match.group(1), session_key=session_key,
+                ))
+            except PermissionError as exc:
+                self._json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            return
+        match = re.fullmatch(r"/api/agent/evidence/(ev_[0-9a-f]{32})", parsed.path)
+        if match:
+            try:
+                session_key, _cookie = self._agent_session()
+                self._json(200, SERVICE.get_agent_evidence(
+                    match.group(1), session_key=session_key,
+                ))
+            except PermissionError as exc:
+                self._json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
             return
         match = re.fullmatch(r"/api/projects/(\d+)/graph-explorer", parsed.path)
         if match:
@@ -2123,7 +2511,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     cookie=f"knowledge_forge_project={project_id}; Path=/; SameSite=Lax",
                 )
             except LookupError as exc:
-                self._respond(404, str(exc), "text/plain; charset=utf-8")
+                self._respond(
+                    404,
+                    render_status_page(
+                        404, "知识库不存在", str(exc) or "没有找到请求的知识库。",
+                    ),
+                )
             except Exception as exc:
                 self._redirect(f"/?kind=error&message={quote(str(exc))}")
             return
@@ -2137,7 +2530,7 @@ class AppHandler(BaseHTTPRequestHandler):
             project_id = int(match.group(1))
             try:
                 if not SERVICE.db.get_project(project_id):
-                    raise LookupError("项目不存在")
+                    raise LookupError("知识库不存在")
                 strategy_key = SERVICE._assert_project_strategy(project_id)
                 graph_state = (
                     None if strategy_key == GRAPHRAG_NATIVE_STRATEGY
@@ -2318,7 +2711,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     project_id, KNOWLEDGE_FORGE_STRATEGY,
                 )
                 if strategy_key != KNOWLEDGE_FORGE_STRATEGY:
-                    raise ValueError("当前项目只允许打开 Knowledge Forge 图谱")
+                    raise ValueError("当前知识库只允许打开 Knowledge Forge 图谱")
                 self._redirect(
                     f"/projects/{project_id}/knowledge-forge#query", project_id,
                 )
@@ -2329,11 +2722,61 @@ class AppHandler(BaseHTTPRequestHandler):
             try: self._json(200, SERVICE.health())
             except Exception as exc: self._json(503, {"status": "error", "error": str(exc)})
             return
-        self._respond(404, "Not found", "text/plain; charset=utf-8")
+        self._respond(
+            404,
+            render_status_page(
+                404, "页面不存在", "请求的页面可能已移动，或地址输入有误。",
+            ),
+        )
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/agent/threads":
+                data = self._request_data()
+                session_key, cookie = self._agent_session(create=True)
+                thread = SERVICE.create_agent_thread(
+                    int(data.get("project_id") or 0), session_key=session_key,
+                )
+                self._json(201, {"ok": True, "thread": thread}, cookie=cookie)
+                return
+            match = re.fullmatch(
+                r"/api/agent/threads/(ath_[0-9a-f]{32})/messages", parsed.path,
+            )
+            if match:
+                data = self._request_data()
+                session_key, _cookie = self._agent_session()
+                result = SERVICE.submit_agent_message(
+                    match.group(1), session_key=session_key,
+                    query=str(data.get("query") or data.get("content") or ""),
+                    requested_mode=str(data.get("mode") or "auto"),
+                )
+                self._json(202, {"ok": True, **result})
+                return
+            match = re.fullmatch(
+                r"/api/agent/runs/(arun_[0-9a-f]{32})/cancel", parsed.path,
+            )
+            if match:
+                session_key, _cookie = self._agent_session()
+                result = SERVICE.cancel_agent_run(
+                    match.group(1), session_key=session_key,
+                )
+                self._json(202, {"ok": True, "run": result})
+                return
+            match = re.fullmatch(
+                r"/api/agent/runs/(arun_[0-9a-f]{32})/feedback", parsed.path,
+            )
+            if match:
+                data = self._request_data()
+                session_key, _cookie = self._agent_session()
+                result = SERVICE.record_agent_feedback(
+                    match.group(1), session_key=session_key,
+                    rating=int(data.get("rating") or 0),
+                    comment=str(data.get("comment") or ""),
+                    action=str(data.get("action") or "answer_rating"),
+                )
+                self._json(200, {"ok": True, "feedback": result})
+                return
             if parsed.path == "/projects":
                 data = self._form()
                 project = SERVICE.create_project(
@@ -2370,7 +2813,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 strategy_key = SERVICE._assert_project_strategy(int(project["id"]))
                 self._redirect(
                     _workspace_path(int(project["id"]), strategy_key)
-                    + f"?kind=ok&message={quote('项目设置已更新')}#settings",
+                    + f"?kind=ok&message={quote('知识库设置已更新')}#settings",
                     int(project["id"]),
                 )
                 return
@@ -2502,12 +2945,38 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "result": result})
                 return
             self._json(404, {"error": "接口不存在"})
+        except PermissionError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": str(exc)})
+        except LookupError as exc:
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+        except (GraphNotReadyError, GraphRAGNativeStale) as exc:
+            self._json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
         except TreatmentMaterializationRequired as exc:
             self._json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
         except Exception as exc:
             LOGGER.exception("Request failed: %s", self.path)
             if self.path.startswith("/api/"): self._json(400, {"ok": False, "error": str(exc)})
             else: self._redirect(f"/?kind=error&message={quote(str(exc))}", self._project())
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        match = re.fullmatch(r"/api/agent/threads/(ath_[0-9a-f]{32})", parsed.path)
+        if not match:
+            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "接口不存在"})
+            return
+        try:
+            session_key, _cookie = self._agent_session()
+            thread = SERVICE.archive_agent_thread(
+                match.group(1), session_key=session_key,
+            )
+            self._json(HTTPStatus.OK, {"ok": True, "thread": thread})
+        except PermissionError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": str(exc)})
+        except RuntimeError as exc:
+            self._json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            LOGGER.exception("Request failed: %s", self.path)
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
 
     def _form(self) -> dict[str, str]:
         raw = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8", "ignore")
@@ -2522,7 +2991,7 @@ class AppHandler(BaseHTTPRequestHandler):
         entries = [item for item in entries if getattr(item, "filename", "")]
         project = SERVICE.db.get_project(project_id)
         if not project:
-            raise LookupError("项目不存在")
+            raise LookupError("知识库不存在")
         requested_parser = form.getfirst("requested_parser", "auto") or "auto"
         requested_strategy = form.getfirst("requested_strategy", "auto") or "auto"
         for item in entries:
@@ -2603,9 +3072,9 @@ CSS = r"""
 .workspace-project-title{display:flex;flex-direction:column;align-items:flex-start;gap:8px}.workspace-project-summary h2{width:100%;word-break:normal}.workspace-strategy-badge{white-space:nowrap}.task-head>div{min-width:0}.task-head>span{flex:0 0 auto}.task-summary{display:block;margin-top:4px;color:#9eb3cc;font-size:12px;font-weight:400;line-height:1.4;overflow-wrap:anywhere}.task-progress{color:#72b8ff;font-variant-numeric:tabular-nums;white-space:nowrap}.task-step-head .task-step-detail[hidden]{display:none}
 .project-list-tools{display:flex;align-items:center;gap:10px;flex:0 0 auto;margin-top:16px}.project-list-tools input{min-width:0;flex:1}.project-list-tools span{min-width:88px;color:#60758d;font-size:12px;text-align:right}
 .project-card[hidden]{display:none}
-.embedded-graph-layout{grid-template-columns:minmax(0,1fr) 320px}.embedded-graph-controls>select,.embedded-graph-controls>input{height:42px;box-sizing:border-box}.embedded-graph-controls>.button{min-height:42px}.embedded-graph-canvas{position:relative;overflow:hidden}.embedded-graph-canvas [data-graph-network]{position:relative;display:block;width:100%;height:clamp(620px,70vh,920px);min-height:620px;background:#f6f8fb}.graph-canvas-overlay{position:absolute;inset:0;z-index:8;display:grid;place-items:center;padding:24px;background:rgba(246,248,251,.88);backdrop-filter:blur(1px)}.graph-canvas-overlay[hidden]{display:none!important}.graph-canvas-overlay .embedded-graph-loading{min-height:0;margin:0;border:0;background:transparent}.graph-canvas-overlay .empty-state{max-width:460px;background:#fff}.kf-gpu-graph-surface,.kf-gpu-default-edges,.kf-gpu-default-nodes,.kf-gpu-emphasized-edges,.kf-gpu-emphasized-nodes,.kf-gpu-node-rings,.kf-gpu-graph-labels{position:absolute;inset:0}.kf-gpu-graph-surface{overflow:hidden;cursor:grab;touch-action:none}.kf-gpu-graph-surface.is-panning{cursor:grabbing}.kf-gpu-graph-surface canvas{display:block;cursor:grab!important;touch-action:none}.kf-gpu-graph-surface.is-panning canvas{cursor:grabbing!important}.kf-gpu-default-edges{z-index:1;overflow:hidden;pointer-events:none}.kf-gpu-default-edge{fill:none;stroke:#7891a7;stroke-width:1.15;stroke-linecap:round;opacity:.32}.kf-gpu-default-nodes{z-index:2;overflow:hidden;pointer-events:none}.kf-gpu-default-node{position:absolute;display:block;border:2px solid rgba(255,255,255,.95);border-radius:50%;box-sizing:border-box;box-shadow:0 1px 3px rgba(34,55,77,.09);opacity:.94}.kf-gpu-emphasized-edges{z-index:3;overflow:hidden;pointer-events:none}.kf-gpu-emphasized-edge{fill:none;stroke:#286da8;stroke-width:2.35;stroke-linecap:round;stroke-linejoin:round;opacity:.94}.kf-gpu-emphasized-nodes{z-index:4;overflow:hidden;pointer-events:none}.kf-gpu-emphasized-node{position:absolute;display:block;border:2px solid rgba(255,255,255,.98);border-radius:50%;box-sizing:border-box;box-shadow:0 1px 3px rgba(34,55,77,.16);opacity:1}.kf-gpu-emphasized-node.is-active{border-color:#fff;box-shadow:0 0 0 2px #df8646,0 1px 5px rgba(194,103,44,.28)}.kf-gpu-node-rings{z-index:5;overflow:hidden;pointer-events:none}.kf-gpu-node-ring{position:absolute;display:block;border:2px solid rgba(255,255,255,.96);border-radius:50%;box-shadow:0 1px 3px rgba(34,55,77,.16);pointer-events:none}.kf-gpu-node-ring.is-active{border-color:#df8646;box-shadow:0 1px 5px rgba(194,103,44,.28)}.kf-gpu-graph-labels{z-index:6;overflow:hidden;pointer-events:none}.kf-gpu-label{position:absolute;left:0;top:0;max-width:190px;padding:1px 4px;border-radius:3px;background:rgba(255,255,255,.68);color:#334b62;font-size:11px;font-weight:600;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 1px 2px rgba(45,83,120,.05);transform-origin:left top}.kf-gpu-label.is-selected{z-index:3;background:rgba(255,248,239,.94);color:#8f4c0c;font-size:12px}.kf-gpu-label.is-related{z-index:2;background:rgba(246,250,253,.88);color:#315f84;font-size:12px}.kf-gpu-graph-tooltip{position:absolute;z-index:7;max-width:270px;padding:7px 9px;border:0;border-radius:5px;background:rgba(255,255,255,.96);color:#344e66;font-size:12px;box-shadow:0 3px 12px rgba(26,62,99,.12);pointer-events:none}.graph-reading-key{display:flex;align-items:center;flex-wrap:wrap;gap:7px 16px;margin:-6px 0 10px;color:#62778e;font-size:12px}.graph-reading-key span{display:inline-flex;align-items:center;gap:5px}.graph-key-dot{width:10px;height:10px;border-radius:50%;background:#6e91b2}.graph-key-line{width:17px;border-top:1px solid rgba(120,145,167,.7)}.graph-key-size-scale{display:inline-flex!important;align-items:flex-end!important;gap:2px;width:34px;height:17px}.graph-key-size-scale b{display:block;flex:0 0 auto;border-radius:50%;background:#6e91b2}.graph-key-size-scale b:nth-child(1){width:7px;height:7px}.graph-key-size-scale b:nth-child(2){width:11px;height:11px}.graph-key-size-scale b:nth-child(3){width:16px;height:16px}.graph-neighbour-button{margin:9px 0 3px}.graph-scene-note{margin-top:9px!important;padding:8px 9px;border-left:3px solid #7da8d4;background:#f3f8fd;color:#476887!important;font-size:12px!important;line-height:1.5}.graph-scene-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:11px 0}.graph-scene-stats>div{padding:7px;border:1px solid #dce7f1;border-radius:5px;background:#f8fbfe}.graph-scene-stats dt{color:#6a8095;font-size:10px}.graph-scene-stats dd{margin:3px 0 0;color:#294b6e;font-size:11px;font-weight:700}.graph-community-stages>div{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.graph-community-stages .button{padding:7px 9px;font-size:12px}.graph-directory-heading{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:2px 0 8px}.graph-directory-heading b{color:#234568;font-size:13px}.graph-directory-heading small,.graph-directory-note{color:#71859a;font-size:11px;line-height:1.45}.graph-directory-note{margin:8px 1px 2px}.embedded-graph-groups[hidden]{display:none!important}
+.embedded-graph-layout{grid-template-columns:minmax(0,1fr) 320px}.embedded-graph-controls>select,.embedded-graph-controls>input{height:42px;box-sizing:border-box}.embedded-graph-controls>.button{min-height:42px}.embedded-graph-canvas{position:relative;overflow:hidden}.embedded-graph-canvas [data-graph-network]{position:relative;display:block;width:100%;height:clamp(620px,70vh,920px);min-height:620px;background:#f6f8fb}.graph-canvas-overlay{position:absolute;inset:0;z-index:8;display:grid;place-items:center;padding:24px;background:rgba(246,248,251,.88);backdrop-filter:blur(1px)}.graph-canvas-overlay[hidden]{display:none!important}.graph-canvas-overlay .embedded-graph-loading{min-height:0;margin:0;border:0;background:transparent}.graph-canvas-overlay .empty-state{max-width:460px;background:#fff}.kf-gpu-graph-surface,.kf-gpu-default-edges,.kf-gpu-default-nodes,.kf-gpu-emphasized-edges,.kf-gpu-emphasized-nodes,.kf-gpu-node-rings,.kf-gpu-graph-labels{position:absolute;inset:0}.kf-gpu-graph-surface{overflow:hidden;cursor:grab;touch-action:none}.kf-gpu-graph-surface.is-panning{cursor:grabbing}.kf-gpu-graph-surface canvas{display:block;cursor:grab!important;touch-action:none}.kf-gpu-graph-surface.is-panning canvas{cursor:grabbing!important}.kf-gpu-default-edges{z-index:1;overflow:hidden;pointer-events:none}.kf-gpu-default-edge{fill:none;stroke:#7891a7;stroke-width:1.15;stroke-linecap:round;opacity:.32}.kf-gpu-default-edge.is-topic-association{stroke:#8b9fb2;stroke-width:1.05;stroke-dasharray:5 5;opacity:.42}.kf-gpu-default-nodes{z-index:2;overflow:hidden;pointer-events:none}.kf-gpu-default-node{position:absolute;display:block;border:2px solid rgba(255,255,255,.95);border-radius:50%;box-sizing:border-box;box-shadow:0 1px 3px rgba(34,55,77,.09);opacity:.94}.kf-gpu-emphasized-edges{z-index:3;overflow:hidden;pointer-events:none}.kf-gpu-emphasized-edge{fill:none;stroke:#286da8;stroke-width:2.35;stroke-linecap:round;stroke-linejoin:round;opacity:.94}.kf-gpu-emphasized-edge.is-topic-association{stroke:#5f7f9c;stroke-dasharray:6 4;opacity:.88}.kf-gpu-emphasized-nodes{z-index:4;overflow:hidden;pointer-events:none}.kf-gpu-emphasized-node{position:absolute;display:block;border:2px solid rgba(255,255,255,.98);border-radius:50%;box-sizing:border-box;box-shadow:0 1px 3px rgba(34,55,77,.16);opacity:1}.kf-gpu-emphasized-node.is-active{border-color:#fff;box-shadow:0 0 0 2px #df8646,0 1px 5px rgba(194,103,44,.28)}.kf-gpu-node-rings{z-index:5;overflow:hidden;pointer-events:none}.kf-gpu-node-ring{position:absolute;display:block;border:2px solid rgba(255,255,255,.96);border-radius:50%;box-shadow:0 1px 3px rgba(34,55,77,.16);pointer-events:none}.kf-gpu-node-ring.is-active{border-color:#df8646;box-shadow:0 1px 5px rgba(194,103,44,.28)}.kf-gpu-graph-labels{z-index:6;overflow:hidden;pointer-events:none}.kf-gpu-label{position:absolute;left:0;top:0;max-width:190px;padding:1px 4px;border-radius:3px;background:rgba(255,255,255,.68);color:#334b62;font-size:11px;font-weight:600;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 1px 2px rgba(45,83,120,.05);transform-origin:left top}.kf-gpu-label.is-selected{z-index:3;background:rgba(255,248,239,.94);color:#8f4c0c;font-size:12px}.kf-gpu-label.is-related{z-index:2;background:rgba(246,250,253,.88);color:#315f84;font-size:12px}.kf-gpu-graph-tooltip{position:absolute;z-index:7;max-width:270px;padding:7px 9px;border:0;border-radius:5px;background:rgba(255,255,255,.96);color:#344e66;font-size:12px;box-shadow:0 3px 12px rgba(26,62,99,.12);pointer-events:none}.graph-reading-key{display:flex;align-items:center;flex-wrap:wrap;gap:7px 16px;margin:-6px 0 10px;color:#62778e;font-size:12px}.graph-reading-key span{display:inline-flex;align-items:center;gap:5px}.graph-key-dot{width:10px;height:10px;border-radius:50%;background:#6e91b2}.graph-key-line{width:17px;border-top:1px solid rgba(120,145,167,.7)}.graph-key-topic-line{width:17px;border-top:1px dashed rgba(108,132,154,.8)}.graph-key-size-scale{display:inline-flex!important;align-items:flex-end!important;gap:2px;width:34px;height:17px}.graph-key-size-scale b{display:block;flex:0 0 auto;border-radius:50%;background:#6e91b2}.graph-key-size-scale b:nth-child(1){width:7px;height:7px}.graph-key-size-scale b:nth-child(2){width:11px;height:11px}.graph-key-size-scale b:nth-child(3){width:16px;height:16px}.graph-neighbour-button{margin:9px 0 3px}.graph-scene-note{margin-top:9px!important;padding:8px 9px;border-left:3px solid #7da8d4;background:#f3f8fd;color:#476887!important;font-size:12px!important;line-height:1.5}.graph-scene-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:11px 0}.graph-scene-stats>div{padding:7px;border:1px solid #dce7f1;border-radius:5px;background:#f8fbfe}.graph-scene-stats dt{color:#6a8095;font-size:10px}.graph-scene-stats dd{margin:3px 0 0;color:#294b6e;font-size:11px;font-weight:700}.graph-community-stages>div{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.graph-community-stages .button{padding:7px 9px;font-size:12px}.graph-directory-heading{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:2px 0 8px}.graph-directory-heading b{color:#234568;font-size:13px}.graph-directory-heading small,.graph-directory-note{color:#71859a;font-size:11px;line-height:1.45}.graph-directory-note{margin:8px 1px 2px}.embedded-graph-groups[hidden]{display:none!important}
 .graph-canvas-scope{position:absolute;top:12px;left:12px;z-index:6;display:inline-flex;align-items:center;padding:3px;border:1px solid rgba(185,205,225,.96);border-radius:7px;background:rgba(255,255,255,.94);box-shadow:0 3px 12px rgba(38,77,116,.1)}.graph-canvas-scope[hidden]{display:none!important}.graph-canvas-scope button{min-height:30px;padding:0 10px;border:0;border-radius:5px;background:transparent;color:#58718b;font:700 12px/1 Arial,"Microsoft YaHei",sans-serif;cursor:pointer}.graph-canvas-scope button:hover{background:#edf6ff;color:#1769c2}.graph-canvas-scope button.is-active{background:#2677d8;color:#fff;box-shadow:0 1px 3px rgba(29,92,158,.18)}.graph-canvas-scope button:focus-visible{outline:2px solid #2677d8;outline-offset:2px}.graph-canvas-nav{position:absolute;top:12px;right:12px;z-index:6;display:flex;align-items:center;gap:5px;padding:4px;border:1px solid rgba(185,205,225,.96);border-radius:7px;background:rgba(255,255,255,.94);box-shadow:0 3px 12px rgba(38,77,116,.14)}.graph-canvas-nav button{display:grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid transparent;border-radius:5px;background:transparent;color:#245a8e;font:700 23px/1 Arial,sans-serif;cursor:pointer}.graph-canvas-nav button:hover:not(:disabled){border-color:#bcd4eb;background:#edf6ff;color:#1769c2}.graph-canvas-nav button:focus-visible{outline:2px solid #2677d8;outline-offset:2px}.graph-canvas-nav button:disabled{color:#aebdca;cursor:not-allowed}.graph-canvas-nav button span{position:relative;top:-1px}.graph-canvas-nav button[data-graph-return-overview]{margin-left:2px;border-left-color:#d7e3ef;border-radius:0}.graph-canvas-nav button[data-graph-return-overview] span{font-size:17px;top:0}.graph-canvas-zoom{display:inline-flex;align-items:center;gap:2px;margin-left:2px;padding-left:4px;border-left:1px solid #d7e3ef}.graph-canvas-zoom output{min-width:44px;color:#49627d;font:12px/1 Arial,"Microsoft YaHei",sans-serif;text-align:center}.graph-community-switch{display:inline-flex;align-items:center;padding:3px;border:1px solid #c7d8e9;border-radius:7px;background:#f8fbfe}.graph-community-switch button{min-height:30px;padding:0 9px;border:0;border-radius:5px;background:transparent;color:#58718b;font:700 12px/1 Arial,"Microsoft YaHei",sans-serif;cursor:pointer}.graph-community-switch button:hover{background:#edf6ff;color:#1769c2}.graph-community-switch button.is-active{background:#2677d8;color:#fff;box-shadow:0 1px 3px rgba(29,92,158,.18)}.graph-community-switch button:focus-visible{outline:2px solid #2677d8;outline-offset:2px}
-@media(max-width:980px){.workspace-body{overflow:auto}.workspace-shell{display:block;width:auto;height:auto;margin:16px auto;padding:0 12px 24px}.workspace-layout{grid-template-columns:1fr;height:auto;min-height:0}.workspace-sidebar{height:auto;overflow:visible;border-right:0;border-bottom:1px solid #dce5ee}.workspace-project-summary{padding:15px 16px}.workspace-nav{grid-template-columns:repeat(4,minmax(160px,1fr));overflow-x:auto}.workspace-nav-item{min-width:160px}.workspace-content,.workspace-view{height:auto;min-height:0;overflow:visible}.embedded-graph-layout{grid-template-columns:1fr}.embedded-graph-sidebar{max-height:none}}
+@media(max-width:1100px){.workspace-body{overflow:auto}.workspace-shell{display:block;width:auto;height:auto;margin:16px auto;padding:0 12px 24px}.workspace-layout{grid-template-columns:1fr;height:auto;min-height:0}.workspace-sidebar{height:auto;overflow:visible;border-right:0;border-bottom:1px solid #dce5ee}.workspace-project-summary{padding:15px 16px}.workspace-nav{grid-template-columns:repeat(4,minmax(160px,1fr));overflow-x:auto}.workspace-nav-item{min-width:160px}.workspace-content,.workspace-view{height:auto;min-height:0;overflow:visible}.embedded-graph-layout{grid-template-columns:1fr}.embedded-graph-sidebar{max-height:none}}
 .structure-media-gallery{display:flex;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-top:12px}.structure-image-figure{max-width:260px;margin:0}.structure-image-button{display:block;width:100%;padding:5px;border:1px solid #cfdae6;border-radius:7px;background:#f7fafc;cursor:zoom-in}.structure-image-button:hover{border-color:#6fa5d7;background:#eef6fd}.structure-image-button img{display:block;width:auto;max-width:100%;max-height:180px;margin:auto;object-fit:contain}.structure-image-figure figcaption{margin-top:5px;color:#637991;font-size:11px;line-height:1.45}.structure-table-preview{width:100%;margin-top:12px;overflow:auto;border:1px solid #d6e1ec;border-radius:7px;background:#fff}.structure-table-preview table,.document-media-body table{width:100%;min-width:520px}.structure-table-preview th,.structure-table-preview td,.document-media-body th,.document-media-body td{padding:8px 10px;font-size:12px;white-space:pre-wrap;word-break:break-word}.structure-table-actions{display:flex;align-items:center;justify-content:flex-end;padding:7px 9px;border-top:1px solid #e1e9f1;background:#f8fafc}.document-media-dialog{width:min(1120px,calc(100% - 28px));max-height:92vh}.document-media-body{max-height:72vh;margin:14px 0;overflow:auto}.document-media-body>img{display:block;max-width:100%;height:auto;margin:auto}.document-media-body>p{white-space:pre-wrap}.document-media-table{overflow:auto;border:1px solid #d6e1ec;border-radius:7px}.result-source{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:8px;color:#657b91;font-size:12px}.result-source a{font-weight:600}.result-media{display:flex;align-items:flex-start;flex-wrap:wrap;gap:8px;width:100%;margin-top:4px}.result-media-thumb{display:inline-flex;padding:4px;border:1px solid #d1deea;border-radius:6px;background:#f7fafc}.result-media-thumb img{display:block;max-width:128px;max-height:86px;object-fit:contain}.result-table{width:100%;margin-top:3px}.result-table summary{font-size:12px}.result-table pre{max-height:260px;overflow:auto;margin:7px 0 0;padding:10px;border-radius:6px;background:#f4f7fa;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.result-report-findings{margin:8px 0 0;padding-left:20px;color:#405a74;font-size:13px}.result-report-findings li+li{margin-top:5px}.result-retrieval-note{padding:9px 11px;border-left:3px solid #74a8d7;background:#f4f9fd;color:#506a83;font-size:12px}
 .result-report-findings-title{margin:12px 0 0;color:#315978;font-size:13px}.result-report-findings-title+.result-report-findings{margin-top:6px}
 @media(max-width:760px){.shell{margin:16px auto;padding:0 10px 24px}header,.section-heading,.project-picker,.upload-form,.search-form{align-items:stretch;flex-direction:column}.home-primary-actions{width:100%}.home-primary-actions .button{flex:1}.chat-entry{min-height:0;padding:24px}.chat-entry-status{align-items:flex-start;flex-direction:column}.project-picker label{min-width:0}.form-grid,.structure-tools{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.construction-controls,.stats-actions,.schema-actions,.graph-actions{align-items:stretch;flex-direction:column}.construction-controls{flex-wrap:wrap}.construction-controls form,.construction-controls .button,.stats-actions .button{width:100%}.construction-controls label{align-items:stretch;flex-direction:column}.construction-controls select{min-width:0}.search-form select{width:100%;min-width:0;flex:auto}.stats-actions .schema-chip{justify-content:center}.panel{padding:16px}.task-step{grid-template-columns:1fr;gap:5px}.home-hero{padding:20px}.hero-layout,.strategy-intro-grid{grid-template-columns:1fr}.hero-copy h2{font-size:25px}.hero-points{margin-top:2px}.home-flow{grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 0}.home-flow li:nth-child(3){border-left:0}.strategy-overview{padding-top:14px}.strategy-heading h2{font-size:22px}.strategy-lead{min-height:0}.choice-guide{grid-template-columns:1fr}.choice-guide em{grid-column:auto}.project-list-heading .button{width:100%}.workspace-nav{padding:8px}.workspace-view-heading h2{font-size:21px}.workspace-settings .form-actions .button{width:100%}}
@@ -2614,6 +3083,324 @@ CSS = r"""
 @media(max-width:760px){.preparation-heading-side{width:100%;max-width:none;justify-items:stretch}.preparation-update-notice{width:100%}.preparation-heading-side .construction-controls{justify-content:stretch}}
 .graph-scope-help{position:relative;display:inline-flex;align-items:center;margin-left:3px;padding-left:6px;border-left:1px solid #d7e3ef}.graph-canvas-scope .graph-scope-help-trigger{display:grid;place-items:center;width:22px;height:22px;min-height:22px;padding:0;border:1px solid #adc3d9;border-radius:50%;background:#fff;color:#486a8a;font:700 12px/1 Arial,"Microsoft YaHei",sans-serif;cursor:help}.graph-canvas-scope .graph-scope-help-trigger:hover,.graph-canvas-scope .graph-scope-help-trigger:focus-visible{border-color:#2677d8;background:#edf6ff;color:#1769c2;outline:none;box-shadow:0 0 0 2px rgba(38,119,216,.16)}.graph-scope-help-tip{position:absolute;top:calc(100% + 9px);left:0;z-index:9;width:290px;max-width:calc(100vw - 80px);padding:9px 11px;border:1px solid #c7d7e7;border-radius:6px;background:rgba(255,255,255,.98);box-shadow:0 5px 16px rgba(30,67,103,.14);color:#405d79;font:12px/1.55 Arial,"Microsoft YaHei",sans-serif;text-align:left;white-space:normal;visibility:hidden;opacity:0;transform:translateY(-3px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}.graph-scope-help-tip:before{content:"";position:absolute;top:-5px;left:7px;width:8px;height:8px;border-top:1px solid #c7d7e7;border-left:1px solid #c7d7e7;background:#fff;transform:rotate(45deg)}.graph-scope-help:hover .graph-scope-help-tip,.graph-scope-help-trigger:focus-visible+.graph-scope-help-tip{visibility:visible;opacity:1;transform:translateY(0)}
 .graph-community-description{display:grid;gap:9px;margin:4px 0 12px}.graph-community-section{padding:10px 11px;border:1px solid #dce6f0;border-radius:6px;background:#fff}.graph-community-section h4{margin:0 0 6px;color:#2a5278;font-size:12px}.graph-community-section p{margin:0;color:#405b76;font-size:12px;line-height:1.6}.graph-community-relations{background:#f8fbfe}.graph-community-evidence{border-left:3px solid #7da8d4;background:#f5f9fd}.graph-community-evidence blockquote{margin:0;color:#3f5c78;font-size:12px;line-height:1.6}
+
+.graph-community-link-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin:10px 0}.graph-community-link-metric{padding:8px 9px;border:1px solid #dce6ef;border-radius:6px;background:#f8fbfe}.graph-community-link-metric small{display:block;color:#74879a;font-size:10px}.graph-community-link-metric b{display:block;margin-top:2px;color:#244b70;font-size:14px}.graph-community-link-section{margin-top:12px}.graph-community-link-section>h4{margin:0 0 7px;color:#2b5278;font-size:12px}.graph-community-link-note{margin:9px 0 0;padding:8px 9px;border-left:3px solid #86a9cb;background:#f4f8fc;color:#4e6880;font-size:11px;line-height:1.55}.graph-predicate-profile{display:grid;gap:6px}.graph-predicate-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 8px;align-items:center;color:#365773;font-size:11px}.graph-predicate-row>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.graph-predicate-row>i{grid-column:1/-1;height:3px;border-radius:3px;background:#e5edf4;overflow:hidden}.graph-predicate-row>i::after{content:"";display:block;width:var(--predicate-share);height:100%;border-radius:inherit;background:#6d9bc6}.graph-community-relation-examples{display:grid;gap:8px}.graph-community-relation-examples .graph-source-card{margin:0}.graph-topic-match-list{display:grid;gap:6px;margin:0;padding:0;list-style:none}.graph-topic-match-list li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:7px 8px;border:1px solid #dce6ef;border-radius:6px;background:#f8fbfe;color:#365773;font-size:11px}.graph-topic-match-list li span{overflow-wrap:anywhere}.graph-topic-match-list li small{color:#6e8296;white-space:nowrap}
+
+/* 2026 visual refresh: product home and knowledge-base workspace. */
+:root{--kf-ink:#172a42;--kf-muted:#667b91;--kf-line:#d8e3ee;--kf-blue:#236fc8;--kf-blue-dark:#185a9f;--kf-soft:#f5f8fc;--kf-card:#fff;--kf-radius:12px}body{background:radial-gradient(circle at 12% -8%,rgba(66,139,216,.10),transparent 28rem),#f3f6fa;color:var(--kf-ink)}.button,.icon-button,input,select,textarea{transition:border-color .16s ease,box-shadow .16s ease,background .16s ease,transform .16s ease}.button{border-radius:8px;font-weight:650}.button.primary{background:linear-gradient(135deg,#2c7bd8,#216bc0);box-shadow:0 4px 12px rgba(35,111,200,.16)}.button.primary:hover{background:linear-gradient(135deg,#236fc8,#185a9f);transform:translateY(-1px)}.button.secondary:hover{border-color:#9db9d5;background:#f6faff;color:#185a9f}.button:focus-visible,.icon-button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:none;border-color:#4b91dc;box-shadow:0 0 0 3px rgba(44,123,216,.16)}.panel{border-color:var(--kf-line);border-radius:var(--kf-radius);box-shadow:0 12px 32px rgba(31,62,96,.055)}
+.home-shell{max-width:1280px;margin-top:20px}.home-header{min-height:58px;margin-bottom:14px;padding:0 4px}.home-header h1{font-size:25px;letter-spacing:-.025em}.home-header p{color:#6f8194;font-size:13px}.home-primary-actions{padding:4px;border:1px solid #d6e1ec;border-radius:10px;background:rgba(255,255,255,.76);box-shadow:0 5px 16px rgba(27,59,94,.05)}.home-primary-actions .button{min-width:112px;border-color:transparent;box-shadow:none}.home-primary-actions .button.secondary{background:transparent}.home-hero{padding:36px;border-color:#c7dced;border-radius:16px;background:linear-gradient(128deg,#fff 0%,#f7fbff 53%,#eaf4fc 100%);box-shadow:0 18px 44px rgba(31,74,119,.075)}.home-hero:before{content:"";position:absolute;right:6%;bottom:-150px;width:330px;height:330px;border-radius:50%;background:radial-gradient(circle,rgba(38,119,216,.09),rgba(38,119,216,0) 66%);pointer-events:none}.hero-layout{grid-template-columns:minmax(0,1.3fr) minmax(330px,.7fr);gap:42px;align-items:center}.hero-copy h2{max-width:720px;margin-top:10px;font-size:36px;line-height:1.18;letter-spacing:-.035em}.hero-copy p{max-width:720px;margin-top:12px;line-height:1.7}.hero-actions{display:flex;align-items:center;gap:10px;margin-top:22px}.hero-actions .button{min-width:132px;text-align:center}.hero-progress-note{display:flex;align-items:center;gap:8px!important;margin-top:15px!important;color:#718398!important;font-size:12px!important}.hero-progress-note i{display:block;flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#35a66f;box-shadow:0 0 0 4px rgba(53,166,111,.1)}.hero-points{gap:12px}.hero-points div{min-height:112px;padding:17px;border-color:rgba(176,201,225,.8);border-radius:11px;background:rgba(255,255,255,.78);box-shadow:0 10px 25px rgba(36,79,121,.055)}.hero-points b{font-size:15px}.hero-points span{font-size:12.5px}.home-flow{margin-top:30px;padding-top:20px}.home-flow li{position:relative;padding:0 16px}.home-flow li>b{background:#e8f2fc;color:#236fc8;box-shadow:inset 0 0 0 1px #c8dcef}.home-flow strong{font-size:13px}.home-flow small{font-size:11px}.product-overview{padding:28px}.product-overview .section-heading h2{margin-top:7px;font-size:25px;letter-spacing:-.02em}.product-overview .section-heading p{max-width:740px}.product-entry-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px;margin-top:20px}.product-entry-card{display:grid;grid-template-columns:54px minmax(0,1fr);gap:16px;min-height:176px;padding:22px;border:1px solid #d6e2ed;border-radius:12px;background:linear-gradient(145deg,#fff,#f8fbff)}.product-entry-card.chat-product-entry{background:linear-gradient(145deg,#fff,#f5fbfa)}.product-entry-index{display:grid;place-items:center;align-self:start;width:48px;height:48px;border-radius:12px;background:#e8f2fc;color:#2168ad;font-size:13px;font-weight:850}.chat-product-entry .product-entry-index{background:#e4f5f1;color:#14786d}.product-entry-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.product-entry-heading h3{margin:0;color:#1a3e64;font-size:21px}.product-entry-heading span{padding:4px 8px;border-radius:999px;background:#e6f6ec;color:#257647;font-size:11px;font-weight:750}.chat-product-entry .product-entry-heading span{background:#eef2f6;color:#63768b}.product-entry-card p{min-height:51px;margin-top:12px;font-size:13px}.text-action{display:inline-flex;align-items:center;gap:7px;margin-top:17px;padding:0;border:0;background:none;color:#216bbe;font:inherit;font-size:13px;font-weight:750;text-decoration:none;cursor:pointer}.text-action:hover{color:#164f8d}.text-action b{transition:transform .16s ease}.text-action:hover b{transform:translateX(3px)}.strategy-overview{padding:28px}.strategy-heading{margin-bottom:20px}.strategy-heading h2{font-size:25px;letter-spacing:-.02em}.strategy-explainer{padding:22px;border-top-width:3px;border-radius:12px}.strategy-lead{min-height:52px;line-height:1.65}.strategy-summary-list{display:grid;gap:0;margin:16px 0 0;padding:0;border-top:1px solid #e2eaf2;list-style:none}.strategy-summary-list li{display:grid;grid-template-columns:52px minmax(0,1fr);gap:10px;padding:11px 0;border-bottom:1px solid #e7edf3;color:#566d84;font-size:13px;line-height:1.55}.strategy-summary-list b{color:#274b70}.choice-guide{border-radius:10px;background:#f6f9fd}.project-list-dialog{border-radius:14px;background:#fbfdff}.project-card{border-radius:11px;background:#fff;box-shadow:0 5px 16px rgba(32,66,101,.045)}.project-card:hover{border-color:#a9c7e5;box-shadow:0 10px 24px rgba(32,66,101,.08)}
+.workspace-brand-header{align-items:center;min-height:54px;margin:0 4px 10px}.workspace-brand-header .brand-link{display:block}.workspace-brand-header h1{font-size:22px;letter-spacing:-.025em}.workspace-brand-header p{margin-top:2px;font-size:12px}.workspace-global-nav{display:flex;align-items:center;gap:6px;margin-left:auto;padding:4px;border:1px solid #d6e1ec;border-radius:10px;background:rgba(255,255,255,.84)}.workspace-global-nav .button{min-width:94px;padding:7px 12px;border-color:transparent;background:transparent;box-shadow:none;text-align:center}.workspace-global-nav .button.is-current{background:#e8f2fc;color:#185fa8}.workspace-layout{grid-template-columns:264px minmax(0,1fr);border-color:#cfdeeb;border-radius:14px;box-shadow:0 18px 45px rgba(25,57,91,.08)}.workspace-sidebar{background:linear-gradient(180deg,#f8fbfe 0%,#f2f6fa 100%)}.workspace-project-summary{padding:23px 19px 20px;background:linear-gradient(145deg,#f6fbff,#e9f3fc)}.workspace-project-title{grid-template-columns:minmax(0,1fr);gap:12px}.workspace-context-label{display:block;margin-bottom:6px;color:#6e859b;font-size:10px;font-weight:800;letter-spacing:.12em}.workspace-project-summary h2{font-size:19px;line-height:1.35}.workspace-strategy-badge{justify-self:start;border:1px solid #c9ddf1;border-radius:999px;background:rgba(255,255,255,.72);font-size:11px}.workspace-nav{gap:7px;padding:14px 11px}.workspace-nav-item{grid-template-columns:36px minmax(0,1fr);padding:12px;border-radius:9px}.workspace-nav-item>span{width:32px;height:32px;border-radius:9px;background:#e8eef5}.workspace-nav-item:hover{background:#fff;border-color:#d7e3ee;box-shadow:0 4px 12px rgba(31,64,99,.045)}.workspace-nav-item[aria-selected=true]{border-color:#b7d3ee;background:#fff;box-shadow:0 7px 18px rgba(37,91,145,.08)}.workspace-nav-item[aria-selected=true]>span{background:linear-gradient(135deg,#2d7cd8,#216bbe);box-shadow:0 4px 10px rgba(38,119,216,.2)}.workspace-content{background:#fff}.workspace-view{padding:30px 32px}.workspace-view-kicker{margin-bottom:8px}.workspace-view-heading h2{font-size:25px;letter-spacing:-.02em}.workspace-view-heading p{max-width:760px}.upload-form{margin-top:22px;padding:17px 18px;border:1px dashed #bbcee0;border-radius:11px;background:#f7faff}.upload-line input{padding:10px;border-color:#cfdeeb}.upload-help{padding-left:2px}.workspace-section{border-color:#e0e8f0}.workspace-section>.section-heading h2{font-size:19px}.table-wrap{border-color:#d8e3ee;border-radius:10px}.document-table{min-width:760px}.document-table .actions{min-width:145px}.document-table tbody tr{transition:background .14s ease}.document-table tbody tr:hover{background:#f8fbfe}.document-table tbody tr:hover .actions{background:#f8fbfe}.stats{gap:12px;margin:17px 0}.stats div{border:1px solid #dbe6ef;border-left:3px solid #2f7bd4;border-radius:9px;background:#f9fbfd;padding:13px 15px}.stats b{color:#1d4268;font-size:23px}.stats span{margin-top:2px}.task-box{border:1px solid #263c58;border-radius:11px;box-shadow:0 10px 25px rgba(8,24,43,.13)}.definition-card,.processing-options,.native-query-answer,.native-context-card{border-radius:9px}.definition-card{background:#fff;box-shadow:0 3px 11px rgba(31,64,99,.035)}.workspace-settings .form-grid{padding:20px;border:1px solid #dbe5ee;border-radius:11px;background:#fafcff}.settings-processing-options{background:#f7faff}.document-table td:first-child strong{display:block;max-width:430px;overflow-wrap:anywhere}
+@media(max-width:1100px){.workspace-brand-header{margin-inline:2px}.workspace-global-nav{margin-left:auto}.workspace-layout{grid-template-columns:1fr;height:auto;min-height:0;border-radius:12px}.workspace-sidebar{height:auto;overflow:visible;border-right:0;border-bottom:1px solid #dce5ee}.workspace-content,.workspace-view{height:auto;min-height:0;overflow:visible}.workspace-project-summary{padding:16px 18px}.workspace-project-title{grid-template-columns:minmax(0,1fr) auto;align-items:center}.workspace-context-label{margin-bottom:3px}.workspace-strategy-badge{justify-self:end}.workspace-nav{grid-template-columns:repeat(4,minmax(155px,1fr));padding:10px}.workspace-view{padding:24px}.workspace-nav-item{min-width:155px}}
+@media(max-width:760px){body{background:#f3f6fa}.home-shell{margin-top:10px}.home-header,.workspace-brand-header{align-items:stretch;flex-direction:column;gap:12px}.home-primary-actions,.workspace-global-nav{width:100%;margin:0}.home-primary-actions .button,.workspace-global-nav .button{flex:1;min-width:0}.home-hero{padding:23px;border-radius:13px}.hero-layout,.strategy-intro-grid{grid-template-columns:1fr}.hero-layout{gap:24px}.hero-copy h2{font-size:29px}.hero-copy p{font-size:14px}.hero-actions{align-items:stretch}.hero-actions .button{flex:1;min-width:0}.hero-points{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.hero-points div{min-height:98px;padding:13px}.home-flow{grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 0}.product-overview,.strategy-overview{padding:20px}.product-entry-grid{grid-template-columns:1fr}.product-entry-card{min-height:0;padding:18px}.strategy-intro-grid{gap:12px}.strategy-explainer{padding:18px}.choice-guide{padding:14px}.workspace-shell{margin-top:10px}.workspace-project-title{grid-template-columns:minmax(0,1fr)}.workspace-strategy-badge{justify-self:start}.workspace-nav{grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible}.workspace-nav-item{min-width:0}.workspace-view{padding:21px 16px}.upload-form{padding:14px}.upload-line{align-items:stretch;flex-direction:column}.upload-line .button{width:100%}.workspace-view-heading h2{font-size:22px}.document-table-wrap{overflow:visible;border:0;border-radius:0;background:transparent}.document-table{display:block;min-width:0}.document-table thead{display:none}.document-table tbody{display:grid;gap:11px}.document-table tbody tr{display:block;overflow:hidden;border:1px solid #d7e3ed;border-radius:10px;background:#fff;box-shadow:0 5px 15px rgba(31,64,99,.045)}.document-table tbody td{display:grid;grid-template-columns:78px minmax(0,1fr);gap:9px;padding:9px 13px;border-bottom:1px solid #edf1f5;text-align:left}.document-table tbody td:before{content:attr(data-label);color:#74879a;font-size:12px;font-weight:700}.document-table tbody td>*{grid-column:2}.document-table tbody td:first-child{padding-top:13px}.document-table tbody td:first-child strong{color:#1d4268}.document-table tbody td .status{justify-self:start}.document-table tbody td small{max-width:none;white-space:normal}.document-table tbody .actions{position:static;display:flex;align-items:center;justify-content:flex-end;min-width:0;padding:10px 13px;background:#f8fbfe}.document-table tbody .actions:before{margin-right:auto}.document-table tbody tr:hover .actions{background:#f8fbfe}.document-table .document-empty-row{box-shadow:none}.document-table .document-empty-row td{display:block;padding:24px}.document-table .document-empty-row td:before{content:none}.workspace-settings .form-grid{padding:15px}.stats{gap:8px}.stats div{padding:11px 12px}}
+@media(max-width:440px){.hero-points{grid-template-columns:repeat(2,minmax(0,1fr))}.hero-points div{min-height:104px}.hero-points span{font-size:11.5px}.product-entry-card{grid-template-columns:42px minmax(0,1fr);gap:12px}.product-entry-index{width:40px;height:40px}.product-entry-heading{align-items:flex-start;flex-direction:column}.strategy-summary-list li{grid-template-columns:45px minmax(0,1fr)}}
+
+/* Full-surface refresh: chat, process artifacts, dialogs and result views. */
+.workspace-settings #project-settings-form{grid-template-columns:repeat(3,minmax(220px,1fr));align-items:start;gap:17px 18px;max-width:none;margin-top:22px;padding:22px}
+.workspace-settings #project-settings-form>label{min-width:0}
+.workspace-settings #project-settings-form>.native-config-note{grid-column:span 2;min-height:82px}
+.workspace-settings #project-settings-form>.form-actions{grid-column:1/-1;margin-top:3px;padding-top:17px;border-top:1px solid #e0e8f0}
+.workspace-settings .settings-processing-options{padding:19px 20px;background:#f7faff}
+.workspace-settings .settings-processing-options .form-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;max-width:none;margin:0;padding:0;border:0;border-radius:0;background:transparent}
+.workspace-settings .settings-processing-options .native-config-note{min-height:0;justify-content:center;background:rgba(255,255,255,.72)}
+.workspace-settings .settings-processing-options>.muted{margin:13px 0 0;padding-top:12px;border-top:1px solid #dfe8f1}
+.status-page{display:grid;grid-template-columns:180px minmax(0,1fr);align-items:center;gap:36px;min-height:430px;padding:48px;background:linear-gradient(135deg,#fff 0%,#f7fbff 64%,#edf5fc 100%)}
+.status-page-code{display:grid;place-items:center;width:160px;height:160px;border:1px solid #cbddec;border-radius:36px;background:rgba(255,255,255,.82);box-shadow:0 14px 32px rgba(35,85,133,.08);color:#347cc6;font-size:46px;font-weight:850;letter-spacing:-.04em}
+.status-page-copy h2{margin-top:9px;color:#1a3e63;font-size:30px;letter-spacing:-.025em}
+.status-page-copy p{max-width:620px;font-size:14px;line-height:1.7}
+.status-page-actions{display:flex;align-items:center;gap:9px;margin-top:22px}
+/* Knowledge Agent: a focused, evidence-first answering workspace. */
+.agent-shell{max-width:1480px}
+.agent-workbench{padding:0;overflow:hidden;background:#fbfdff}
+.agent-heading{align-items:flex-start;margin:0;padding:25px 28px 22px;border-bottom:1px solid #dce6ef;background:linear-gradient(135deg,#fff 0%,#f5faff 100%)}
+.agent-heading h2{margin-top:7px;color:#183d63;font-size:26px;letter-spacing:-.025em}
+.agent-heading p{max-width:820px;font-size:13px;line-height:1.7}
+.agent-scope-bar{display:flex;align-items:flex-end;gap:14px;padding:16px 22px;border-bottom:1px solid #dfe8f1;background:#fff}
+.agent-scope-bar>label{display:grid;flex:1 1 520px;gap:6px;min-width:0}
+.agent-scope-bar>#agent-mode-field{flex:0 1 310px}
+.agent-scope-bar>[hidden]{display:none}
+.agent-scope-bar label>span{color:#49657f;font-size:11px;font-weight:800;letter-spacing:.035em}
+.agent-scope-bar select{min-width:0;height:42px;border-radius:8px;background:#fbfdff}
+.agent-layout{display:grid;grid-template-columns:250px minmax(0,1fr) 350px;height:clamp(650px,calc(100vh - 220px),900px);min-height:0}
+.agent-thread-pane{display:flex;min-width:0;min-height:0;flex-direction:column;border-right:1px solid #dce6ef;background:#fbfdff}
+.agent-thread-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:17px 14px 13px;border-bottom:1px solid #e1e9f1}
+.agent-thread-heading h3{margin:0;color:#1f4569;font-size:16px}
+.agent-thread-heading span{display:block;margin-top:3px;color:#7a8da0;font-size:10px}
+.agent-thread-heading .button{min-width:auto;padding:7px 10px;border-radius:7px;font-size:11px}
+.agent-thread-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:7px;padding:11px;overflow:auto;scrollbar-gutter:stable}
+.agent-thread-empty{margin:0;padding:18px 10px;color:#7a8da0;font-size:11px;line-height:1.65;text-align:center}
+.agent-thread-row{position:relative;min-width:0}
+.agent-thread-item{display:flex;width:100%;flex-direction:column;gap:5px;padding:11px 48px 11px 10px;border:1px solid transparent;border-radius:9px;background:transparent;color:#2a4864;text-align:left;cursor:pointer;transition:border-color .14s ease,background .14s ease,box-shadow .14s ease}
+.agent-thread-item:hover{border-color:#d4e1ed;background:#f4f8fc}
+.agent-thread-item.active{border-color:#b9d3eb;background:#edf6ff;box-shadow:inset 3px 0 #2b79ca}
+.agent-thread-item:disabled{cursor:default;opacity:.72}
+.agent-thread-item strong{display:-webkit-box;overflow:hidden;color:#234768;font-size:12px;line-height:1.45;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.agent-thread-preview{display:block;overflow:hidden;color:#6a8094;font-size:10px;line-height:1.45;text-overflow:ellipsis;white-space:nowrap}
+.agent-thread-item small{display:flex;align-items:center;gap:7px;color:#8293a4;font-size:9px}
+.agent-thread-item small span+span::before{content:'·';margin-right:7px;color:#adbac6}
+.agent-thread-running{color:#27835d!important;font-weight:800}
+.agent-thread-delete{position:absolute;top:8px;right:7px;padding:4px 6px;border:0;border-radius:5px;background:transparent;color:#8798a8;font-size:9px;cursor:pointer;opacity:.68;transition:opacity .14s ease,background .14s ease,color .14s ease}
+.agent-thread-row:hover .agent-thread-delete,.agent-thread-delete:focus-visible{opacity:1}
+.agent-thread-delete:hover{background:#fff0f0;color:#b84e54}
+.agent-thread-delete:disabled{cursor:default;opacity:.3}
+.agent-conversation{display:grid;grid-template-rows:minmax(0,1fr) auto;min-width:0;min-height:0;overflow:hidden;border-right:1px solid #dce6ef;background:#f6f8fb}
+.agent-message-list{display:flex;min-height:0;flex-direction:column;gap:18px;padding:27px 32px;overflow:auto;scrollbar-gutter:stable}
+.agent-message-list::before{content:"";margin-top:auto}
+.agent-empty{display:grid;place-items:center;align-content:center;flex:1;min-height:430px;padding:40px;text-align:center}
+.agent-empty[hidden]{display:none}
+.agent-empty>span{display:grid;place-items:center;width:64px;height:64px;border:1px solid #c8daec;border-radius:19px;background:linear-gradient(145deg,#e8f3fd,#fff);box-shadow:0 10px 25px rgba(39,87,136,.09);color:#2167ad;font-weight:900;letter-spacing:.06em}
+.agent-empty h3{margin:17px 0 0;color:#214568;font-size:21px}
+.agent-empty p{max-width:650px;font-size:13px;line-height:1.75}
+.agent-message{position:relative;width:min(850px,92%);padding:16px 18px;border:1px solid #d8e3ed;border-radius:12px;background:#fff;box-shadow:0 5px 16px rgba(28,59,91,.045);transition:border-color .16s ease,background-color .16s ease,box-shadow .16s ease}
+.agent-message.user{align-self:flex-end;width:min(700px,86%);border-color:#bdd6ee;background:#edf6ff}
+.agent-message.assistant{align-self:flex-start}
+.agent-message.assistant.agent-turn-selectable{cursor:pointer}
+.agent-message.assistant.evidence-selected{border-color:#9fc3e5;box-shadow:inset 3px 0 #2b79ca,0 5px 16px rgba(28,59,91,.055)}
+.agent-message.failed{border-color:#efc4c6;background:#fffafa}
+.agent-message.cancelled{border-color:#d8dfe7;background:#f8fafc}
+.agent-message-role{display:block;margin-bottom:8px;color:#617991;font-size:11px;font-weight:800;letter-spacing:.05em}
+.agent-message.user .agent-message-role{color:#2b6da9}
+.agent-message-body{color:#203b56;font-size:14px;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere}
+.agent-execution-trace{margin:0 0 13px;border:1px solid #dbe6ef;border-radius:9px;background:#f8fbfe;color:#395673;overflow:hidden}
+.agent-execution-trace>summary{display:flex;align-items:center;gap:10px;min-height:39px;padding:8px 11px;cursor:pointer;list-style:none;user-select:none}
+.agent-execution-trace>summary::-webkit-details-marker{display:none}
+.agent-execution-trace>summary::before{content:'›';display:grid;place-items:center;width:18px;height:18px;border-radius:50%;background:#e7f1fa;color:#3477b7;font-size:17px;font-weight:800;line-height:1;transition:transform .15s ease}
+.agent-execution-trace[open]>summary::before{transform:rotate(90deg)}
+.agent-trace-summary-label{color:#2e587e;font-size:12px;font-weight:800}
+.agent-trace-summary-status{margin-left:auto;color:#698097;font-size:10px;text-align:right}
+.agent-execution-trace.is-running .agent-trace-summary-status{color:#247153}
+.agent-execution-trace.is-failed .agent-trace-summary-status{color:#a74a50}
+.agent-trace-body{display:grid;gap:13px;max-height:350px;padding:12px 13px 13px;border-top:1px solid #e2eaf1;overflow:auto;background:#fff;scrollbar-gutter:stable}
+.agent-trace-current{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:7px;background:#edf8f3;color:#28694f;font-size:11px;font-weight:750}
+.agent-trace-current i{width:7px;height:7px;border-radius:50%;background:#35a276;box-shadow:0 0 0 4px rgba(53,162,118,.11);animation:agent-trace-pulse 1.3s ease-in-out infinite}
+@keyframes agent-trace-pulse{50%{opacity:.45;transform:scale(.78)}}
+.agent-trace-body h4{margin:0 0 7px;color:#315978;font-size:11px;letter-spacing:.025em}
+.agent-trace-decisions>div{display:grid;gap:7px}
+.agent-trace-decisions>div>div{padding:8px 10px;border-left:2px solid #8db6d9;border-radius:4px;background:#f5f9fc}
+.agent-trace-decisions b{display:block;color:#315a7d;font-size:11px}
+.agent-trace-decisions p,.agent-trace-item p{margin:3px 0 0;color:#5a7187;font-size:10.5px;line-height:1.55}
+.agent-trace-timeline ol{display:grid;gap:0;margin:0;padding:0;list-style:none}
+.agent-trace-item{position:relative;display:grid;grid-template-columns:17px minmax(0,1fr);gap:8px;padding:0 0 11px}
+.agent-trace-item:not(:last-child)::before{content:'';position:absolute;left:7px;top:14px;bottom:0;width:1px;background:#dce6ee}
+.agent-trace-marker{position:relative;z-index:1;display:block;width:9px;height:9px;margin:4px;border:2px solid #fff;border-radius:50%;background:#7da1c2;box-shadow:0 0 0 1px #aec5d9}
+.agent-trace-item.is-tool .agent-trace-marker{border-radius:3px;background:#5e8fba}
+.agent-trace-item.status-running .agent-trace-marker{background:#31a173;box-shadow:0 0 0 1px #67b799}
+.agent-trace-item.status-failed .agent-trace-marker{background:#c75e65;box-shadow:0 0 0 1px #dc9499}
+.agent-trace-item.status-degraded .agent-trace-marker{background:#ca8a2c;box-shadow:0 0 0 1px #dfb46f}
+.agent-trace-item>div,.agent-trace-item-detail{min-width:0}
+.agent-trace-item-detail{border-radius:6px;transition:background-color .14s ease}
+.agent-trace-item-detail[open]{margin:-5px -7px -2px;padding:5px 7px 7px;background:#f7fafc}
+.agent-trace-item-detail>summary{cursor:pointer;list-style:none}
+.agent-trace-item-detail>summary::-webkit-details-marker{display:none}
+.agent-trace-item-detail>summary:focus-visible{outline:2px solid #7eb1dd;outline-offset:3px;border-radius:3px}
+.agent-trace-item-head{display:flex;align-items:flex-start;justify-content:space-between;gap:9px}
+.agent-trace-item-heading{display:block;min-width:0}
+.agent-trace-item-head strong{color:#345773;font-size:11px;line-height:1.4}
+.agent-trace-item-meta{display:flex;flex:0 0 auto;align-items:center;gap:6px;color:#8091a2}
+.agent-trace-item-head small{font-size:9px}
+.agent-trace-item code{display:inline-block;margin-top:5px;padding:2px 5px;border-radius:4px;background:#edf3f8;color:#56718a;font:9px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace}
+.agent-trace-expand-label{display:inline-flex;align-items:center;gap:3px;color:#47789f;font-size:9px;font-style:normal;font-weight:700}
+.agent-trace-expand-label::before{content:'›';font-size:13px;line-height:1;transition:transform .14s ease}
+.agent-trace-item-detail[open] .agent-trace-expand-label::before{transform:rotate(90deg)}
+.agent-trace-item-detail[open] .agent-trace-expand-label{font-size:0}
+.agent-trace-item-detail[open] .agent-trace-expand-label::after{content:'收起';font-size:9px}
+.agent-trace-item-panel{margin-top:8px;padding-top:8px;border-top:1px solid #e1e9f0}
+.agent-trace-facts{display:grid;grid-template-columns:minmax(86px,auto) minmax(0,1fr);gap:5px 11px;margin:0}
+.agent-trace-facts dt{color:#71869a;font-size:9.5px;font-weight:700}
+.agent-trace-facts dd{min-width:0;margin:0;color:#334f68;font-size:10px;line-height:1.5;overflow-wrap:anywhere}
+.agent-trace-evidence{display:grid;gap:7px;margin-top:10px;padding-top:9px;border-top:1px solid #e1e9f0}
+.agent-trace-evidence h5{margin:0;color:#315978;font-size:10px}
+.agent-trace-evidence>div{display:grid;gap:6px}
+.agent-trace-evidence-card{display:grid;width:100%;gap:4px;padding:8px 9px;border:1px solid #d9e5ef;border-radius:6px;background:#fff;color:#344f68;text-align:left;cursor:pointer;transition:border-color .14s ease,background-color .14s ease,box-shadow .14s ease}
+.agent-trace-evidence-card:hover{border-color:#9fc3e3;background:#f8fbfe;box-shadow:0 2px 7px rgba(38,82,123,.07)}
+.agent-trace-evidence-card:focus-visible{outline:2px solid #71a7d6;outline-offset:1px}
+.agent-trace-evidence-head{display:flex;align-items:flex-start;justify-content:space-between;gap:9px}
+.agent-trace-evidence-head b{min-width:0;color:#2f597c;font-size:10px;line-height:1.4;overflow-wrap:anywhere}
+.agent-trace-evidence-head small{flex:0 0 auto;color:#668098;font-size:8.5px;line-height:1.4}
+.agent-trace-evidence-location{overflow:hidden;color:#75899c;font-size:8.5px;text-overflow:ellipsis;white-space:nowrap}
+.agent-trace-evidence-card p{display:-webkit-box;overflow:hidden;margin:0;color:#4f687f;font-size:9.5px;line-height:1.48;-webkit-box-orient:vertical;-webkit-line-clamp:3}
+.agent-trace-placeholder{margin:0;color:#71869a;font-size:11px;line-height:1.6}
+.agent-trace-disclosure{margin:0;padding-top:9px;border-top:1px solid #e8eef3;color:#8292a1;font-size:9.5px;line-height:1.5}
+.agent-message-actions{display:flex;align-items:center;gap:6px;margin-top:13px;padding-top:10px;border-top:1px solid #e7edf3}
+.agent-message-actions button{padding:5px 8px;border:0;border-radius:6px;background:transparent;color:#61778c;font:inherit;font-size:11px;cursor:pointer}
+.agent-message-actions button:hover{background:#eef4fa;color:#1e67ad}
+.agent-message-actions button:disabled{cursor:default;color:#3a805e}
+.agent-composer{padding:15px 20px 18px;border-top:1px solid #dbe5ee;background:rgba(255,255,255,.96)}
+.agent-composer textarea{min-height:78px;max-height:190px;padding:13px 14px;border-radius:10px;resize:vertical;background:#fff;line-height:1.55}
+.agent-composer-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:10px}
+.agent-composer-footer>span{color:#6b8196;font-size:11px}
+.agent-composer-footer>div{display:flex;align-items:center;gap:8px}
+.agent-composer-footer .button{min-width:86px}
+.agent-source-pane{min-width:0;min-height:0;padding:20px 17px;background:#fff;overflow:auto}
+.agent-source-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:0 3px 14px;border-bottom:1px solid #e0e8f0}
+.agent-source-heading h3{margin:5px 0 0;color:#1c4167;font-size:20px}
+.agent-source-heading>span{display:grid;place-items:center;min-width:30px;height:30px;padding:0 8px;border-radius:999px;background:#eaf3fc;color:#2168ad;font-size:12px;font-weight:800}
+.agent-source-turn{display:grid;gap:6px;margin:13px 2px 3px}
+.agent-source-turn[hidden]{display:none}
+.agent-source-turn>span{color:#60778d;font-size:10px;font-weight:800}
+.agent-source-turn select{width:100%;height:36px;padding:0 30px 0 9px;border:1px solid #cfdeeb;border-radius:7px;background:#f8fbfe;color:#31516f;font-size:11px}
+.agent-source-content{min-width:0;transform-origin:top center}
+#agent-source-empty{padding:14px 3px;color:#74879a;font-size:12px;line-height:1.65}
+.agent-source-list{display:grid;gap:9px;margin-top:13px}
+.agent-source-card{display:block;width:100%;padding:12px;border:1px solid #d9e4ee;border-radius:9px;background:#fbfdff;color:#304d69;text-align:left;cursor:pointer;transition:border-color .14s ease,background .14s ease,transform .14s ease}
+.agent-source-card:hover{border-color:#a9c7e5;background:#f4f9fe;transform:translateY(-1px)}
+.agent-source-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.agent-source-card-head b{color:#24567f;font-size:12px;line-height:1.45}
+.agent-source-card-head small{flex:0 0 auto;padding:3px 6px;border-radius:999px;background:#eaf2f9;color:#52718d;font-size:9px;font-weight:700}
+.agent-source-card-location{display:block;margin-top:7px;color:#6c8195;font-size:10px;line-height:1.45;overflow-wrap:anywhere}
+.agent-source-card-media{display:flex;align-items:center;gap:6px;margin-top:9px;overflow:hidden}.agent-source-card-media img{display:block;width:auto;max-width:calc(50% - 3px);height:82px;border:1px solid #d7e2ec;border-radius:6px;background:#fff;object-fit:contain}.agent-source-card-media small{align-self:flex-end;padding:3px 6px;border-radius:999px;background:#eaf2f9;color:#52718d;font-size:9px;font-weight:700}
+.agent-source-card p{display:-webkit-box;margin-top:7px;overflow:hidden;color:#445f78;font-size:11px;line-height:1.55;-webkit-box-orient:vertical;-webkit-line-clamp:4}
+.agent-evidence-dialog{width:min(880px,calc(100% - 28px));max-height:88vh}
+.agent-evidence-dialog[open]{display:flex;flex-direction:column}
+.agent-evidence-dialog>.dialog-heading{flex:0 0 auto}
+.agent-evidence-body{display:grid;gap:13px;min-height:0;padding:18px 21px 22px;overflow:auto;background:#f6f8fb}
+.agent-evidence-content{margin:0;padding:14px 15px;border:1px solid #d9e4ee;border-left:3px solid #5794cf;border-radius:8px;background:#fff;color:#294660;font-size:13px;line-height:1.75;white-space:pre-wrap}
+.agent-evidence-source{padding:14px 15px;border:1px solid #d8e3ed;border-radius:9px;background:#fff}
+.agent-evidence-source h3{margin:0;color:#234b70;font-size:14px;overflow-wrap:anywhere}
+.agent-evidence-source h4{margin:14px 0 7px;color:#355c7e;font-size:12px}
+.agent-evidence-source p{font-size:11px}
+.agent-evidence-source blockquote{margin:12px 0;padding:10px 12px;border-left:3px solid #85add2;background:#f5f9fd;color:#36536f;font-size:12px;line-height:1.7;white-space:pre-wrap}
+.agent-evidence-source>a:not(.agent-evidence-image){display:inline-flex;margin-top:8px;color:#1769c2;font-size:12px;font-weight:750;text-decoration:none}
+.agent-evidence-source pre{max-height:320px;margin:0;padding:11px;border:1px solid #e0e7ee;border-radius:7px;background:#f8fafc;color:#2f4962;font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:auto;white-space:pre-wrap}
+.agent-evidence-image{display:inline-block;margin:12px 10px 0 0;padding:5px;border:1px solid #d7e2ec;border-radius:8px;background:#fff}
+.agent-evidence-image img{display:block;width:auto;max-width:240px;max-height:180px;border-radius:5px;object-fit:contain}
+
+.process-artifacts .table-wrap{background:#fff}
+.artifact-table tbody tr{transition:background .14s ease}
+.artifact-table tbody tr:hover{background:#f8fbfe}
+.artifact-table td:first-child strong{display:block;max-width:520px;color:#1f405f;overflow-wrap:anywhere}
+.artifact-table .artifact-actions{text-align:right}
+.artifact-table .artifact-actions .button{margin-block:2px}
+
+dialog:not(.graph-evidence-modal){padding:0;border-color:#cbd9e6;border-radius:14px;background:#fff;overflow:hidden;box-shadow:0 26px 75px rgba(15,35,60,.26)}
+dialog:not(.graph-evidence-modal)::backdrop{background:rgba(24,40,59,.48);backdrop-filter:blur(2px)}
+dialog:not(.graph-evidence-modal)>.dialog-heading{position:relative;z-index:2;margin:0;padding:18px 21px 16px;border-bottom:1px solid #dde6ee;background:linear-gradient(135deg,#fff,#f7faff)}
+dialog:not(.graph-evidence-modal)>.dialog-heading h2{color:#1a395a;font-size:20px;letter-spacing:-.015em}
+dialog:not(.graph-evidence-modal)>.dialog-heading p{font-size:12px}
+dialog:not(.graph-evidence-modal)>.dialog-heading .icon-button{border:1px solid #d0dce8;background:#fff;color:#3b5875;box-shadow:none}
+dialog:not(.graph-evidence-modal)>.dialog-heading .icon-button:hover{border-color:#a9bfd5;background:#eef5fb}
+#create-project-dialog>form{margin:0;padding:20px 22px}
+.project-list-dialog .project-list-tools{margin:0;padding:16px 22px 0}
+.project-list-dialog .project-grid{margin:0;padding:16px 22px 22px}
+dialog:not(.graph-evidence-modal)>.dialog-actions,#create-project-dialog .dialog-actions{margin:0;padding:13px 20px;border-top:1px solid #dde6ee;background:#f8fafc}
+.log-dialog>.history-log{margin:16px 20px;min-height:300px;border:1px solid #263a53;border-radius:9px;background:#0f1d2e;box-shadow:inset 0 1px 10px rgba(0,0,0,.16)}
+dialog:not(.graph-evidence-modal)>.job-log-error{margin:16px 20px 0}
+.delete-progress-dialog>.delete-progress-body{margin:20px}
+.delete-progress-dialog>.delete-progress-bar{margin:0 20px 20px}
+.structure-dialog>.structure-tools{margin:16px 20px 12px}
+.structure-dialog>.structure-list{display:grid;gap:9px;max-height:58vh;margin:0 20px;padding:10px;border-color:#d7e2ec;border-radius:10px;background:#f5f8fb}
+.structure-dialog>.structure-pager{margin:12px 20px;color:#687e94;font-size:12px}
+.structure-row{padding:14px 15px;border:1px solid #d8e3ed!important;border-radius:9px;background:#fff;box-shadow:0 3px 10px rgba(31,64,99,.035)}
+.structure-row-head{align-items:flex-start}
+.structure-row-meta{line-height:1.5}
+.structure-text{color:#2c4660;font:13px/1.72 system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+.structure-metadata{padding-top:8px;border-top:1px solid #e8edf2}
+.structure-metadata pre{border:1px solid #e1e8ef;border-radius:7px;background:#f8fafc}
+.block-type,.chunk-badge{border-radius:999px}
+.structure-image-button,.structure-table-preview{border-radius:9px}
+.document-media-dialog>.document-media-body{margin:16px 20px;max-height:72vh;padding:12px;border:1px solid #dce5ed;border-radius:10px;background:#f7f9fc}
+.document-media-body>p{padding:0 8px;color:#496178;font-size:13px;line-height:1.65}
+.structure-dialog>.artifact-content{margin:16px 20px;min-height:320px;border:1px solid #263a53;border-radius:9px;background:#0f1d2e}
+.native-query-answer{box-shadow:0 6px 18px rgba(31,70,109,.05)}
+.result-group{display:grid;gap:10px;margin-top:18px}
+.result-card{padding:14px 15px;border:1px solid #dbe5ee;border-radius:9px;background:#fbfdff}
+.result-card h3{color:#274c70}
+.result-card p{line-height:1.65}
+.result-source a{color:#216bbe;text-decoration:none}
+.result-source a:hover{text-decoration:underline}
+
+@media(max-width:900px){
+  .agent-scope-bar{flex-wrap:wrap}
+  .agent-scope-bar>label,.agent-scope-bar>#agent-mode-field{flex:1 1 300px}
+  .agent-layout{grid-template-columns:1fr;height:auto;min-height:650px}
+  .agent-thread-pane{max-height:250px;border-right:0;border-bottom:1px solid #dce6ef}
+  .agent-thread-list{max-height:190px}
+  .agent-conversation{border-right:0;border-bottom:1px solid #dce6ef}
+  .agent-message-list{min-height:500px}
+  .agent-source-pane{max-height:440px}
+}
+@media(min-width:901px) and (max-width:1180px){
+  .agent-layout{grid-template-columns:225px minmax(0,1fr)}
+  .agent-source-pane{grid-column:1/-1;max-height:390px;border-top:1px solid #dce6ef}
+}
+@media(max-width:1180px){
+  .workspace-settings #project-settings-form{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .workspace-settings #project-settings-form>.native-config-note{grid-column:1/-1}
+}
+@media(max-width:760px){
+  .agent-heading{align-items:flex-start;flex-direction:column;padding:21px 18px}
+  .agent-heading h2{font-size:23px}
+  .agent-scope-bar{align-items:stretch;flex-direction:column;padding:14px}
+  .agent-scope-bar>label,.agent-scope-bar>#agent-mode-field{flex:auto;width:100%}
+  .agent-thread-heading{padding:14px 13px 11px}
+  .agent-thread-list{padding:9px}
+  .agent-message-list{gap:13px;min-height:420px;padding:18px 12px}
+  .agent-empty{min-height:360px;padding:24px 14px}
+  .agent-message,.agent-message.user{width:96%;padding:14px}
+  .agent-composer{padding:12px}
+  .agent-composer-footer{align-items:flex-start;flex-direction:column}
+  .agent-composer-footer>div{align-self:stretch}
+  .agent-composer-footer .button{flex:1}
+  .agent-source-pane{padding:17px 13px}
+  .agent-evidence-body{padding:13px 14px 17px}
+  .agent-evidence-image img{max-width:100%}
+  .workspace-settings #project-settings-form{grid-template-columns:1fr;padding:15px}
+  .workspace-settings #project-settings-form>.native-config-note{grid-column:auto}
+  .workspace-settings .settings-processing-options{padding:15px}
+  .workspace-settings .settings-processing-options .form-grid{grid-template-columns:1fr}
+  .workspace-settings>.section-heading{align-items:flex-start;flex-direction:row}
+  .workspace-settings>.section-heading>div{min-width:0}
+  .workspace-settings>.section-heading .refresh-button{flex:0 0 34px}
+  .workspace-content .stats-actions{align-items:stretch;flex-direction:column;overflow:visible}
+  .workspace-content .stats-actions>.construction-controls{flex:0 0 auto;width:100%;align-items:stretch;flex-direction:column;flex-wrap:nowrap}
+  .workspace-content .stats-actions>.construction-controls form,
+  .workspace-content .stats-actions>.construction-controls .button{width:100%}
+  .workspace-content .stats-actions>.schema-actions,
+  .workspace-content .stats-actions>.graph-actions{width:100%;align-items:stretch;flex-direction:column}
+  .workspace-content .stats-actions>.schema-actions .button,
+  .workspace-content .stats-actions>.graph-actions .button{width:100%}
+  .embedded-graph-controls{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center}
+  .embedded-graph-controls>select{grid-column:1/-1;width:100%;min-width:0}
+  .embedded-graph-controls>input{width:100%;min-width:0}
+  .graph-canvas-scope{top:10px;left:10px;max-width:calc(100% - 20px)}
+  .graph-canvas-nav{top:55px;right:10px}
+  .status-page{grid-template-columns:1fr;gap:24px;min-height:0;padding:30px 22px}
+  .status-page-code{width:104px;height:104px;border-radius:27px;font-size:34px}
+  .status-page-copy h2{font-size:26px}
+  .status-page-actions{align-items:stretch;flex-direction:column}
+  .status-page-actions .button{text-align:center}
+  dialog:not(.graph-evidence-modal){width:calc(100% - 18px);max-height:94vh}
+  dialog:not(.graph-evidence-modal)>.dialog-heading{align-items:flex-start;flex-direction:row;padding:15px 16px}
+  #create-project-dialog>form{padding:16px}
+  .project-list-dialog .project-list-tools{padding:13px 16px 0}
+  .project-list-dialog .project-grid{padding:13px 16px 16px}
+  .project-list-dialog .project-card{padding:15px}
+  .project-list-dialog .bind-form{align-items:stretch;flex-direction:column}
+  .structure-dialog>.structure-tools{margin:13px 14px 9px}
+  .structure-dialog>.structure-list{margin:0 14px;padding:7px}
+  .structure-dialog>.structure-pager{align-items:stretch;flex-direction:column;margin:10px 14px}
+  .structure-dialog>.structure-pager>div .button{flex:1}
+  .structure-row{padding:12px}
+  .structure-row-head{align-items:flex-start;flex-direction:column}
+  .document-media-dialog>.document-media-body{margin:13px 14px;padding:8px}
+  .log-dialog>.history-log,.structure-dialog>.artifact-content{margin:13px 14px;min-height:260px}
+  dialog:not(.graph-evidence-modal)>.dialog-actions,#create-project-dialog .dialog-actions{padding:11px 14px}
+  .process-artifacts .table-wrap{overflow:visible;border:0;background:transparent}
+  .artifact-table{display:block;min-width:0}
+  .artifact-table thead{display:none}
+  .artifact-table tbody{display:grid;gap:10px}
+  .artifact-table tbody tr{display:block;overflow:hidden;border:1px solid #d7e3ed;border-radius:10px;background:#fff;box-shadow:0 5px 15px rgba(31,64,99,.045)}
+  .artifact-table tbody td{display:grid;grid-template-columns:92px minmax(0,1fr);gap:9px;padding:10px 12px;border-bottom:1px solid #edf1f5;text-align:left}
+  .artifact-table tbody td::before{content:attr(data-label);color:#74879a;font-size:11px;font-weight:700}
+  .artifact-table tbody td>*{grid-column:2}
+  .artifact-table tbody td .status{justify-self:start}
+  .artifact-table .artifact-actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px;text-align:left}
+  .artifact-table .artifact-actions::before{margin-right:auto}
+  .artifact-table .artifact-actions>*{grid-column:auto;margin:0!important}
+  .artifact-table .artifact-actions .button{flex:1 1 130px}
+  .artifact-table .artifact-empty-row{box-shadow:none}
+  .artifact-table .artifact-empty-row td{display:block;padding:22px}
+  .artifact-table .artifact-empty-row td::before{content:none}
+}
 """
 
 SCRIPT = r"""
@@ -2630,7 +3417,20 @@ const taskStatusLabels={queued:'排队中',running:'执行中',completed:'已完
 const clampProgress=value=>Math.max(0,Math.min(100,Math.round(Number(value)||0)));
 function labelsForJob(job){if(job.kind==='graphrag_native_build')return nativeSubtaskLabels;if(job.kind==='content_preparation'&&window.KF.taskProfile==='graphrag_native')return nativePreparationLabels;return window.KF.taskLabels||subtaskLabels}
 function legacySubtasks(job){const p=clampProgress(job.progress),step=(status,progress,detail='')=>({status,progress:clampProgress(progress),detail});const result={structure:step('waiting',0),chunking:step('waiting',0),schema_base:step('waiting',0),extraction:step('waiting',0),graph_sync:step('waiting',0)};if(job.kind==='graph_sync'){result.graph_sync=step(job.status==='completed'?'completed':job.status==='failed'?'failed':'running',p);return result}if(job.kind==='schema_reassessment'){result.schema_base=step(job.status==='completed'?'completed':job.status==='failed'?'failed':'running',p,'重新评估');return result}result.structure=p>=18?step('completed',100):step('running',p/18*100);if(p>=20)result.chunking=p>=42?step('completed',100):step('running',(p-20)/22*100);if(p>=44)result.schema_base=p>=50?step('completed',100):step('running',(p-44)/6*100);if(p>=52)result.extraction=p>=90?step('completed',100):step('running',(p-52)/38*100);if(p>=92)result.graph_sync=p>=96?step('completed',100):step('running',(p-92)/4*100);if(job.status==='completed')for(const key of Object.keys(result))result[key]=step('completed',100,result[key].detail);return result}
-function nativeSubtasks(job){const p=clampProgress(job.progress),step=(status,progress,detail='')=>({status,progress:clampProgress(progress),detail}),result={structure:step('waiting',0),chunking:step('waiting',0),schema_base:step('waiting',0),extraction:step('waiting',0),graph_sync:step('waiting',0)};if(p<10)result.structure=step('running',p*10);else result.structure=step('completed',100,'已冻结文档版本');if(p>=10&&p<18)result.chunking=step('running',(p-10)*12.5);else if(p>=18)result.chunking=step('completed',100);if(p>=18&&p<25)result.schema_base=step('running',(p-18)*14.3);else if(p>=25)result.schema_base=step('completed',100);if(p>=30&&p<75)result.extraction=step('running',Math.max(5,(p-30)*2.2),'GraphRAG 标准流程');else if(p>=75)result.extraction=step('completed',100);if(p>=75&&p<100)result.graph_sync=step('running',(p-75)*4,'验证构建成果');if(job.status==='completed')for(const key of Object.keys(result))result[key]=step('completed',100,result[key].detail);if(job.status==='failed'||job.status==='cancelled'){const active=['graph_sync','extraction','schema_base','chunking','structure'].find(key=>result[key].status==='running')||'structure';result[active]=step(job.status,p,result[active].detail)}return result}
+function nativeSubtasks(job){
+  const p=clampProgress(job.progress),step=(status,progress,detail='')=>({status,progress:clampProgress(progress),detail}),result={structure:step('waiting',0),chunking:step('waiting',0),schema_base:step('waiting',0),extraction:step('waiting',0),graph_sync:step('waiting',0)};
+  const nativeProgress=job.metadata?.native_progress||{},numberOr=(value,fallback)=>Number.isFinite(Number(value))?clampProgress(value):clampProgress(fallback);
+  if(p<10)result.structure=step('running',p*10);else result.structure=step('completed',100,'已固定文档版本');
+  if(p>=10&&p<25)result.chunking=step('running',(p-10)/15*100);else if(p>=25)result.chunking=step('completed',100);
+  if(p>=25&&p<30)result.schema_base=step('running',(p-25)/5*100);else if(p>=30)result.schema_base=step('completed',100);
+  const executionProgress=numberOr(nativeProgress.execution_progress,(p-30)/42*100),executionDetail=String(nativeProgress.detail||'').trim()||'GraphRAG 标准流程正在运行';
+  if(p>=30&&p<72)result.extraction=step('running',executionProgress,executionDetail);else if(p>=72)result.extraction=step('completed',100,'GraphRAG 标准流程已完成');
+  const validationProgress=numberOr(nativeProgress.phase_progress,(p-72)/28*100),validationDetail=['validation','publication'].includes(String(nativeProgress.phase||''))&&String(nativeProgress.detail||'').trim()?String(nativeProgress.detail).trim():'正在验证并发布构建成果';
+  if(p>=72&&p<100)result.graph_sync=step('running',validationProgress,validationDetail);
+  if(job.status==='completed')for(const key of Object.keys(result))result[key]=step('completed',100,result[key].detail);
+  if(job.status==='failed'||job.status==='cancelled'){const active=['graph_sync','extraction','schema_base','chunking','structure'].find(key=>result[key].status==='running')||'structure';result[active]=step(job.status,p,result[active].detail)}
+  return result
+}
 function jobSubtasks(job){if(job.kind==='graphrag_native_build')return nativeSubtasks(job);const stored=job.metadata?.subtasks;if(!stored||typeof stored!=='object')return legacySubtasks(job);return {...legacySubtasks({kind:job.kind,status:'queued',progress:0}),...stored}}
 let activeMonitorGeneration=0,renderedMonitorKey='',renderedSubtaskProgress={};
 function presentationDetail(key,data,job){const detail=String(data?.detail||'').trim();if(window.KF.strategyKey==='knowledge_forge'&&key==='schema_base'&&data?.status==='completed')return '已确认本次构建使用的实体类别、关系规则和发布约束。';return detail}
@@ -2679,7 +3479,7 @@ let lastStatisticsRefresh=0;
 async function refreshStatistics(force=false){if(!window.KF.projectId||(!force&&Date.now()-lastStatisticsRefresh<2000))return;lastStatisticsRefresh=Date.now();try{const response=await fetch('/api/projects/'+window.KF.projectId+'/statistics'),data=await response.json();if(!response.ok)return;for(const key of ['documents','chunks','entities','relations']){const target=document.querySelector('[data-stat="'+key+'"]');if(target)target.textContent=Number(data[key]||0).toLocaleString()}}catch(_error){}}
 function updatingStatisticKeys(kind){if(kind==='content_preparation')return window.KF.taskProfile==='graphrag_native'?[]:['chunks'];if(kind==='ingestion')return['entities','relations'];if(['graphrag_native_build','document_cleanup'].includes(kind))return['chunks','entities','relations'];if(kind==='graph_sync')return['entities','relations'];return[]}
 function setStatisticsUpdating(updating,kind=''){const active=new Set(updating?updatingStatisticKeys(kind):[]);for(const key of ['chunks','entities','relations']){const target=document.querySelector('[data-stat="'+key+'"]');if(!target)continue;const changing=active.has(key);target.classList.toggle('is-updating',changing);target.setAttribute('aria-label',changing?target.textContent+'，仍在更新':target.textContent)}}
-function applyJobReadiness(job){const metadata=job.metadata||{},documentId=job.document_id||metadata.document_id;if(documentId){const structure=document.querySelector('[data-view-structure="'+documentId+'"]'),chunks=document.querySelector('[data-view-chunks="'+documentId+'"]'),label=document.querySelector('[data-stage-label="'+documentId+'"]'),status=document.querySelector('[data-document-status="'+documentId+'"]');if(structure&&metadata.structure_ready)structure.disabled=false;if(chunks&&metadata.chunks_ready)chunks.disabled=false;if(label&&metadata.stage)label.textContent=stageLabels[metadata.stage]||metadata.stage;if(status){let state=job.status==='completed'?'indexed':job.status==='failed'?'failed':job.status==='running'?'processing':'uploaded',text={uploaded:'已上传',processing:'处理中',indexed:'已入库',failed:'失败'}[state];if(job.kind==='content_preparation'){const native=window.KF.taskProfile==='graphrag_native';state=job.status==='failed'?'failed':job.status==='running'?'processing':'uploaded';text=job.status==='completed'?(native?'源文档已准备':'预处理完成'):job.status==='failed'?(native?'源文档准备失败':'预处理失败'):job.status==='running'?(native?'准备源文档中':'预处理中'):(native?'等待源文档准备':'等待预处理')}status.className='status status-'+state;status.textContent=text||job.status}}}
+function applyJobReadiness(job){const metadata=job.metadata||{},documentId=job.document_id||metadata.document_id;if(documentId){const structure=document.querySelector('[data-view-structure="'+documentId+'"]'),chunks=document.querySelector('[data-view-chunks="'+documentId+'"]'),label=document.querySelector('[data-stage-label="'+documentId+'"]'),status=document.querySelector('[data-document-status="'+documentId+'"]');if(structure&&metadata.structure_ready)structure.disabled=false;if(chunks&&metadata.chunks_ready)chunks.disabled=false;if(label&&metadata.stage)label.textContent=stageLabels[metadata.stage]||metadata.stage;if(status){let state=job.status==='completed'?'indexed':job.status==='failed'?'failed':job.status==='running'?'processing':'uploaded',text={uploaded:'已上传',processing:'处理中',indexed:'已入库',failed:'失败'}[state];if(job.kind==='content_preparation'){const native=window.KF.taskProfile==='graphrag_native';state=job.status==='failed'?'failed':job.status==='running'?'processing':'uploaded';text=job.status==='completed'?(native?'已准备':'预处理完成'):job.status==='failed'?(native?'准备失败':'预处理失败'):job.status==='running'?(native?'准备中':'预处理中'):(native?'待准备':'等待预处理')}status.className='status status-'+state;status.textContent=text||job.status}}}
 function monitor(id,kind='',batch=''){if(!id)return;const generation=++activeMonitorGeneration,monitorKey=(batch?'batch:':'job:')+(batch||id),preparation=kind==='content_preparation',slot=document.querySelector('[data-task-slot="'+(preparation?'preparation':'graph')+'"]');if(slot&&box.parentElement!==slot)slot.append(box);box.hidden=false;box.dataset.job=id;box.dataset.batch=batch;box.dataset.kind=kind;setStatisticsUpdating(true,kind);const target=preparation?preparationLogButton:['ingestion','graphrag_native_build'].includes(kind)?ingestionLogButton:null,activeLogButton=document.querySelector('#active-job-log');for(const button of [target,activeLogButton])if(button){button.dataset.job=id;button.dataset.batch=batch;button.disabled=false}if(taskTitle)taskTitle.textContent=kind==='graphrag_native_build'?'GraphRAG Native 构建':kind==='graph_sync'?'发布知识图谱':kind==='schema_reassessment'?'更新知识结构':kind==='document_cleanup'?'清理文档':kind==='content_preparation'?(window.KF.taskProfile==='graphrag_native'?'准备 GraphRAG 源文档':'文档预处理'):window.KF.strategyKey==='knowledge_forge'?'Knowledge Forge 构建':'知识库构建';const tick=async()=>{if(generation!==activeMonitorGeneration)return;try{const endpoint=batch?'/api/job-batches/'+batch:'/api/jobs/'+id,res=await fetch(endpoint),job=await res.json();if(generation!==activeMonitorGeneration)return;if(!res.ok)throw new Error(job.error||'任务状态读取失败');renderSubtasks(job,monitorKey);syncCancellationControls(job,id,batch);updateNativeRuntime(job);setStatisticsUpdating(!['completed','failed','cancelled'].includes(job.status),job.kind||kind);if(taskDuration)taskDuration.textContent='用时 '+formatDuration(job.elapsed_seconds);for(const item of job.jobs||[job])applyJobReadiness(item);await refreshStatistics();if(generation!==activeMonitorGeneration)return;if(['completed','failed','cancelled'].includes(job.status)){setStatisticsUpdating(false,job.kind||kind);setTimeout(()=>{if(generation===activeMonitorGeneration)location.reload()},900);return}}catch(error){if(generation!==activeMonitorGeneration)return;if(taskStatus)taskStatus.textContent='状态读取失败'}if(generation===activeMonitorGeneration)setTimeout(tick,800)};tick()}
 if(box?.dataset.job)monitor(box.dataset.job,box.dataset.kind||'',box.dataset.batch||'');
 for(const button of cancelJobButtons)button.addEventListener('click',async()=>{const preparation=button.dataset.cancelScope==='preparation',label=preparation?'预处理':'图谱构建';if(!confirm('确认终止当前'+label+'吗？系统会等待当前安全步骤结束，并且不会发布未完成结果。'))return;button.disabled=true;button.textContent='正在提交…';try{const body=new URLSearchParams({job_id:button.dataset.job||'',batch_id:button.dataset.batch||'',kind:button.dataset.kind||''}),response=await fetch('/api/projects/'+window.KF.projectId+'/jobs/cancel',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body}),data=await response.json();if(!response.ok)throw new Error(data.error||'终止请求提交失败');button.textContent='正在终止…';if(taskStatus)taskStatus.textContent='正在终止';if(taskSummary){taskSummary.textContent='正在等待当前安全步骤结束，未完成结果不会发布。';taskSummary.hidden=false}}catch(error){button.disabled=false;button.textContent=preparation?'终止预处理':'终止构建';alert(error.message||'终止请求提交失败')}});
@@ -2689,9 +3489,9 @@ const deleteDialog=document.querySelector('#delete-progress-dialog'),deleteSpinn
 function updateDeleteProgress(progress,title,detail){deleteBar.style.width=clampProgress(progress)+'%';deleteTitle.textContent=title;deleteDetail.textContent=detail||''}
 function finishDeleteProgress(success,title,detail){deleteSpinner.hidden=true;deleteResult.hidden=false;deleteResult.className='delete-result '+(success?'success':'failure');deleteResult.textContent=success?'✓':'!';updateDeleteProgress(100,title,detail);deleteClose.disabled=false;if(success)setTimeout(()=>location.reload(),1300)}
 async function pollDeleteJob(jobId){try{const response=await fetch('/api/jobs/'+jobId),job=await response.json();if(!response.ok)throw new Error(job.error||'删除任务不存在');const latest=(job.log||[]).at(-1)||'后台清理正在进行';updateDeleteProgress(job.progress||10,job.status==='queued'?'正在等待解析步骤退出':'正在清理派生数据',latest);if(job.status==='completed'){finishDeleteProgress(true,'删除完成','文档、知识库贡献、图谱数据和过程文件已完成清理。');return}if(job.status==='failed'||job.status==='cancelled'){finishDeleteProgress(false,'后台清理未完成',job.error_message||latest);return}deletePollTimer=setTimeout(()=>pollDeleteJob(jobId),700)}catch(error){finishDeleteProgress(false,'删除状态读取失败',error.message||'请刷新页面确认文档状态')}}
-document.querySelectorAll('[data-delete]').forEach(button=>button.onclick=async()=>{if(!confirm('确认软删除该文档及其向量、实体提及和关系贡献吗？'))return;button.disabled=true;deleteSpinner.hidden=false;deleteResult.hidden=true;deleteResult.className='delete-result';deleteClose.disabled=true;deleteMessage.textContent='正在提交删除请求...';updateDeleteProgress(3,'正在取消相关任务','请稍候，不要重复点击删除。');deleteDialog?.showModal();try{const response=await fetch('/api/documents/'+button.dataset.delete+'/delete',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'删除失败');button.closest('tr')?.classList.add('deleting-row');deleteMessage.textContent='文档已从当前项目移除，正在完成后台清理';updateDeleteProgress(8,'文档已软删除','正在等待活动解析步骤安全退出。');pollDeleteJob(data.job_id)}catch(error){button.disabled=false;finishDeleteProgress(false,'删除失败',error.message||'删除请求执行失败')}});
+document.querySelectorAll('[data-delete]').forEach(button=>button.onclick=async()=>{if(!confirm('确认软删除该文档及其向量、实体提及和关系贡献吗？'))return;button.disabled=true;deleteSpinner.hidden=false;deleteResult.hidden=true;deleteResult.className='delete-result';deleteClose.disabled=true;deleteMessage.textContent='正在提交删除请求...';updateDeleteProgress(3,'正在取消相关任务','请稍候，不要重复点击删除。');deleteDialog?.showModal();try{const response=await fetch('/api/documents/'+button.dataset.delete+'/delete',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'删除失败');button.closest('tr')?.classList.add('deleting-row');deleteMessage.textContent='文档已从当前知识库移除，正在完成后台清理';updateDeleteProgress(8,'文档已软删除','正在等待活动解析步骤安全退出。');pollDeleteJob(data.job_id)}catch(error){button.disabled=false;finishDeleteProgress(false,'删除失败',error.message||'删除请求执行失败')}});
 deleteClose?.addEventListener('click',()=>location.reload());deleteDialog?.addEventListener('cancel',event=>{if(deleteClose.disabled)event.preventDefault()});
-document.querySelector('[data-reassess-schema]')?.addEventListener('click',async event=>{if(!confirm('将基于当前项目全部已入库文档，从基础知识结构重新评估实体类别和关系约束。该操作不会自动重跑已有文档的实体抽取，是否继续？'))return;const button=event.currentTarget;button.disabled=true;try{const response=await fetch('/api/projects/'+button.dataset.reassessSchema+'/schema/reassess',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'知识结构重新评估提交失败');monitor(data.job_id,'schema_reassessment')}catch(error){alert(error.message||'知识结构重新评估提交失败');button.disabled=false}});
+document.querySelector('[data-reassess-schema]')?.addEventListener('click',async event=>{if(!confirm('将基于当前知识库全部已入库文档，从基础知识结构重新评估实体类别和关系约束。该操作不会自动重跑已有文档的实体抽取，是否继续？'))return;const button=event.currentTarget;button.disabled=true;try{const response=await fetch('/api/projects/'+button.dataset.reassessSchema+'/schema/reassess',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'知识结构重新评估提交失败');monitor(data.job_id,'schema_reassessment')}catch(error){alert(error.message||'知识结构重新评估提交失败');button.disabled=false}});
 document.querySelector('[data-rebuild-graph]')?.addEventListener('click',async event=>{const button=event.currentTarget;button.disabled=true;try{const response=await fetch('/api/projects/'+button.dataset.rebuildGraph+'/graph',{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'图谱重建提交失败');monitor(data.job_id,'graph_sync')}catch(error){alert(error.message||'图谱重建提交失败');button.disabled=false}});
 const createDialog=document.querySelector('#create-project-dialog');
 document.querySelector('#open-create-project')?.addEventListener('click',()=>createDialog?.showModal());
@@ -2791,8 +3591,13 @@ function openDocumentMedia(id){const asset=documentMediaAssets.get(String(id||''
 function resetDocumentMediaAssets(){documentMediaAssets.clear();documentMediaSequence=0}
 const structureDialog=document.querySelector('#structure-dialog'),structureSummary=document.querySelector('#structure-summary'),structureError=document.querySelector('#structure-error'),structureTools=document.querySelector('#structure-tools'),structureList=document.querySelector('#structure-list'),structureSearch=document.querySelector('#structure-search'),structureType=document.querySelector('#structure-type'),structurePager=document.querySelector('#structure-pager'),structureRange=document.querySelector('#structure-range'),structurePrev=document.querySelector('#structure-prev'),structureNext=document.querySelector('#structure-next');
 const structureTypeNames={heading:'标题',paragraph:'正文段落',table:'表格',table_row:'表格行',image:'图片'};let structureData=null,structurePage=1;const structurePageSize=20;
+function resetPagedListScroll(container){
+  if(!container)return;
+  container.scrollTop=0;container.scrollLeft=0;
+  requestAnimationFrame(()=>{container.scrollTop=0;container.scrollLeft=0});
+}
 function filteredStructureBlocks(){if(!structureData)return[];const query=(structureSearch.value||'').trim().toLowerCase(),type=structureType.value;return structureData.blocks.filter(block=>{if(type&&block.block_type!==type)return false;if(!query)return true;return [block.text,block.section_title,(block.heading_path||[]).join(' / '),block.page].some(value=>String(value??'').toLowerCase().includes(query))})}
-function renderStructureBlocks(){resetDocumentMediaAssets();const blocks=filteredStructureBlocks(),pages=Math.max(1,Math.ceil(blocks.length/structurePageSize));structurePage=Math.min(Math.max(1,structurePage),pages);const start=(structurePage-1)*structurePageSize,visible=blocks.slice(start,start+structurePageSize);structureList.innerHTML=visible.map(block=>{const path=(block.heading_path||[]).filter(Boolean).join(' / '),metadata=block.metadata&&Object.keys(block.metadata).length?'<details class="structure-metadata"><summary>查看元数据</summary><pre>'+esc(JSON.stringify(block.metadata,null,2))+'</pre></details>':'';return '<article class="structure-row"><div class="structure-row-head"><div class="structure-row-meta"><strong>#'+esc(block.order)+'</strong><span class="block-type">'+esc(structureTypeNames[block.block_type]||block.block_type||'未知')+'</span>'+(block.page?'<span>第 '+esc(block.page)+' 页</span>':'')+'<span>层级 '+esc(block.level||1)+'</span><span>章节：'+esc(block.section_title||'未命名')+'</span></div></div>'+(path?'<div class="structure-row-meta">标题路径：'+esc(path)+'</div>':'')+'<p class="structure-text">'+esc(block.text||'')+'</p>'+structureBlockMediaMarkup(block)+metadata+'</article>'}).join('')||'<div class="empty">没有符合条件的结构块。</div>';structureRange.textContent=blocks.length?'第 '+(start+1)+'-'+Math.min(start+structurePageSize,blocks.length)+' 条，共 '+blocks.length+' 条':'共 0 条';structurePrev.disabled=structurePage<=1;structureNext.disabled=structurePage>=pages;structurePager.hidden=false}
+function renderStructureBlocks(){resetDocumentMediaAssets();const blocks=filteredStructureBlocks(),pages=Math.max(1,Math.ceil(blocks.length/structurePageSize));structurePage=Math.min(Math.max(1,structurePage),pages);const start=(structurePage-1)*structurePageSize,visible=blocks.slice(start,start+structurePageSize);structureList.innerHTML=visible.map(block=>{const path=(block.heading_path||[]).filter(Boolean).join(' / '),metadata=block.metadata&&Object.keys(block.metadata).length?'<details class="structure-metadata"><summary>查看元数据</summary><pre>'+esc(JSON.stringify(block.metadata,null,2))+'</pre></details>':'';return '<article class="structure-row"><div class="structure-row-head"><div class="structure-row-meta"><strong>#'+esc(block.order)+'</strong><span class="block-type">'+esc(structureTypeNames[block.block_type]||block.block_type||'未知')+'</span>'+(block.page?'<span>第 '+esc(block.page)+' 页</span>':'')+'<span>层级 '+esc(block.level||1)+'</span><span>章节：'+esc(block.section_title||'未命名')+'</span></div></div>'+(path?'<div class="structure-row-meta">标题路径：'+esc(path)+'</div>':'')+'<p class="structure-text">'+esc(block.text||'')+'</p>'+structureBlockMediaMarkup(block)+metadata+'</article>'}).join('')||'<div class="empty">没有符合条件的结构块。</div>';structureRange.textContent=blocks.length?'第 '+(start+1)+'-'+Math.min(start+structurePageSize,blocks.length)+' 条，共 '+blocks.length+' 条':'共 0 条';structurePrev.disabled=structurePage<=1;structureNext.disabled=structurePage>=pages;structurePager.hidden=false;resetPagedListScroll(structureList)}
 async function showStructure(documentId){structureDialog?.showModal();structureSummary.textContent='正在读取解析结果...';structureError.hidden=true;structureTools.hidden=true;structurePager.hidden=true;structureList.innerHTML='<div class="empty">正在加载结构块...</div>';structureSearch.value='';structureType.replaceChildren(new Option('全部类型',''));structureData=null;try{const response=await fetch('/api/documents/'+documentId+'/structure'),data=await response.json();if(!response.ok)throw new Error(data.error||'结构块读取失败');structureData=data;const parser=data.plan?.effective_parser||'未知解析器',strategy=data.plan?.effective_strategy||'未知策略';structureSummary.textContent=data.document_name+' · '+parser+' · '+strategy+' · '+data.block_count+' 个结构块';for(const type of data.block_types||[])structureType.add(new Option(structureTypeNames[type]||type,type));structureTools.hidden=false;structurePage=1;renderStructureBlocks()}catch(error){structureSummary.textContent='结构块读取失败';structureError.textContent=error.message||'结构块读取失败';structureError.hidden=false;structureList.innerHTML=''}}
 document.querySelectorAll('[data-view-structure]').forEach(button=>button.addEventListener('click',()=>showStructure(button.dataset.viewStructure)));
 structureSearch?.addEventListener('input',()=>{structurePage=1;renderStructureBlocks()});structureType?.addEventListener('change',()=>{structurePage=1;renderStructureBlocks()});structurePrev?.addEventListener('click',()=>{structurePage--;renderStructureBlocks()});structureNext?.addEventListener('click',()=>{structurePage++;renderStructureBlocks()});document.querySelectorAll('[data-close-structure]').forEach(button=>button.addEventListener('click',()=>structureDialog?.close()));structureDialog?.addEventListener('click',event=>{if(event.target===structureDialog)structureDialog.close()});
@@ -2805,6 +3610,7 @@ function renderChunks(){
     return '<article class="structure-row"><div class="structure-row-head"><div class="structure-row-meta"><strong>#'+(start+index+1)+'</strong><span class="block-type">'+esc(chunk.section_title||'未命名章节')+'</span><span>'+esc(chunk.chunk_key)+'</span></div></div><div class="chunk-badges"><span class="chunk-badge">'+esc(role==='parent'?'父级摘要块':role==='table_row'?'表格行块':'检索子块')+'</span><span class="chunk-badge">'+esc(chunk.token_count??metadata.token_count??0)+' Token</span>'+(pageLabel?'<span class="chunk-badge">'+esc(pageLabel)+'</span>':'')+'<span class="chunk-badge '+(enabled?'graph':'skipped')+'">'+(enabled?'参与图谱抽取':'不参与图谱抽取')+'</span>'+(parent?'<span class="chunk-badge">父块：'+esc(parent)+'</span>':'')+'</div><p class="structure-text">'+esc(chunk.content||'')+'</p>'+chunkMediaMarkup(chunk)+'<details class="structure-metadata"><summary>查看元数据</summary><pre>'+esc(JSON.stringify(metadata,null,2))+'</pre></details></article>';
   }).join('')||'<div class="empty">没有符合条件的知识块。</div>';
   chunkRange.textContent=chunks.length?'第 '+(start+1)+'-'+Math.min(start+chunkPageSize,chunks.length)+' 条，共 '+chunks.length+' 条':'共 0 条';chunkPrev.disabled=chunkPage<=1;chunkNext.disabled=chunkPage>=pageCount;chunkPager.hidden=false;
+  resetPagedListScroll(chunkList);
 }
 async function showChunks(documentId){chunkDialog?.showModal();chunkSummary.textContent='正在读取分块结果...';chunkError.hidden=true;chunkTools.hidden=true;chunkPager.hidden=true;chunkList.innerHTML='<div class="empty">正在加载知识块...</div>';chunkSearch.value='';chunkRole.value='';chunkData=null;try{const response=await fetch('/api/documents/'+documentId+'/chunks'),data=await response.json();if(!response.ok)throw new Error(data.error||'知识块读取失败');chunkData=data;chunkSummary.textContent=data.document_name+' · '+data.chunk_count+' 个知识块';chunkTools.hidden=false;chunkPage=1;renderChunks()}catch(error){chunkSummary.textContent='知识块读取失败';chunkError.textContent=error.message||'知识块读取失败';chunkError.hidden=false;chunkList.innerHTML=''}}
 document.querySelectorAll('[data-view-chunks]').forEach(button=>button.addEventListener('click',()=>showChunks(button.dataset.viewChunks)));chunkSearch?.addEventListener('input',()=>{chunkPage=1;renderChunks()});chunkRole?.addEventListener('change',()=>{chunkPage=1;renderChunks()});chunkPrev?.addEventListener('click',()=>{chunkPage--;renderChunks()});chunkNext?.addEventListener('click',()=>{chunkPage++;renderChunks()});document.querySelectorAll('[data-close-chunks]').forEach(button=>button.addEventListener('click',()=>chunkDialog?.close()));chunkDialog?.addEventListener('click',event=>{if(event.target===chunkDialog)chunkDialog.close()});
@@ -2812,7 +3618,7 @@ document.querySelectorAll('[data-view-chunks]').forEach(button=>button.addEventL
 document.querySelectorAll('[data-close-document-media]').forEach(button=>button.addEventListener('click',()=>documentMediaDialog?.close()));documentMediaDialog?.addEventListener('click',event=>{if(event.target===documentMediaDialog)documentMediaDialog.close()});
 const nativeArtifactDialog=document.querySelector('#native-artifact-dialog'),nativeArtifactTitle=document.querySelector('#native-artifact-title'),nativeArtifactSummary=document.querySelector('#native-artifact-summary'),nativeArtifactError=document.querySelector('#native-artifact-error'),nativeArtifactKind=document.querySelector('#native-artifact-kind'),nativeArtifactContent=document.querySelector('#native-artifact-content');
 async function loadNativeArtifact(kind){nativeArtifactError.hidden=true;nativeArtifactContent.textContent='正在读取...';try{const response=await fetch('/api/projects/'+window.KF.projectId+'/graphrag-native/artifacts/'+encodeURIComponent(kind)+'?limit=100'),data=await response.json();if(!response.ok)throw new Error(data.error||'构建产物读取失败');nativeArtifactTitle.textContent='GraphRAG 构建产物';nativeArtifactSummary.textContent=data.logical_name+' · 显示 '+data.items.length+' / '+data.total+' 条 · 运行编号 '+data.run_id;nativeArtifactContent.textContent=JSON.stringify(data.items,null,2)}catch(error){nativeArtifactSummary.textContent='读取失败';nativeArtifactError.textContent=error.message||'构建产物读取失败';nativeArtifactError.hidden=false;nativeArtifactContent.textContent=''}}
-async function showNativeDocuments(documentId){nativeArtifactDialog?.showModal();nativeArtifactKind.closest('.structure-tools').hidden=true;nativeArtifactError.hidden=true;nativeArtifactContent.textContent='正在生成结构化文档预览...';try{const response=await fetch('/api/projects/'+window.KF.projectId+'/graphrag-native/source-documents?document_id='+encodeURIComponent(documentId)+'&limit=100'),data=await response.json();if(!response.ok)throw new Error(data.error||'结构化文档读取失败');nativeArtifactTitle.textContent='结构化文档';nativeArtifactSummary.textContent='显示 '+data.items.length+' / '+data.total+' 条；这是 GraphRAG 构建前冻结的文档内容。';nativeArtifactContent.textContent=JSON.stringify(data.items,null,2)}catch(error){nativeArtifactSummary.textContent='读取失败';nativeArtifactError.textContent=error.message||'结构化文档读取失败';nativeArtifactError.hidden=false;nativeArtifactContent.textContent=''}}
+async function showNativeDocuments(documentId){nativeArtifactDialog?.showModal();nativeArtifactKind.closest('.structure-tools').hidden=true;nativeArtifactError.hidden=true;nativeArtifactContent.textContent='正在生成结构化文档预览...';try{const response=await fetch('/api/projects/'+window.KF.projectId+'/graphrag-native/source-documents?document_id='+encodeURIComponent(documentId)+'&limit=100'),data=await response.json();if(!response.ok)throw new Error(data.error||'结构化文档读取失败');nativeArtifactTitle.textContent='结构化文档';nativeArtifactSummary.textContent='显示 '+data.items.length+' / '+data.total+' 条；这是本次 GraphRAG 构建使用的文档内容。';nativeArtifactContent.textContent=JSON.stringify(data.items,null,2)}catch(error){nativeArtifactSummary.textContent='读取失败';nativeArtifactError.textContent=error.message||'结构化文档读取失败';nativeArtifactError.hidden=false;nativeArtifactContent.textContent=''}}
 document.querySelectorAll('[data-view-native-documents]').forEach(button=>button.addEventListener('click',()=>showNativeDocuments(button.dataset.viewNativeDocuments)));
 document.querySelector('#view-native-artifacts')?.addEventListener('click',()=>{nativeArtifactDialog?.showModal();nativeArtifactKind.closest('.structure-tools').hidden=false;nativeArtifactKind.value='documents';loadNativeArtifact('documents')});
 nativeArtifactKind?.addEventListener('change',()=>loadNativeArtifact(nativeArtifactKind.value));
@@ -3193,7 +3999,7 @@ if(root&&root.dataset.ready==='true'){
   const clean=value=>String(value??'').replace(/\s+/g,' ').trim();
   const short=(value,size=180)=>{const text=clean(value);return text.length>size?text.slice(0,size-1)+'…':text};
   const html=value=>esc(String(value??''));
-  const state={view:null,overview:null,renderer:null,community:'',communityLevel:'focus',overviewRelationScope:'backbone',query:'',mode:'overview',loading:false,history:[],historyIndex:-1,entityMetricMode:'evidence',reportPollTimer:0,reportStatus:'not_started',evidenceAssets:new Map(),evidenceAssetSequence:0};
+  const state={view:null,overview:null,renderer:null,community:'',communityLevel:'full',overviewRelationScope:'all_communities',query:'',mode:'overview',loading:false,history:[],historyIndex:-1,entityMetricMode:'evidence',reportPollTimer:0,reportStatus:'not_started',evidenceAssets:new Map(),evidenceAssetSequence:0};
   const endpoint='/api/projects/'+window.KF.projectId+'/graph-explorer';
   const reportEndpoint='/api/projects/'+window.KF.projectId+'/knowledge-forge/community-reports';
   const graphContainer=q('[data-graph-network]');
@@ -3204,8 +4010,20 @@ if(root&&root.dataset.ready==='true'){
   const evidenceLocationHeading=isKnowledgeForge?'原文依据与来源':'文本单元依据与来源';
   const evidenceModalTitle=isKnowledgeForge?'原文资料':'文本单元资料';
   const groupName=group=>clean(group?.label||group?.title||group?.key||'未分组');
-  const groupNavigationName=group=>{const base=groupName(group),topic=clean(group?.semantic_title||group?.community_report?.title);return topic&&topic!==base?base+' · '+short(topic,36):base};
-  const nodeName=node=>clean(node?.title||node?.label||node?.id||'未知实体');
+  function summaryCommunityTopic(group){
+    const summary=clean(group?.summary||group?.description);if(!summary)return '';
+    const focus=summary.match(/^该社区主要围绕[“"]([^”"]+)[”"]展开/u);
+    if(focus)return clean(focus[1]);
+    const pair=summary.match(/^该社区主要介绍[“"]([^”"]+)[”"]与[“"]([^”"]+)[”"]之间/u);
+    if(pair)return clean(pair[1])+' 与 '+clean(pair[2]);
+    const quoted=[...summary.matchAll(/[“"]([^”"]{1,64})[”"]/gu)].map(match=>clean(match[1])).filter(Boolean);
+    return [...new Set(quoted)].slice(0,2).join(' 与 ');
+  }
+  const communityTopic=group=>clean(group?.semantic_title||group?.community_report?.title).replace(/^(?:社区|Community)\s*[0-9A-Za-z_-]+\s*[：:]\s*/iu,'').trim()||summaryCommunityTopic(group);
+  const groupNavigationName=group=>{const base=groupName(group),topic=communityTopic(group);return topic&&topic!==base?base+' · '+short(topic,36):base};
+  const communityCanvasName=(group,node)=>communityTopic(group)||clean(node?.title||node?.label)||groupName(group);
+  const groupForNode=node=>(state.overview?.groups||state.view?.groups||[]).find(group=>String(group?.key||'')===String(node?.community_key||node?.group||''));
+  const nodeName=node=>node?.kind==='community'?communityCanvasName(groupForNode(node),node):clean(node?.title||node?.label||node?.id||'未知实体');
   const relationName=edge=>clean(edge?.label||edge?.predicate_label||relationLabels[clean(edge?.predicate)]||edge?.description||'关系');
   const evidence=edge=>clean(edge?.evidence_text)||((edge?.text_unit_ids||[]).length?'文本单元编号：'+edge.text_unit_ids.join('、'):'暂无可展示的'+evidenceLabel);
   const evidenceCount=edge=>{if(edge?.evidence_count!==null&&edge?.evidence_count!==undefined&&edge?.evidence_count!==''){const explicit=Number(edge.evidence_count);if(Number.isFinite(explicit)&&explicit>=0)return Math.round(explicit)}if(Array.isArray(edge?.text_unit_ids))return edge.text_unit_ids.length;return clean(edge?.evidence_text)?1:0};
@@ -3312,12 +4130,20 @@ if(root&&root.dataset.ready==='true'){
     q('[data-graph-status]').innerHTML='<div class="embedded-graph-loading"><span class="embedded-graph-spinner" aria-hidden="true"></span><div><b>'+html(message)+'</b><p>大型图谱会按社区和实体邻域分批加载。</p></div></div>';
   }
   function displayPayload(payload){
-    const nodes=Array.isArray(payload.nodes)?payload.nodes:[];
+    const sourceNodes=Array.isArray(payload.nodes)?payload.nodes:[];
     const edges=Array.isArray(payload.edges)?payload.edges:[];
-    if(payload.mode==='overview')return {...payload,nodes,edges};
+    if(payload.mode==='overview'){
+      const groupsByKey=new Map((payload.groups||[]).map(group=>[String(group.key||''),group]));
+      const nodes=sourceNodes.map(node=>{
+        if(node?.kind!=='community')return node;
+        const group=groupsByKey.get(String(node.community_key||node.group||''));
+        return {...node,title:communityCanvasName(group,node)};
+      });
+      return {...payload,nodes,edges};
+    }
     const connected=new Set();
     edges.forEach(edge=>{connected.add(String(edge.source));connected.add(String(edge.target))});
-    return {...payload,nodes:nodes.filter(node=>connected.has(String(node.id))),edges};
+    return {...payload,nodes:sourceNodes.filter(node=>connected.has(String(node.id))),edges};
   }
   function normalizedRoute(parameters={}){
     return {
@@ -3363,13 +4189,15 @@ if(root&&root.dataset.ready==='true'){
   function nodeById(id){return (state.view?.nodes||[]).find(node=>String(node.id)===String(id))}
   function renderAudit(edges){
     const communityOverview=(state.view||{}).mode==='overview';
+    const auditableEdges=communityOverview?edges.filter(edge=>edge.kind!=='community_topic_association'):edges;
+    const topicCount=communityOverview?edges.length-auditableEdges.length:0;
     q('[data-graph-audit-summary]').textContent=communityOverview
-      ?'当前视图共 '+edges.length+' 条社区间汇总关系；进入社区后可查看每一条实体关系及其'+evidenceLabel+'。'
-      :'当前视图共 '+edges.length+' 条实体关系；可逐条查看其'+evidenceLabel+'。';
-    state.entityMetricMode=entityMetricMode(edges);
+      ?'当前视图共 '+auditableEdges.length+' 条社区间事实关系汇总；进入社区后可查看实体关系及其'+evidenceLabel+'。'+(topicCount?' 另有 '+topicCount+' 条内容导航关联，不属于关系审计。':'')
+      :'当前视图共 '+auditableEdges.length+' 条实体关系；可逐条查看其'+evidenceLabel+'。';
+    state.entityMetricMode=entityMetricMode(auditableEdges);
     q('[data-graph-audit-metric]').textContent=communityOverview?'汇总关系数':entityMetricLabel(state.entityMetricMode);
     q('[data-graph-audit-evidence]').hidden=communityOverview;
-    q('[data-graph-audit-rows]').innerHTML=edges.map(edge=>{
+    q('[data-graph-audit-rows]').innerHTML=auditableEdges.map(edge=>{
       const source=nodeById(edge.source),target=nodeById(edge.target);
       const metric=communityOverview?edge.count??edge.weight??'—':entityMetricValue(edge,state.entityMetricMode);
       const evidenceMarkup='<div class="graph-evidence-quote">'+html(evidence(edge))+'</div>'+sourceCardMarkup(edge,{showEvidence:false});
@@ -3416,9 +4244,10 @@ if(root&&root.dataset.ready==='true'){
     const panel=q('[data-graph-details]'),view=state.view||{};
     if(view.mode==='overview'){
       const shown=view.visible_communities??(view.nodes||[]).length,collapsed=view.collapsed_communities??0,internalOnly=view.internal_only_communities??0,isolated=view.isolated_entities??0;
-      const scope=view.overview_relation_scope||'backbone',totalEdges=view.total_cross_community_relationships??(view.edges||[]).length,visibleEdges=view.visible_cross_community_relationships??(view.edges||[]).length;
+      const scope=view.overview_relation_scope||'all_communities',totalEdges=view.total_cross_community_relationships??(view.edges||[]).length,visibleEdges=view.visible_cross_community_relationships??(view.edges||[]).length;
+      const topicEdges=view.visible_topic_associations??0;
       const includesInternal=scope==='all_communities',visibleInternal=view.visible_internal_only_communities??0,hiddenInternal=view.hidden_internal_only_communities??internalOnly;
-      panel.innerHTML='<h3>全局社区地图</h3><p>'+(includesInternal?'显示 '+shown+' 个含关系的社区，其中 '+visibleInternal+' 个社区目前没有跨社区连线。':'显示 '+shown+' 个存在跨社区联系的社区。')+' 圆点大小代表成员数，连线粗细代表'+html(relationshipLabel)+'数量。</p><p class="graph-scene-note">跨社区连线：'+visibleEdges+' / '+totalEdges+' 条</p>'+(collapsed?'<p class="graph-scene-note">另有 '+collapsed+' 个较小社区折叠在“其他社区”中，可用下方目录或选择器进入。</p>':'')+(!includesInternal&&internalOnly?'<p class="graph-scene-note">另有 '+internalOnly+' 个仅含内部关系的社区未显示；切换到“全部关系社区”即可同时查看。</p>':'')+(includesInternal&&hiddenInternal?'<p class="graph-scene-note">其余 '+hiddenInternal+' 个仅含内部关系的社区仍可从目录或选择器进入。</p>':'')+(isolated?'<p class="graph-scene-note">另有 '+isolated+' 个没有关系的实体未放入地图，仍可通过搜索查看。</p>':'');
+      panel.innerHTML='<h3>全局社区地图</h3><p>'+(includesInternal?'显示 '+shown+' 个含关系的社区，其中 '+visibleInternal+' 个社区没有跨社区事实联系。':'显示 '+shown+' 个存在跨社区事实联系的社区。')+' 圆点大小代表成员数，实线粗细代表'+html(relationshipLabel)+'数量。'+(topicEdges?'虚线表示内容相近的社区，仅用于浏览，不代表原文事实。':'')+'</p><p class="graph-scene-note">跨社区事实联系：'+visibleEdges+' / '+totalEdges+' 条'+(topicEdges?' · 内容导航关联：'+topicEdges+' 条':'')+'</p>'+(collapsed?'<p class="graph-scene-note">另有 '+collapsed+' 个较小社区折叠在“其他社区”中，可用下方目录或选择器进入。</p>':'')+(!includesInternal&&internalOnly?'<p class="graph-scene-note">另有 '+internalOnly+' 个仅含内部关系的社区未显示；切换到“全部关系社区”即可同时查看。</p>':'')+(includesInternal&&hiddenInternal?'<p class="graph-scene-note">其余 '+hiddenInternal+' 个仅含内部关系的社区仍可从目录或选择器进入。</p>':'')+(isolated?'<p class="graph-scene-note">另有 '+isolated+' 个没有关系的实体未放入地图，仍可通过搜索查看。</p>':'');
     }else if(view.mode==='community'){
       const summary=view.focus?.description||view.focus?.summary||'这里显示该社区内的实体及关系。';
       panel.innerHTML='<article class="graph-community-detail"><header class="graph-community-detail-header"><h3>'+html(groupName(view.focus))+'</h3></header>'+communityNarrativeMarkup(summary)+communityReportMarkup(view.focus)+communityEvidenceMarkup(summary,view.focus?.community_report,view.focus?.evidence_sources)+'</article>';
@@ -3455,10 +4284,28 @@ if(root&&root.dataset.ready==='true'){
   }
   function renderEdgeDetails(edge){
     const source=nodeById(edge.source),target=nodeById(edge.target);
+    if(edge.kind==='community_topic_association'){
+      const similarity=Number(edge.score),similarityText=Number.isFinite(similarity)?Math.round(similarity*100)+'%':'—';
+      const threshold=Number(edge.threshold),thresholdText=Number.isFinite(threshold)&&threshold>0?Math.round(threshold*100)+'%':'';
+      const reasonLabels={mutual_nearest:'两个社区互为最相近的合格主题',coverage_nearest:'这是该社区最有代表性的合格内容关联',reciprocal_top3:'两个社区都位于对方最相近的三个主题中'};
+      const reasons=(Array.isArray(edge.selection_reasons)?edge.selection_reasons:[]).map(value=>reasonLabels[value]).filter(Boolean);
+      const signals=[];if(reasons.length)signals.push(reasons.join('；'));if(Number(edge.shared_document_count)>0)signals.push('共同出现在 '+Number(edge.shared_document_count)+' 个来源文档中');if(edge.lexical_support)signals.push('名称中还存在可区分的共同词汇线索');if(!signals.length)signals.push('两个社区的代表实体向量相似度达到保守阈值');
+      const matches=(Array.isArray(edge.representative_entity_matches)?edge.representative_entity_matches:[]).slice(0,5);
+      const matchMarkup=matches.length?'<section class="graph-community-link-section"><h4>代表实体对应</h4><ul class="graph-topic-match-list">'+matches.map(item=>{const score=Number(item.score),scoreText=Number.isFinite(score)?Math.round(score*100)+'%':'—';return '<li><span>'+html(item.source_entity_name||item.source_entity_key||'实体')+' ↔ '+html(item.target_entity_name||item.target_entity_key||'实体')+'</span><small>'+html(scoreText)+'</small></li>'}).join('')+'</ul></section>':'';
+      const panel=q('[data-graph-details]');
+      panel.innerHTML='<h3>社区内容关联</h3><div class="graph-relation-card">'+miniNode(source)+'<span class="graph-mini-relation"><b>'+html(short(edge.label||'内容相近',24))+'</b></span>'+miniNode(target)+'</div><div class="graph-community-link-metrics"><div class="graph-community-link-metric"><small>内容相似度</small><b>'+html(similarityText)+'</b></div>'+(thresholdText?'<div class="graph-community-link-metric"><small>最低入选阈值</small><b>'+html(thresholdText)+'</b></div>':'')+'</div><section class="graph-community-link-section"><h4>为什么相连</h4><p>'+html(signals.join('；'))+'。</p></section>'+matchMarkup+'<p class="graph-community-link-note">这条虚线用于发现内容相近的社区，不表示原文事实，也不进入关系审计或知识检索。</p>';
+      return;
+    }
     const communityAggregate=edge.kind==='community_relation';
     if(communityAggregate){
-      const aggregateNote=isKnowledgeForge?'这是两个社区中已验证实体关系的汇总，不对应单一原文证据。进入社区后可查看每一条实体关系及其原文依据。':'这是两个社区中 GraphRAG 抽取关系的汇总，不对应单一文本单元。进入社区后可查看各条关系说明及其文本单元依据。';
-      q('[data-graph-details]').innerHTML='<h3>社区间联系</h3><div class="graph-relation-card">'+miniNode(source)+'<span class="graph-mini-relation"><b>跨社区关联</b></span>'+miniNode(target)+'</div><dl><div><dt>汇总关系数</dt><dd>'+html(edge.count??edge.weight??'—')+'</dd></div><div><dt>说明</dt><dd>'+html(aggregateNote)+'</dd></div></dl>';
+      const total=Math.max(0,Number(edge.count??edge.weight??0)||0),predicateTotal=Math.max(0,Number(edge.predicate_type_count)||0),pairTotal=Math.max(0,Number(edge.entity_pair_count)||0),documentTotal=Math.max(0,Number(edge.document_count)||0);
+      const predicates=(Array.isArray(edge.predicate_counts)?edge.predicate_counts:[]).filter(item=>Number(item?.count)>0),predicateMarkup=predicates.length?'<section class="graph-community-link-section"><h4>关系构成</h4><div class="graph-predicate-profile">'+predicates.map(item=>{const count=Number(item.count)||0,share=total?Math.max(2,Math.min(100,Math.round(count/total*100))):0;return '<div class="graph-predicate-row"><span>'+html(item.label||'关系')+'</span><b>'+count+' 条</b><i style="--predicate-share:'+share+'%"></i></div>'}).join('')+'</div></section>':'';
+      const direction=edge.direction_counts||{},forward=Math.max(0,Number(direction.source_to_target)||0),reverse=Math.max(0,Number(direction.target_to_source)||0),directionMarkup=(forward||reverse)?'<section class="graph-community-link-section"><h4>事实方向</h4><p>'+html(nodeName(source))+' → '+html(nodeName(target))+'：'+forward+' 条；'+html(nodeName(target))+' → '+html(nodeName(source))+'：'+reverse+' 条。</p></section>':'';
+      const examples=(Array.isArray(edge.relation_examples)?edge.relation_examples:[]).slice(0,5),examplesMarkup=examples.length?'<section class="graph-community-link-section"><h4>可核对关系 <small>展示 '+examples.length+' / '+total+' 条</small></h4><div class="graph-community-relation-examples">'+examples.map(item=>sourceCardMarkup(item,{showEvidence:true})).join('')+'</div></section>':'<p class="graph-community-link-note">当前聚合结果没有可展示的关系样例；关系数量与类型分布仍来自当前图谱中的实体关系。</p>';
+      const aggregateNote=isKnowledgeForge?'实线由已经发布的实体关系汇总而成；下方样例保留原文、页码以及可用的图片或表格。':'实线由 GraphRAG 抽取的实体关系汇总而成；下方样例保留可用的文本单元来源。';
+      const panel=q('[data-graph-details]');
+      panel.innerHTML='<h3>社区间事实联系</h3><div class="graph-relation-card">'+miniNode(source)+'<span class="graph-mini-relation"><b>'+html(short(edge.label||'社区间联系',24))+'</b></span>'+miniNode(target)+'</div><div class="graph-community-link-metrics"><div class="graph-community-link-metric"><small>实体关系</small><b>'+total+' 条</b></div><div class="graph-community-link-metric"><small>关系类型</small><b>'+predicateTotal+' 种</b></div><div class="graph-community-link-metric"><small>实体对</small><b>'+pairTotal+' 组</b></div><div class="graph-community-link-metric"><small>来源文档</small><b>'+(documentTotal||'—')+'</b></div></div>'+predicateMarkup+directionMarkup+examplesMarkup+'<p class="graph-community-link-note">'+html(aggregateNote)+'</p>';
+      bindEvidenceActions(panel);
       return;
     }
     const mode=state.entityMetricMode||entityMetricMode(state.view?.edges||[]),metric='<div><dt>'+html(entityMetricLabel(mode))+'</dt><dd>'+html(entityMetricValue(edge,mode))+'</dd></div>',verification=isKnowledgeForge?'<div><dt>验证状态</dt><dd>已验证</dd></div>':'';
@@ -3476,7 +4323,7 @@ if(root&&root.dataset.ready==='true'){
     box.querySelectorAll('[data-common-group]').forEach(button=>button.addEventListener('click',()=>openCommunity(button.dataset.commonGroup)));
   }
   function updateZoomValue(percent){q('[data-graph-zoom-value]').value=Math.max(1,Math.round(percent||100))+'%';q('[data-graph-zoom-value]').textContent=Math.max(1,Math.round(percent||100))+'%'}
-  function syncOverviewScope(scope){const control=q('[data-graph-overview-scope]'),visible=(state.view||{}).mode==='overview';control.hidden=!visible;control.querySelectorAll('[data-overview-relation-scope]').forEach(button=>{const active=button.dataset.overviewRelationScope===scope;button.classList.toggle('is-active',active);button.setAttribute('aria-pressed',String(active));});}
+  function syncOverviewScope(scope){const control=q('[data-graph-overview-scope]'),visible=(state.view||{}).mode==='overview';control.hidden=!visible;q('[data-graph-topic-key]').hidden=!(visible&&Number((state.view||{}).visible_topic_associations)>0);control.querySelectorAll('[data-overview-relation-scope]').forEach(button=>{const active=button.dataset.overviewRelationScope===scope;button.classList.toggle('is-active',active);button.setAttribute('aria-pressed',String(active));});}
   function syncCommunityScope(level){const control=q('[data-graph-community-scope]'),visible=(state.view||{}).mode==='community';control.hidden=!visible;control.querySelectorAll('[data-community-stage]').forEach(button=>{const active=button.dataset.communityStage===level;button.classList.toggle('is-active',active);button.setAttribute('aria-pressed',String(active));});}
   function graphSelectionActive(){return Number(state.renderer?.selectedNode)>=0||Number(state.renderer?.selectedEdge)>=0}
   function mergeCommunityReportState(payload){
@@ -3535,8 +4382,8 @@ if(root&&root.dataset.ready==='true'){
     q('[data-graph-count]').textContent=countText;
     scheduleReportPolling();
   }
-  async function openCommunity(key,level='focus'){state.community=String(key||'');state.communityLevel=level;q('[data-graph-group-filter]').value=state.community;if(!state.community)return requestView({mode:'overview',overview_relation_scope:state.overviewRelationScope,limit:1200});if(isKnowledgeForge)fetch(reportEndpoint+'/'+encodeURIComponent(state.community)+'/prioritize',{method:'POST'}).then(async response=>{const payload=await response.json();if(response.ok&&payload.status)state.reportStatus=payload.status;scheduleReportPolling(600)}).catch(()=>{});return requestView({mode:'community',community:state.community,community_level:state.communityLevel,limit:2000})}
-  function resetToOverview(){state.community='';state.communityLevel='focus';state.overviewRelationScope='backbone';state.query='';state.mode='overview';q('[data-graph-filter]').value='';q('[data-graph-group-filter]').value='';requestView({mode:'overview',overview_relation_scope:state.overviewRelationScope,limit:1200})}
+  async function openCommunity(key,level='full'){state.community=String(key||'');state.communityLevel=level;q('[data-graph-group-filter]').value=state.community;if(!state.community)return requestView({mode:'overview',overview_relation_scope:state.overviewRelationScope,limit:1200});if(isKnowledgeForge)fetch(reportEndpoint+'/'+encodeURIComponent(state.community)+'/prioritize',{method:'POST'}).then(async response=>{const payload=await response.json();if(response.ok&&payload.status)state.reportStatus=payload.status;scheduleReportPolling(600)}).catch(()=>{});return requestView({mode:'community',community:state.community,community_level:state.communityLevel,limit:2000})}
+  function resetToOverview(){state.community='';state.communityLevel='full';state.overviewRelationScope='all_communities';state.query='';state.mode='overview';q('[data-graph-filter]').value='';q('[data-graph-group-filter]').value='';requestView({mode:'overview',overview_relation_scope:state.overviewRelationScope,limit:1200})}
   function setupGraphPaneResizer(){
     const layout=q('.embedded-graph-layout'),separator=q('[data-graph-pane-resizer]');if(!layout||!separator)return;
     const storageKey='knowledge-forge.graph.sidebar-width';
@@ -3557,7 +4404,7 @@ if(root&&root.dataset.ready==='true'){
     if(index<0||index>=state.history.length||state.loading)return;
     state.historyIndex=index;
     const route=state.history[index];
-    state.community=String(route.community||'');state.communityLevel=route.community_level||'focus';state.overviewRelationScope=route.overview_relation_scope||'backbone';state.query=route.q||'';state.mode=route.mode||'overview';
+    state.community=String(route.community||'');state.communityLevel=route.community_level||'full';state.overviewRelationScope=route.overview_relation_scope||'all_communities';state.query=route.q||'';state.mode=route.mode||'overview';
     q('[data-graph-filter]').value=state.query;q('[data-graph-group-filter]').value=state.community;
     requestView(route,{history:'restore'});
   }

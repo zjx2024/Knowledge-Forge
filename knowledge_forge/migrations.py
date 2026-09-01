@@ -2748,6 +2748,233 @@ ALTER TABLE projects
 """
 
 
+KNOWLEDGE_AGENT_V1_SQL = r"""
+-- The first knowledge-agent release is deliberately a read-only consumer of
+-- published knowledge artifacts.  These tables persist its control plane,
+-- evidence ledger and citation lineage; they do not duplicate graph facts.
+CREATE TABLE IF NOT EXISTS agent_threads (
+    id TEXT PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id),
+    strategy_key TEXT NOT NULL CHECK (
+        strategy_key IN ('knowledge_forge','graphrag_native')
+    ),
+    session_key_hash TEXT NOT NULL CHECK (length(session_key_hash)=64),
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (
+        status IN ('active','archived')
+    ),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_threads_session
+    ON agent_threads(session_key_hash,updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_threads_project
+    ON agent_threads(project_id,updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    strategy_key TEXT NOT NULL CHECK (
+        strategy_key IN ('knowledge_forge','graphrag_native')
+    ),
+    requested_mode TEXT NOT NULL DEFAULT 'auto' CHECK (
+        requested_mode IN ('auto','basic','local','global')
+    ),
+    effective_mode TEXT NOT NULL DEFAULT '',
+    query TEXT NOT NULL CHECK (length(btrim(query))>0),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (
+        status IN ('queued','running','completed','failed','cancelled')
+    ),
+    stage TEXT NOT NULL DEFAULT 'queued',
+    cancellation_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    snapshot_ref JSONB NOT NULL DEFAULT '{}'::jsonb,
+    budget JSONB NOT NULL DEFAULT '{}'::jsonb,
+    retrieval_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    sufficiency JSONB NOT NULL DEFAULT '{}'::jsonb,
+    answer_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    answer_text TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    UNIQUE(id,project_id),
+    FOREIGN KEY(thread_id,project_id)
+        REFERENCES agent_threads(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_thread
+    ON agent_runs(thread_id,created_at,id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_active
+    ON agent_runs(status,updated_at) WHERE status IN ('queued','running');
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    run_id TEXT,
+    project_id BIGINT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    status TEXT NOT NULL DEFAULT 'completed' CHECK (
+        status IN ('accepted','streaming','completed','failed','cancelled')
+    ),
+    content TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(id,project_id),
+    UNIQUE(run_id,id),
+    FOREIGN KEY(thread_id,project_id)
+        REFERENCES agent_threads(id,project_id),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_thread
+    ON agent_messages(thread_id,created_at,id);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_run
+    ON agent_messages(run_id,created_at) WHERE run_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS agent_run_steps (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence>0),
+    step_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('queued','running','completed','failed','cancelled','degraded')
+    ),
+    input_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    output_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE(run_id,sequence),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_tool_calls (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    tool_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running','completed','failed','cancelled','degraded')
+    ),
+    request_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    response_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_run
+    ON agent_tool_calls(run_id,started_at,id);
+
+CREATE TABLE IF NOT EXISTS agent_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    evidence_type TEXT NOT NULL CHECK (
+        evidence_type IN ('chunk','entity','relation','community_report','native_context','derived_answer')
+    ),
+    strategy_key TEXT NOT NULL CHECK (
+        strategy_key IN ('knowledge_forge','graphrag_native')
+    ),
+    snapshot_ref JSONB NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    entity_keys TEXT[] NOT NULL DEFAULT '{}',
+    relation_keys TEXT[] NOT NULL DEFAULT '{}',
+    source_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    retrieval_channels TEXT[] NOT NULL DEFAULT '{}',
+    raw_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fused_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    rerank_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    provenance_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    provenance_valid BOOLEAN NOT NULL DEFAULT FALSE,
+    rank INTEGER NOT NULL DEFAULT 0,
+    selected BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,evidence_id),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evidence_run_rank
+    ON agent_evidence(run_id,selected DESC,rank,evidence_id);
+
+CREATE TABLE IF NOT EXISTS agent_claim_citations (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    message_id TEXT NOT NULL,
+    claim_index INTEGER NOT NULL CHECK(claim_index>=0),
+    claim_text TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    citation_index INTEGER NOT NULL CHECK(citation_index>0),
+    status TEXT NOT NULL CHECK(status IN ('supported','qualified','conflict')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,claim_index,evidence_id),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id),
+    FOREIGN KEY(run_id,evidence_id)
+        REFERENCES agent_evidence(run_id,evidence_id),
+    FOREIGN KEY(run_id,message_id)
+        REFERENCES agent_messages(run_id,id),
+    FOREIGN KEY(message_id,project_id)
+        REFERENCES agent_messages(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_claim_citations_message
+    ON agent_claim_citations(message_id,claim_index,citation_index);
+
+CREATE TABLE IF NOT EXISTS agent_run_events (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_events_stream
+    ON agent_run_events(run_id,id);
+
+CREATE TABLE IF NOT EXISTS agent_feedback (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
+    session_key_hash TEXT NOT NULL CHECK(length(session_key_hash)=64),
+    rating SMALLINT NOT NULL CHECK(rating IN (-1,0,1)),
+    comment TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'answer_rating',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(run_id,session_key_hash,action),
+    FOREIGN KEY(run_id,project_id)
+        REFERENCES agent_runs(id,project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_feedback_run
+    ON agent_feedback(run_id,updated_at DESC);
+"""
+
+
+KNOWLEDGE_AGENT_CONTEXT_RUNTIME_SQL = r"""
+-- LangGraph's official PostgreSQL checkpointer owns its checkpoint tables and
+-- internal migration ledger.  Keep that execution-only state isolated from
+-- Knowledge Forge's authoritative project, message, evidence and fact tables.
+CREATE SCHEMA IF NOT EXISTS knowledge_agent;
+COMMENT ON SCHEMA knowledge_agent IS
+    'Ephemeral LangGraph execution checkpoints; agent_messages remains authoritative';
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -2932,6 +3159,18 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0034_project_knowledge_language",
         description="Persist a forward-only project language policy for generated knowledge",
         sql=PROJECT_KNOWLEDGE_LANGUAGE_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0035_knowledge_agent_v1",
+        description="Persist read-only knowledge-agent runs, evidence, citations and feedback",
+        sql=KNOWLEDGE_AGENT_V1_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0036_knowledge_agent_context_runtime",
+        description="Isolate durable LangGraph conversation-context checkpoints",
+        sql=KNOWLEDGE_AGENT_CONTEXT_RUNTIME_SQL,
         startup_safe=True,
     ),
 )

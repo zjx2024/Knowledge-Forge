@@ -1,5 +1,7 @@
 # 迁移与发布安全
 
+> 更新时间：2026-09-01
+
 ## 迁移命令
 
 以下只读命令不会创建迁移表或修改业务数据：
@@ -16,6 +18,13 @@
 ```
 
 服务启动仅执行标记为快速且安全的迁移。回填、并发索引等重操作必须由运维人员显式执行。迁移受 PostgreSQL advisory lock 保护，每一步独立记录 checksum、状态、耗时、执行模式和进度；失败后再次执行会从持久化状态继续。已应用迁移的 checksum 改变时必须停止并使用新的 forward-fix 迁移，禁止改写历史脚本。
+
+当前最新迁移为：
+
+- `0035_knowledge_agent_v1`：统一智能体会话、运行、消息、步骤、工具调用、证据、引用、SSE 事件和反馈；
+- `0036_knowledge_agent_context_runtime`：独立 `knowledge_agent` schema 和 LangGraph PostgreSQL checkpoint 运行边界。
+
+两项都采用只前进迁移。不得把 LangGraph 自建表混入业务 `public` schema，也不得通过删除 checkpoint 代替会话归档接口。
 
 ## 备份恢复验证
 
