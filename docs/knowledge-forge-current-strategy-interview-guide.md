@@ -376,7 +376,7 @@ policy_hash  = graph_policy_hash(policy_axes, active_schema_version)
 当前关键 profile 包括：
 
 - <code>kf-document-structure-v8-docling-heading-sanity-all-routes</code>
-- <code>kf-document-chunks-v11-pdf-soft-wrap-sentence-integrity</code>
+- <code>kf-document-chunks-v12-split-adjacent-article-preview</code>
 - <code>kf-schema-graph-eligible-v1</code>
 
 ### 6.3 复用条件
@@ -455,11 +455,33 @@ quality_floor = max(200, page_count × 40)
 
 这是解析器级回退，不是知识抽取策略回退；最终仍进入同一 Knowledge Forge 流程。
 
-### 7.3 文档类型识别
+### 7.3 文档类型识别与分块策略
 
-论文特征不是根据文件名硬编码，而是检查摘要、关键词、方法、实验、结论、参考文献等标记。不同标记达到至少 4 类时倾向论文策略。
+“自动选择”本身不执行分块，它先根据文件和结构特征确定实际策略。当前路由为：
 
-电子表格进入 table 策略，其余默认 general。
+~~~text
+if suffix in {xlsx, xls, csv}:
+    effective_strategy = table
+elif paper_score >= 4:
+    effective_strategy = paper
+else:
+    effective_strategy = general
+~~~
+
+其中 <code>paper_score</code> 是解析前结构探测文本中命中的不同论文标记数，标记包括摘要、关键词、引言、研究方法、实验、结果、结论和参考文献及其英文形式。系统检查的是结构信号，不根据文件名或具体领域词硬编码。PDF 使用探测页文本，DOCX 和文本文件使用其可读取正文；达到 4 个不同标记才自动进入论文策略。
+
+<code>default</code> 不参与自动路由，只用于兼容旧版字符分块。用户手动指定策略时，系统先校验该策略是否支持文件格式，然后按指定策略执行，不再重新猜测文档类型。
+
+四种实际分块策略如下：
+
+| 策略 | 具体方式 | 检索与图谱处理 |
+|---|---|---|
+| <code>general</code> 通用分块 | 以解析出的章节为边界，按句子和 Token 预算组合正文；默认目标约 512 Token、最大 800 Token。只有在继续加入下一句会超过最大值时，才携带最多约 <code>512 × 12%</code> 的句子级重叠。一个章节产生多个子块时，额外建立一个不超过约 220 Token 的父级概览块。章节很多时，默认仅在总章节数不少于 24 的情况下，把连续、无图片、无表格且较短的叶子小节合并到约 512 Token，同时保留每个原小节标题、来源键、页码和标题路径。 | 子块参与向量检索和图谱抽取；父级概览块用于检索导航，不重复抽取图事实。高置信目录页和成对的次语言摘要仍可检索，但关闭图谱抽取。适合普通说明书、规范、报告、Word、Markdown、文本和非论文 PDF。 |
+| <code>paper</code> 论文分块 | 仍以章节和句子为边界，但使用论文预算：默认目标约 640 Token、最大 900 Token，最大边界处重叠约 <code>640 × 10%</code>。在切分前把内容区分为主摘要、正文、参考文献、次语言镜像摘要、作者简介，以及双栏抽取时可能混入的下一篇文章预览。参考文献还会恢复全角编号和跨页续排。 | 主语言摘要和正文参与检索与图谱抽取；参考文献、次语言镜像摘要、作者简介和相邻文章预览只保留检索与来源定位，不重复生成图事实。适合论文、学位论文和结构接近论文的技术文档。 |
+| <code>table</code> 表格分块 | 解析器先识别多行表头，再把每一数据行转成“列名: 单元格值”的自描述文本；一行对应一个逻辑知识块，并保存工作表名、表格序号、原始行号、表头和值。XLSX、XLS、CSV 自动使用该策略；DOCX 或 PDF 也可手动使用，但必须实际解析出表格行，否则明确失败。 | 每行独立参与向量检索和图谱抽取，避免单独单元格失去列语义。若项目设置的单 Chunk Token 上限小于超长行，系统会继续拆分该行，但保留相同表格元数据。 |
+| <code>default</code> 兼容分块 | 沿章节按字符预算切分，默认最大约 2400 字符、相邻块重叠约 160 字符；不建立父子块，也不使用通用/论文的 Token 目标。 | 保留章节、页码和图谱可用性标记，主要用于复现旧项目的历史行为。新文档自动模式不会选择它。 |
+
+上述数值都是默认配置，可分别通过 <code>GENERAL_CHUNK_*</code>、<code>PAPER_CHUNK_*</code>、<code>CHUNK_MAX_CHARS</code>、<code>CHUNK_OVERLAP_CHARS</code> 和 <code>GENERAL_COALESCE_MIN_SECTIONS</code> 调整。无论使用哪种策略，项目级“单切片 Token 上限”都会在最后执行一次统一硬约束；超限块被继续切分，但策略、章节、页码、图片和表格元数据不丢失。
 
 论文与普通文档共用保守的双语镜像识别：只有正文主语言明确、摘要/执行摘要/内容提要/概述存在中英文成对标题、两份内容篇幅相近且位于文档前部时，次语言版本才被标记为仅检索。未成对的英文 Summary、普通英文技术章节和真正的双语正文继续参与图谱抽取。
 
