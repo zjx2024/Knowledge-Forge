@@ -1,7 +1,10 @@
 from contextlib import contextmanager
+import uuid
 
 from knowledge_forge.database import Database, SCHEMA_SQL
 from knowledge_forge.hugegraph_store import HugeGraphStore
+from knowledge_forge.graph_policy import project_graph_policy_hash
+from knowledge_forge.graph_safety import GraphMutationContext
 
 
 class Result:
@@ -56,12 +59,13 @@ def test_confidence_zero_is_preserved_for_mentions_candidates_and_relations():
     connection = RecordingConnection()
     database = database_with_connection(connection)
     database.add_entity_mention({
-        "project_id": 1, "document_id": 2, "chunk_id": 3, "canonical_entity_id": 4,
+        "project_id": 1, "document_id": 2, "revision_id": "revision-2",
+        "chunk_id": 3, "canonical_entity_id": 4,
         "mention_text": "Alpha", "normalized_name": "alpha", "entity_type": "Organization",
         "confidence": 0,
     })
     mention_insert = connection.calls[0]
-    assert mention_insert[1][8] == 0
+    assert mention_insert[1][10] == 0
 
     connection.calls.clear()
     database.upsert_relation_candidate({
@@ -138,14 +142,25 @@ class GraphDatabase:
     def set_relation_graph_id(self, relation_id, edge_id):
         pass
 
+    def assert_graph_lease(self, project_id, namespace_id, generation, lease_token):
+        return True
+
 
 def test_hugegraph_sync_requests_only_publishable_relations(monkeypatch):
     database = GraphDatabase()
     store = HugeGraphStore(database)
     client = Client()
     monkeypatch.setattr(store, "client", lambda: client)
+    namespace = str(uuid.UUID(int=1))
+    project = {
+        "id": 1, "project_key": "p1", "active_schema_version": 1,
+        "graph_namespace_id": namespace, "graph_generation": 3,
+    }
     report = store.sync_document_assertions(
-        {"id": 1, "project_key": "p1", "active_schema_version": 1}, {"id": 2},
+        project, {"id": 2}, mutation=GraphMutationContext(
+            namespace_id=namespace, project_id=1, generation=3,
+            policy_hash=project_graph_policy_hash(project), lease_token="lease",
+        ),
     )
     assert database.default_listing_called is True
     assert report["relations"] == 1

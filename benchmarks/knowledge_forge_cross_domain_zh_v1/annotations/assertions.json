@@ -1,0 +1,1975 @@
+{
+  "annotation_policy": "Complete binary source assertions under the declared entity and relation policy; optional inference tiers are reported separately.",
+  "relations": [
+    {
+      "assertion_id": "zh-software-hierarchy:a001",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:platform",
+      "subject_span": [
+        10,
+        17
+      ],
+      "predicate": "provides",
+      "object_canonical_id": "zh-os:partition_management",
+      "object_span": [
+        19,
+        23
+      ],
+      "evidence_span": [
+        10,
+        53
+      ],
+      "evidence_text": "ACore平台提供分区管理、任务管理、时间管理、任务间通信管理、健康监控和虚中断管理。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a002",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:platform",
+      "subject_span": [
+        10,
+        17
+      ],
+      "predicate": "provides",
+      "object_canonical_id": "zh-os:task_management",
+      "object_span": [
+        24,
+        28
+      ],
+      "evidence_span": [
+        10,
+        53
+      ],
+      "evidence_text": "ACore平台提供分区管理、任务管理、时间管理、任务间通信管理、健康监控和虚中断管理。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a003",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:platform",
+      "subject_span": [
+        10,
+        17
+      ],
+      "predicate": "provides",
+      "object_canonical_id": "zh-os:time_management",
+      "object_span": [
+        29,
+        33
+      ],
+      "evidence_span": [
+        10,
+        53
+      ],
+      "evidence_text": "ACore平台提供分区管理、任务管理、时间管理、任务间通信管理、健康监控和虚中断管理。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a004",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:platform",
+      "subject_span": [
+        10,
+        17
+      ],
+      "predicate": "provides",
+      "object_canonical_id": "zh-os:intertask_communication",
+      "object_span": [
+        34,
+        41
+      ],
+      "evidence_span": [
+        10,
+        53
+      ],
+      "evidence_text": "ACore平台提供分区管理、任务管理、时间管理、任务间通信管理、健康监控和虚中断管理。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a005",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:platform",
+      "subject_span": [
+        10,
+        17
+      ],
+      "predicate": "provides",
+      "object_canonical_id": "zh-os:health_monitoring",
+      "object_span": [
+        42,
+        46
+      ],
+      "evidence_span": [
+        10,
+        53
+      ],
+      "evidence_text": "ACore平台提供分区管理、任务管理、时间管理、任务间通信管理、健康监控和虚中断管理。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a006",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:platform",
+      "subject_span": [
+        10,
+        17
+      ],
+      "predicate": "provides",
+      "object_canonical_id": "zh-os:virtual_interrupt_management",
+      "object_span": [
+        47,
+        52
+      ],
+      "evidence_span": [
+        10,
+        53
+      ],
+      "evidence_text": "ACore平台提供分区管理、任务管理、时间管理、任务间通信管理、健康监控和虚中断管理。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a007",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:space_isolation",
+      "subject_span": [
+        66,
+        70
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:partition_management",
+      "object_span": [
+        57,
+        61
+      ],
+      "evidence_span": [
+        55,
+        70
+      ],
+      "evidence_text": "— 分区管理\n  — 空间隔离",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a008",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:interpartition_communication",
+      "subject_span": [
+        75,
+        80
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:partition_management",
+      "object_span": [
+        57,
+        61
+      ],
+      "evidence_span": [
+        55,
+        80
+      ],
+      "evidence_text": "— 分区管理\n  — 空间隔离\n  — 分区间通信",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a009",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:schedule_management",
+      "subject_span": [
+        92,
+        97
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:task_management",
+      "object_span": [
+        83,
+        87
+      ],
+      "evidence_span": [
+        81,
+        97
+      ],
+      "evidence_text": "— 任务管理\n  — 调度表管理",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a010",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:timer_management",
+      "subject_span": [
+        102,
+        107
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:task_management",
+      "object_span": [
+        83,
+        87
+      ],
+      "evidence_span": [
+        81,
+        107
+      ],
+      "evidence_text": "— 任务管理\n  — 调度表管理\n  — 定时器管理",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a011",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:message_queue",
+      "subject_span": [
+        122,
+        126
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:intertask_communication",
+      "object_span": [
+        110,
+        117
+      ],
+      "evidence_span": [
+        108,
+        126
+      ],
+      "evidence_text": "— 任务间通信管理\n  — 消息队列",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a012",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:mutex_semaphore",
+      "subject_span": [
+        131,
+        136
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:intertask_communication",
+      "object_span": [
+        110,
+        117
+      ],
+      "evidence_span": [
+        108,
+        136
+      ],
+      "evidence_text": "— 任务间通信管理\n  — 消息队列\n  — 互斥信号量",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a013",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:event",
+      "subject_span": [
+        141,
+        143
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:intertask_communication",
+      "object_span": [
+        110,
+        117
+      ],
+      "evidence_span": [
+        108,
+        143
+      ],
+      "evidence_text": "— 任务间通信管理\n  — 消息队列\n  — 互斥信号量\n  — 事件",
+      "structure": "hierarchical_list",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a014",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:health_monitoring",
+      "subject_span": [
+        145,
+        149
+      ],
+      "predicate": "has_level",
+      "object_canonical_id": "zh-os:core_level",
+      "object_span": [
+        151,
+        154
+      ],
+      "evidence_span": [
+        145,
+        164
+      ],
+      "evidence_text": "健康监控分为核心级、多分区级和分区级。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a015",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:health_monitoring",
+      "subject_span": [
+        145,
+        149
+      ],
+      "predicate": "has_level",
+      "object_canonical_id": "zh-os:multi_partition_level",
+      "object_span": [
+        155,
+        159
+      ],
+      "evidence_span": [
+        145,
+        164
+      ],
+      "evidence_text": "健康监控分为核心级、多分区级和分区级。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a016",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:health_monitoring",
+      "subject_span": [
+        145,
+        149
+      ],
+      "predicate": "has_level",
+      "object_canonical_id": "zh-os:partition_level",
+      "object_span": [
+        160,
+        163
+      ],
+      "evidence_span": [
+        145,
+        164
+      ],
+      "evidence_text": "健康监控分为核心级、多分区级和分区级。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a017",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:log_module",
+      "subject_span": [
+        164,
+        168
+      ],
+      "predicate": "outputs",
+      "object_canonical_id": "zh-os:fault_record",
+      "object_span": [
+        170,
+        174
+      ],
+      "evidence_span": [
+        164,
+        184
+      ],
+      "evidence_text": "日志模块输出故障记录，但不负责调度任务。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a018",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:configuration_database",
+      "subject_span": [
+        185,
+        190
+      ],
+      "predicate": "stores",
+      "object_canonical_id": "zh-os:schedule_table",
+      "object_span": [
+        192,
+        195
+      ],
+      "evidence_span": [
+        185,
+        201
+      ],
+      "evidence_text": "配置数据库保存调度表和分区参数。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-software-hierarchy:a019",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:configuration_database",
+      "subject_span": [
+        185,
+        190
+      ],
+      "predicate": "stores",
+      "object_canonical_id": "zh-os:partition_parameter",
+      "object_span": [
+        196,
+        200
+      ],
+      "evidence_span": [
+        185,
+        201
+      ],
+      "evidence_text": "配置数据库保存调度表和分区参数。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a001",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:factory",
+      "subject_span": [
+        12,
+        17
+      ],
+      "predicate": "located_in",
+      "object_canonical_id": "zh-mfg:jiangsu",
+      "object_span": [
+        19,
+        21
+      ],
+      "evidence_span": [
+        12,
+        34
+      ],
+      "evidence_text": "华宁材料厂位于江苏，生产电池隔膜和复合涂层。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a002",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:factory",
+      "subject_span": [
+        12,
+        17
+      ],
+      "predicate": "produces",
+      "object_canonical_id": "zh-mfg:separator",
+      "object_span": [
+        24,
+        28
+      ],
+      "evidence_span": [
+        12,
+        34
+      ],
+      "evidence_text": "华宁材料厂位于江苏，生产电池隔膜和复合涂层。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a003",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:factory",
+      "subject_span": [
+        12,
+        17
+      ],
+      "predicate": "produces",
+      "object_canonical_id": "zh-mfg:coating",
+      "object_span": [
+        29,
+        33
+      ],
+      "evidence_span": [
+        12,
+        34
+      ],
+      "evidence_text": "华宁材料厂位于江苏，生产电池隔膜和复合涂层。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a004",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:logistics",
+      "subject_span": [
+        34,
+        40
+      ],
+      "predicate": "supplies",
+      "object_canonical_id": "zh-mfg:packaging",
+      "object_span": [
+        48,
+        52
+      ],
+      "evidence_span": [
+        34,
+        53
+      ],
+      "evidence_text": "远航物流公司向华宁材料厂供应包装材料。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a005",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:packaging",
+      "subject_span": [
+        48,
+        52
+      ],
+      "predicate": "supplied_to",
+      "object_canonical_id": "zh-mfg:factory",
+      "object_span": [
+        41,
+        46
+      ],
+      "evidence_span": [
+        34,
+        53
+      ],
+      "evidence_text": "远航物流公司向华宁材料厂供应包装材料。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a006",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:separator",
+      "subject_span": [
+        53,
+        57
+      ],
+      "predicate": "used_for",
+      "object_canonical_id": "zh-mfg:assembly_line",
+      "object_span": [
+        60,
+        67
+      ],
+      "evidence_span": [
+        53,
+        68
+      ],
+      "evidence_text": "电池隔膜应用于储能电池装配线。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a007",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:separator",
+      "subject_span": [
+        98,
+        102
+      ],
+      "predicate": "derived_from",
+      "object_canonical_id": "zh-mfg:resin",
+      "object_span": [
+        105,
+        110
+      ],
+      "evidence_span": [
+        70,
+        129
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |",
+      "structure": "table_header_bound",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a008",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:separator",
+      "subject_span": [
+        98,
+        102
+      ],
+      "predicate": "checked_by",
+      "object_canonical_id": "zh-mfg:thickness_measurement",
+      "object_span": [
+        113,
+        117
+      ],
+      "evidence_span": [
+        70,
+        129
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |",
+      "structure": "table_header_bound",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a009",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:separator",
+      "subject_span": [
+        98,
+        102
+      ],
+      "predicate": "used_for",
+      "object_canonical_id": "zh-mfg:assembly_line",
+      "object_span": [
+        120,
+        127
+      ],
+      "evidence_span": [
+        70,
+        129
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |",
+      "structure": "table_header_bound",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a010",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:coating",
+      "subject_span": [
+        132,
+        136
+      ],
+      "predicate": "derived_from",
+      "object_canonical_id": "zh-mfg:ceramic_powder",
+      "object_span": [
+        139,
+        143
+      ],
+      "evidence_span": [
+        70,
+        160
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |\n| 复合涂层 | 陶瓷粉体 | 附着力试验 | 耐热保护 |",
+      "structure": "table_header_bound",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a011",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:coating",
+      "subject_span": [
+        132,
+        136
+      ],
+      "predicate": "checked_by",
+      "object_canonical_id": "zh-mfg:adhesion_test",
+      "object_span": [
+        146,
+        151
+      ],
+      "evidence_span": [
+        70,
+        160
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |\n| 复合涂层 | 陶瓷粉体 | 附着力试验 | 耐热保护 |",
+      "structure": "table_header_bound",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a012",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:coating",
+      "subject_span": [
+        132,
+        136
+      ],
+      "predicate": "used_for",
+      "object_canonical_id": "zh-mfg:heat_protection",
+      "object_span": [
+        154,
+        158
+      ],
+      "evidence_span": [
+        70,
+        160
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |\n| 复合涂层 | 陶瓷粉体 | 附着力试验 | 耐热保护 |",
+      "structure": "table_header_bound",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a013",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:batch_a17",
+      "subject_span": [
+        162,
+        168
+      ],
+      "predicate": "inspected_by",
+      "object_canonical_id": "zh-mfg:quality_lab",
+      "object_span": [
+        169,
+        174
+      ],
+      "evidence_span": [
+        162,
+        183
+      ],
+      "evidence_text": "批次A-17由质量实验室检验，结果为合格。",
+      "structure": "batch_record",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a014",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:batch_a17",
+      "subject_span": [
+        162,
+        168
+      ],
+      "predicate": "has_status",
+      "object_canonical_id": "zh-mfg:qualified",
+      "object_span": [
+        180,
+        182
+      ],
+      "evidence_span": [
+        162,
+        183
+      ],
+      "evidence_text": "批次A-17由质量实验室检验，结果为合格。",
+      "structure": "batch_record",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-manufacturing-table:a015",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:warehouse",
+      "subject_span": [
+        183,
+        185
+      ],
+      "predicate": "stores",
+      "object_canonical_id": "zh-mfg:batch_a17",
+      "object_span": [
+        187,
+        193
+      ],
+      "evidence_span": [
+        183,
+        194
+      ],
+      "evidence_text": "仓库保存批次A-17。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a001",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:clause_1",
+      "subject_span": [
+        12,
+        15
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-law:article_12",
+      "object_span": [
+        0,
+        4
+      ],
+      "evidence_span": [
+        0,
+        15
+      ],
+      "evidence_text": "第十二条 申请与审查\n\n（一）",
+      "structure": "section_hierarchy",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a002",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:clause_2",
+      "subject_span": [
+        38,
+        41
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-law:article_12",
+      "object_span": [
+        0,
+        4
+      ],
+      "evidence_span": [
+        0,
+        41
+      ],
+      "evidence_text": "第十二条 申请与审查\n\n（一）申请人应当向受理机构提交申请材料和安全报告。\n（二）",
+      "structure": "section_hierarchy",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a003",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:clause_3",
+      "subject_span": [
+        73,
+        76
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-law:article_12",
+      "object_span": [
+        0,
+        4
+      ],
+      "evidence_span": [
+        0,
+        76
+      ],
+      "evidence_text": "第十二条 申请与审查\n\n（一）申请人应当向受理机构提交申请材料和安全报告。\n（二）受理机构应在五个工作日内审查申请材料，并将审查结果通知申请人。\n（三）",
+      "structure": "section_hierarchy",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a004",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:applicant",
+      "subject_span": [
+        15,
+        18
+      ],
+      "predicate": "submits",
+      "object_canonical_id": "zh-law:application_materials",
+      "object_span": [
+        27,
+        31
+      ],
+      "evidence_span": [
+        12,
+        37
+      ],
+      "evidence_text": "（一）申请人应当向受理机构提交申请材料和安全报告。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a005",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:applicant",
+      "subject_span": [
+        15,
+        18
+      ],
+      "predicate": "submits",
+      "object_canonical_id": "zh-law:safety_report",
+      "object_span": [
+        32,
+        36
+      ],
+      "evidence_span": [
+        12,
+        37
+      ],
+      "evidence_text": "（一）申请人应当向受理机构提交申请材料和安全报告。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a006",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:application_materials",
+      "subject_span": [
+        27,
+        31
+      ],
+      "predicate": "submitted_to",
+      "object_canonical_id": "zh-law:receiving_authority",
+      "object_span": [
+        21,
+        25
+      ],
+      "evidence_span": [
+        12,
+        37
+      ],
+      "evidence_text": "（一）申请人应当向受理机构提交申请材料和安全报告。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a007",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:safety_report",
+      "subject_span": [
+        32,
+        36
+      ],
+      "predicate": "submitted_to",
+      "object_canonical_id": "zh-law:receiving_authority",
+      "object_span": [
+        21,
+        25
+      ],
+      "evidence_span": [
+        12,
+        37
+      ],
+      "evidence_text": "（一）申请人应当向受理机构提交申请材料和安全报告。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a008",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:receiving_authority",
+      "subject_span": [
+        41,
+        45
+      ],
+      "predicate": "reviews",
+      "object_canonical_id": "zh-law:application_materials",
+      "object_span": [
+        55,
+        59
+      ],
+      "evidence_span": [
+        38,
+        72
+      ],
+      "evidence_text": "（二）受理机构应在五个工作日内审查申请材料，并将审查结果通知申请人。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a009",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:review",
+      "subject_span": [
+        53,
+        55
+      ],
+      "predicate": "has_deadline",
+      "object_canonical_id": "zh-law:five_workdays",
+      "object_span": [
+        47,
+        52
+      ],
+      "evidence_span": [
+        38,
+        72
+      ],
+      "evidence_text": "（二）受理机构应在五个工作日内审查申请材料，并将审查结果通知申请人。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a010",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:receiving_authority",
+      "subject_span": [
+        41,
+        45
+      ],
+      "predicate": "notifies",
+      "object_canonical_id": "zh-law:review_result",
+      "object_span": [
+        62,
+        66
+      ],
+      "evidence_span": [
+        38,
+        72
+      ],
+      "evidence_text": "（二）受理机构应在五个工作日内审查申请材料，并将审查结果通知申请人。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a011",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:review_result",
+      "subject_span": [
+        62,
+        66
+      ],
+      "predicate": "notified_to",
+      "object_canonical_id": "zh-law:applicant",
+      "object_span": [
+        68,
+        71
+      ],
+      "evidence_span": [
+        38,
+        72
+      ],
+      "evidence_text": "（二）受理机构应在五个工作日内审查申请材料，并将审查结果通知申请人。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a012",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:receiving_authority",
+      "subject_span": [
+        84,
+        88
+      ],
+      "predicate": "requires_action_from",
+      "object_canonical_id": "zh-law:applicant",
+      "object_span": [
+        91,
+        94
+      ],
+      "evidence_span": [
+        73,
+        109
+      ],
+      "evidence_text": "（三）申请材料缺失的，受理机构应要求申请人补正；补正通知应列明缺失项目。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a013",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:applicant",
+      "subject_span": [
+        91,
+        94
+      ],
+      "predicate": "supplements",
+      "object_canonical_id": "zh-law:application_materials",
+      "object_span": [
+        76,
+        80
+      ],
+      "evidence_span": [
+        73,
+        109
+      ],
+      "evidence_text": "（三）申请材料缺失的，受理机构应要求申请人补正；补正通知应列明缺失项目。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "obligation_inference",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a014",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:supplement_notice",
+      "subject_span": [
+        97,
+        101
+      ],
+      "predicate": "lists",
+      "object_canonical_id": "zh-law:missing_items",
+      "object_span": [
+        104,
+        108
+      ],
+      "evidence_span": [
+        73,
+        109
+      ],
+      "evidence_text": "（三）申请材料缺失的，受理机构应要求申请人补正；补正通知应列明缺失项目。",
+      "structure": "numbered_clause",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-regulation-clauses:a015",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:safety_report",
+      "subject_span": [
+        111,
+        115
+      ],
+      "predicate": "basis_for",
+      "object_canonical_id": "zh-law:approval_decision",
+      "object_span": [
+        116,
+        120
+      ],
+      "evidence_span": [
+        111,
+        124
+      ],
+      "evidence_text": "安全报告是审批决定的依据。",
+      "structure": "prose",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a001",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:lin_lan",
+      "subject_span": [
+        3,
+        5
+      ],
+      "predicate": "carries",
+      "object_canonical_id": "zh-story:thermometer",
+      "object_span": [
+        7,
+        10
+      ],
+      "evidence_span": [
+        0,
+        15
+      ],
+      "evidence_text": "清晨，林岚带着测温仪来到北站。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a002",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:lin_lan",
+      "subject_span": [
+        3,
+        5
+      ],
+      "predicate": "arrives_at",
+      "object_canonical_id": "zh-story:north_station",
+      "object_span": [
+        12,
+        14
+      ],
+      "evidence_span": [
+        0,
+        15
+      ],
+      "evidence_text": "清晨，林岚带着测温仪来到北站。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a003",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:lin_lan",
+      "subject_span": [
+        15,
+        16
+      ],
+      "predicate": "gives",
+      "object_canonical_id": "zh-story:thermometer",
+      "object_span": [
+        17,
+        19
+      ],
+      "evidence_span": [
+        15,
+        37
+      ],
+      "evidence_text": "她把仪器交给值班员周启，周启用它检查冷却泵。",
+      "structure": "narrative_coreference",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a004",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:thermometer",
+      "subject_span": [
+        17,
+        19
+      ],
+      "predicate": "given_to",
+      "object_canonical_id": "zh-story:zhou_qi",
+      "object_span": [
+        24,
+        26
+      ],
+      "evidence_span": [
+        15,
+        37
+      ],
+      "evidence_text": "她把仪器交给值班员周启，周启用它检查冷却泵。",
+      "structure": "narrative_coreference",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a005",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:zhou_qi",
+      "subject_span": [
+        24,
+        26
+      ],
+      "predicate": "uses",
+      "object_canonical_id": "zh-story:thermometer",
+      "object_span": [
+        30,
+        31
+      ],
+      "evidence_span": [
+        15,
+        37
+      ],
+      "evidence_text": "她把仪器交给值班员周启，周启用它检查冷却泵。",
+      "structure": "narrative_coreference",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a006",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:zhou_qi",
+      "subject_span": [
+        24,
+        26
+      ],
+      "predicate": "checks",
+      "object_canonical_id": "zh-story:cooling_pump",
+      "object_span": [
+        33,
+        36
+      ],
+      "evidence_span": [
+        15,
+        37
+      ],
+      "evidence_text": "她把仪器交给值班员周启，周启用它检查冷却泵。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a007",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:zhou_qi",
+      "subject_span": [
+        44,
+        45
+      ],
+      "predicate": "places",
+      "object_canonical_id": "zh-story:thermometer",
+      "object_span": [
+        46,
+        49
+      ],
+      "evidence_span": [
+        38,
+        69
+      ],
+      "evidence_text": "检查结束后，他将测温仪放入蓝色工具箱，并把检测报告交还给林岚。",
+      "structure": "narrative_coreference",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a008",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:thermometer",
+      "subject_span": [
+        46,
+        49
+      ],
+      "predicate": "located_in",
+      "object_canonical_id": "zh-story:blue_toolbox",
+      "object_span": [
+        51,
+        56
+      ],
+      "evidence_span": [
+        38,
+        69
+      ],
+      "evidence_text": "检查结束后，他将测温仪放入蓝色工具箱，并把检测报告交还给林岚。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a009",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:zhou_qi",
+      "subject_span": [
+        44,
+        45
+      ],
+      "predicate": "returns",
+      "object_canonical_id": "zh-story:inspection_report",
+      "object_span": [
+        59,
+        63
+      ],
+      "evidence_span": [
+        38,
+        69
+      ],
+      "evidence_text": "检查结束后，他将测温仪放入蓝色工具箱，并把检测报告交还给林岚。",
+      "structure": "narrative_coreference",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a010",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:inspection_report",
+      "subject_span": [
+        59,
+        63
+      ],
+      "predicate": "returned_to",
+      "object_canonical_id": "zh-story:lin_lan",
+      "object_span": [
+        66,
+        68
+      ],
+      "evidence_span": [
+        38,
+        69
+      ],
+      "evidence_text": "检查结束后，他将测温仪放入蓝色工具箱，并把检测报告交还给林岚。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a011",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:lin_lan",
+      "subject_span": [
+        86,
+        88
+      ],
+      "predicate": "reads",
+      "object_canonical_id": "zh-story:inspection_report",
+      "object_span": [
+        90,
+        92
+      ],
+      "evidence_span": [
+        86,
+        99
+      ],
+      "evidence_text": "林岚阅读报告后通知维修组。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a012",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:lin_lan",
+      "subject_span": [
+        86,
+        88
+      ],
+      "predicate": "notifies",
+      "object_canonical_id": "zh-story:maintenance_team",
+      "object_span": [
+        95,
+        98
+      ],
+      "evidence_span": [
+        86,
+        99
+      ],
+      "evidence_text": "林岚阅读报告后通知维修组。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a013",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:maintenance_team",
+      "subject_span": [
+        100,
+        103
+      ],
+      "predicate": "arrives_at",
+      "object_canonical_id": "zh-story:north_station",
+      "object_span": [
+        105,
+        107
+      ],
+      "evidence_span": [
+        100,
+        115
+      ],
+      "evidence_text": "维修组赶到北站并更换了传感器。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a014",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:maintenance_team",
+      "subject_span": [
+        100,
+        103
+      ],
+      "predicate": "replaces",
+      "object_canonical_id": "zh-story:sensor",
+      "object_span": [
+        111,
+        114
+      ],
+      "evidence_span": [
+        100,
+        115
+      ],
+      "evidence_text": "维修组赶到北站并更换了传感器。",
+      "structure": "narrative",
+      "schema_status": "extension",
+      "adjudication_tier": "core_direct",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "assertion_id": "zh-narrative-coreference:a015",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:zhou_qi",
+      "subject_span": [
+        115,
+        117
+      ],
+      "predicate": "remains_at",
+      "object_canonical_id": "zh-story:north_station",
+      "object_span": [
+        121,
+        123
+      ],
+      "evidence_span": [
+        115,
+        142
+      ],
+      "evidence_text": "周启没有离开北站；“警报响起”也不等于“冷却泵停机”。",
+      "structure": "explicit_negation",
+      "schema_status": "extension",
+      "adjudication_tier": "negation_paraphrase",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    }
+  ],
+  "negative_claims": [
+    {
+      "claim_id": "zh-software-hierarchy:n001",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:task_management",
+      "subject_span": [
+        83,
+        87
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-os:partition_management",
+      "object_span": [
+        57,
+        61
+      ],
+      "evidence_span": [
+        55,
+        87
+      ],
+      "evidence_text": "— 分区管理\n  — 空间隔离\n  — 分区间通信\n— 任务管理",
+      "reason_code": "SIBLING_LIST_ITEMS",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-software-hierarchy:n002",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:log_module",
+      "subject_span": [
+        164,
+        168
+      ],
+      "predicate": "schedules",
+      "object_canonical_id": "zh-os:scheduling_task",
+      "object_span": [
+        179,
+        183
+      ],
+      "evidence_span": [
+        164,
+        184
+      ],
+      "evidence_text": "日志模块输出故障记录，但不负责调度任务。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-software-hierarchy:n003",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:message_queue",
+      "subject_span": [
+        122,
+        126
+      ],
+      "predicate": "contains",
+      "object_canonical_id": "zh-os:mutex_semaphore",
+      "object_span": [
+        131,
+        136
+      ],
+      "evidence_span": [
+        108,
+        143
+      ],
+      "evidence_text": "— 任务间通信管理\n  — 消息队列\n  — 互斥信号量\n  — 事件",
+      "reason_code": "SIBLING_LIST_ITEMS",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-software-hierarchy:n004",
+      "document_id": "zh-software-hierarchy",
+      "subject_canonical_id": "zh-os:core_level",
+      "subject_span": [
+        151,
+        154
+      ],
+      "predicate": "same_as",
+      "object_canonical_id": "zh-os:partition_level",
+      "object_span": [
+        160,
+        163
+      ],
+      "evidence_span": [
+        145,
+        164
+      ],
+      "evidence_text": "健康监控分为核心级、多分区级和分区级。",
+      "reason_code": "COORDINATED_DISTINCT_ITEMS",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-manufacturing-table:n001",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:jiangsu",
+      "subject_span": [
+        195,
+        197
+      ],
+      "predicate": "instance_of",
+      "object_canonical_id": "zh-mfg:supplier",
+      "object_span": [
+        199,
+        202
+      ],
+      "evidence_span": [
+        195,
+        233
+      ],
+      "evidence_text": "江苏不是供应商，检测方法也不是产品；表格中的相邻单元格不能自动建立额外关系。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-manufacturing-table:n002",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:inspection_method",
+      "subject_span": [
+        203,
+        207
+      ],
+      "predicate": "instance_of",
+      "object_canonical_id": "zh-mfg:product",
+      "object_span": [
+        210,
+        212
+      ],
+      "evidence_span": [
+        195,
+        233
+      ],
+      "evidence_text": "江苏不是供应商，检测方法也不是产品；表格中的相邻单元格不能自动建立额外关系。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-manufacturing-table:n003",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:resin",
+      "subject_span": [
+        105,
+        110
+      ],
+      "predicate": "used_for",
+      "object_canonical_id": "zh-mfg:assembly_line",
+      "object_span": [
+        120,
+        127
+      ],
+      "evidence_span": [
+        70,
+        129
+      ],
+      "evidence_text": "| 产品 | 原料来源 | 检测方法 | 用途 |\n| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |",
+      "reason_code": "SIBLING_COLUMNS",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-manufacturing-table:n004",
+      "document_id": "zh-manufacturing-table",
+      "subject_canonical_id": "zh-mfg:separator",
+      "subject_span": [
+        98,
+        102
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-mfg:coating",
+      "object_span": [
+        132,
+        136
+      ],
+      "evidence_span": [
+        96,
+        160
+      ],
+      "evidence_text": "| 电池隔膜 | 聚乙烯树脂 | 厚度测量 | 储能电池装配线 |\n| 复合涂层 | 陶瓷粉体 | 附着力试验 | 耐热保护 |",
+      "reason_code": "SIBLING_ROWS",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-regulation-clauses:n001",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:applicant",
+      "subject_span": [
+        124,
+        127
+      ],
+      "predicate": "same_as",
+      "object_canonical_id": "zh-law:permit_holder",
+      "object_span": [
+        139,
+        144
+      ],
+      "evidence_span": [
+        124,
+        145
+      ],
+      "evidence_text": "申请人并不因提交材料而自动成为许可持有人。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-regulation-clauses:n002",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:clause_1",
+      "subject_span": [
+        146,
+        151
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-law:clause_2",
+      "object_span": [
+        152,
+        157
+      ],
+      "evidence_span": [
+        146,
+        173
+      ],
+      "evidence_text": "第（一）项与第（二）项是并列义务，不是相互包含的条款。",
+      "reason_code": "SIBLING_CLAUSES",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-regulation-clauses:n003",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:review_result",
+      "subject_span": [
+        62,
+        66
+      ],
+      "predicate": "part_of",
+      "object_canonical_id": "zh-law:application_materials",
+      "object_span": [
+        55,
+        59
+      ],
+      "evidence_span": [
+        38,
+        72
+      ],
+      "evidence_text": "（二）受理机构应在五个工作日内审查申请材料，并将审查结果通知申请人。",
+      "reason_code": "SEPARATE_CLAUSE_ROLES",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-regulation-clauses:n004",
+      "document_id": "zh-regulation-clauses",
+      "subject_canonical_id": "zh-law:application_materials",
+      "subject_span": [
+        130,
+        134
+      ],
+      "predicate": "grants_status",
+      "object_canonical_id": "zh-law:permit_holder",
+      "object_span": [
+        139,
+        144
+      ],
+      "evidence_span": [
+        124,
+        145
+      ],
+      "evidence_text": "申请人并不因提交材料而自动成为许可持有人。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-narrative-coreference:n001",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:alarm",
+      "subject_span": [
+        72,
+        74
+      ],
+      "predicate": "causes",
+      "object_canonical_id": "zh-story:shutdown",
+      "object_span": [
+        83,
+        85
+      ],
+      "evidence_span": [
+        70,
+        86
+      ],
+      "evidence_text": "随后警报响起，但冷却泵没有停机。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-narrative-coreference:n002",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:zhou_qi",
+      "subject_span": [
+        115,
+        117
+      ],
+      "predicate": "leaves",
+      "object_canonical_id": "zh-story:north_station",
+      "object_span": [
+        121,
+        123
+      ],
+      "evidence_span": [
+        115,
+        142
+      ],
+      "evidence_text": "周启没有离开北站；“警报响起”也不等于“冷却泵停机”。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-narrative-coreference:n003",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:alarm",
+      "subject_span": [
+        125,
+        129
+      ],
+      "predicate": "same_as",
+      "object_canonical_id": "zh-story:shutdown",
+      "object_span": [
+        135,
+        140
+      ],
+      "evidence_span": [
+        115,
+        142
+      ],
+      "evidence_text": "周启没有离开北站；“警报响起”也不等于“冷却泵停机”。",
+      "reason_code": "EXPLICIT_NEGATION",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    },
+    {
+      "claim_id": "zh-narrative-coreference:n004",
+      "document_id": "zh-narrative-coreference",
+      "subject_canonical_id": "zh-story:lin_lan",
+      "subject_span": [
+        66,
+        68
+      ],
+      "predicate": "gives",
+      "object_canonical_id": "zh-story:inspection_report",
+      "object_span": [
+        59,
+        63
+      ],
+      "evidence_span": [
+        38,
+        69
+      ],
+      "evidence_text": "检查结束后，他将测温仪放入蓝色工具箱，并把检测报告交还给林岚。",
+      "reason_code": "REVERSED_ROLE",
+      "label_source": "assistant_expert_annotator",
+      "review_status": "single_expert_reviewed"
+    }
+  ]
+}

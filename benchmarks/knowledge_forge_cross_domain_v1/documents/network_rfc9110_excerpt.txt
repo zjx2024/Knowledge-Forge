@@ -1,0 +1,9 @@
+3.1. HTTP Resources
+
+Everything in HTTP is identified by a URI. A resource is the target of an HTTP request. A representation describes the current or intended state of a resource.
+
+3.3. Connections
+
+An HTTP client establishes a connection to an HTTP server. The client sends requests to the server, and the server sends responses to the client. A server does not assume that two requests on the same connection came from the same user agent.
+
+The request and response messages travel over the connection; the resource is identified by its URI, not by the connection itself.

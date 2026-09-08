@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONTAINER_NAME="${1:-hugegraph}"
-IMAGE_NAME="${2:-hugegraph/hugegraph:latest}"
+IMAGE_NAME="${2:-hugegraph/hugegraph:1.7.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/hugegraph/knowledge_forge.properties"
 

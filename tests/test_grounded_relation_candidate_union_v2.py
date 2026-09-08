@@ -1,0 +1,9 @@
+from __future__ import annotations
+
+from tests.test_grounded_relation_runtime_wiring import (
+    test_runtime_local_subgraph_enters_verifier_without_duplicate_pair_classification,
+)
+
+
+def test_candidate_union_regression_uses_public_runtime_fixture():
+    test_runtime_local_subgraph_enters_verifier_without_duplicate_pair_classification()

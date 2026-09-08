@@ -1,8 +1,11 @@
 import threading
+import uuid
 
 import pytest
 
 from knowledge_forge.config import Config
+from knowledge_forge.graph_manifest import build_graph_manifest
+from knowledge_forge.graph_policy import GRAPH_READY
 from knowledge_forge.service import IngestionCancelled, KnowledgeForgeService
 
 
@@ -17,6 +20,8 @@ class FakeDatabase:
         self.jobs = {self.job["id"]: self.job}
         self.soft_delete_calls = 0
         self.graph_states = []
+        self.namespace = str(uuid.UUID(int=9))
+        self.lease = None
 
     def get_document(self, document_id):
         return None if self.soft_deleted else self.document
@@ -36,7 +41,14 @@ class FakeDatabase:
         self.soft_delete_calls += 1
         self.soft_deleted = True
 
-    def create_job(self, kind, project_id=None, document_id=None):
+    def assert_project_construction_strategy(self, project_id, expected_strategy=None):
+        assert project_id == 9
+        return "knowledge_forge"
+
+    def create_job(
+        self, kind, project_id=None, document_id=None, *,
+        metadata=None, strategy_key="stable",
+    ):
         job = {
             "id": "cleanup-job",
             "kind": kind,
@@ -45,7 +57,7 @@ class FakeDatabase:
             "status": "queued",
             "progress": 0,
             "log": [],
-            "metadata": {},
+            "metadata": metadata or {},
         }
         self.jobs[job["id"]] = job
         return job
@@ -72,7 +84,11 @@ class FakeDatabase:
         return {"id": project_id, "graph_status": status, **values}
 
     def get_project(self, project_id):
-        return {"id": project_id, "project_key": "test"}
+        return {
+            "id": project_id, "project_key": "test",
+            "graph_namespace_id": self.namespace, "graph_generation": 0,
+            "active_schema_version": 1,
+        }
 
     def list_documents(self, project_id):
         return []
@@ -82,6 +98,26 @@ class FakeDatabase:
 
     def list_pending_indexing_failures(self, project_id, object_type="relation"):
         return []
+
+    def list_blocking_indexing_failures(self, project_id, graph_generation):
+        return []
+
+    def acquire_graph_lease(self, project_id, namespace_id, generation, owner, **kwargs):
+        self.lease = {"id": "lease-id", "lease_token": uuid.uuid4().hex}
+        return dict(self.lease)
+
+    def heartbeat_graph_lease(self, lease_id, lease_token, **kwargs):
+        return bool(self.lease and lease_token == self.lease["lease_token"])
+
+    def release_graph_lease(self, lease_id, lease_token):
+        return True
+
+    def persist_graph_manifest(self, project_id, namespace_id, generation, role, lease_token, manifest):
+        return manifest
+
+    def complete_graph_rebuild(self, project_id, generation, **kwargs):
+        self.set_graph_state(project_id, GRAPH_READY, current_policy=True)
+        return self.get_project(project_id)
 
     def cancel_project_jobs(self, project_id, kinds, reason):
         self.cancelled_project_jobs.append((project_id, kinds, reason))
@@ -108,14 +144,30 @@ class FakeGraph:
     def ensure_schema(self):
         self.calls.append("schema")
 
-    def delete_project(self, project_id):
-        self.calls.append(("purge", project_id))
+    @staticmethod
+    def _manifest(project, mutation):
+        return build_graph_manifest(
+            [], namespace_id=mutation.namespace_id, project_id=project["id"],
+            graph_generation=mutation.generation, policy_hash=mutation.policy_hash,
+        )
 
-    def statistics(self, project_id):
+    def expected_manifest(self, project, documents, *, mutation):
+        return self._manifest(project, mutation)
+
+    def writer_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def actual_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def delete_project(self, project, *, mutation):
+        self.calls.append(("purge", project["id"]))
+
+    def statistics(self, project):
         return {"relations": 0}
 
-    def prune_project_entities(self, project_id):
-        self.pruned.append(project_id)
+    def prune_project_entities(self, project, *, mutation):
+        self.pruned.append(project["id"])
 
 
 class DeferredExecutor:
@@ -161,13 +213,15 @@ def test_delete_document_cancels_work_and_moves_source_and_process_files(tmp_pat
 
     assert database.cancelled is True
     assert database.soft_deleted is True
-    assert database.cancelled_project_jobs[0][0:2] == (9, ["schema_reassessment"])
+    assert database.cancelled_project_jobs[0][0:2] == (
+        9, ["schema_reassessment", "community_report_build"],
+    )
     assert job_id == "cleanup-job"
     assert service.graph.deleted == []
     service.cleanup_executor.run_all()
     assert service.graph.deleted == []
     assert service.graph.calls == ["schema", ("purge", 9)]
-    assert service.graph.pruned == [9]
+    assert service.graph.pruned == []
     assert service.schemas.activated == [9]
     assert not source.exists()
     assert not process.exists()

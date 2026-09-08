@@ -1,0 +1,42 @@
+[
+  {
+    "question_id": "agent-na-zh-01",
+    "language": "zh-CN",
+    "task_type": "no_answer",
+    "retrieval_expectation": "refusal",
+    "question": "这些文档中给出的火星基地管理员私人手机号是多少？",
+    "reference_answer": "知识库没有提供该信息，应拒绝作答。",
+    "answer_atoms": [],
+    "expected_outcome": "refusal"
+  },
+  {
+    "question_id": "agent-na-zh-02",
+    "language": "zh-CN",
+    "task_type": "no_answer",
+    "retrieval_expectation": "refusal",
+    "question": "根据这些文档，2029 年该系统的准确市场售价是多少？",
+    "reference_answer": "知识库没有提供该信息，应拒绝作答。",
+    "answer_atoms": [],
+    "expected_outcome": "refusal"
+  },
+  {
+    "question_id": "agent-na-en-01",
+    "language": "en",
+    "task_type": "no_answer",
+    "retrieval_expectation": "refusal",
+    "question": "What private mobile number is assigned to the Mars base administrator?",
+    "reference_answer": "The knowledge base does not contain that information.",
+    "answer_atoms": [],
+    "expected_outcome": "refusal"
+  },
+  {
+    "question_id": "agent-na-en-02",
+    "language": "en",
+    "task_type": "no_answer",
+    "retrieval_expectation": "refusal",
+    "question": "What exact retail price will this system have in 2029?",
+    "reference_answer": "The knowledge base does not contain that information.",
+    "answer_atoms": [],
+    "expected_outcome": "refusal"
+  }
+]

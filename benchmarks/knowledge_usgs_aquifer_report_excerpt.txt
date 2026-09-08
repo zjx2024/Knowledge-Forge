@@ -1,0 +1,10 @@
+Digital data sets
+
+This report contains digital data sets for principal aquifers, surficial geology, and ground-water regions. The principal aquifer data were derived from the National Atlas. The ground-water regions data set provides a framework for regional analysis.
+
+Data set | Source | Purpose
+Principal aquifers | National Atlas | aquifer mapping
+Surficial geology | State compilations | geologic context
+Ground-water regions | USGS compilation | regional analysis
+
+The table lists data-set attributes; a neighboring cell is not, by itself, a semantic relation.

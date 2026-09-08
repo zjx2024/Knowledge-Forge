@@ -1,0 +1,15 @@
+{
+  "name": "knowledge-forge-graph-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/graph-explorer.js --bundle --minify --sourcemap --format=iife --global-name=KFGraphUI --outfile=../knowledge_forge/static/graph-explorer.js && node scripts/generate-license-notice.mjs"
+  },
+  "dependencies": {
+    "@cosmos.gl/graph": "3.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.8"
+  }
+}

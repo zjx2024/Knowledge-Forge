@@ -1,0 +1,16 @@
+[Unit]
+Description=Knowledge Forge dedicated reranker service
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/knowledge-forge/environment
+WorkingDirectory=%h
+ExecStart=/bin/sh -lc 'cd "$${KNOWLEDGE_FORGE_HOME}" && exec "$${KNOWLEDGE_FORGE_HOME}/.venv/bin/python" "$${KNOWLEDGE_FORGE_HOME}/reranker_server.py"'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

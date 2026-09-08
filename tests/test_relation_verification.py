@@ -15,14 +15,20 @@ SOURCE = "Alpha produces Beta. Beta uses Gamma."
 
 
 def extraction(relations=None):
+    alpha_start = SOURCE.index("Alpha")
+    beta_start = SOURCE.index("Beta")
+    gamma_start = SOURCE.index("Gamma")
     return {
         "entities": [
             {"id": "e1", "name": "Alpha", "type": "Organization", "description": "", "aliases": [],
-             "evidence": "Alpha", "confidence": 0.9},
+             "evidence": "Alpha", "mention_start": alpha_start,
+             "mention_end": alpha_start + len("Alpha"), "confidence": 0.9},
             {"id": "e2", "name": "Beta", "type": "Product", "description": "", "aliases": [],
-             "evidence": "Beta", "confidence": 0.9},
+             "evidence": "Beta", "mention_start": beta_start,
+             "mention_end": beta_start + len("Beta"), "confidence": 0.9},
             {"id": "e3", "name": "Gamma", "type": "Technology", "description": "", "aliases": [],
-             "evidence": "Gamma", "confidence": 0.9},
+             "evidence": "Gamma", "mention_start": gamma_start,
+             "mention_end": gamma_start + len("Gamma"), "confidence": 0.9},
         ],
         "relations": relations if relations is not None else [
             {"source": "e1", "target": "e2", "type": "produces", "description": "",
@@ -99,6 +105,9 @@ def test_empty_verifier_response_retries_then_marks_missing(monkeypatch):
     assert result["_diagnostics"]["retry_count"] == 1
     assert result["_diagnostics"]["missing_decisions"] == 1
     assert len(result["_verification_events"]) == 2
+    assert all(call["context_budget_tokens"] == 32768 for call in ollama.calls)
+    assert all("max_output_tokens" in call for call in ollama.calls)
+    assert all("max_tokens" not in call for call in ollama.calls)
 
 
 def test_only_missing_candidate_is_retried_and_remains_quarantined(monkeypatch):
@@ -181,6 +190,39 @@ def test_supported_relation_with_exact_evidence_is_publishable(monkeypatch):
     assert relation["evidence_text"] == "Alpha produces Beta."
     assert relation["evidence_start"] == 0
     assert is_publishable_relation(relation["verification_status"], relation["metadata"])
+
+
+def test_ollama_root_array_aliases_reuse_only_source_backed_candidate_evidence(monkeypatch):
+    def aliased(values):
+        return {"items": [{
+            "candidate_id": values[0]["candidate_id"],
+            "decision": "supported",
+            "corrected_type": values[0]["proposed_type"],
+            "orientation": "not_reversed",
+        }]}
+
+    result = run_extract(monkeypatch, ScriptedVerifier(extraction(), [aliased]))
+    relation = result["relations"][0]
+    assert relation["verification_status"] == "llm_verified"
+    assert relation["evidence_text"] == "Alpha produces Beta."
+    assert relation["orientation"] == "as_is"
+
+
+def test_ollama_candidate_keyed_negative_alias_remains_quarantined(monkeypatch):
+    def aliased(values):
+        return {
+            values[0]["candidate_id"]: {
+                "decision": "insufficient_evidence",
+                "corrected_type": values[0]["proposed_type"],
+                "orientation": "endpoints are not reversed",
+            },
+        }
+
+    result = run_extract(monkeypatch, ScriptedVerifier(extraction(), [aliased]))
+    relation = result["relations"][0]
+    assert relation["verification_status"] == "uncertain"
+    assert result["_diagnostics"]["verifier_failures"] == 0
+    assert result["_diagnostics"]["published"] == 0
 
 
 def test_supported_relation_may_omit_corrected_type(monkeypatch):

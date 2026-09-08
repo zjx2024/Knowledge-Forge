@@ -1,0 +1,35 @@
+{
+  "dataset": "knowledge-forge-hybrid-rag",
+  "version": "v1",
+  "level": "engineering_calibration",
+  "status": "single_expert_authored",
+  "label_source": "assistant_expert_annotator",
+  "frozen_at": "2026-08-11T00:00:00Z",
+  "production_gate_eligible": false,
+  "purpose": "Evaluate whether graph retrieval adds useful grounded facts without regressing direct knowledge-base retrieval.",
+  "source_corpora": [
+    "../knowledge_forge_cross_domain_v1",
+    "../knowledge_forge_cross_domain_zh_v1"
+  ],
+  "questions_path": "questions.json",
+  "retrieval_acceptance": {
+    "top_k": 10,
+    "minimum_hybrid_evidence_hit_rate": 0.8,
+    "maximum_hybrid_regression_rate_vs_vector": 0.02,
+    "minimum_graph_suitable_gain_rate": 0.05,
+    "minimum_graph_preferred_fact_coverage": 0.7,
+    "maximum_graph_context_ratio_vs_vector": 0.6,
+    "maximum_negative_relation_leaks": 0
+  },
+  "expected_counts": {
+    "questions": 24,
+    "languages": {"en": 12, "zh-CN": 12},
+    "task_types": {
+      "single_fact": 5,
+      "multi_hop": 6,
+      "aggregation": 8,
+      "vector_fallback": 5
+    },
+    "documents_covered": 10
+  }
+}

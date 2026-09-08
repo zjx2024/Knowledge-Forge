@@ -1,0 +1,87 @@
+{
+  "dataset": "knowledge-forge-cross-domain-zh",
+  "version": "v1",
+  "level": "calibration_supplement",
+  "status": "single_expert_reviewed_calibration",
+  "label_source": "assistant_expert_annotator",
+  "language": "zh-CN",
+  "frozen_at": "2026-08-11T00:00:00Z",
+  "recall_universe_complete": true,
+  "precision_adjudication_universe": "targeted hard negatives; not the entity Cartesian product",
+  "production_gate_eligible": false,
+  "trusted_approval": null,
+  "ontology_path": "ontology.json",
+  "sources_path": "SOURCES.json",
+  "annotations": {
+    "entities": "annotations/entities.json",
+    "coreference_links": "annotations/coreference_links.json",
+    "assertions": "annotations/assertions.json",
+    "ambiguous_claims": "annotations/ambiguous_claims.json"
+  },
+  "documents": [
+    {
+      "id": "zh-software-hierarchy",
+      "path": "documents/zh-software-hierarchy.txt",
+      "split": "dev",
+      "content_sha256": "f07dc66cd66e28c4fb7ed1a0fb0542eec50bf73860c79019f1243df0fc7bc3d3",
+      "language": "zh-CN",
+      "domain": "embedded_software",
+      "structure": [
+        "numbered_heading",
+        "hierarchical_list",
+        "prose"
+      ]
+    },
+    {
+      "id": "zh-manufacturing-table",
+      "path": "documents/zh-manufacturing-table.txt",
+      "split": "dev",
+      "content_sha256": "a317e0ee7715c09fa0d324ce5eaef244208dbf982b3ddf2367c11e2b45cbf4fc",
+      "language": "zh-CN",
+      "domain": "manufacturing",
+      "structure": [
+        "prose",
+        "pipe_table",
+        "batch_record",
+        "negation"
+      ]
+    },
+    {
+      "id": "zh-regulation-clauses",
+      "path": "documents/zh-regulation-clauses.txt",
+      "split": "holdout",
+      "content_sha256": "966a45ba840de979445bd8773f9d2900b4668f39235afe8c913a305257bd6320",
+      "language": "zh-CN",
+      "domain": "regulation",
+      "structure": [
+        "article_heading",
+        "numbered_clauses",
+        "obligation",
+        "negation"
+      ]
+    },
+    {
+      "id": "zh-narrative-coreference",
+      "path": "documents/zh-narrative-coreference.txt",
+      "split": "holdout",
+      "content_sha256": "2c6edad83911fc0e428aa9c6ae5348162be9c15e5b2a6ce2f56224031a02173b",
+      "language": "zh-CN",
+      "domain": "maintenance_narrative",
+      "structure": [
+        "narrative",
+        "coreference",
+        "event_sequence",
+        "explicit_negation"
+      ]
+    }
+  ],
+  "expected_counts": {
+    "documents": 4,
+    "entity_mentions": 113,
+    "canonical_entities": 71,
+    "coreference_links": 3,
+    "complete_positive_assertions": 64,
+    "unique_positive_facts": 63,
+    "predicate_specific_negative_claims": 16
+  }
+}

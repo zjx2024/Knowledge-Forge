@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from knowledge_forge.config import Config
 from knowledge_forge.hugegraph_store import HugeGraphStore
 
@@ -42,6 +44,30 @@ def test_hugegraph_iterators_follow_all_cursor_pages():
     assert all(call["limit"] == Config.hugegraph_page_size for call in graph.vertex_calls)
 
 
+class OverlappingPagedGraph(FakePagedGraph):
+    def getEdgeByPage(self, **kwargs):
+        page = kwargs.get("page")
+        if page is None:
+            return [SimpleNamespace(id="e1"), SimpleNamespace(id="e2")], "edge-page-2"
+        return [SimpleNamespace(id="e2"), SimpleNamespace(id="e3")], None
+
+    def getVertexByPage(self, **kwargs):
+        page = kwargs.get("page")
+        if page is None:
+            return [SimpleNamespace(id="v1"), SimpleNamespace(id="v2")], "vertex-page-2"
+        return [SimpleNamespace(id="v2"), SimpleNamespace(id="v3")], None
+
+
+def test_hugegraph_iterators_deduplicate_overlapping_page_boundaries():
+    graph = OverlappingPagedGraph()
+
+    edges = list(HugeGraphStore._iter_edges(graph, label="kf_related", properties={}))
+    vertices = list(HugeGraphStore._iter_vertices(graph, "KFEntity", {}))
+
+    assert [item.id for item in edges] == ["e1", "e2", "e3"]
+    assert [item.id for item in vertices] == ["v1", "v2", "v3"]
+
+
 class RepeatedCursorGraph:
     def __init__(self):
         self.calls = 0
@@ -51,9 +77,8 @@ class RepeatedCursorGraph:
         return [SimpleNamespace(id=f"e{self.calls}")], "same-page"
 
 
-def test_hugegraph_iterator_stops_on_repeated_cursor():
+def test_hugegraph_iterator_fails_closed_on_repeated_cursor():
     graph = RepeatedCursorGraph()
-    edges = list(HugeGraphStore._iter_edges(graph, label="kf_related", properties={}))
-
-    assert [item.id for item in edges] == ["e1", "e2"]
+    with pytest.raises(RuntimeError, match="repeated cursor"):
+        list(HugeGraphStore._iter_edges(graph, label="kf_related", properties={}))
     assert graph.calls == 2

@@ -1,0 +1,15 @@
+services:
+  # The API-only CPU profile does not need a local cross-encoder process.
+  # The application keeps its deterministic/vector fallback when reranking is
+  # disabled.  A remote reranker can be configured in a separate deployment.
+  knowledge-forge-reranker:
+    profiles: ["local-reranker"]
+
+  knowledge-forge:
+    environment:
+      ENTITY_RERANKER_ENABLED: "false"
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      knowledge-forge-init:
+        condition: service_completed_successfully

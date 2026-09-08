@@ -1,0 +1,68 @@
+"""Versioned construction policy sets shared by evaluation and publication."""
+
+from __future__ import annotations
+
+from types import MappingProxyType
+from typing import Mapping
+
+from .relation_verification import RELATION_VERIFICATION_POLICY_VERSION
+
+
+POLICY_AXES = (
+    "entity_extraction_policy_version",
+    "entity_resolution_policy_version",
+    "relation_candidate_policy_version",
+    "relation_classifier_policy_version",
+    "verification_policy_version",
+    "schema_policy_version",
+)
+
+CONTROL_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    "entity_extraction_policy_version": "entity-extraction-p0-v1",
+    "entity_resolution_policy_version": "entity-resolution-p0-v1",
+    "relation_candidate_policy_version": "relation-candidate-p0-v1",
+    "relation_classifier_policy_version": "relation-classifier-p0-v1",
+    "verification_policy_version": RELATION_VERIFICATION_POLICY_VERSION,
+    "schema_policy_version": "schema-policy-p0-v1",
+})
+
+RELATION_CANDIDATE_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **CONTROL_POLICY_SET,
+    # Persisted identifiers are immutable audit data.  Their historical
+    # ``shadow`` segment is intentionally retained even though current Python
+    # symbols and product terminology no longer use it.
+    "relation_candidate_policy_version": "relation-candidate-p1-shadow-v4",
+    "relation_classifier_policy_version": "relation-classifier-p1-shadow-v1",
+    "verification_policy_version": "relation-classifier-p1-shadow-v1",
+})
+
+GROUNDED_ENTITY_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **RELATION_CANDIDATE_POLICY_SET,
+    "entity_extraction_policy_version": "entity-extraction-p2-proposition-arguments-v15-reference-placeholders",
+    "entity_resolution_policy_version": "entity-resolution-p2-symbol-safe-v10",
+    "entity_identity_policy_version": "entity-identity-symbol-safe-v9",
+    "entity_identity_profile": "bounded_similarity",
+})
+
+# The entity snapshot is reused by relation-policy evaluations.  Keep the
+# required policy axes present for audit compatibility, but make relation axes
+# explicitly non-semantic here; the relation runtime owns and fingerprints its
+# own policy set.  Otherwise a verifier/predicate change needlessly re-runs the
+# expensive, model-backed entity extraction.
+ENTITY_EXTRACTION_POLICY_SET: Mapping[str, str] = MappingProxyType({
+    **GROUNDED_ENTITY_POLICY_SET,
+    "relation_candidate_policy_version": "entity-shadow-relation-independent-v1",
+    "relation_classifier_policy_version": "entity-shadow-relation-independent-v1",
+    "verification_policy_version": "entity-shadow-relation-independent-v1",
+})
+
+PUBLISH_PREDICATE_VERSION = "publish-predicate-p0-v1"
+
+
+def normalize_policy_set(values: Mapping[str, object]) -> dict[str, str]:
+    """Return a complete, ordered policy set and reject partial snapshots."""
+
+    missing = [axis for axis in POLICY_AXES if not str(values.get(axis) or "").strip()]
+    if missing:
+        raise ValueError(f"策略集合缺少版本轴: {', '.join(missing)}")
+    return {axis: str(values[axis]) for axis in POLICY_AXES}

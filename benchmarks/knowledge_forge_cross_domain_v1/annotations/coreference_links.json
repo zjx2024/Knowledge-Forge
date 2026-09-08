@@ -1,0 +1,13 @@
+[
+  {"link_id":"alice-coref-1","document_id":"narrative-alice-excerpt","source_span":[52,55],"source_text":"her","target_mention_id":"alice:alice0","relation":"refers_to"},
+  {"link_id":"alice-coref-2","document_id":"narrative-alice-excerpt","source_span":[119,122],"source_text":"she","target_mention_id":"alice:alice0","relation":"refers_to"},
+  {"link_id":"alice-coref-3","document_id":"narrative-alice-excerpt","source_span":[148,151],"source_text":"her","target_mention_id":"alice:alice0","relation":"refers_to"},
+  {"link_id":"alice-coref-4","document_id":"narrative-alice-excerpt","source_span":[176,178],"source_text":"it","target_mention_id":"alice:book","relation":"refers_to"},
+  {"link_id":"alice-coref-5","document_id":"narrative-alice-excerpt","source_span":[215,217],"source_text":"it","target_mention_id":"alice:book","relation":"refers_to"},
+  {"link_id":"alice-coref-6","document_id":"narrative-alice-excerpt","source_span":[272,275],"source_text":"her","target_mention_id":"alice:alice0","relation":"refers_to"},
+  {"link_id":"alice-coref-7","document_id":"narrative-alice-excerpt","source_span":[308,311],"source_text":"its","target_mention_id":"alice:white_rabbit","relation":"refers_to"},
+  {"link_id":"alice-coref-8","document_id":"narrative-alice-excerpt","source_span":[344,346],"source_text":"it","target_mention_id":"alice:watch","relation":"refers_to"},
+  {"link_id":"alice-coref-9","document_id":"narrative-alice-excerpt","source_span":[421,423],"source_text":"it","target_mention_id":"alice:rabbit3","relation":"refers_to"},
+  {"link_id":"alice-coref-10","document_id":"narrative-alice-excerpt","source_span":[499,502],"source_text":"she","target_mention_id":"alice:alice2","relation":"refers_to"},
+  {"link_id":"alice-coref-11","document_id":"narrative-alice-excerpt","source_span":[524,526],"source_text":"it","target_mention_id":"alice:rabbit_hole","relation":"refers_to"}
+]

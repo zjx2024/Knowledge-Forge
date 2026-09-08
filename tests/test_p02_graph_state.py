@@ -9,8 +9,10 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import (
     GRAPH_FAILED,
+    GRAPH_POLICY_HASH,
     GRAPH_POLICY_VERSION,
     GRAPH_READY,
     GRAPH_REBUILDING,
@@ -105,30 +107,32 @@ def test_old_nonempty_graphs_are_marked_stale_but_empty_projects_are_excluded():
     statement, params = connection.calls[0]
     assert "graph_status<>%s" in statement
     assert "graph_policy_version<>%s" in statement
+    assert "updated_at" not in statement
     assert params[0] == GRAPH_STALE
-    assert params[-2:] == ("empty", GRAPH_POLICY_VERSION)
+    assert params[-3:] == ("empty", GRAPH_POLICY_VERSION, GRAPH_POLICY_HASH)
 
 
-def test_direct_graph_view_returns_409_for_noncurrent_graph(monkeypatch):
+def test_legacy_graph_view_routes_to_inline_workspace_without_hubble(monkeypatch):
     class NotReadyService:
         @staticmethod
-        def hubble_project_url(project_id):
-            raise GraphNotReadyError("图谱需要按当前验证策略重建")
+        def _assert_project_strategy(project_id, expected_strategy=None):
+            return expected_strategy
 
     monkeypatch.setattr(web, "SERVICE", NotReadyService())
     handler = object.__new__(web.AppHandler)
     handler.path = "/graph/view?project=7"
     response = {}
-    handler._respond = lambda status, body, content_type: response.update(
-        status=status, body=body, content_type=content_type,
+    handler._redirect = lambda target, project_id=None: response.update(
+        target=target, project_id=project_id,
     )
-    handler._redirect = lambda *_args, **_kwargs: pytest.fail("must not redirect")
     handler._project = lambda: 7
 
     handler.do_GET()
 
-    assert response["status"] == HTTPStatus.CONFLICT
-    assert "当前验证策略重建" in response["body"]
+    assert response == {
+        "target": "/projects/7/knowledge-forge#query",
+        "project_id": 7,
+    }
 
 
 class RebuildSubmissionConnection:
@@ -138,12 +142,15 @@ class RebuildSubmissionConnection:
     def execute(self, statement, params=None):
         text = str(statement)
         self.calls.append((text, tuple(params or ())))
-        if "SELECT id FROM projects" in text:
-            return Rows(one={"id": 7})
-        if "SELECT id FROM jobs" in text:
+        if "SELECT id,graph_generation FROM projects" in text:
+            return Rows(one={"id": 7, "graph_generation": 3})
+        if "SELECT id,status,target_generation FROM jobs" in text or "SELECT id FROM jobs" in text:
             return Rows(one=None)
         if "INSERT INTO jobs" in text:
-            return Rows(one={"id": params[0], "project_id": 7, "status": "queued"})
+            return Rows(one={
+                "id": params[0], "project_id": 7, "status": "queued",
+                "target_generation": params[2],
+            })
         if "UPDATE projects" in text:
             return Rows(rowcount=1)
         raise AssertionError(text)
@@ -154,6 +161,7 @@ def test_graph_rebuild_submission_atomically_enters_rebuilding():
     job = database_with_connection(connection).create_graph_rebuild_job(7)
 
     assert job["project_id"] == 7
+    assert job["target_generation"] == 3
     update = next(call for call in connection.calls if "UPDATE projects" in call[0])
     assert update[1] == (GRAPH_REBUILDING, 7)
 
@@ -163,6 +171,10 @@ class LifecycleDatabase:
         self.project = {
             "id": 7,
             "project_key": "project-7",
+            "graph_namespace_id": str(uuid.UUID(int=7)),
+            "graph_generation": 0,
+            "graph_ready_generation": 0,
+            "active_schema_version": 1,
             "embedding_model": "embed",
             "graph_status": GRAPH_STALE,
             "graph_policy_version": "",
@@ -175,6 +187,8 @@ class LifecycleDatabase:
         self.expected_relations = expected_relations
         self.jobs = {"job-1": {"id": "job-1", "project_id": 7, "status": "queued"}}
         self.state_history = []
+        self.lease = None
+        self.manifests = {}
 
     def get_project(self, project_id):
         return dict(self.project) if project_id == 7 else None
@@ -213,6 +227,38 @@ class LifecycleDatabase:
     def list_pending_indexing_failures(self, project_id, object_type="relation"):
         return []
 
+    def list_blocking_indexing_failures(self, project_id, graph_generation):
+        return []
+
+    def acquire_graph_lease(self, project_id, namespace_id, generation, owner, **kwargs):
+        self.lease = {"id": "lease-id", "lease_token": uuid.uuid4().hex}
+        return dict(self.lease)
+
+    def assert_graph_lease(self, project_id, namespace_id, generation, lease_token):
+        return bool(self.lease and lease_token == self.lease["lease_token"])
+
+    def heartbeat_graph_lease(self, lease_id, lease_token, **kwargs):
+        return self.assert_graph_lease(7, self.project["graph_namespace_id"], 0, lease_token)
+
+    def release_graph_lease(self, lease_id, lease_token):
+        return True
+
+    def persist_graph_manifest(self, project_id, namespace_id, generation, role, lease_token, manifest):
+        self.manifests[role] = manifest
+        return manifest
+
+    def complete_graph_rebuild(self, project_id, generation, **kwargs):
+        if generation != self.project["graph_generation"]:
+            return None
+        self.project.update({
+            "graph_status": GRAPH_READY,
+            "graph_ready_generation": generation,
+            "graph_policy_version": GRAPH_POLICY_VERSION,
+            "graph_policy_hash": kwargs["policy_hash"],
+            "graph_error": "",
+        })
+        return dict(self.project)
+
 
 class LifecycleGraph:
     def __init__(self, fail_at=""):
@@ -223,25 +269,41 @@ class LifecycleGraph:
     def ensure_schema(self):
         return None
 
-    def delete_project(self, project_id):
+    @staticmethod
+    def _manifest(project, mutation):
+        return build_graph_manifest(
+            [], namespace_id=mutation.namespace_id, project_id=project["id"],
+            graph_generation=mutation.generation, policy_hash=mutation.policy_hash,
+        )
+
+    def expected_manifest(self, project, documents, *, mutation):
+        return self._manifest(project, mutation)
+
+    def writer_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def actual_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def delete_project(self, project, *, mutation):
         self.edges.clear()
         self.document_writes = 0
         if self.fail_at == "purge":
             raise RuntimeError("purge failed")
 
-    def replace_document(self, project, document, chunks):
+    def write_document_snapshot(self, project, document, chunks, *, mutation):
         self.document_writes += 1
         if self.fail_at == "after_first_document" and self.document_writes == 2:
             raise RuntimeError("second document failed")
 
-    def sync_document_assertions(self, project, document):
+    def sync_document_assertions(self, project, document, *, mutation):
         self.edges.add(int(document["id"]))
         return {"entities": 2, "relations": 1}
 
-    def prune_project_entities(self, project_id):
+    def prune_project_entities(self, project, *, mutation):
         return 0
 
-    def statistics(self, project_id):
+    def statistics(self, project):
         count = len(self.edges)
         if self.fail_at == "final_check":
             count += 1
@@ -361,19 +423,22 @@ def test_relation_indexing_outbox_is_retried_without_changing_assertion_state():
 
 
 @pytest.mark.integration
-def test_p02_real_postgres_policy_migration_and_audit_transactions():
+def test_p02_real_postgres_policy_migration_and_audit_transactions(active_document_revision):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
-    schema_name = f"kf_p02_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_p02_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as admin:
-        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             admin.execute(
                 sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name))
             )
-            admin.execute(SCHEMA_SQL)
-            admin.execute(SCHEMA_SQL)
+            if not managed_schema:
+                admin.execute(SCHEMA_SQL)
+                admin.execute(SCHEMA_SQL)
             project_id = admin.execute(
                 "INSERT INTO projects(project_key,name) VALUES('p02','P02') RETURNING id"
             ).fetchone()["id"]
@@ -383,6 +448,8 @@ def test_p02_real_postgres_policy_migration_and_audit_transactions():
                    VALUES(%s,'hash','a.txt','a.txt','/a','/a',1) RETURNING id""",
                 (project_id,),
             ).fetchone()["id"]
+            if managed_schema:
+                active_document_revision(admin, project_id, document_id)
             chunk_id = admin.execute(
                 """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
                    VALUES(%s,%s,'chunk','Alpha uses Beta','chunk-hash') RETURNING id""",
@@ -565,4 +632,5 @@ def test_p02_real_postgres_policy_migration_and_audit_transactions():
             }
             assert recorded_runs == {success_run}
         finally:
-            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))

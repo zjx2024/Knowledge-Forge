@@ -18,13 +18,22 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from PIL import Image, ImageFile, ImageOps
 
-from .chunking import DocumentBlock, ParsedDocument, _heading_info, _heading_path, _slug
+from .chunking import (
+    DocumentBlock,
+    ParsedDocument,
+    _heading_info,
+    _heading_path,
+    _slug,
+    sanitize_parsed_document,
+)
 from .config import Config
 from .ollama import OllamaClient
+from .unicode_safety import sanitize_unicode_data
 
 
 LOGGER = logging.getLogger(__name__)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+IMAGE_ANALYSIS_CACHE_VERSION = 3
 
 
 IMAGE_ANALYSIS_SCHEMA = {
@@ -35,8 +44,16 @@ IMAGE_ANALYSIS_SCHEMA = {
         "ocr_text": {"type": "string"},
         "facts": {"type": "array", "items": {"type": "string"}},
         "relationships": {"type": "array", "items": {"type": "string"}},
+        "knowledge_relevance": {
+            "type": "string",
+            "enum": ["substantive", "context_only", "decorative"],
+        },
+        "relevance_reason": {"type": "string"},
     },
-    "required": ["title", "description", "ocr_text", "facts", "relationships"],
+    "required": [
+        "title", "description", "ocr_text", "facts", "relationships",
+        "knowledge_relevance", "relevance_reason",
+    ],
 }
 
 
@@ -69,7 +86,7 @@ class DocumentMediaService:
         progress: Callable[[int, int, str], None] | None = None,
     ) -> ParsedDocument:
         if path.suffix.lower() not in {".pdf", ".docx"}:
-            return parsed
+            return sanitize_parsed_document(parsed)
         media_dir.mkdir(parents=True, exist_ok=True)
         raw = self._extract(path, parsed)
         assets = self._materialize(raw, media_dir)
@@ -95,13 +112,29 @@ class DocumentMediaService:
                         "analysis_model": project.get("llm_model") or Config.default_llm_model,
                         "title": str(analysis.get("title") or ""),
                         "description": str(analysis.get("description") or ""),
+                        "knowledge_relevance": str(
+                            analysis.get("knowledge_relevance") or "context_only"
+                        ),
+                        "relevance_reason": str(
+                            analysis.get("relevance_reason") or ""
+                        ),
+                        "graph_extraction_enabled": (
+                            str(analysis.get("knowledge_relevance") or "")
+                            == "substantive"
+                        ),
                     }
                     image_blocks.append(DocumentBlock(
                         key=f"b{order:05d}",
                         block_type="image",
                         text=text,
                         order=order,
-                        section_key=str(source.get("section_key") or f"media_{index:04d}"),
+                        # Keep every media analysis in its own retrieval region
+                        # so a non-substantive image can be excluded from graph
+                        # extraction without disabling adjacent body text.
+                        section_key=(
+                            f"{str(source.get('section_key') or 'media')}"
+                            f"_image_{asset.content_hash[:12]}"
+                        ),
                         section_title=str(source.get("section_title") or path.stem),
                         level=int(source.get("level") or 1),
                         heading_path=tuple(source.get("heading_path") or (path.stem,)),
@@ -127,12 +160,12 @@ class DocumentMediaService:
         if failures:
             warnings.append(f"{failures} 张图片未能完成视觉理解")
         quality["warnings"] = warnings
-        return ParsedDocument(
+        return sanitize_parsed_document(ParsedDocument(
             blocks=[*parsed.blocks, *image_blocks],
             parser_type=parsed.parser_type,
             parser_version=parsed.parser_version,
             quality=quality,
-        )
+        ))
 
     def _extract(self, path: Path, parsed: ParsedDocument) -> list[tuple[bytes, dict[str, Any]]]:
         if path.suffix.lower() == ".docx":
@@ -330,8 +363,13 @@ class DocumentMediaService:
         if cache_path.exists():
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                if cached.get("model") == model and cached.get("version") == 1:
-                    return dict(cached.get("analysis") or {})
+                if (
+                    cached.get("model") == model
+                    and cached.get("version") == IMAGE_ANALYSIS_CACHE_VERSION
+                ):
+                    return sanitize_unicode_data(
+                        dict(cached.get("analysis") or {})
+                    )
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -342,6 +380,11 @@ class DocumentMediaService:
             "ocr_text": ocr_text,
             "facts": [],
             "relationships": [],
+            # Without visual analysis, preserve the previous graph behavior;
+            # OCR-only deployments cannot safely infer that an image is merely
+            # decorative. The configured vision pass supplies the real role.
+            "knowledge_relevance": "substantive",
+            "relevance_reason": "visual relevance classification unavailable",
         }
         if Config.image_analysis_enabled:
             source = asset.sources[0] if asset.sources else {}
@@ -350,7 +393,15 @@ class DocumentMediaService:
                 system=(
                     "You extract knowledge from an image embedded in a source document. Describe only visible content. "
                     "Transcribe meaningful text, list explicit factual statements, and express visible relationships as "
-                    "short 'A --relation--> B' strings. Do not infer facts that are not shown. Return schema-valid JSON only."
+                    "short 'A --relation--> B' strings. Classify knowledge_relevance as substantive only when the image "
+                    "itself conveys domain facts useful to a knowledge graph, such as a diagram, chart, data table, map, "
+                    "technical screenshot, or evidentiary photograph. Use context_only for portraits, author photos, "
+                    "signatures, covers and logos; use decorative for styling or layout imagery. Non-substantive images "
+                    "remain searchable/displayable but must not contribute graph facts. Relationships must express "
+                    "domain semantics between meaningful objects or concepts. Keep axis names, legends, colours, marker "
+                    "shapes and other visual encodings in the description or OCR text, but do not emit them as graph "
+                    "relationships. Do not infer facts that are not "
+                    "shown. Return schema-valid JSON only."
                 ),
                 prompt=(
                     f"Image source: {self._source_label(source)}\n"
@@ -359,15 +410,17 @@ class DocumentMediaService:
                 ),
                 schema=IMAGE_ANALYSIS_SCHEMA,
                 temperature=0,
-                max_tokens=int(project.get("model_max_tokens") or 32768),
+                context_budget_tokens=int(project.get("model_max_tokens") or 32768),
+                max_output_tokens=Config.image_analysis_max_output_tokens,
                 images=[asset.data],
             )
             analysis.update({key: visual.get(key, analysis[key]) for key in analysis})
             if ocr_text and not str(analysis.get("ocr_text") or "").strip():
                 analysis["ocr_text"] = ocr_text
 
+        analysis = sanitize_unicode_data(analysis)
         cache_path.write_text(json.dumps({
-            "version": 1,
+            "version": IMAGE_ANALYSIS_CACHE_VERSION,
             "model": model,
             "analysis": analysis,
         }, ensure_ascii=False, indent=2), encoding="utf-8")

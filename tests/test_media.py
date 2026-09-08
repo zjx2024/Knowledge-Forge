@@ -20,6 +20,8 @@ class FakeVisionOllama:
             "ocr_text": "服务 A  服务 B",
             "facts": ["服务 A 和服务 B 出现在系统架构图中"],
             "relationships": ["服务 A --调用--> 服务 B"],
+            "knowledge_relevance": "substantive",
+            "relevance_reason": "架构图表达了服务之间的调用关系",
         }
 
 
@@ -72,6 +74,9 @@ def test_docx_image_becomes_a_provenance_rich_knowledge_chunk(monkeypatch, tmp_p
     assert any("系统架构图" in chunk.content for chunk in result.chunks)
     assert any(chunk.metadata.get("media_assets") for chunk in result.chunks)
     assert ollama.calls[0]["images"]
+    assert "axis names, legends, colours, marker shapes" in (
+        ollama.calls[0]["system"]
+    )
 
 
 def test_image_analysis_cache_is_scoped_by_model(monkeypatch, tmp_path):
@@ -133,3 +138,53 @@ def test_tiny_decorative_docx_image_is_filtered(monkeypatch, tmp_path):
 
     assert not [block for block in enriched.blocks if block.block_type == "image"]
     assert ollama.calls == []
+
+
+def test_context_only_image_remains_retrievable_but_not_graph_eligible(
+    monkeypatch, tmp_path,
+):
+    configure_media(monkeypatch, tmp_path)
+    source = tmp_path / "context-image.docx"
+    document = Document()
+    document.add_heading("作者信息", level=1)
+    document.add_paragraph("正文仍应参与图谱抽取。")
+    document.add_picture(BytesIO(image_bytes()))
+    document.save(source)
+
+    class ContextOnlyVision(FakeVisionOllama):
+        def json_chat(self, **kwargs):
+            result = super().json_chat(**kwargs)
+            return {
+                **result,
+                "title": "人物照片",
+                "description": "一张人物肖像照片。",
+                "facts": ["人物位于纯色背景前"],
+                "relationships": ["人物 --位于--> 纯色背景"],
+                "knowledge_relevance": "context_only",
+                "relevance_reason": "图片仅用于作者身份展示",
+            }
+
+    plan, parsed = parse_document_structure(source)
+    enriched = DocumentMediaService(ContextOnlyVision()).enrich(
+        source,
+        parsed,
+        {"id": 1, "llm_model": "vision-model", "model_max_tokens": 32768},
+        tmp_path / "media" / "project_1" / "context",
+    )
+    result = build_processing_result(
+        source, plan, enriched, source_name=source.name, chunk_max_tokens=512,
+    )
+
+    image_block = next(
+        block for block in enriched.blocks if block.block_type == "image"
+    )
+    assert image_block.metadata["graph_extraction_enabled"] is False
+    image_chunk = next(
+        chunk for chunk in result.chunks if "人物肖像照片" in chunk.content
+    )
+    assert image_chunk.metadata["graph_extraction_enabled"] is False
+    assert any(
+        "正文仍应参与图谱抽取" in chunk.content
+        and chunk.metadata["graph_extraction_enabled"] is True
+        for chunk in result.chunks
+    )

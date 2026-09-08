@@ -33,6 +33,44 @@ must not require a running RAGFlow service or call its API.
    supported by another document.
 8. Long-running work uses the PostgreSQL `jobs` table; do not rely on process
    memory for user-visible status.
+9. Fixes to extraction, normalization, graph construction and UI state must be
+   generic system fixes. Production control flow must not branch on the current
+   task, a specific uploaded document, a concrete domain term, or a hard-coded
+   predicate name. Such examples may appear only in tests, Gold fixtures or
+   documentation.
+10. Before reporting implementation work as complete, run and report relevant
+    self-checks. Prefer targeted regression tests plus the standard compile/test
+    commands below; do not rely on the user to discover first-order failures
+    through the UI.
+11. A change that affects a user-visible HTTP route, browser interaction,
+    background job, or model-backed workflow is not self-checked by unit tests
+    alone. Before reporting it complete, exercise the real public HTTP/job
+    entrypoint against isolated data, wait for its terminal state, and inspect
+    the persisted result or failure record. For Ollama-backed workflows this
+    must use the configured runtime model service, not only scripted fixtures.
+    A fail-closed error, stale lease, malformed model response, migration gap,
+    or missing UI state means the change is incomplete and must be fixed before
+    asking the user to test it.
+12. `graphrag_native` is an independent, project-wide GraphRAG 3.1.1 strategy.
+    Its algorithm facts stay in immutable per-run Parquet/LanceDB bundles and
+    its PostgreSQL tables are control-plane metadata only.  Never route it
+    through Stable/Enhanced extraction, canonical entities, pgvector or
+    HugeGraph, and never silently fall back to those paths.
+13. A native run may become queryable only after independent bundle validation
+    and current-source freshness checks.  Native active-run and project
+    selected-strategy pointers are separate CAS-controlled concepts; do not
+    auto-select, activate, delete, commit, push or deploy native work without
+    explicit user authority.
+14. Before restarting `knowledge-forge.service`, query every active
+    `graphrag_native_build`.  Do not restart while one is running: systemd
+    terminates its isolated GraphRAG child and recovery restarts the entire
+    run.  Finish it, cancel it with user authority, or use a non-disruptive
+    observation path instead.
+15. After every `git push`, inspect the remote CI/check runs for the pushed
+    commit and wait until all required checks reach a terminal state.  Do not
+    report the push as complete while checks are pending.  If a check fails,
+    inspect its remote logs, fix the failure, push again, and repeat until all
+    required checks pass or a genuine external blocker is reported.
 
 ## Module boundaries
 

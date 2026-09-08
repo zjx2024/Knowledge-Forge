@@ -1,0 +1,13 @@
+{
+  "mentions": [
+    {"id": "m1", "document_id": "fixture-dev-1", "start": 0, "end": 5, "type": "Organization"},
+    {"id": "m2", "document_id": "fixture-dev-1", "start": 11, "end": 15, "type": "Product"}
+  ],
+  "clusters": {"m1": "c1", "m2": "c2"},
+  "must_links": [],
+  "cannot_links": [["m1", "m2"]],
+  "relations": [
+    {"source": "m1", "predicate": "uses", "target": "m2", "direction": "forward", "evidence_start": 0, "evidence_end": 16}
+  ],
+  "hard_negative_relations": []
+}

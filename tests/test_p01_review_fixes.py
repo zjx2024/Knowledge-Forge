@@ -6,9 +6,16 @@ import pytest
 import psycopg
 from psycopg import sql
 
+from knowledge_forge.construction_strategies import KNOWLEDGE_FORGE_STRATEGY
 from knowledge_forge.database import Database, SCHEMA_SQL
+from knowledge_forge.graph_policy import GraphNotReadyError
+from knowledge_forge.graph_manifest import build_graph_manifest
 from knowledge_forge.graph_policy import GRAPH_POLICY_VERSION
 from knowledge_forge.relation_verification import PUBLISHABLE_RELATION_STATUSES
+from knowledge_forge.relation_runtime import (
+    LOADED_RELATION_CODE_DIGEST,
+    relation_runtime_treatment_digest,
+)
 from knowledge_forge.service import KnowledgeForgeService
 
 
@@ -27,61 +34,188 @@ class Rows:
 
 class SearchDatabase:
     def __init__(self):
-        self.statuses = [
-            "rules_verified", "llm_verified", "manual_verified",
-            "rejected", "uncertain", "verification_failed", "verification_missing",
-        ]
-        self.refiltered_ids = []
+        self.snapshot_calls = []
 
     def get_project(self, project_id):
         return {"id": project_id, "embedding_model": "embed"}
 
-    def search_graph_text(self, project_id, query, limit):
-        # Deliberately simulate stale/unsafe lexical input. Service must re-filter it.
+    def assert_project_construction_strategy(self, project_id, expected):
+        assert project_id == 4
+        assert expected == KNOWLEDGE_FORGE_STRATEGY
+        return expected
+
+    def get_project_strategy_graph(self, project_id, strategy):
+        assert project_id == 4
+        assert strategy == KNOWLEDGE_FORGE_STRATEGY
         return {
-            "entities": [],
-            "relations": [
-                {"id": index, "verification_status": status}
-                for index, status in enumerate(self.statuses, 1)
-            ],
+            "status": "ready", "generation": 3, "ready_generation": 3,
+            "policy_summary": {
+                "entity_namespace_id": "namespace-current",
+                "entity_metrics": {"relation_v2_run_id": "relation-run-current"},
+            },
         }
 
-    def get_entities_by_ids(self, project_id, ids):
-        return []
+    def get_grounded_entity_namespace(self, namespace_id):
+        assert namespace_id == "namespace-current"
+        return {
+            "id": namespace_id, "project_id": 4, "status": "ready",
+            "snapshot_complete": True, "embedding_model": "embed",
+        }
 
-    def get_relations_by_ids(self, project_id, ids):
-        self.refiltered_ids = sorted(ids)
-        return [
-            {"id": index, "verification_status": status, "confidence": 0.8}
-            for index, status in enumerate(self.statuses, 1)
-            if index in ids and status in PUBLISHABLE_RELATION_STATUSES
-        ]
+    def get_grounded_relation_run(self, run_id):
+        assert run_id == "relation-run-current"
+        return {
+            "id": run_id, "project_id": 4, "status": "ready",
+            "fingerprint_components": {
+                "materialization_root": {
+                    "code_tree": LOADED_RELATION_CODE_DIGEST,
+                    "treatment": relation_runtime_treatment_digest(),
+                },
+            },
+        }
+
+    def search_knowledge_forge_entities(self, namespace_id, query, limit):
+        self.snapshot_calls.append(("entities", namespace_id, query))
+        return [{
+            "canonical_key": "entity-current", "name": "Alpha",
+            "primary_type": "Thing", "aliases": [], "metadata": {},
+            "source_count": 2, "lexical_score": 1.0,
+        }]
+
+    def search_grounded_entity_vector_candidates(
+        self, namespace_id, model_name, query_vector, limit,
+    ):
+        self.snapshot_calls.append(("entity-vectors", namespace_id, model_name))
+        return [{
+            "canonical_key": "entity-current", "name": "Alpha",
+            "primary_type": "Thing", "aliases": [], "metadata": {},
+            "source_count": 2, "vector_score": 0.9,
+        }]
+
+    def search_knowledge_forge_relations(
+        self, namespace_id, relation_run_id, query, *, chunk_ids,
+        canonical_keys, limit,
+    ):
+        self.snapshot_calls.append((
+            "relations", namespace_id, relation_run_id, tuple(chunk_ids),
+            tuple(canonical_keys),
+        ))
+        return [{
+            "id": "fact-current", "source_name": "Alpha",
+            "source_canonical_key": "entity-current",
+            "relation_type": "connected_to", "target_name": "Beta",
+            "target_canonical_key": "entity-beta",
+            "evidence_text": "Alpha connects to Beta.", "chunk_id": 7,
+            "metadata": {"confidence": 0.91}, "evidence_count": 1,
+            "evidence_records": [{
+                "verification_attempt_id": "supported-verification",
+            }],
+            "lexical_score": 1.0, "original_filename": "current.pdf",
+            "storage_path": "/files/current.pdf",
+        }]
+
+    def search_graph_text(self, *_args, **_kwargs):
+        raise AssertionError("Knowledge Forge search must not read legacy graph text")
+
+    def get_entities_by_ids(self, *_args, **_kwargs):
+        raise AssertionError("Knowledge Forge search must not read legacy entities")
+
+    def get_relations_by_ids(self, *_args, **_kwargs):
+        raise AssertionError("Knowledge Forge search must not read legacy relations")
 
 
 class SearchVectors:
-    def search_type(self, project, query, object_type, limit):
-        if object_type == "relation":
-            return [
-                {"object_key": str(index), "score": 1 - index / 100}
-                for index in range(1, 8)
-            ]
-        return []
-
     def search(self, project, query, top_k):
-        return []
+        return [{
+            "chunk_id": 7, "object_key": "chunk-current",
+            "content": "Alpha connects to Beta.", "score": 0.8,
+        }]
 
 
-def test_service_search_refilters_lexical_and_vector_relation_ids():
+class SearchOllama:
+    def embed(self, texts, model):
+        assert model == "embed"
+        if texts == ["Alpha"]:
+            return [[0.1, 0.2]]
+        assert any("Alpha" in text and "Beta" in text for text in texts)
+        return [[0.1, 0.2] for _ in texts]
+
+
+def test_service_search_reads_only_current_knowledge_forge_snapshot():
     service = object.__new__(KnowledgeForgeService)
     service.db = SearchDatabase()
     service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
 
     result = service.search(4, "Alpha")
 
-    assert service.db.refiltered_ids == list(range(1, 8))
-    assert {item["verification_status"] for item in result["relations"]} == set(
-        PUBLISHABLE_RELATION_STATUSES
-    )
+    assert result["strategy"] == KNOWLEDGE_FORGE_STRATEGY
+    assert result["graph_generation"] == 3
+    assert result["entity_namespace_id"] == "namespace-current"
+    assert result["relation_run_id"] == "relation-run-current"
+    assert result["entities"][0]["canonical_key"] == "entity-current"
+    assert result["relations"][0]["id"] == "fact-current"
+    assert result["relations"][0]["verification_status"] == "SUPPORTED"
+    assert result["relations"][0]["evidence_count"] == 1
+    assert ("entities", "namespace-current", "Alpha") in service.db.snapshot_calls
+    assert (
+        "relations", "namespace-current", "relation-run-current", (7,),
+        ("entity-current",),
+    ) in service.db.snapshot_calls
+    assert result["relations"][0]["network_scope"] == "seed_boundary"
+    assert result["relations"][0]["graph_hop"] == 1
+    assert result["graph_retrieval"]["maximum_hops"] == 2
+
+
+def test_service_search_fails_closed_when_knowledge_forge_graph_is_stale():
+    database = SearchDatabase()
+    database.get_project_strategy_graph = lambda *_args: {
+        "status": "stale", "generation": 4, "ready_generation": 3,
+        "error_message": "source changed",
+    }
+    service = object.__new__(KnowledgeForgeService)
+    service.db = database
+    service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
+
+    with pytest.raises(GraphNotReadyError, match="source changed"):
+        service.search(4, "Alpha")
+
+
+def test_service_search_fails_closed_for_cross_project_relation_run():
+    database = SearchDatabase()
+    database.get_grounded_relation_run = lambda *_args: {
+        "id": "relation-run-current", "project_id": 99, "status": "ready",
+    }
+    service = object.__new__(KnowledgeForgeService)
+    service.db = database
+    service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
+
+    with pytest.raises(GraphNotReadyError, match="关系快照不完整"):
+        service.search(4, "Alpha")
+
+
+def test_service_search_fails_closed_for_obsolete_relation_treatment():
+    database = SearchDatabase()
+    database.get_grounded_relation_run = lambda *_args: {
+        "id": "relation-run-current",
+        "project_id": 4,
+        "status": "ready",
+        "fingerprint_components": {
+            "materialization_root": {
+                "code_tree": LOADED_RELATION_CODE_DIGEST,
+                "treatment": "obsolete-treatment",
+            },
+        },
+    }
+    service = object.__new__(KnowledgeForgeService)
+    service.db = database
+    service.vectors = SearchVectors()
+    service.ollama = SearchOllama()
+
+    with pytest.raises(GraphNotReadyError, match="抽取策略已升级"):
+        service.search(4, "Alpha")
 
 
 class QueryRecorder:
@@ -265,9 +399,15 @@ class GraphRebuildDatabase:
     def __init__(self):
         self.updated = False
         self.states = []
+        self.namespace = str(uuid.UUID(int=1))
+        self.lease = None
 
     def get_project(self, project_id):
-        return {"id": project_id, "project_key": "p1"}
+        return {
+            "id": project_id, "project_key": "p1",
+            "graph_namespace_id": self.namespace, "graph_generation": 0,
+            "active_schema_version": 1,
+        }
 
     def list_documents(self, project_id):
         return [{"id": 2, "status": "indexed", "original_filename": "a.txt"}]
@@ -287,6 +427,29 @@ class GraphRebuildDatabase:
     def list_pending_indexing_failures(self, project_id, object_type="relation"):
         return []
 
+    def list_blocking_indexing_failures(self, project_id, graph_generation):
+        return []
+
+    def acquire_graph_lease(self, project_id, namespace_id, generation, owner, **kwargs):
+        self.lease = {"id": "lease-id", "lease_token": uuid.uuid4().hex}
+        return dict(self.lease)
+
+    def heartbeat_graph_lease(self, lease_id, lease_token, **kwargs):
+        return bool(self.lease and lease_token == self.lease["lease_token"])
+
+    def release_graph_lease(self, lease_id, lease_token):
+        return True
+
+    def persist_graph_manifest(self, project_id, namespace_id, generation, role, lease_token, manifest):
+        return manifest
+
+    def complete_graph_rebuild(self, project_id, generation, **kwargs):
+        self.updated = True
+        return self.get_project(project_id)
+
+    def update_job(self, job_id, **kwargs):
+        return {"id": job_id, **kwargs}
+
     def set_graph_state(self, project_id, status, **values):
         self.states.append((status, values))
         self.updated = status == "ready" and values.get("current_policy") is True
@@ -302,22 +465,38 @@ class GraphRebuildStore:
     def ensure_schema(self):
         self.calls.append("schema")
 
-    def delete_project(self, project_id):
+    @staticmethod
+    def _manifest(project, mutation):
+        return build_graph_manifest(
+            [], namespace_id=mutation.namespace_id, project_id=project["id"],
+            graph_generation=mutation.generation, policy_hash=mutation.policy_hash,
+        )
+
+    def expected_manifest(self, project, documents, *, mutation):
+        return self._manifest(project, mutation)
+
+    def writer_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def actual_manifest(self, project, *, mutation):
+        return self._manifest(project, mutation)
+
+    def delete_project(self, project, *, mutation):
         self.calls.append("purge")
         self.edges.clear()
 
-    def replace_document(self, project, document, chunks):
+    def write_document_snapshot(self, project, document, chunks, *, mutation):
         self.calls.append("document")
 
-    def sync_document_assertions(self, project, document):
+    def sync_document_assertions(self, project, document, *, mutation):
         self.calls.append("relations")
         self.edges.add("published-edge")
         return {"entities": 2, "relations": 1}
 
-    def prune_project_entities(self, project_id):
+    def prune_project_entities(self, project, *, mutation):
         self.calls.append("prune")
 
-    def statistics(self, project_id):
+    def statistics(self, project):
         return {"relations": len(self.edges)}
 
 
@@ -335,17 +514,20 @@ def test_explicit_project_graph_rebuild_purges_stale_edges_before_sync():
 
 
 @pytest.mark.integration
-def test_disposable_postgres_schema_and_policy_migration():
+def test_disposable_postgres_schema_and_policy_migration(active_document_revision):
     dsn = os.getenv("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("KNOWLEDGE_FORGE_TEST_POSTGRES_DSN is not configured")
-    schema_name = f"kf_p01_{uuid.uuid4().hex[:12]}"
+    managed_schema = os.getenv("KNOWLEDGE_FORGE_TEST_SCHEMA", "").strip()
+    schema_name = managed_schema or f"kf_p01_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(dsn, autocommit=True) as conn:
-        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
+        if not managed_schema:
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name)))
         try:
             conn.execute(sql.SQL("SET search_path TO {},public").format(sql.Identifier(schema_name)))
-            conn.execute(SCHEMA_SQL)
-            conn.execute(SCHEMA_SQL)
+            if not managed_schema:
+                conn.execute(SCHEMA_SQL)
+                conn.execute(SCHEMA_SQL)
             project_id = conn.execute(
                 "INSERT INTO projects(project_key,name) VALUES('p','P') RETURNING id"
             ).fetchone()[0]
@@ -355,6 +537,9 @@ def test_disposable_postgres_schema_and_policy_migration():
                 RETURNING id""",
                 (project_id,),
             ).fetchone()[0]
+            revision_id = None
+            if managed_schema:
+                revision_id = active_document_revision(conn, project_id, document_id)
             chunk_id = conn.execute(
                 """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
                 VALUES(%s,%s,'c','Alpha uses Beta','ch') RETURNING id""",
@@ -406,10 +591,19 @@ def test_disposable_postgres_schema_and_policy_migration():
                 "SELECT is_deleted FROM vector_embeddings WHERE object_key=%s", (str(assertion_id),)
             ).fetchone()[0] is True
             with pytest.raises(psycopg.errors.ForeignKeyViolation):
-                conn.execute(
-                    """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
-                    VALUES(%s,999999,'bad','bad','bad')""",
-                    (project_id,),
-                )
+                if managed_schema:
+                    conn.execute(
+                        """INSERT INTO chunks(
+                           project_id,document_id,revision_id,chunk_key,content,content_hash)
+                           VALUES(%s,999999,%s,'bad','bad','bad')""",
+                        (project_id, revision_id),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO chunks(project_id,document_id,chunk_key,content,content_hash)
+                        VALUES(%s,999999,'bad','bad','bad')""",
+                        (project_id,),
+                    )
         finally:
-            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))
+            if not managed_schema:
+                conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema_name)))

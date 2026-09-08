@@ -1,0 +1,21 @@
+{
+  "annotation_policy": "Claims are quarantined when the frozen evidence supports multiple materially different dependency attachments and does not directly entail one relation reading. They are excluded from both positive recall and hard-negative precision denominators.",
+  "claims": [
+    {
+      "claim_id": "alice-u01",
+      "document_id": "narrative-alice-excerpt",
+      "subject_canonical_id": "alice:sister",
+      "subject_span": [56, 62],
+      "predicate": "located_in",
+      "object_canonical_id": "alice:bank",
+      "object_span": [70, 74],
+      "evidence_span": [0, 104],
+      "evidence_text": "Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do.",
+      "reason_code": "PP_ATTACHMENT_AMBIGUOUS",
+      "adjudication_note": "The phrase 'on the bank' can attach to Alice's sitting event or to 'her sister'. Under strict direct-entailment scoring, the sister's location is not determined.",
+      "label_source": "assistant_expert_annotator",
+      "reviewer": "assistant-expert",
+      "reviewed_at": "2026-08-10T00:00:00Z"
+    }
+  ]
+}

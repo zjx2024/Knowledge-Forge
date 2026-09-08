@@ -22,6 +22,7 @@ from .entity_identity import (
     types_are_compatible,
 )
 from .entity_reranker import EntityReranker
+from .observability import increment
 from .relation_verification import (
     RELATION_VERIFICATION_POLICY_VERSION,
     UNCERTAIN,
@@ -45,7 +46,10 @@ class EntityResolutionSession:
     llm_model: str
     model_max_tokens: int
     exact_cache: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    exact_candidates_cache: dict[tuple[str, str], list[dict[str, Any]]] = field(default_factory=dict)
+    query_vector_cache: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     population_cache: dict[str, int] = field(default_factory=dict)
+    occurrence_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class EntityResolver:
@@ -99,8 +103,13 @@ class EntityResolver:
         )
         selected = candidates[:adaptive_top_k]
         scores = self.reranker.score(raw, selected)
-        if not self.reranker.available:
+        used_model = bool(getattr(
+            self.reranker, "last_score_used_model", self.reranker.available,
+        ))
+        if not used_model:
+            increment("entity_reranker_fallback")
             return
+        increment("entity_reranker_used")
         for candidate, reranker_score in zip(selected, scores):
             values = candidate["resolution_scores"]
             values["reranker"] = max(0.0, min(1.0, reranker_score))
@@ -158,13 +167,18 @@ class EntityResolver:
             lexical_top_k,
             Config.entity_lexical_recall_threshold,
         )
+        increment("entity_lexical_candidates", len(lexical_rows))
         for row in lexical_rows:
             combined[int(row["id"])] = dict(row)
 
         content = entity_identity_text(
             raw["name"], raw["type"], raw.get("description") or "", raw.get("aliases") or [],
         )
-        query_vector = self.vectors.ollama.embed([content], session.embedding_model)[0]
+        cache_key = (raw["type"], normalized)
+        query_vector = session.query_vector_cache.get(cache_key)
+        if query_vector is None:
+            query_vector = self.vectors.ollama.embed([content], session.embedding_model)[0]
+            session.query_vector_cache[cache_key] = query_vector
         vector_rows = self.db.search_entity_vector_candidates(
             session.project_id,
             raw["type"],
@@ -172,6 +186,7 @@ class EntityResolver:
             query_vector,
             vector_top_k,
         )
+        increment("entity_vector_candidates", len(vector_rows))
         for row in vector_rows:
             if float(row.get("vector_score") or 0.0) < Config.entity_vector_recall_threshold:
                 continue
@@ -191,6 +206,8 @@ class EntityResolver:
             item = dict(candidate)
             item["resolution_scores"] = self._candidate_score(raw, candidate)
             ranked.append(item)
+        ranked = self._filter_cannot_linked(session, raw, chunk, ranked)
+        increment("entity_candidates_after_filter", len(ranked))
         ranked.sort(key=lambda item: item["resolution_scores"]["combined"], reverse=True)
         self._rerank_candidates(raw, ranked)
         ranked.sort(
@@ -202,6 +219,39 @@ class EntityResolver:
             reverse=True,
         )
         return ranked, query_vector
+
+    def _filter_cannot_linked(
+        self,
+        session: EntityResolutionSession,
+        raw: dict[str, Any],
+        chunk: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        valid = []
+        for candidate in candidates:
+            if identifiers_conflict(raw["name"], candidate["name"]):
+                increment("entity_identifier_conflict_rejected")
+                continue
+            valid.append(candidate)
+        if not valid or not hasattr(self.db, "blocked_entity_candidate_ids"):
+            return valid
+        mention_key = Database._stable_mention_key({
+            "project_id": session.project_id,
+            "document_id": int(raw.get("_document_id") or chunk.get("document_id") or 0),
+            "revision_id": str(chunk.get("revision_id") or ""),
+            "chunk_id": int(chunk.get("id") or 0),
+            "entity_type": raw.get("type") or "GenericEntity",
+            "mention_text": raw.get("name") or "",
+            "mention_start": raw.get("mention_start"),
+            "mention_end": raw.get("mention_end"),
+            "evidence_start": raw.get("evidence_start"),
+            "evidence_end": raw.get("evidence_end"),
+        })
+        blocked = set(self.db.blocked_entity_candidate_ids(
+            session.project_id, mention_key, [int(item["id"]) for item in valid],
+        ))
+        increment("entity_cannot_link_rejected", len(blocked))
+        return [item for item in valid if int(item["id"]) not in blocked]
 
     def _llm_adjudicate(
         self,
@@ -216,7 +266,10 @@ class EntityResolver:
         schema = {
             "type": "object",
             "properties": {
-                "decision": {"type": "string", "enum": ["merge", "separate"]},
+                "decision": {
+                    "type": "string",
+                    "enum": ["MATCH", "NO_MATCH", "UNCERTAIN", "merge", "separate"],
+                },
                 "candidate_id": {"type": "integer"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                 "reason": {"type": "string"},
@@ -254,14 +307,16 @@ class EntityResolver:
                 prompt=json.dumps(payload, ensure_ascii=False),
                 schema=schema,
                 temperature=0,
-                max_tokens=session.model_max_tokens,
+                context_budget_tokens=session.model_max_tokens,
+                max_output_tokens=Config.entity_review_max_output_tokens,
             )
         except Exception as exc:
             return None, f"LLM review failed: {exc}", 0.0
         confidence = coerce_confidence(result.get("confidence"), 0.0)
         candidate_id = int(result.get("candidate_id") or 0)
         match = next((item for item in selected if int(item["id"]) == candidate_id), None)
-        if result.get("decision") != "merge" or confidence < Config.entity_llm_accept_threshold:
+        verdict = str(result.get("decision") or "").upper()
+        if verdict not in {"MATCH", "MERGE"} or confidence < Config.entity_llm_accept_threshold:
             return None, str(result.get("reason") or "LLM kept entities separate"), confidence
         if (
             not match
@@ -269,6 +324,8 @@ class EntityResolver:
             or identifiers_conflict(raw["name"], match["name"])
         ):
             return None, "LLM selected an invalid or conflicting candidate", confidence
+        if not self._filter_cannot_linked(session, raw, chunk, [dict(match)]):
+            return None, "LLM selected a candidate blocked by current cannot-link constraints", confidence
         return match, str(result.get("reason") or "LLM confirmed the same entity"), confidence
 
     def _resolve_one(
@@ -280,21 +337,60 @@ class EntityResolver:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         normalized = normalize_name(raw["name"])
         cache_key = (raw["type"], normalized)
-        cached = session.exact_cache.get(cache_key)
-        if cached:
-            entity = cached
-            exact = [cached]
-            decision: dict[str, Any] = {
-                "decision": "session_exact", "candidate_ids": [int(cached["id"])],
-                "scores": {str(cached["id"]): {"combined": 1.0}}, "reason": "同一文档会话内精确命中",
-            }
+        cached = None
+        if cache_key in session.exact_candidates_cache:
+            exact = session.exact_candidates_cache[cache_key]
         else:
-            exact = self.db.find_exact_entity_candidates(session.project_id, raw["type"], normalized)
-            entity = exact[0] if exact else None
+            exact = self.db.find_exact_entity_candidates(
+                session.project_id, raw["type"], normalized,
+            )
+            session.exact_candidates_cache[cache_key] = exact
+        exact = [
+            item for item in exact
+            if types_are_compatible(raw["type"], item["entity_type"])
+        ]
+        exact = self._filter_cannot_linked(session, raw, chunk, [dict(item) for item in exact])
+        entity = exact[0] if len(exact) == 1 else None
+        if len(exact) == 1:
+            increment("entity_exact_unique")
+        elif len(exact) > 1:
+            increment("entity_exact_ambiguous")
         if entity and not cached:
             decision = {
                 "decision": "database_exact", "candidate_ids": [int(item["id"]) for item in exact],
                 "scores": {str(entity["id"]): {"combined": 1.0}}, "reason": "规范名称或别名精确命中",
+            }
+        elif not entity and len(exact) > 1:
+            candidates = []
+            for candidate in exact:
+                item = dict(candidate)
+                item["resolution_scores"] = self._candidate_score(raw, candidate)
+                candidates.append(item)
+            self._rerank_candidates(raw, candidates)
+            candidates.sort(
+                key=lambda item: (
+                    item["resolution_scores"]["reranker"],
+                    item["resolution_scores"]["combined"],
+                    int(item.get("source_count") or 0),
+                    -int(item["id"]),
+                ),
+                reverse=True,
+            )
+            entity, reason, confidence = self._llm_adjudicate(
+                session, raw, chunk, candidates,
+            )
+            increment("entity_llm_disambiguation")
+            decision = {
+                "decision": "llm_merge" if entity else "llm_separate",
+                "candidate_ids": [int(item["id"]) for item in exact],
+                "scores": {
+                    **{
+                        str(item["id"]): item["resolution_scores"]
+                        for item in candidates
+                    },
+                    "llm_confidence": confidence,
+                },
+                "reason": reason,
             }
         elif not entity:
             candidates, _ = self._retrieve_candidates(session, raw, chunk)
@@ -332,6 +428,7 @@ class EntityResolver:
                 or best_scores["reranker"] >= Config.entity_reranker_review_threshold
             ):
                 entity, reason, confidence = self._llm_adjudicate(session, raw, chunk, candidates)
+                increment("entity_llm_disambiguation")
                 decision = {
                     "decision": "llm_merge" if entity else "llm_separate",
                     "candidate_ids": [int(item["id"]) for item in candidates],
@@ -343,19 +440,60 @@ class EntityResolver:
                     "reason": "未召回达到复核阈值的候选实体",
                 }
 
+        if entity and not self._filter_cannot_linked(
+            session, raw, chunk, [dict(entity)],
+        ):
+            entity = None
+            decision = {
+                "decision": "new_after_cannot_link",
+                "candidate_ids": list(decision.get("candidate_ids") or []),
+                "scores": dict(decision.get("scores") or {}),
+                "reason": "最终接受前 cannot-link 复核拒绝候选实体",
+            }
+
         aliases = credible_aliases(raw["name"], raw.get("aliases") or [])
         normalized_aliases = [value for value in (normalize_name(alias) for alias in aliases) if value]
         if not entity:
-            key = hashlib.sha256(f"{session.project_id}|{raw['type']}|{normalized}".encode()).hexdigest()
-            entity = self.db.upsert_canonical_entity({
-                "project_id": session.project_id, "entity_key": key, "name": raw["name"],
-                "normalized_name": normalized, "entity_type": raw["type"], "aliases": aliases,
-                "normalized_aliases": normalized_aliases, "description": raw.get("description") or "",
-                "schema_version": schema_version, "metadata": {"resolution": "new"},
-            })
-            self.vectors.upsert_entity_embedding(session.project_id, entity, session.embedding_model)
-            if decision["decision"] == "llm_separate":
-                decision["decision"] = "new_after_llm"
+            occurrence_start = raw.get("mention_start")
+            occurrence_end = raw.get("mention_end")
+            if occurrence_start is None:
+                occurrence_start = raw.get("evidence_start")
+            if occurrence_end is None:
+                occurrence_end = raw.get("evidence_end")
+            occurrence_material = "\x1f".join((
+                str(session.project_id), str(chunk.get("revision_id") or ""),
+                str(chunk.get("id") or ""),
+                str(occurrence_start if occurrence_start is not None else ""),
+                str(occurrence_end if occurrence_end is not None else ""),
+                str(raw["type"]), str(raw["name"]),
+            ))
+            key = hashlib.sha256(occurrence_material.encode("utf-8")).hexdigest()
+            entity = session.occurrence_cache.get(key)
+            if entity:
+                decision = {
+                    "decision": "duplicate_occurrence", "candidate_ids": [int(entity["id"])],
+                    "scores": {}, "reason": "同一来源位置的重复抽取结果",
+                }
+            else:
+                entity = self.db.upsert_canonical_entity({
+                    "project_id": session.project_id, "entity_key": key, "name": raw["name"],
+                    "normalized_name": normalized, "entity_type": raw["type"], "aliases": aliases,
+                    "normalized_aliases": normalized_aliases, "description": raw.get("description") or "",
+                    "schema_version": schema_version, "metadata": {"resolution": "new"},
+                })
+                increment("entity_new_canonical")
+                session.occurrence_cache[key] = entity
+                query_vector = session.query_vector_cache.get(cache_key)
+                if query_vector is not None and hasattr(self.vectors, "upsert_entity_embedding_with_vector"):
+                    self.vectors.upsert_entity_embedding_with_vector(
+                        session.project_id, entity, session.embedding_model, query_vector,
+                    )
+                else:
+                    self.vectors.upsert_entity_embedding(
+                        session.project_id, entity, session.embedding_model,
+                    )
+                if decision["decision"] == "llm_separate":
+                    decision["decision"] = "new_after_llm"
         else:
             type_changed = False
             if entity["entity_type"] == "GenericEntity" and raw["type"] != "GenericEntity":
@@ -375,7 +513,8 @@ class EntityResolver:
             if type_changed or evidence_changed:
                 self.vectors.upsert_entity_embedding(session.project_id, entity, session.embedding_model)
 
-        session.exact_cache[cache_key] = entity
+        if decision["decision"] not in {"new_no_candidate", "new_after_llm", "llm_separate"}:
+            session.exact_cache[cache_key] = entity
         return entity, decision
 
     def resolve_chunk(
@@ -390,32 +529,124 @@ class EntityResolver:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         project_id = int(project["id"])
         session = session or self.start_session(project)
+        raw_entities = [
+            {**raw, "_document_id": document_id}
+            for raw in (extraction.get("entities") or [])
+            if normalize_name(raw.get("name") or "")
+        ]
+        mention_keys: dict[str, str] = {}
+        for raw in raw_entities:
+            mention_values = {
+                "project_id": project_id, "document_id": document_id,
+                "revision_id": str(chunk.get("revision_id") or ""),
+                "chunk_id": int(chunk["id"]), "entity_type": raw["type"],
+                "mention_text": raw["name"], "mention_start": raw.get("mention_start"),
+                "mention_end": raw.get("mention_end"),
+                "evidence_start": raw.get("evidence_start"),
+                "evidence_end": raw.get("evidence_end"),
+            }
+            mention_keys[str(raw["id"])] = Database._stable_mention_key(mention_values)
+        active_assignments = (
+            self.db.find_active_entity_assignments_by_mention_keys(
+                project_id, list(mention_keys.values()),
+            )
+            if hasattr(self.db, "find_active_entity_assignments_by_mention_keys") else {}
+        )
+        unique_raws: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw in raw_entities:
+            if mention_keys[str(raw["id"])] in active_assignments:
+                continue
+            key = (str(raw["type"]), normalize_name(raw["name"]))
+            unique_raws.setdefault(key, raw)
+        exact_requests = [
+            key for key in unique_raws
+            if key not in session.exact_cache and key not in session.exact_candidates_cache
+        ]
+        if exact_requests:
+            if hasattr(self.db, "find_exact_entity_candidates_batch"):
+                session.exact_candidates_cache.update(
+                    self.db.find_exact_entity_candidates_batch(project_id, exact_requests)
+                )
+            else:
+                for entity_type, normalized in exact_requests:
+                    session.exact_candidates_cache[(entity_type, normalized)] = (
+                        self.db.find_exact_entity_candidates(project_id, entity_type, normalized)
+                    )
+        embedding_requests = [
+            (key, raw)
+            for key, raw in unique_raws.items()
+            if key not in session.exact_cache
+            and not session.exact_candidates_cache.get(key)
+            and key not in session.query_vector_cache
+        ]
+        batch_size = max(1, Config.entity_embedding_batch_size)
+        for start in range(0, len(embedding_requests), batch_size):
+            batch = embedding_requests[start : start + batch_size]
+            contents = [
+                entity_identity_text(
+                    raw["name"], raw["type"], raw.get("description") or "",
+                    raw.get("aliases") or [],
+                )
+                for _, raw in batch
+            ]
+            vectors = self.vectors.ollama.embed(contents, session.embedding_model)
+            if len(vectors) != len(batch):
+                raise RuntimeError("实体 embedding 批次返回数量不一致")
+            for (key, _), vector in zip(batch, vectors):
+                session.query_vector_cache[key] = vector
         local_map: dict[str, dict[str, Any]] = {}
-        mentions: list[dict[str, Any]] = []
-        for raw in extraction.get("entities") or []:
+        mention_values: list[dict[str, Any]] = []
+        decision_values: list[dict[str, Any]] = []
+        for raw in raw_entities:
             normalized = normalize_name(raw["name"])
             if not normalized: continue
             aliases = credible_aliases(raw["name"], raw.get("aliases") or [])
-            entity, resolution = self._resolve_one(session, raw, chunk, schema_version)
+            mention_key = mention_keys[str(raw["id"])]
+            entity = active_assignments.get(mention_key)
+            if entity:
+                resolution = {
+                    "decision": "existing_assignment",
+                    "candidate_ids": [int(entity["id"])], "scores": {},
+                    "reason": "稳定 mention_key 已有活动 assignment，保持 occurrence 归属",
+                }
+            else:
+                entity, resolution = self._resolve_one(
+                    session, raw, chunk, schema_version,
+                )
             local_map[raw["id"]] = entity
-            mention = self.db.add_entity_mention({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
+            mention_values.append({"project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
+                "revision_id": str(chunk.get("revision_id") or ""),
                 "canonical_entity_id": int(entity["id"]), "mention_text": raw["name"], "normalized_name": normalized,
                 "entity_type": raw["type"], "description": raw.get("description") or "",
                 "confidence": 0.5 if raw.get("confidence") is None else raw.get("confidence"),
                 "extraction_version": "v2", "evidence_text": raw.get("evidence_text") or "",
+                "mention_start": raw.get("mention_start"), "mention_end": raw.get("mention_end"),
                 "evidence_start": raw.get("evidence_start"), "evidence_end": raw.get("evidence_end"),
                 "metadata": {"raw_aliases": raw.get("raw_aliases") or [], "accepted_aliases": aliases,
                     "verified_surface_forms": raw.get("verified_surface_forms") or [],
                     "resolution": resolution}})
-            self.db.add_entity_resolution_decision({
+            decision_values.append({
                 "project_id": project_id, "document_id": document_id, "chunk_id": int(chunk["id"]),
+                "revision_id": str(chunk.get("revision_id") or ""),
                 "canonical_entity_id": int(entity["id"]), "mention_text": raw["name"],
                 "normalized_name": normalized, "entity_type": raw["type"], "decision": resolution["decision"],
                 "candidate_entity_ids": resolution.get("candidate_ids") or [], "scores": resolution.get("scores") or {},
                 "reason": resolution.get("reason") or "", "model_name": session.llm_model,
                 "metadata": {"schema_version": schema_version},
             })
-            mentions.append(mention)
+            mention_values[-1]["mention_key"] = mention_key
+            decision_values[-1]["mention_key"] = mention_values[-1]["mention_key"]
+        if hasattr(self.db, "persist_entity_resolution_batch"):
+            mentions = self.db.persist_entity_resolution_batch(mention_values, decision_values)
+        else:
+            mentions = []
+            for mention_values_item, decision_values_item in zip(mention_values, decision_values):
+                mentions.append(self.db.add_entity_mention(mention_values_item))
+                self.db.add_entity_resolution_decision(decision_values_item)
+        mention_key_by_raw_id = {
+            str(raw["id"]): str(mention.get("mention_key") or raw["id"])
+            for raw, mention in zip(raw_entities, mentions)
+        }
         raw_entity_map = {str(item["id"]): item for item in extraction.get("entities") or []}
         candidate_values: list[dict[str, Any]] = []
         for raw in extraction.get("relations") or []:
@@ -428,9 +659,13 @@ class EntityResolver:
                 "candidate_id": raw["candidate_id"], "project_id": project_id,
                 "document_id": document_id, "chunk_id": int(chunk["id"]),
                 "candidate_ordinal": int(raw.get("candidate_ordinal") or 0),
-                "source_mention_id": original_source_id,
+                "source_mention_id": mention_key_by_raw_id.get(
+                    original_source_id, original_source_id,
+                ),
                 "source_name": original.get("source_name") or original_source.get("name") or "",
-                "target_mention_id": original_target_id,
+                "target_mention_id": mention_key_by_raw_id.get(
+                    original_target_id, original_target_id,
+                ),
                 "target_name": original.get("target_name") or original_target.get("name") or "",
                 "proposed_relation_type": original.get("type") or raw.get("type") or "",
                 "proposed_evidence": original.get("evidence_text") or "",

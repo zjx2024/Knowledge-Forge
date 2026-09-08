@@ -1,0 +1,16 @@
+[Unit]
+Description=Knowledge Forge development web service
+Wants=knowledge-forge-reranker.service
+After=default.target knowledge-forge-reranker.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/knowledge-forge/environment
+WorkingDirectory=%h
+ExecStart=/bin/sh -lc 'cd "$${KNOWLEDGE_FORGE_HOME}" && exec "$${KNOWLEDGE_FORGE_HOME}/.venv/bin/python" "$${KNOWLEDGE_FORGE_HOME}/server.py"'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

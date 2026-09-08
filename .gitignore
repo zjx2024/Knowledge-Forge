@@ -1,6 +1,10 @@
 .env
 .env.docker
 .venv/
+.venv-*-backup-*/
+.venv-*-failed-*/
+.graphrag-smoke/
+graphrag-output/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -10,9 +14,23 @@ KnowledgeFiles/docs/*
 KnowledgeFiles/chunks/*
 KnowledgeFiles/media/*
 KnowledgeFiles/.trash/*
+KnowledgeFiles/graphrag_native/*
 !KnowledgeFiles/docs/.gitkeep
 !KnowledgeFiles/chunks/.gitkeep
 !KnowledgeFiles/.trash/.gitkeep
+!KnowledgeFiles/graphrag_native/.gitkeep
 logs/*
 !logs/.gitkeep
 external/
+
+# Local Codex work logs and recovery artifacts.
+.codex/
+
+# Operator-created database and runtime backups.
+backups/
+
+# Evaluation exports are reproducible runtime output, not source fixtures.
+artifacts/
+
+# Front-end dependencies are restored from webui/package-lock.json.
+webui/node_modules/

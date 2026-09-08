@@ -1,0 +1,44 @@
+{
+  "reviewed_at": "2026-08-11T00:00:00Z",
+  "reviewer": "assistant-expert-second-pass",
+  "independent_human_review": false,
+  "policy": "Assertions not listed here remain core_direct. Listed assertions are plausible graph facts but depend on temporal state, metonymy, mediator decomposition, obligation abstraction, or a broader canonical predicate. Report both core-direct scores and an all-label interpretation band; never relabel a hard negative from this file.",
+  "interpretation_band": [
+    {
+      "assertion_id": "net-a05",
+      "reason": "The server is the complement of establishes; connection-to-server is a useful mediator decomposition rather than the literal main predicate."
+    },
+    {
+      "assertion_id": "legal-a09",
+      "reason": "The text calls the numbered requirements obligations; resolving that phrase to the broader general-requirements canonical entity is an abstraction."
+    },
+    {
+      "assertion_id": "usgs-a06",
+      "reason": "supports is a broad normalization of provides-a-framework-for; the same sentence also has more literal provides and used_for decompositions."
+    },
+    {
+      "assertion_id": "nasa-a09",
+      "reason": "applies_to is inferred from a requirement identifier attached to a shall-clause actor."
+    },
+    {
+      "assertion_id": "nasa-a12",
+      "reason": "applies_to is inferred from a requirement identifier attached to a shall-clause actor."
+    },
+    {
+      "assertion_id": "nasa-a13",
+      "reason": "mapped_to is a normalized reading of a generic statement that the service map links the service and requirement concepts."
+    },
+    {
+      "assertion_id": "alice-a10",
+      "reason": "carries is a useful state abstraction from taking the watch out, but the text primarily asserts an action."
+    },
+    {
+      "assertion_id": "alice-a11",
+      "reason": "Taking a watch out of a pocket entails a prior temporal location, not an unqualified current located_in state."
+    },
+    {
+      "assertion_id": "alice-a14",
+      "reason": "The possessive waistcoat-pocket supports association with the Rabbit, but possesses is metonymic rather than a literal ownership statement."
+    }
+  ]
+}

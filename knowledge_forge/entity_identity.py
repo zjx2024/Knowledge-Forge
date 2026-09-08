@@ -12,10 +12,82 @@ _ACRONYM_STOP_WORDS = {
     "a", "an", "and", "at", "by", "de", "for", "from", "in", "la", "of", "on", "or", "the", "to",
 }
 
+# Ordinary entity identity intentionally ignores punctuation (``U-Net`` and
+# ``U Net`` are the same useful lexical form). Mathematical operators are
+# different: deleting them makes unrelated expressions such as ``A ∩ B`` and
+# ``‖a-b‖`` share the key ``ab``, or makes ``c = 1`` collide with the client
+# identifier ``C1``. Preserve only an operator signature and only when an
+# unmistakable mathematical symbol is present; prose/name normalization keeps
+# its historical behavior.
+_MATHEMATICAL_OPERATOR_CODES = {
+    "=": "eq",
+    "+": "plus",
+    "-": "minus",
+    "−": "minus",
+    "×": "times",
+    "*": "times",
+    "÷": "divide",
+    "/": "divide",
+    "%": "percent",
+    "~": "range",
+    "∼": "range",
+    "∩": "intersection",
+    "∪": "union",
+    "∑": "sum",
+    "∏": "product",
+    "√": "root",
+    "∥": "norm",
+    "‖": "norm",
+    "≤": "le",
+    "≥": "ge",
+    "<": "lt",
+    ">": "gt",
+    "≈": "approx",
+    "≠": "neq",
+    "∈": "in",
+    "∉": "notin",
+    "⊂": "subset",
+    "⊆": "subseteq",
+}
+_UNAMBIGUOUS_MATHEMATICAL_SYMBOL = re.compile(
+    r"[=×÷∩∪∑∏√∥‖≤≥≈≠∈∉⊂⊆]"
+)
+
+
+def _symbolic_operator_signature(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value or "")
+    if not _UNAMBIGUOUS_MATHEMATICAL_SYMBOL.search(normalized):
+        return ()
+    return tuple(
+        code
+        for character in normalized
+        if (code := _MATHEMATICAL_OPERATOR_CODES.get(character))
+    )
+
+
+def _unicode_identity_lexical(value: str) -> str:
+    """Return the script-preserving lexical portion of an identity key.
+
+    Entity names are multilingual identifiers, not ASCII identifiers.  The
+    previous allow-list retained Latin, digits and CJK ideographs only, which
+    silently erased Greek, Cyrillic, Arabic, Kana and Hangul letters.  That
+    made distinct formula symbols such as ``θ j`` and ``j`` exact aliases and
+    could collapse ordinary non-Latin names as well.  NFKC plus case-folding
+    still unifies compatibility/case variants; Unicode letters and numbers
+    themselves must remain part of the identity.
+    """
+
+    normalized = unicodedata.normalize("NFKC", value or "").casefold().strip()
+    return "".join(character for character in normalized if character.isalnum())
+
 
 def normalize_name(value: str) -> str:
     value = unicodedata.normalize("NFKC", value or "").casefold().strip()
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value)
+    lexical = _unicode_identity_lexical(value)
+    signature = _symbolic_operator_signature(value)
+    if signature:
+        return lexical + "__math_" + "_".join(signature)
+    return lexical
 
 
 def _latin_tokens(value: str) -> list[str]:
@@ -110,10 +182,30 @@ def credible_aliases(name: str, aliases: Iterable[str]) -> list[str]:
 
 def identifiers_conflict(left: str, right: str) -> bool:
     """Do not merge names carrying different explicit identifiers or versions."""
+    left_symbolic = _symbolic_operator_signature(left)
+    right_symbolic = _symbolic_operator_signature(right)
+    if left_symbolic != right_symbolic and (left_symbolic or right_symbolic):
+        left_lexical = _unicode_identity_lexical(left)
+        right_lexical = _unicode_identity_lexical(right)
+        if left_lexical and left_lexical == right_lexical:
+            return True
     pattern = r"\d+(?:[._-]\d+)*"
-    left_ids = set(re.findall(pattern, unicodedata.normalize("NFKC", left or "")))
-    right_ids = set(re.findall(pattern, unicodedata.normalize("NFKC", right or "")))
-    return bool(left_ids and right_ids and left_ids != right_ids)
+    left_value = unicodedata.normalize("NFKC", left or "")
+    right_value = unicodedata.normalize("NFKC", right or "")
+    left_ids = set(re.findall(pattern, left_value))
+    right_ids = set(re.findall(pattern, right_value))
+    if left_ids and right_ids:
+        return left_ids != right_ids
+    if bool(left_ids) == bool(right_ids):
+        return False
+    # A bare family name and the same family plus an explicit numeric suffix
+    # are not automatically the same identity (``MIPS`` versus ``mips64``,
+    # ``RFC`` versus ``RFC 9110``).  Treat only an exact identifier-stripped
+    # base as a conflict; unrelated names that merely contain a number remain
+    # available to the ordinary bounded resolver.
+    left_base = normalize_name(re.sub(pattern, "", left_value))
+    right_base = normalize_name(re.sub(pattern, "", right_value))
+    return bool(left_base and left_base == right_base)
 
 
 def types_are_compatible(left: str, right: str) -> bool:

@@ -1,0 +1,210 @@
+{
+  "result_id": "knowledge-forge-relation-upper-bound-2026-08-11",
+  "status": "pass_upper_bound_component",
+  "model": "qwen3.6:latest",
+  "scope": {
+    "gold_entity_mentions": true,
+    "gold_per_document_logical_schema": true,
+    "model_source_frame_binding": true,
+    "production_validation_and_final_verifier": true,
+    "persisted_entity_resolution": false,
+    "end_to_end_public_job": false
+  },
+  "protocol": {
+    "saved_run_gold_tier": "all_labels",
+    "primary_metrics_recomputed_as": "core_direct_with_interpretation_outputs_ignored_for_precision",
+    "open_fact_gleaning_rounds": 1,
+    "source_binding_gleaning_rounds": 1,
+    "semantic_recall_shortlist": true,
+    "reference_adjudication": true,
+    "gold_coreference_proxies": false,
+    "final_verifier": true
+  },
+  "source_artifacts": [
+    {
+      "logical_name": "four-domain-revert",
+      "sha256": "6590c2fba175633a243520f4f14e4ef5cdd714c038927fbf2e14a19328f29bd9",
+      "selected_documents": [
+        "software-python-reference",
+        "legal-ecfr-grants-excerpt",
+        "engineering-nasa-utm-requirements-excerpt",
+        "narrative-alice-excerpt"
+      ]
+    },
+    {
+      "logical_name": "six-domain-latest",
+      "sha256": "0a1fc4a15726b8409e8d4968b84691ebcdca86d7817ea18984ef16ca9bc09c4d",
+      "selected_documents": [
+        "network-rfc9110-excerpt",
+        "knowledge-usgs-aquifer-report-excerpt"
+      ]
+    }
+  ],
+  "documents": [
+    {
+      "document_id": "software-python-reference",
+      "gold_unique_facts": 11,
+      "exact_hits": 11,
+      "supported_unique_facts": 12,
+      "precision": 0.9166666667,
+      "recall": 1.0,
+      "core_direct_gold_unique_facts": 11,
+      "core_direct_exact_hits": 11,
+      "interpretation_unique_facts": 0,
+      "interpretation_exact_hits": 0,
+      "non_gold_supported_facts": 1,
+      "all_label_misses": [],
+      "non_gold_supported": [
+        [
+          "py:for_statement",
+          "differs_from",
+          "py:compound_statement"
+        ]
+      ],
+      "core_direct_precision": 0.9166666667,
+      "core_direct_recall": 1.0,
+      "hard_negative_leaks": 0
+    },
+    {
+      "document_id": "network-rfc9110-excerpt",
+      "gold_unique_facts": 10,
+      "exact_hits": 10,
+      "supported_unique_facts": 10,
+      "precision": 1.0,
+      "recall": 1.0,
+      "core_direct_gold_unique_facts": 9,
+      "core_direct_exact_hits": 9,
+      "interpretation_unique_facts": 1,
+      "interpretation_exact_hits": 1,
+      "non_gold_supported_facts": 0,
+      "all_label_misses": [],
+      "non_gold_supported": [],
+      "core_direct_precision": 1.0,
+      "core_direct_recall": 1.0,
+      "hard_negative_leaks": 0
+    },
+    {
+      "document_id": "legal-ecfr-grants-excerpt",
+      "gold_unique_facts": 9,
+      "exact_hits": 8,
+      "supported_unique_facts": 9,
+      "precision": 0.8888888889,
+      "recall": 0.8888888889,
+      "core_direct_gold_unique_facts": 8,
+      "core_direct_exact_hits": 7,
+      "interpretation_unique_facts": 1,
+      "interpretation_exact_hits": 1,
+      "non_gold_supported_facts": 1,
+      "all_label_misses": [
+        [
+          "legal:general_requirements",
+          "applies_to",
+          "legal:applicant"
+        ]
+      ],
+      "non_gold_supported": [
+        [
+          "legal:applicant",
+          "applies_to",
+          "legal:general_requirements"
+        ]
+      ],
+      "core_direct_precision": 0.875,
+      "core_direct_recall": 0.875,
+      "hard_negative_leaks": 0
+    },
+    {
+      "document_id": "knowledge-usgs-aquifer-report-excerpt",
+      "gold_unique_facts": 15,
+      "exact_hits": 15,
+      "supported_unique_facts": 15,
+      "precision": 1.0,
+      "recall": 1.0,
+      "core_direct_gold_unique_facts": 14,
+      "core_direct_exact_hits": 14,
+      "interpretation_unique_facts": 1,
+      "interpretation_exact_hits": 1,
+      "non_gold_supported_facts": 0,
+      "all_label_misses": [],
+      "non_gold_supported": [],
+      "core_direct_precision": 1.0,
+      "core_direct_recall": 1.0,
+      "hard_negative_leaks": 0
+    },
+    {
+      "document_id": "engineering-nasa-utm-requirements-excerpt",
+      "gold_unique_facts": 15,
+      "exact_hits": 15,
+      "supported_unique_facts": 15,
+      "precision": 1.0,
+      "recall": 1.0,
+      "core_direct_gold_unique_facts": 12,
+      "core_direct_exact_hits": 12,
+      "interpretation_unique_facts": 3,
+      "interpretation_exact_hits": 3,
+      "non_gold_supported_facts": 0,
+      "all_label_misses": [],
+      "non_gold_supported": [],
+      "core_direct_precision": 1.0,
+      "core_direct_recall": 1.0,
+      "hard_negative_leaks": 0
+    },
+    {
+      "document_id": "narrative-alice-excerpt",
+      "gold_unique_facts": 18,
+      "exact_hits": 17,
+      "supported_unique_facts": 17,
+      "precision": 1.0,
+      "recall": 0.9444444444,
+      "core_direct_gold_unique_facts": 15,
+      "core_direct_exact_hits": 15,
+      "interpretation_unique_facts": 3,
+      "interpretation_exact_hits": 2,
+      "non_gold_supported_facts": 0,
+      "all_label_misses": [
+        [
+          "alice:watch",
+          "located_in",
+          "alice:waistcoat_pocket"
+        ]
+      ],
+      "non_gold_supported": [],
+      "core_direct_precision": 1.0,
+      "core_direct_recall": 1.0,
+      "hard_negative_leaks": 0
+    }
+  ],
+  "aggregate": {
+    "gold_unique_facts": 78,
+    "exact_hits": 76,
+    "supported_unique_facts": 78,
+    "precision": 0.9743589744,
+    "recall": 0.9743589744,
+    "hard_negative_leaks": 0,
+    "minimum_document_recall": 0.8888888889,
+    "primary_core_direct": {
+      "gold_unique_facts": 69,
+      "exact_hits": 68,
+      "interpretation_unique_facts": 9,
+      "interpretation_exact_hits": 8,
+      "non_gold_supported_facts": 2,
+      "precision_evaluated_facts": 70,
+      "precision": 0.9714285714,
+      "recall": 0.9855072464,
+      "minimum_document_precision": 0.875,
+      "minimum_document_recall": 0.875
+    }
+  },
+  "current_default_difference": {
+    "source_binding_gleaning_rounds": 0,
+    "observed_extra_bindings_from_second_round": 2,
+    "extra_calls": 6,
+    "documents_with_extra_bindings": [
+      "software-python-reference"
+    ],
+    "counterfactual_core_recall_lower_bound_if_both_unique_and_required": 0.9565217391,
+    "counterfactual_minimum_document_core_recall": 0.8181818182,
+    "status": "requires_end_to_end_runtime_confirmation",
+    "note": "The current default removes the universal second binding call and retains the deterministic semantic shortlist. Only the Python document added bindings in round two. Even the deliberately pessimistic candidate-set subtraction of two unique core hits remains above the aggregate and bucket recall gates, but verifier batching and model nondeterminism make this a bound, not a runtime score. This saved upper-bound run must not be presented as the current end-to-end score."
+  }
+}

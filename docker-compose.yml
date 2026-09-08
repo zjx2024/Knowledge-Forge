@@ -5,10 +5,14 @@ services:
     image: knowledge-forge-postgres:pg16-vector
     container_name: knowledge-forge-postgres
     restart: unless-stopped
+    # PostgreSQL parallel queries can exceed Docker's 64 MB default /dev/shm
+    # during document preparation. The named data volume is preserved when
+    # the container is recreated with this larger shared-memory budget.
+    shm_size: "512m"
     env_file:
       - .env.docker
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - knowledge-forge-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -17,14 +21,70 @@ services:
       timeout: 5s
       retries: 20
 
+  knowledge-forge-init:
+    image: knowledge-forge:latest
+    container_name: knowledge-forge-init
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /app/KnowledgeFiles/docs /app/KnowledgeFiles/chunks /app/KnowledgeFiles/graphrag_native
+        /app/KnowledgeFiles/media /app/KnowledgeFiles/.trash
+        /home/knowledgeforge/.cache &&
+        chown -R 10001:10001 /app/KnowledgeFiles /home/knowledgeforge/.cache
+    volumes:
+      - ./KnowledgeFiles:/app/KnowledgeFiles
+      - knowledge-forge-docling-cache:/home/knowledgeforge/.cache
+    restart: "no"
+
+  knowledge-forge-reranker:
+    image: knowledge-forge:latest
+    container_name: knowledge-forge-reranker
+    command: ["python", "reranker_server.py"]
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      RERANKER_HOST: "0.0.0.0"
+      RERANKER_PORT: "8012"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    gpus: all
+    ports:
+      - "8012:8012"
+    volumes:
+      - ${ENTITY_RERANKER_HOST_PATH:-/home/kdfy/models/bge-reranker-v2-m3}:/models/entity-reranker:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8012/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
   knowledge-forge:
-    build: .
+    build:
+      context: .
+      args:
+        CONSTRAINTS_FILE: constraints-gpu.txt
+        DOCLING_REQUIREMENTS: requirements-docling-gpu.txt
     image: knowledge-forge:latest
     container_name: knowledge-forge
     restart: unless-stopped
     env_file:
       - .env.docker
     environment:
+      RUNTIME_MODE: "development"
+      UPLOAD_HOST: "0.0.0.0"
+      ALLOW_UNSAFE_PUBLIC_BIND: "true"
+      # Default is the local service; the value from .env.docker is used by
+      # the application when a remote reranker is configured.
+      # ENTITY_RERANKER_URL: "http://knowledge-forge-reranker:8012"
       HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
@@ -32,13 +92,16 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      knowledge-forge-init:
+        condition: service_completed_successfully
+      knowledge-forge-reranker:
+        condition: service_healthy
     ports:
       - "8011:8011"
       - "8010:8010"
     volumes:
       - ./KnowledgeFiles:/app/KnowledgeFiles
-      - knowledge-forge-docling-cache:/root/.cache
-      - ${ENTITY_RERANKER_HOST_PATH:-/home/kdfy/models/bge-reranker-v2-m3}:/models/entity-reranker:ro
+      - knowledge-forge-docling-cache:/home/knowledgeforge/.cache
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
