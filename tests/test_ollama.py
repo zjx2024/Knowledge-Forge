@@ -461,3 +461,91 @@ def test_model_info_reads_ollama_context_length(monkeypatch):
 
     assert info["context_length"] == 262144
     assert info["capabilities"] == ["completion"]
+
+
+def test_openai_compatible_provider_discovers_configured_models_without_tags_call():
+    client = OllamaClient(
+        llm_provider="openai_compatible",
+        embedding_provider="openai_compatible",
+        llm_api_base_url="https://llm.example/v1",
+        embedding_api_base_url="https://embedding.example/v1",
+        llm_api_models=["remote-chat"],
+        embedding_api_models=["remote-embed"],
+    )
+
+    models = client.models()
+
+    assert {(item["name"], item["model_type"]) for item in models} == {
+        ("remote-chat", "llm"), ("remote-embed", "embedding"),
+    }
+    assert client.base_url_for("llm") == "https://llm.example/v1"
+    assert client.base_url_for("embedding") == "https://embedding.example/v1"
+    assert client.model_info("remote-chat", "llm")["context_length"] >= 1024
+
+
+def test_openai_compatible_embedding_orders_indexed_vectors(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": 1, "embedding": [0.3, 0.4]},
+                    {"index": 0, "embedding": [0.1, 0.2]},
+                ],
+            }
+
+    calls = []
+    client = OllamaClient(
+        embedding_provider="openai_compatible",
+        embedding_api_base_url="https://embedding.example",
+        embedding_api_key="secret",
+    )
+    monkeypatch.setattr(
+        client, "_request",
+        lambda method, url, **kwargs: calls.append((method, url, kwargs)) or Response(),
+    )
+
+    assert client.embed(["a", "b"], "remote-embed") == [
+        [0.1, 0.2], [0.3, 0.4]
+    ]
+    assert calls[0][1] == "https://embedding.example/v1/embeddings"
+    assert calls[0][2]["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_openai_compatible_chat_preserves_schema_and_uses_json_object_contract(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {"content": '{"ok":true}'},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 2},
+            }
+
+    calls = []
+    client = OllamaClient(
+        llm_provider="openai_compatible",
+        llm_api_base_url="https://llm.example/v1",
+        llm_api_key="secret",
+    )
+    monkeypatch.setattr(
+        client, "_request",
+        lambda method, url, **kwargs: calls.append((method, url, kwargs)) or Response(),
+    )
+
+    result = client.json_chat(
+        model="remote-chat", system="system", prompt="prompt",
+        schema={"type": "object", "required": ["ok"]},
+    )
+
+    assert result == {"ok": True}
+    assert calls[0][1] == "https://llm.example/v1/chat/completions"
+    assert calls[0][2]["json"]["response_format"] == {"type": "json_object"}
+    assert "required" in calls[0][2]["json"]["messages"][0]["content"]
+    assert client.last_call_diagnostics.prompt_eval_count == 9

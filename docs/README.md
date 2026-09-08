@@ -5,6 +5,7 @@
 ## 当前维护文档
 
 - [`PROJECT_STATUS.md`](PROJECT_STATUS.md)：当前知识构建与单知识库智能体能力、质量判断、实现边界和下一阶段；
+- [`deployment.md`](deployment.md)：换机部署、Ollama/HugeGraph/reranker、远程模型 API、CPU Compose 与 systemd；
 - [`knowledge-forge-current-strategy-interview-guide.md`](knowledge-forge-current-strategy-interview-guide.md)：Knowledge Forge 完整构建策略、公式、统一智能体概览与面试说明；
 - [`knowledge-agent-implementation-roadmap.md`](knowledge-agent-implementation-roadmap.md)：统一知识问答智能体的现行实现、协议和从第一版到最终版的路线；
 - [`naming-and-compatibility.md`](naming-and-compatibility.md)：当前代码术语和必须保留的历史存储标识；

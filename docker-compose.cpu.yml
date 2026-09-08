@@ -1,0 +1,18 @@
+services:
+  knowledge-forge-reranker:
+    # The base file is the GPU deployment.  This override selects the CPU
+    # dependency lock and removes the GPU device request from the reranker.
+    build:
+      args:
+        CONSTRAINTS_FILE: constraints.txt
+        DOCLING_REQUIREMENTS: requirements-docling.txt
+    gpus: !reset []
+
+  knowledge-forge:
+    # Keep the same application image and volumes, but build the CPU PyTorch
+    # variant and do not require NVIDIA Container Toolkit on the host.
+    build:
+      args:
+        CONSTRAINTS_FILE: constraints.txt
+        DOCLING_REQUIREMENTS: requirements-docling.txt
+    gpus: !reset []

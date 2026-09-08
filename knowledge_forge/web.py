@@ -67,6 +67,12 @@ def _model_options(models: list[dict], kind: str, selected: str = "") -> str:
     return "".join(options)
 
 
+def _available_models() -> list[dict]:
+    """Read deployment-appropriate models while keeping old service doubles usable."""
+    getter = getattr(SERVICE, "available_models", None)
+    return getter() if callable(getter) else SERVICE.db.list_models()
+
+
 def _named_options(options: dict[str, str], selected: str = "", *, include_auto: bool = True) -> str:
     return "".join(
         f'<option value="{_esc(key)}"{" selected" if key == selected else ""}>{_esc(label)}</option>'
@@ -925,7 +931,7 @@ def _project_binding(project_id: int) -> dict[str, Any] | None:
 def render_home_page(message: tuple[str, str] | None = None) -> str:
     """Common knowledge-base creation/selection page; workspaces are strategy-owned."""
 
-    projects, models = SERVICE.db.list_projects(), SERVICE.db.list_models()
+    projects, models = SERVICE.db.list_projects(), _available_models()
     cards: list[str] = []
     for project in projects:
         project_id = int(project["id"])
@@ -1559,7 +1565,7 @@ def render_page(
     if strategy_key not in visible_strategy_keys:
         strategy_key = KNOWLEDGE_FORGE_STRATEGY
     ui = _strategy_ui(strategy_key)
-    projects, models = SERVICE.db.list_projects(), SERVICE.db.list_models()
+    projects, models = SERVICE.db.list_projects(), _available_models()
     current = next((item for item in projects if item["id"] == project_id), None)
     if current:
         binding = _project_binding(int(current["id"]))
@@ -3504,9 +3510,9 @@ settingsForm?.addEventListener('submit',event=>{{
 }});
 let tokenLimits=null;
 function applyTokenLimits(clamp=false){if(!tokenLimits||!modelTokenInput||!chunkTokenInput)return;const llmMax=Number(tokenLimits.llm_context_max),embeddingMax=Number(tokenLimits.embedding_context_max);modelTokenInput.max=String(llmMax);if(clamp&&Number(modelTokenInput.value)>llmMax)modelTokenInput.value=String(llmMax);const chunkMax=Math.min(Number(modelTokenInput.value)||llmMax,llmMax,embeddingMax);chunkTokenInput.max=String(chunkMax);if(clamp&&Number(chunkTokenInput.value)>chunkMax)chunkTokenInput.value=String(chunkMax);if(modelTokenHint){modelTokenHint.textContent='当前 LLM 支持的最大上下文：'+llmMax.toLocaleString()+' Token';modelTokenHint.classList.remove('failure')}if(chunkTokenHint){chunkTokenHint.textContent='当前模型组合允许的最大切片：'+chunkMax.toLocaleString()+' Token（Embedding 上限 '+embeddingMax.toLocaleString()+'）';chunkTokenHint.classList.remove('failure')}}
-async function refreshTokenLimits(clamp=false){if(!llmSelect||!embeddingSelect)return;if(modelTokenHint)modelTokenHint.textContent='正在读取当前 LLM 的上下文上限...';if(chunkTokenHint)chunkTokenHint.textContent='正在读取 LLM 与 Embedding 的共同上限...';try{const query=new URLSearchParams({llm_model:llmSelect.value,embedding_model:embeddingSelect.value});const response=await fetch('/api/models/limits?'+query),data=await response.json();if(!response.ok)throw new Error(data.error||'模型上限读取失败');tokenLimits=data;applyTokenLimits(clamp)}catch(error){if(modelTokenHint){modelTokenHint.textContent=error.message||'模型上限读取失败';modelTokenHint.classList.add('failure')}if(chunkTokenHint){chunkTokenHint.textContent='请先确认 Ollama 模型可用';chunkTokenHint.classList.add('failure')}}}
+async function refreshTokenLimits(clamp=false){if(!llmSelect||!embeddingSelect)return;if(modelTokenHint)modelTokenHint.textContent='正在读取当前 LLM 的上下文上限...';if(chunkTokenHint)chunkTokenHint.textContent='正在读取 LLM 与 Embedding 的共同上限...';try{const query=new URLSearchParams({llm_model:llmSelect.value,embedding_model:embeddingSelect.value});const response=await fetch('/api/models/limits?'+query),data=await response.json();if(!response.ok)throw new Error(data.error||'模型上限读取失败');tokenLimits=data;applyTokenLimits(clamp)}catch(error){if(modelTokenHint){modelTokenHint.textContent=error.message||'模型上限读取失败';modelTokenHint.classList.add('failure')}if(chunkTokenHint){chunkTokenHint.textContent='请确认当前模型提供方可用'}}}
 function replaceModelOptions(select,models,kind){if(!select)return;const current=select.value,names=models.filter(model=>model.model_type===kind).map(model=>model.name);if(current&&!names.includes(current))names.unshift(current);select.replaceChildren(...names.map(name=>new Option(name,name,name===current,name===current)))}
-document.querySelector('#sync-models')?.addEventListener('click',async e=>{const button=e.currentTarget,status=document.querySelector('#model-sync-status');button.disabled=true;if(status){status.hidden=true;status.className='model-sync-status'}try{const r=await fetch('/api/models/sync',{method:'POST'}),d=await r.json();if(!r.ok)throw new Error(d.error||'同步失败');replaceModelOptions(llmSelect,d.models||[],'llm');replaceModelOptions(embeddingSelect,d.models||[],'embedding');await refreshTokenLimits(true);if(status){status.textContent='已同步 '+d.count+' 个 Ollama 模型';status.classList.add('success');status.hidden=false}}catch(error){if(status){status.textContent=error.message||'同步失败';status.classList.add('failure');status.hidden=false}}finally{button.disabled=false}});
+document.querySelector('#sync-models')?.addEventListener('click',async e=>{const button=e.currentTarget,status=document.querySelector('#model-sync-status');button.disabled=true;if(status){status.hidden=true;status.className='model-sync-status'}try{const r=await fetch('/api/models/sync',{method:'POST'}),d=await r.json();if(!r.ok)throw new Error(d.error||'同步失败');replaceModelOptions(llmSelect,d.models||[],'llm');replaceModelOptions(embeddingSelect,d.models||[],'embedding');await refreshTokenLimits(true);if(status){status.textContent='已同步 '+d.count+' 个当前提供方模型';status.classList.add('success');status.hidden=false}}catch(error){if(status){status.textContent=error.message||'同步失败';status.classList.add('failure');status.hidden=false}}finally{button.disabled=false}});
 llmSelect?.addEventListener('change',()=>refreshTokenLimits(true));embeddingSelect?.addEventListener('change',()=>refreshTokenLimits(true));modelTokenInput?.addEventListener('input',()=>applyTokenLimits(true));
 const workspaceViews=new Set(['documents','build','query','settings']);
 const workspaceNavigation=[...document.querySelectorAll('[data-workspace-target]')];

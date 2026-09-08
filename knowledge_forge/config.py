@@ -28,6 +28,25 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def _configured_provider(name: str, default: str = "ollama") -> str:
+    value = os.getenv(name, default).strip().lower().replace("-", "_")
+    aliases = {
+        "openai": "openai_compatible",
+        "openai_compat": "openai_compatible",
+        "api": "openai_compatible",
+        "remote": "openai_compatible",
+    }
+    return aliases.get(value, value or default)
+
+
+def _configured_models(name: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    )
+
+
 class Config:
     runtime_mode = os.getenv("RUNTIME_MODE", "development").strip().lower()
     service_host = os.getenv("SERVICE_HOST", "127.0.0.1")
@@ -54,6 +73,26 @@ class Config:
     # single-endpoint deployment exactly.
     ollama_embedding_base_url = os.getenv(
         "OLLAMA_EMBEDDING_BASE_URL", ollama_base_url,
+    )
+    # Ollama remains the backwards-compatible default.  The two provider
+    # settings are deliberately independent so a CPU deployment can use a
+    # remote LLM, a remote embedding endpoint, or both without changing the
+    # project schema or the callers of OllamaClient.
+    llm_provider = _configured_provider("LLM_PROVIDER")
+    llm_api_base_url = os.getenv("LLM_API_BASE_URL", "").strip().rstrip("/")
+    llm_api_key = os.getenv("LLM_API_KEY", "")
+    llm_api_models = _configured_models("LLM_API_MODELS")
+    llm_api_context_tokens = max(
+        1024, int(os.getenv("LLM_API_CONTEXT_TOKENS", "32768"))
+    )
+    embedding_provider = _configured_provider("EMBEDDING_PROVIDER")
+    embedding_api_base_url = os.getenv(
+        "EMBEDDING_API_BASE_URL", ""
+    ).strip().rstrip("/")
+    embedding_api_key = os.getenv("EMBEDDING_API_KEY", "")
+    embedding_api_models = _configured_models("EMBEDDING_API_MODELS")
+    embedding_api_context_tokens = max(
+        1024, int(os.getenv("EMBEDDING_API_CONTEXT_TOKENS", "8192"))
     )
     # A model tag does not fully identify its numerical vector space: moving
     # the same model between execution backends (for example CPU -> CUDA) can

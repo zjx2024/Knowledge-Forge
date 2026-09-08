@@ -82,7 +82,9 @@ services:
       RUNTIME_MODE: "development"
       UPLOAD_HOST: "0.0.0.0"
       ALLOW_UNSAFE_PUBLIC_BIND: "true"
-      ENTITY_RERANKER_URL: "http://knowledge-forge-reranker:8012"
+      # Default is the local service; the value from .env.docker is used by
+      # the application when a remote reranker is configured.
+      # ENTITY_RERANKER_URL: "http://knowledge-forge-reranker:8012"
       HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.com}"
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

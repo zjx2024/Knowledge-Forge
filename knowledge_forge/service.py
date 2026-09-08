@@ -908,26 +908,88 @@ class KnowledgeForgeService:
 
     def sync_ollama_models(self) -> list[dict[str, Any]]:
         discovered = []
+        seen: set[tuple[str, str]] = set()
         for model in self.ollama.models():
             name = str(model.get("name") or "").strip()
             if name:
-                try:
-                    metadata = self.ollama.model_info(name)
-                except Exception as exc:
-                    LOGGER.warning("Ollama model metadata unavailable for %s: %s", name, exc)
-                    metadata = {"context_length": 8192, "capabilities": []}
                 model_type = (
-                    "embedding"
-                    if "embedding" in (metadata.get("capabilities") or [])
-                    else self._model_type(name)
+                    str(model.get("model_type") or "").strip()
+                    or (
+                        "embedding"
+                        if "embedding" in (model.get("capabilities") or [])
+                        else self._model_type(name)
+                    )
                 )
+                if model_type not in {"llm", "embedding"}:
+                    model_type = self._model_type(name)
+                provider = str(
+                    model.get("provider") or self.ollama.provider_for(model_type)
+                )
+                key = (name, provider)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    try:
+                        metadata = self.ollama.model_info(
+                            name, model_type=model_type,
+                        )
+                    except TypeError:
+                        # Keep older test doubles and third-party adapters
+                        # compatible with the original one-argument method.
+                        metadata = self.ollama.model_info(name)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Model metadata unavailable for %s: %s", name, exc
+                    )
+                    metadata = {"context_length": 8192, "capabilities": []}
                 discovered.append(self.db.upsert_model(
                     name,
                     model_type,
-                    base_url=Config.ollama_base_url,
+                    provider=provider,
+                    base_url=(
+                        model.get("base_url")
+                        or self.ollama.base_url_for(model_type)
+                    ),
                     metadata=metadata,
                 ))
         return discovered
+
+    def available_models(self) -> list[dict[str, Any]]:
+        """Return models usable under the current deployment providers.
+
+        The database may still contain model rows from a previous Ollama-only
+        deployment.  Project selection must not present those stale rows after
+        switching to an API provider, while API models should be visible before
+        the optional discovery button has been pressed.
+        """
+
+        current_providers = {
+            self.ollama.provider_for("llm"),
+            self.ollama.provider_for("embedding"),
+        }
+        records = [
+            item for item in self.db.list_models()
+            if str(item.get("provider") or "ollama") in current_providers
+        ]
+        known = {(str(item.get("name") or ""), str(item.get("model_type") or "")) for item in records}
+        for model_type in ("llm", "embedding"):
+            if self.ollama.provider_for(model_type) != "openai_compatible":
+                continue
+            for name in self.ollama.api_models_for(model_type):
+                if (name, model_type) in known:
+                    continue
+                records.append({
+                    "name": name,
+                    "model_type": model_type,
+                    "provider": "openai_compatible",
+                    "base_url": self.ollama.base_url_for(model_type),
+                    "metadata": self.ollama.model_info(name, model_type),
+                })
+        return sorted(
+            records,
+            key=lambda item: (str(item.get("model_type") or ""), str(item.get("name") or "")),
+        )
 
     @staticmethod
     def _metadata(value: Any) -> dict[str, Any]:
@@ -981,18 +1043,37 @@ class KnowledgeForgeService:
         ]
 
     def _model_context_limit(self, model_name: str, model_type: str) -> int:
-        models = {item["name"]: item for item in self.db.list_models()}
-        record = models.get(model_name)
+        provider = self.ollama.provider_for(model_type)
+        records = self.db.list_models()
+        record = next(
+            (
+                item for item in records
+                if item.get("name") == model_name
+                and str(item.get("provider") or "ollama") == provider
+            ),
+            None,
+        )
+        # A pre-provider project may have only an Ollama row.  Its selected
+        # name remains valid when the deployment is switched to an API; the
+        # current provider is authoritative for the new call.
+        if record is None:
+            record = next(
+                (item for item in records if item.get("name") == model_name),
+                None,
+            )
         if record and record.get("model_type") != model_type:
             raise ValueError(f"请选择有效的 {'LLM' if model_type == 'llm' else 'Embedding'} 模型")
         metadata = self._metadata(record.get("metadata")) if record else {}
         try:
-            metadata = self.ollama.model_info(model_name)
+            try:
+                metadata = self.ollama.model_info(model_name, model_type=model_type)
+            except TypeError:
+                metadata = self.ollama.model_info(model_name)
             self.db.upsert_model(
                 model_name,
                 model_type,
-                provider=(record or {}).get("provider") or "ollama",
-                base_url=(record or {}).get("base_url") or Config.ollama_base_url,
+                provider=provider,
+                base_url=self.ollama.base_url_for(model_type),
                 metadata=metadata,
             )
         except Exception as exc:
@@ -1089,7 +1170,9 @@ class KnowledgeForgeService:
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
-        available = {item["name"]: item["model_type"] for item in self.db.list_models()}
+        available = {
+            item["name"]: item["model_type"] for item in self.available_models()
+        }
         if llm_model and available.get(llm_model) != "llm":
             raise ValueError("请选择有效的 LLM 模型")
         if embedding_model and available.get(embedding_model) != "embedding":
@@ -9348,6 +9431,10 @@ class KnowledgeForgeService:
         ollama_models = len(self.ollama.models())
         graphs = self.graph.available_graphs()
         return {"status": "ok", "postgres": "reachable", "ollama_models": ollama_models,
+                "model_providers": {
+                    "llm": self.ollama.provider_for("llm"),
+                    "embedding": self.ollama.provider_for("embedding"),
+                },
                 "hugegraph": Config.hugegraph_graph, "hugegraph_ready": Config.hugegraph_graph in graphs,
                 "vector_backend": "pgvector-hnsw",
                 "entity_reranker": self.resolver.reranker.diagnostics(),

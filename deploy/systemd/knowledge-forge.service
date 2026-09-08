@@ -5,13 +5,12 @@ After=default.target knowledge-forge-reranker.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/zjx-projects/knowledge-forge
-ExecStart=%h/zjx-projects/knowledge-forge/.venv/bin/python %h/zjx-projects/knowledge-forge/server.py
+EnvironmentFile=%h/.config/knowledge-forge/environment
+WorkingDirectory=%h
+ExecStart=/bin/sh -lc 'cd "$${KNOWLEDGE_FORGE_HOME}" && exec "$${KNOWLEDGE_FORGE_HOME}/.venv/bin/python" "$${KNOWLEDGE_FORGE_HOME}/server.py"'
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
-StandardOutput=append:%h/zjx-projects/knowledge-forge/.codex/work/knowledge-forge-systemd.log
-StandardError=append:%h/zjx-projects/knowledge-forge/.codex/work/knowledge-forge-systemd.log
 
 [Install]
 WantedBy=default.target

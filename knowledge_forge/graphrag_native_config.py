@@ -336,6 +336,10 @@ class GraphRAGNativeSettingsBuilder:
         embedding_model: str,
         embedding_dimension: int,
         api_base: str,
+        completion_api_base: str | None = None,
+        embedding_api_base: str | None = None,
+        completion_api_key_env: str = "GRAPHRAG_API_KEY",
+        embedding_api_key_env: str = "GRAPHRAG_API_KEY",
     ) -> dict[str, Any]:
         if embedding_dimension <= 0:
             raise GraphRAGNativeConfigError("embedding dimension 必须先经实际 probe 确认")
@@ -343,6 +347,14 @@ class GraphRAGNativeSettingsBuilder:
         api_base = str(api_base).rstrip("/")
         if not api_base:
             raise GraphRAGNativeConfigError("GraphRAG provider endpoint 不能为空")
+        completion_api_base = str(completion_api_base or api_base).rstrip("/")
+        embedding_api_base = str(embedding_api_base or api_base).rstrip("/")
+        if not completion_api_base or not embedding_api_base:
+            raise GraphRAGNativeConfigError("GraphRAG completion/embedding endpoint 不能为空")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", completion_api_key_env):
+            raise GraphRAGNativeConfigError("completion API key 环境变量名无效")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", embedding_api_key_env):
+            raise GraphRAGNativeConfigError("embedding API key 环境变量名无效")
         # These are current GraphRAG 3.1.1 keys, validated again by load_config
         # after being written.  No workflows key is emitted: Standard remains
         # entirely upstream-owned.
@@ -350,16 +362,16 @@ class GraphRAGNativeSettingsBuilder:
             "completion_models": {
                 "default_completion_model": {
                     "model_provider": "openai", "model": completion_model,
-                    "api_base": api_base, "auth_method": "api_key",
-                    "api_key": "${GRAPHRAG_API_KEY}",
+                    "api_base": completion_api_base, "auth_method": "api_key",
+                    "api_key": "${" + completion_api_key_env + "}",
                     "retry": {"type": "exponential_backoff"},
                 },
             },
             "embedding_models": {
                 "default_embedding_model": {
                     "model_provider": "openai", "model": embedding_model,
-                    "api_base": api_base, "auth_method": "api_key",
-                    "api_key": "${GRAPHRAG_API_KEY}",
+                    "api_base": embedding_api_base, "auth_method": "api_key",
+                    "api_key": "${" + embedding_api_key_env + "}",
                     "retry": {"type": "exponential_backoff"},
                 },
             },
@@ -425,11 +437,19 @@ class GraphRAGNativeSettingsBuilder:
         embedding_model: str,
         embedding_dimension: int,
         api_base: str,
+        completion_api_base: str | None = None,
+        embedding_api_base: str | None = None,
+        completion_api_key_env: str = "GRAPHRAG_API_KEY",
+        embedding_api_key_env: str = "GRAPHRAG_API_KEY",
     ) -> dict[str, Any]:
         root = Path(run_root).resolve()
         settings = self.build_mapping(
             run_root=root, completion_model=completion_model, embedding_model=embedding_model,
             embedding_dimension=embedding_dimension, api_base=api_base,
+            completion_api_base=completion_api_base,
+            embedding_api_base=embedding_api_base,
+            completion_api_key_env=completion_api_key_env,
+            embedding_api_key_env=embedding_api_key_env,
         )
         if "workflows" in settings:
             raise GraphRAGNativeConfigError("native settings 不得覆盖 GraphRAG Standard workflows")
@@ -441,11 +461,13 @@ class GraphRAGNativeSettingsBuilder:
         # GraphRAG's LiteLLM adapter requires a non-empty API key even for a
         # local OpenAI-compatible endpoint.  Keep the placeholder in process
         # environment only; it is never written into either settings file.
-        previous_key = os.environ.get("GRAPHRAG_API_KEY")
+        key_names = {"GRAPHRAG_API_KEY", completion_api_key_env, embedding_api_key_env}
+        previous_keys = {name: os.environ.get(name) for name in key_names}
         previous_cost_map = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
         previous_cwd = Path.cwd()
-        if not previous_key:
-            os.environ["GRAPHRAG_API_KEY"] = "graphrag-local-placeholder"
+        for name, previous in previous_keys.items():
+            if not previous:
+                os.environ[name] = "graphrag-local-placeholder"
         if previous_cost_map is None:
             os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
         try:
@@ -458,8 +480,11 @@ class GraphRAGNativeSettingsBuilder:
             # web worker and test runner are long-lived, so restore it before
             # any subsequent relative-path operation.
             os.chdir(previous_cwd)
-            if previous_key is None:
-                os.environ.pop("GRAPHRAG_API_KEY", None)
+            for name, previous in previous_keys.items():
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
             if previous_cost_map is None:
                 os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
         if str(config.input.type) != "parquet" or config.cluster_graph.use_lcc:

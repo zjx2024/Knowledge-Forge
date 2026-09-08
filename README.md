@@ -3,6 +3,9 @@
 Knowledge Forge 是一个通用、多项目的知识库、知识图谱与证据约束问答平台。它直接使用
 PostgreSQL、HugeGraph、Ollama 和独立 reranker 服务，不依赖 RAGFlow 运行时。
 
+换机部署、无 GPU + 远程模型 API、Ollama、HugeGraph、reranker、CPU Compose 和 systemd
+配置统一见 [换机部署手册](docs/deployment.md)。
+
 ## 核心能力
 
 - 支持 DOCX、PDF、Markdown、纯文本、XLSX、XLS 和 CSV 上传；解析器与分块策略按文档独立路由。
@@ -54,13 +57,13 @@ knowledge-forge/
 
 - PostgreSQL + pgvector：元数据、章节、知识块、HNSW 向量索引、Schema 版本、实体、提及、关系断言和任务。
 - HugeGraph：可遍历的文档、知识块、规范实体和实体关系。
-- Ollama：模型发现、向量生成、逻辑 Schema 评估和结构化图谱抽取。
+- 模型提供方：默认 Ollama，也支持按 LLM/Embedding 分别配置 OpenAI 兼容 API；负责向量生成、逻辑 Schema 评估和结构化图谱抽取。
 - Reranker HTTP 服务：独立加载交叉编码器，为实体归一候选和智能体检索候选提供有界相关度重排。
 
 ## 前置条件
 
 1. PostgreSQL 16 + pgvector 可访问；Docker 部署会基于 `postgres:16` 自动构建并启动对应数据库。
-2. Ollama 可访问，至少有一个 LLM 和一个 Embedding 模型。
+2. 默认需要 Ollama，至少有一个 LLM 和一个 Embedding 模型；无 GPU 机器也可改用远程 OpenAI 兼容 LLM/Embedding API，详见部署手册。
 3. HugeGraph 1.7 可访问。
 4. `bge-reranker-v2-m3` 本地模型目录可读；不启用实体重排时可明确关闭。
 5. Python 3.12 或 Docker Compose。
@@ -95,7 +98,8 @@ LLM: qwen3.6:latest
 Embedding: bge-m3:latest
 ```
 
-可在新建项目或项目设置中选择 Ollama 已安装的其他模型。项目设置同时保存“项目上下文
+可在新建项目或项目设置中选择当前模型提供方可用的其他模型。默认提供方是 Ollama，也可按
+LLM/Embedding 分别改为 OpenAI 兼容 API。项目设置同时保存“项目上下文
 Token 上限”和“单切片 Token 上限”：前者是应用侧请求预算，不会向 Ollama 发送
 `num_ctx`，也不会覆盖容器的 `OLLAMA_CONTEXT_LENGTH`；后者约束该项目后续文档生成的
 每个知识块。页面会根据所选 LLM 和 Embedding 模型动态限制可填最大值。
@@ -166,7 +170,7 @@ IMAGE_PDF_RENDER_SCALE=1.7
 
 ```bash
 cd /home/kdfy/zjx-projects/knowledge-forge
-sudo ./deploy/init_hugegraph_graph.sh hugegraph hugegraph/hugegraph:latest
+sudo ./deploy/init_hugegraph_graph.sh hugegraph hugegraph/hugegraph:1.7.0
 curl http://127.0.0.1:8080/graphs
 ```
 
@@ -268,14 +272,24 @@ sudo docker compose up -d --build
 sudo docker compose logs -f knowledge-forge
 ```
 
+没有 GPU 且使用远程 LLM/Embedding API 时，使用 CPU 覆盖文件：
+
+```bash
+sudo docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+```
+
+在 `.env.docker` 中将 `LLM_PROVIDER`、`EMBEDDING_PROVIDER` 设置为
+`openai_compatible` 并填写对应 `*_API_BASE_URL`、`*_API_KEY`、`*_API_MODELS`；这样应用不依赖本机 Ollama。
+若同时不想在本机加载 reranker 模型，可再加入 `-f docker-compose.cpu-api.yml`，该覆盖会关闭本地 reranker 容器并使用确定性降级排序。
+
 停止：
 
 ```bash
 sudo docker compose down
 ```
 
-Compose 使用独立的 `knowledge-forge-postgres` 保存业务数据，通过
-`host.docker.internal` 访问宿主机上的 Ollama 和 HugeGraph；浏览器访问地址仍由
+Compose 使用独立的 `knowledge-forge-postgres` 保存业务数据。默认通过
+`host.docker.internal` 访问宿主机上的 Ollama 和 HugeGraph；API 模式则访问配置的远程模型服务；浏览器访问地址仍由
 `SERVICE_HOST/HTTP_BASE_URL` 决定。宿主机可通过 `5433` 端口访问该数据库。
 
 ## 文档构建流程
@@ -421,6 +435,9 @@ Transformers 离线推理；Knowledge Forge 主进程不再导入 torch 或持�
 
 ```bash
 mkdir -p ~/.config/systemd/user
+mkdir -p ~/.config/knowledge-forge
+cp deploy/systemd/knowledge-forge.env.example ~/.config/knowledge-forge/environment
+# 编辑上面的 environment，至少设置 KNOWLEDGE_FORGE_HOME 为当前仓库绝对路径
 cp deploy/systemd/knowledge-forge-reranker.service ~/.config/systemd/user/
 cp deploy/systemd/knowledge-forge.service ~/.config/systemd/user/
 systemctl --user daemon-reload

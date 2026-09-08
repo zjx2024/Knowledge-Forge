@@ -338,19 +338,51 @@ class GraphRAGNativeExecutor:
             "code_tree_hash": self._sha256_bytes(json.dumps(source_manifest, sort_keys=True).encode("utf-8")),
         }
 
-    @staticmethod
-    def _provider_api_base() -> str:
-        base = Config.ollama_base_url.rstrip("/")
+    def _provider_api_base(self, model_type: str = "llm") -> str:
+        getter = getattr(self.service.ollama, "base_url_for", None)
+        if callable(getter):
+            configured = getter(model_type)
+        else:
+            configured = (
+                Config.ollama_base_url
+                if model_type == "llm" else Config.ollama_embedding_base_url
+            )
+        base = str(configured).rstrip("/")
+        provider_getter = getattr(self.service.ollama, "provider_for", None)
+        if callable(provider_getter) and provider_getter(model_type) == "openai_compatible" and not base:
+            raise RuntimeError(
+                f"GraphRAG Native {model_type} API 地址未配置"
+            )
         return base if base.endswith("/v1") else base + "/v1"
+
+    def _provider_api_key(self, model_type: str) -> str:
+        configured = os.getenv(
+            "GRAPHRAG_API_KEY" if model_type == "llm" else "GRAPHRAG_EMBEDDING_API_KEY",
+            "",
+        ).strip()
+        if configured:
+            return configured
+        getter = getattr(self.service.ollama, "api_key_for", None)
+        if callable(getter):
+            return str(getter(model_type) or "").strip()
+        return ""
 
     def _provider_identity(self, project: dict[str, Any]) -> tuple[dict[str, str], int]:
         completion_model = str(project.get("llm_model") or Config.default_llm_model)
         embedding_model = str(project.get("embedding_model") or Config.default_embedding_model)
-        completion = self.service.ollama.model_info(completion_model)
-        embedding = self.service.ollama.model_info(embedding_model)
-        api_key = os.getenv("GRAPHRAG_API_KEY", "graphrag-local-placeholder")
+        try:
+            completion = self.service.ollama.model_info(
+                completion_model, model_type="llm",
+            )
+            embedding = self.service.ollama.model_info(
+                embedding_model, model_type="embedding",
+            )
+        except TypeError:
+            completion = self.service.ollama.model_info(completion_model)
+            embedding = self.service.ollama.model_info(embedding_model)
+        api_key = self._provider_api_key("embedding") or "graphrag-local-placeholder"
         probe = GraphRAGNativeProviderDoctor.probe_embedding(
-            api_base=self._provider_api_base(), model=embedding_model, api_key=api_key,
+            api_base=self._provider_api_base("embedding"), model=embedding_model, api_key=api_key,
             timeout=min(60, Config.ollama_timeout),
         )
         return {
@@ -776,7 +808,12 @@ class GraphRAGNativeExecutor:
                 raise RuntimeError("GraphRAG Native run 目录冲突，拒绝覆盖历史 artifact")
             stage_root.mkdir(parents=True, exist_ok=False)
             self.service.db.update_job(job_id, status="running", progress=2, log="GraphRAG Native：初始化隔离 staging run")
-            provider_environment = {"GRAPHRAG_API_KEY": os.getenv("GRAPHRAG_API_KEY", "graphrag-local-placeholder")}
+            provider_environment = {
+                "GRAPHRAG_API_KEY": self._provider_api_key("llm")
+                or "graphrag-local-placeholder",
+                "GRAPHRAG_EMBEDDING_API_KEY": self._provider_api_key("embedding")
+                or "graphrag-local-placeholder",
+            }
             models = {
                 "completion": str(project.get("llm_model") or Config.default_llm_model),
                 "embedding": str(project.get("embedding_model") or Config.default_embedding_model),
@@ -829,7 +866,11 @@ class GraphRAGNativeExecutor:
             self._assert_not_cancelled(job_id)
             settings = self.settings.write_and_validate(
                 run_root=stage_root, completion_model=models["completion"], embedding_model=models["embedding"],
-                embedding_dimension=dimension, api_base=self._provider_api_base(),
+                embedding_dimension=dimension, api_base=self._provider_api_base("llm"),
+                completion_api_base=self._provider_api_base("llm"),
+                embedding_api_base=self._provider_api_base("embedding"),
+                completion_api_key_env="GRAPHRAG_API_KEY",
+                embedding_api_key_env="GRAPHRAG_EMBEDDING_API_KEY",
             )
             run = self.service.db.create_graphrag_native_run({
                 "run_id": run_id, "project_id": project_id, **identity,
