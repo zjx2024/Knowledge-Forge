@@ -2975,6 +2975,24 @@ COMMENT ON SCHEMA knowledge_agent IS
 """
 
 
+PROJECT_MODEL_CONNECTION_SQL = r"""
+-- Optional per-knowledge-base model connections.  Empty values inherit the
+-- homepage defaults; non-empty values are used only within that project.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS ollama_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS ollama_embedding_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_models TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_context_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_models TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_context_tokens INTEGER NOT NULL DEFAULT 0;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version="0001_document_content_revisions",
@@ -3171,6 +3189,12 @@ MIGRATIONS: tuple[Migration, ...] = (
         version="0036_knowledge_agent_context_runtime",
         description="Isolate durable LangGraph conversation-context checkpoints",
         sql=KNOWLEDGE_AGENT_CONTEXT_RUNTIME_SQL,
+        startup_safe=True,
+    ),
+    Migration(
+        version="0037_project_model_connections",
+        description="Persist optional per-knowledge-base Ollama and API model connections",
+        sql=PROJECT_MODEL_CONNECTION_SQL,
         startup_safe=True,
     ),
 )

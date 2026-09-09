@@ -11,11 +11,14 @@ import threading
 import time
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
 import requests
@@ -378,6 +381,50 @@ class TreatmentMaterializationRequired(RuntimeError):
     """Treatment snapshots cannot activate until formal materialization is implemented."""
 
 
+def _model_scoped_worker(*, subject: str = "document") -> Callable:
+    """Decorate a durable worker with its knowledge-base model configuration."""
+
+    def decorate(worker: Callable) -> Callable:
+        @wraps(worker)
+        def wrapped(service: "KnowledgeForgeService", job_id: str, subject_id: int, *args: Any):
+            if not hasattr(service, "_model_client_context"):
+                # Historic narrow test doubles construct the service with
+                # ``__new__`` and inject a fake client directly.
+                return worker(service, job_id, subject_id, *args)
+            project_id = int(subject_id)
+            if subject == "document":
+                document = service.db.get_document(int(subject_id))
+                if not document:
+                    raise LookupError("文档不存在")
+                project_id = int(document["project_id"])
+            return service._run_project_scoped(
+                worker, project_id, job_id, subject_id, *args,
+            )
+
+        return wrapped
+
+    return decorate
+
+
+class _ProjectModelClientRouter:
+    """Keep existing collaborators project-aware without shared mutable switching.
+
+    Components are constructed once and retain this proxy.  A request or worker
+    enters ``model_scope`` before touching model-backed work; the proxy then
+    resolves to that knowledge base's client through a ContextVar.  Different
+    requests cannot overwrite one another's provider/API configuration.
+    """
+
+    def __init__(self, service: "KnowledgeForgeService"):
+        self._service = service
+
+    def _client(self) -> OllamaClient:
+        return self._service._model_client_context.get() or self._service._global_ollama
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client(), name)
+
+
 class KnowledgeForgeService:
     INGESTION_SUBTASKS = (
         "structure",
@@ -400,6 +447,51 @@ class KnowledgeForgeService:
         "graph_sync",
         "community_report_build",
     })
+
+    _GLOBAL_MODEL_SETTING_DEFAULTS = {
+        "default_llm_model": Config.default_llm_model,
+        "default_embedding_model": Config.default_embedding_model,
+        "llm_provider": Config.llm_provider,
+        "embedding_provider": Config.embedding_provider,
+        "ollama_base_url": Config.ollama_base_url,
+        "ollama_embedding_base_url": Config.ollama_embedding_base_url,
+        "llm_api_base_url": Config.llm_api_base_url,
+        "llm_api_key": Config.llm_api_key,
+        "llm_api_models": ",".join(Config.llm_api_models),
+        "llm_api_context_tokens": str(Config.llm_api_context_tokens),
+        "embedding_api_base_url": Config.embedding_api_base_url,
+        "embedding_api_key": Config.embedding_api_key,
+        "embedding_api_models": ",".join(Config.embedding_api_models),
+        "embedding_api_context_tokens": str(Config.embedding_api_context_tokens),
+    }
+
+    @property
+    def ollama(self) -> Any:
+        """Return the global client/router used by existing collaborators."""
+
+        runtime = getattr(self, "_ollama_runtime", None)
+        if runtime is not None:
+            return runtime
+        return getattr(self, "_global_ollama", None)
+
+    @ollama.setter
+    def ollama(self, value: Any) -> None:
+        # A few integration fixtures replace the service client directly.  Keep
+        # that supported while production uses the project-aware router.
+        self._ollama_runtime = value
+        for component_name in (
+            "media", "vectors", "schemas", "community_report_generator",
+        ):
+            component = getattr(self, component_name, None)
+            if component is not None and hasattr(component, "ollama"):
+                component.ollama = value
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            if hasattr(agent, "ollama"):
+                agent.ollama = value
+            context = getattr(agent, "context", None)
+            if context is not None and hasattr(context, "ollama"):
+                context.ollama = value
 
     @staticmethod
     def _relation_entities_with_canonicals(
@@ -486,7 +578,11 @@ class KnowledgeForgeService:
 
     def __init__(self, database: Database | None = None):
         self.db = database or Database()
-        self.ollama = OllamaClient()
+        self._model_client_context: ContextVar[OllamaClient | None] = ContextVar(
+            "knowledge_forge_model_client", default=None,
+        )
+        self._global_ollama = OllamaClient()
+        self._ollama_runtime = _ProjectModelClientRouter(self)
         self.media = DocumentMediaService(self.ollama)
         self.vectors = VectorStore(self.db, self.ollama)
         self.schemas = SchemaEvolutionService(self.db, self.ollama)
@@ -517,6 +613,302 @@ class KnowledgeForgeService:
             max_workers=Config.agent_max_workers,
             thread_name_prefix="knowledge-forge-agent",
         )
+
+    @classmethod
+    def _global_model_setting_key(cls, name: str) -> str:
+        return f"global_{name}"
+
+    @staticmethod
+    def _setting_csv(value: object) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in str(value or "").split(","):
+            normalized = item.strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return tuple(result)
+
+    def _global_model_settings(self) -> dict[str, Any]:
+        """Return persisted service defaults with environment fallbacks.
+
+        These are the homepage defaults.  Project model selections and any
+        non-empty project connection overrides remain durable project data;
+        blank project connection fields resolve to these defaults.
+        """
+
+        getter = getattr(self.db, "get_settings", None)
+        rows: dict[str, str] = {}
+        if callable(getter):
+            try:
+                rows = dict(getter(prefix="global_"))
+            except TypeError:
+                rows = dict(getter("global_"))
+        values: dict[str, Any] = {}
+        for name, fallback in self._GLOBAL_MODEL_SETTING_DEFAULTS.items():
+            raw = rows.get(self._global_model_setting_key(name), fallback)
+            values[name] = str(raw if raw is not None else "").strip()
+        for name in (
+            "llm_provider", "embedding_provider",
+        ):
+            try:
+                values[name] = OllamaClient._normalize_provider(values[name])
+            except ValueError:
+                LOGGER.warning("Invalid persisted %s; using Ollama", name)
+                values[name] = "ollama"
+        for name in ("llm_api_context_tokens", "embedding_api_context_tokens"):
+            try:
+                values[name] = max(1024, int(values[name]))
+            except (TypeError, ValueError):
+                values[name] = int(self._GLOBAL_MODEL_SETTING_DEFAULTS[name])
+        values["llm_api_models"] = self._setting_csv(values["llm_api_models"])
+        values["embedding_api_models"] = self._setting_csv(values["embedding_api_models"])
+        values["ollama_base_url"] = values["ollama_base_url"].rstrip("/") or Config.ollama_base_url
+        values["ollama_embedding_base_url"] = (
+            values["ollama_embedding_base_url"].rstrip("/")
+            or values["ollama_base_url"]
+        )
+        return values
+
+    @staticmethod
+    def _project_setting_value(project: Mapping[str, Any], name: str) -> str:
+        value = project.get(name)
+        if value in (None, "", 0, "0"):
+            return ""
+        return str(value).strip()
+
+    def _project_model_settings(self, project: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge a project's optional model connection overrides with globals."""
+
+        global_values = self._global_model_settings()
+        values: dict[str, Any] = {}
+        for name in (
+            "llm_provider", "embedding_provider", "ollama_base_url",
+            "ollama_embedding_base_url", "llm_api_base_url", "llm_api_models",
+            "llm_api_context_tokens", "embedding_api_base_url", "embedding_api_models",
+            "embedding_api_context_tokens",
+        ):
+            raw = self._project_setting_value(project, name)
+            values[name] = raw if raw else global_values[name]
+        for name in ("llm_api_key", "embedding_api_key"):
+            raw = self._project_setting_value(project, name)
+            values[name] = raw if raw else global_values[name]
+        for name in ("llm_provider", "embedding_provider"):
+            values[name] = OllamaClient._normalize_provider(values[name])
+        for name in ("llm_api_context_tokens", "embedding_api_context_tokens"):
+            try:
+                values[name] = max(1024, int(values[name]))
+            except (TypeError, ValueError):
+                values[name] = int(global_values[name])
+        values["llm_api_models"] = self._setting_csv(values["llm_api_models"])
+        values["embedding_api_models"] = self._setting_csv(values["embedding_api_models"])
+        values["ollama_base_url"] = (
+            str(values["ollama_base_url"] or Config.ollama_base_url).rstrip("/")
+        )
+        values["ollama_embedding_base_url"] = (
+            str(values["ollama_embedding_base_url"] or values["ollama_base_url"]).rstrip("/")
+        )
+        values["llm_api_key_configured"] = bool(values["llm_api_key"])
+        values["embedding_api_key_configured"] = bool(values["embedding_api_key"])
+        return values
+
+    def project_model_settings(self, project: Mapping[str, Any] | int) -> dict[str, Any]:
+        """Return project settings for the UI, excluding API secrets.
+
+        The raw override values are kept alongside effective values so the UI
+        can distinguish “继承主页” from an explicit project configuration.
+        """
+
+        row = self.db.get_project(int(project)) if isinstance(project, int) else project
+        if not row:
+            raise LookupError("项目不存在")
+        effective = self._project_model_settings(row)
+        public = {
+            "llm_provider": self._project_setting_value(row, "llm_provider"),
+            "embedding_provider": self._project_setting_value(row, "embedding_provider"),
+            "ollama_base_url": self._project_setting_value(row, "ollama_base_url"),
+            "ollama_embedding_base_url": self._project_setting_value(row, "ollama_embedding_base_url"),
+            "llm_api_base_url": self._project_setting_value(row, "llm_api_base_url"),
+            "llm_api_models": self._setting_csv(row.get("llm_api_models")),
+            "llm_api_context_tokens": int(row.get("llm_api_context_tokens") or 0),
+            "embedding_api_base_url": self._project_setting_value(row, "embedding_api_base_url"),
+            "embedding_api_models": self._setting_csv(row.get("embedding_api_models")),
+            "embedding_api_context_tokens": int(row.get("embedding_api_context_tokens") or 0),
+            "llm_api_key_configured": bool(self._project_setting_value(row, "llm_api_key")),
+            "embedding_api_key_configured": bool(self._project_setting_value(row, "embedding_api_key")),
+        }
+        for name in (
+            "llm_provider", "embedding_provider", "ollama_base_url",
+            "ollama_embedding_base_url", "llm_api_base_url", "llm_api_models",
+            "llm_api_context_tokens", "embedding_api_base_url", "embedding_api_models",
+            "embedding_api_context_tokens",
+        ):
+            public[f"effective_{name}"] = effective[name]
+        public["effective_llm_api_key_configured"] = effective["llm_api_key_configured"]
+        public["effective_embedding_api_key_configured"] = effective["embedding_api_key_configured"]
+        return public
+
+    def _project_ollama(self, project: Mapping[str, Any]) -> OllamaClient:
+        values = self._project_model_settings(project)
+        return OllamaClient(
+            base_url=values["ollama_base_url"],
+            embedding_base_url=values["ollama_embedding_base_url"],
+            llm_provider=values["llm_provider"],
+            embedding_provider=values["embedding_provider"],
+            llm_api_base_url=values["llm_api_base_url"],
+            embedding_api_base_url=values["embedding_api_base_url"],
+            llm_api_key=values["llm_api_key"],
+            embedding_api_key=values["embedding_api_key"],
+            llm_api_models=values["llm_api_models"] or (project.get("llm_model") or Config.default_llm_model,),
+            embedding_api_models=values["embedding_api_models"] or (project.get("embedding_model") or Config.default_embedding_model,),
+            llm_api_context_tokens=values["llm_api_context_tokens"],
+            embedding_api_context_tokens=values["embedding_api_context_tokens"],
+        )
+
+    @contextmanager
+    def model_scope(self, project: Mapping[str, Any] | int):
+        row = self.db.get_project(int(project)) if isinstance(project, int) else project
+        if not row:
+            raise LookupError("项目不存在")
+        context = getattr(self, "_model_client_context", None)
+        if context is None:
+            # Keep lightweight pre-bootstrap test services and integrations
+            # that inject a compatible client directly on ``service.ollama``.
+            yield self.ollama
+            return
+        token = context.set(self._project_ollama(row))
+        try:
+            yield context.get()
+        finally:
+            context.reset(token)
+
+    def global_model_settings(self) -> dict[str, Any]:
+        """Return homepage-safe global settings without exposing API secrets."""
+
+        values = self._global_model_settings()
+        public = {
+            key: value for key, value in values.items()
+            if key not in {"llm_api_key", "embedding_api_key"}
+        }
+        public["llm_api_key_configured"] = bool(values.get("llm_api_key"))
+        public["embedding_api_key_configured"] = bool(values.get("embedding_api_key"))
+        return public
+
+    def _reload_model_runtime(self) -> None:
+        """Apply global provider settings without rebuilding project data."""
+
+        values = self._global_model_settings()
+        client = OllamaClient(
+            base_url=values["ollama_base_url"],
+            embedding_base_url=values["ollama_embedding_base_url"],
+            llm_provider=values["llm_provider"],
+            embedding_provider=values["embedding_provider"],
+            llm_api_base_url=values["llm_api_base_url"],
+            embedding_api_base_url=values["embedding_api_base_url"],
+            llm_api_key=values["llm_api_key"],
+            embedding_api_key=values["embedding_api_key"],
+            llm_api_models=values["llm_api_models"] or (values["default_llm_model"],),
+            embedding_api_models=(
+                values["embedding_api_models"]
+                or (values["default_embedding_model"],)
+            ),
+            llm_api_context_tokens=values["llm_api_context_tokens"],
+            embedding_api_context_tokens=values["embedding_api_context_tokens"],
+        )
+        self._global_ollama = client
+        # These components retain the client reference passed at construction.
+        # Update that reference in place after a settings save so the next
+        # request uses the new provider without changing project records.
+        for component in (
+            getattr(self, "media", None),
+            getattr(self, "vectors", None),
+            getattr(self, "schemas", None),
+            getattr(self, "community_report_generator", None),
+        ):
+            if component is not None and hasattr(component, "ollama"):
+                # Existing collaborators use the project-aware router.  Keep
+                # compatibility with narrow test doubles that still hold a
+                # concrete client reference.
+                if not isinstance(component.ollama, _ProjectModelClientRouter):
+                    component.ollama = self.ollama
+
+    def update_global_model_settings(self, submitted: Mapping[str, object]) -> dict[str, Any]:
+        """Save homepage defaults and provider/API settings.
+
+        Blank API key fields intentionally retain the existing key.  A clear
+        checkbox is required to remove one, which prevents an accidental empty
+        form field from disabling a configured remote endpoint.
+        """
+
+        current = self._global_model_settings()
+        values: dict[str, Any] = {}
+        for name in (
+            "default_llm_model", "default_embedding_model",
+            "llm_provider", "embedding_provider",
+            "ollama_base_url", "ollama_embedding_base_url",
+            "llm_api_base_url", "embedding_api_base_url",
+            "llm_api_models", "embedding_api_models",
+            "llm_api_context_tokens", "embedding_api_context_tokens",
+        ):
+            values[name] = str(submitted.get(name, current[name]) or "").strip()
+        for name in ("llm_provider", "embedding_provider"):
+            values[name] = OllamaClient._normalize_provider(values[name])
+        for name in ("default_llm_model", "default_embedding_model"):
+            if not values[name]:
+                raise ValueError("默认模型不能为空；如果使用 API，请填写 API 模型名称")
+        for name, provider, label in (
+            ("ollama_base_url", "llm_provider", "LLM"),
+            ("ollama_embedding_base_url", "embedding_provider", "Embedding"),
+        ):
+            if values[provider] == "ollama" and not values[name]:
+                raise ValueError(f"{label} 使用本地 Ollama 时必须填写 Ollama 地址")
+            if values[name]:
+                if not values[name].startswith(("http://", "https://")):
+                    raise ValueError("Ollama 地址必须以 http:// 或 https:// 开头")
+                values[name] = values[name].rstrip("/")
+        for provider, base_name, label in (
+            ("llm_provider", "llm_api_base_url", "LLM"),
+            ("embedding_provider", "embedding_api_base_url", "Embedding"),
+        ):
+            if values[provider] == "openai_compatible":
+                if not values[base_name]:
+                    raise ValueError(f"{label} 使用远程 API 时必须填写 API 地址")
+                if not values[base_name].startswith(("http://", "https://")):
+                    raise ValueError(f"{label} API 地址必须以 http:// 或 https:// 开头")
+                values[base_name] = values[base_name].rstrip("/")
+        for name in ("llm_api_context_tokens", "embedding_api_context_tokens"):
+            try:
+                parsed = int(values[name])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("API 上下文 Token 上限必须是整数") from exc
+            if not 1024 <= parsed <= 1_000_000:
+                raise ValueError("API 上下文 Token 上限必须在 1024 到 1000000 之间")
+            values[name] = str(parsed)
+        # The API model is intentionally free-form.  The provider, rather
+        # than Knowledge Forge, owns the model catalogue, so a user may enter
+        # any model identifier accepted by that endpoint.  Keep the legacy
+        # CSV setting as a one-item compatibility mirror for model discovery
+        # and older callers.
+        values["llm_api_models"] = (
+            values["default_llm_model"]
+            if values["llm_provider"] == "openai_compatible"
+            else ",".join(self._setting_csv(values["llm_api_models"]))
+        )
+        values["embedding_api_models"] = (
+            values["default_embedding_model"]
+            if values["embedding_provider"] == "openai_compatible"
+            else ",".join(self._setting_csv(values["embedding_api_models"]))
+        )
+        for name in ("llm_api_key", "embedding_api_key"):
+            submitted_key = str(submitted.get(name) or "")
+            clear_key = str(submitted.get(f"clear_{name}") or "") in {"1", "true", "on"}
+            values[name] = submitted_key if submitted_key else ("" if clear_key else current[name])
+        setter = getattr(self.db, "set_settings", None)
+        if not callable(setter):
+            raise RuntimeError("数据库设置接口不可用")
+        setter({self._global_model_setting_key(name): value for name, value in values.items()})
+        self._reload_model_runtime()
+        return self.global_model_settings()
 
     def _mark_graphrag_native_source_changed(self, project_id: int, reason: str) -> None:
         """Invalidate only the immutable native pointer after source mutation."""
@@ -557,6 +949,29 @@ class KnowledgeForgeService:
         except KeyError as exc:  # normalize_strategy currently catches this first.
             raise ValueError(f"未注册的知识构建方案: {strategy_key}") from exc
 
+    def _run_project_scoped(
+        self, worker: Callable[..., None], project_id: int, *args: Any,
+    ) -> None:
+        """Run one model-backed operation with the knowledge base client."""
+
+        project = self.db.get_project(int(project_id))
+        if not project:
+            raise LookupError("项目不存在")
+        with self.model_scope(project):
+            worker(*args)
+
+    def _prepare_document_content_scoped(
+        self, job_id: str, document_id: int, strategy_key: str,
+    ) -> None:
+        document = self.db.get_document(int(document_id))
+        if not document:
+            raise LookupError("文档不存在")
+        self._run_project_scoped(
+            self._prepare_document_content, int(document["project_id"]),
+            job_id, document_id, strategy_key,
+        )
+
+    @_model_scoped_worker(subject="project")
     def _ingest_graphrag_native(self, job_id: str, project_id: int) -> None:
         """Execute only the isolated native strategy; it has no fallback chain."""
 
@@ -569,6 +984,9 @@ class KnowledgeForgeService:
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db.bootstrap()
+        # Load persisted homepage defaults after the settings table exists.
+        # This does not touch any project's saved model or language fields.
+        self._reload_model_runtime()
         for project in self.db.list_projects():
             selection = self.db.get_project_construction_strategy_selection(int(project["id"]))
             if (
@@ -1082,7 +1500,15 @@ class KnowledgeForgeService:
             LOGGER.warning("Using cached context limit for %s: %s", model_name, exc)
         return max(1024, int(metadata.get("context_length") or 8192))
 
-    def project_token_limits(self, llm_model: str, embedding_model: str) -> dict[str, int]:
+    def project_token_limits(
+        self, llm_model: str, embedding_model: str, *, project_id: int | None = None,
+    ) -> dict[str, int]:
+        if project_id is not None:
+            project = self.db.get_project(int(project_id))
+            if not project:
+                raise LookupError("项目不存在")
+            with self.model_scope(project):
+                return self.project_token_limits(llm_model, embedding_model)
         llm_context = self._model_context_limit(llm_model, "llm")
         embedding_context = self._model_context_limit(embedding_model, "embedding")
         return {
@@ -1125,9 +1551,10 @@ class KnowledgeForgeService:
         )
         if strategy_key not in {KNOWLEDGE_FORGE_STRATEGY, GRAPHRAG_NATIVE_STRATEGY}:
             raise ValueError("请选择 Knowledge Forge 或 GraphRAG Native")
+        defaults = self._global_model_settings()
         project = self.db.create_project(
-            name, (description or "").strip(), llm_model or Config.default_llm_model,
-            embedding_model or Config.default_embedding_model,
+            name, (description or "").strip(), llm_model or defaults["default_llm_model"],
+            embedding_model or defaults["default_embedding_model"],
             strategy_key=strategy_key,
             knowledge_language=knowledge_language,
         )
@@ -1166,19 +1593,91 @@ class KnowledgeForgeService:
         model_max_tokens: int,
         chunk_max_tokens: int,
         knowledge_language: str | None = None,
+        model_connection: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         project = self.db.get_project(project_id)
         if not project:
             raise LookupError("项目不存在")
+        has_connection_submission = model_connection is not None
+        submitted = dict(model_connection or {})
+        connection_values: dict[str, Any] = {}
+        for name in (
+            "llm_provider", "embedding_provider", "ollama_base_url",
+            "ollama_embedding_base_url", "llm_api_base_url", "llm_api_models",
+            "llm_api_context_tokens", "embedding_api_base_url", "embedding_api_models",
+            "embedding_api_context_tokens",
+        ):
+            connection_values[name] = (
+                str(submitted.get(name) or "").strip()
+                if has_connection_submission
+                else self._project_setting_value(project, name)
+            )
+        for name in ("llm_provider", "embedding_provider"):
+            if connection_values[name]:
+                connection_values[name] = OllamaClient._normalize_provider(
+                    connection_values[name]
+                )
+        for name, label in (
+            ("ollama_base_url", "Ollama LLM"),
+            ("ollama_embedding_base_url", "Ollama Embedding"),
+            ("llm_api_base_url", "LLM API"),
+            ("embedding_api_base_url", "Embedding API"),
+        ):
+            value = connection_values[name]
+            if value and not value.startswith(("http://", "https://")):
+                raise ValueError(f"{label} 地址必须以 http:// 或 https:// 开头")
+            connection_values[name] = value.rstrip("/")
+        for name in ("llm_api_models", "embedding_api_models"):
+            connection_values[name] = ",".join(self._setting_csv(connection_values[name]))
+        for name in ("llm_api_context_tokens", "embedding_api_context_tokens"):
+            raw = connection_values[name]
+            if not raw:
+                connection_values[name] = 0
+                continue
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("知识库 API 上下文 Token 上限必须是整数") from exc
+            if not 1024 <= parsed <= 1_000_000:
+                raise ValueError("知识库 API 上下文 Token 上限必须在 1024 到 1000000 之间")
+            connection_values[name] = parsed
+        for name in ("llm_api_key", "embedding_api_key"):
+            submitted_key = str(submitted.get(name) or "")
+            clear_key = str(submitted.get(f"clear_{name}") or "") in {"1", "true", "on"}
+            connection_values[name] = (
+                self._project_setting_value(project, name)
+                if not has_connection_submission else
+                (submitted_key if submitted_key else
+                 ("" if clear_key else self._project_setting_value(project, name)))
+            )
+        project_candidate = {**project, **connection_values}
+        effective_connection = self._project_model_settings(project_candidate)
+        for provider, base_name, label in (
+            ("llm_provider", "llm_api_base_url", "LLM"),
+            ("embedding_provider", "embedding_api_base_url", "Embedding"),
+        ):
+            if effective_connection[provider] == "openai_compatible" and not effective_connection[base_name]:
+                raise ValueError(f"{label} 使用远程 API 时必须填写 API 地址")
+        if effective_connection["llm_provider"] == "openai_compatible" and not str(llm_model or "").strip():
+            raise ValueError("LLM 使用远程 API 时必须填写 API 模型名称")
+        if effective_connection["embedding_provider"] == "openai_compatible" and not str(embedding_model or "").strip():
+            raise ValueError("Embedding 使用远程 API 时必须填写 API 模型名称")
         available = {
             item["name"]: item["model_type"] for item in self.available_models()
         }
-        if llm_model and available.get(llm_model) != "llm":
+        if llm_model and available.get(llm_model) != "llm" and not (
+            effective_connection["llm_provider"] == "openai_compatible"
+            and effective_connection["llm_api_base_url"]
+        ):
             raise ValueError("请选择有效的 LLM 模型")
-        if embedding_model and available.get(embedding_model) != "embedding":
+        if embedding_model and available.get(embedding_model) != "embedding" and not (
+            effective_connection["embedding_provider"] == "openai_compatible"
+            and effective_connection["embedding_api_base_url"]
+        ):
             raise ValueError("请选择有效的 Embedding 模型")
-        selected_llm = llm_model or Config.default_llm_model
-        selected_embedding = embedding_model or Config.default_embedding_model
+        defaults = self._global_model_settings()
+        selected_llm = llm_model or defaults["default_llm_model"]
+        selected_embedding = embedding_model or defaults["default_embedding_model"]
         selected_knowledge_language = normalize_knowledge_language(
             (
                 knowledge_language
@@ -1186,7 +1685,19 @@ class KnowledgeForgeService:
                 else project.get("knowledge_language") or "auto"
             ),
         )
-        limits = self.project_token_limits(selected_llm, selected_embedding)
+        project_candidate.update({
+            "llm_model": selected_llm,
+            "embedding_model": selected_embedding,
+        })
+        # Keep the legacy API model catalogue as a one-item compatibility
+        # mirror.  API model identifiers are free-form and are not validated
+        # against the local Ollama catalogue.
+        if connection_values["llm_provider"] == "openai_compatible":
+            connection_values["llm_api_models"] = selected_llm
+        if connection_values["embedding_provider"] == "openai_compatible":
+            connection_values["embedding_api_models"] = selected_embedding
+        with self.model_scope(project_candidate):
+            limits = self.project_token_limits(selected_llm, selected_embedding)
         if not 1024 <= model_max_tokens <= limits["llm_context_max"]:
             raise ValueError(
                 f"模型 Token 上限必须在 1024 到 {limits['llm_context_max']} 之间"
@@ -1203,6 +1714,7 @@ class KnowledgeForgeService:
             model_max_tokens=model_max_tokens,
             chunk_max_tokens=chunk_max_tokens,
             knowledge_language=selected_knowledge_language,
+            **connection_values,
         )
 
     def update_project_models(self, project_id: int, llm_model: str, embedding_model: str) -> dict[str, Any]:
@@ -2059,6 +2571,7 @@ class KnowledgeForgeService:
                 "Community report embedding failed report=%s: %s", report_id, exc,
             )
 
+    @_model_scoped_worker(subject="project")
     def _run_knowledge_forge_community_reports(
         self, job_id: str, project_id: int, run_id: str,
     ) -> None:
@@ -2976,6 +3489,17 @@ class KnowledgeForgeService:
         )
 
     def graphrag_native_query(self, project_id: int, *, mode: str, question: str) -> dict[str, Any]:
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        with self.model_scope(project):
+            return self._graphrag_native_query_in_scope(
+                project_id, mode=mode, question=question,
+            )
+
+    def _graphrag_native_query_in_scope(
+        self, project_id: int, *, mode: str, question: str,
+    ) -> dict[str, Any]:
         self._assert_project_strategy(project_id, GRAPHRAG_NATIVE_STRATEGY)
         result = self.graphrag_native_runtime.query(
             project_id, mode=mode, question=question,
@@ -4964,11 +5488,11 @@ class KnowledgeForgeService:
         )
         self.executor.submit(
             self._recover_code_only_knowledge_forge_snapshot_job,
-            str(job["id"]),
-            project_id,
+            str(job["id"]), project_id,
         )
         return job
 
+    @_model_scoped_worker(subject="project")
     @recorded_job("knowledge_forge_snapshot_recovery")
     def _recover_code_only_knowledge_forge_snapshot_job(
         self, job_id: str, project_id: int,
@@ -6707,6 +7231,7 @@ class KnowledgeForgeService:
                 self._discard_staged_media_directory(media_dir)
             raise
 
+    @_model_scoped_worker()
     @recorded_job("content_preparation")
     def _prepare_document_content(
         self,
@@ -6785,6 +7310,7 @@ class KnowledgeForgeService:
                 metadata={"stage": "failed"},
             )
 
+    @_model_scoped_worker()
     @recorded_job("ingestion")
     def _ingest_document(self, job_id: str, document_id: int) -> None:
         revision: dict[str, Any] | None = None
@@ -7272,6 +7798,7 @@ class KnowledgeForgeService:
             except Exception:
                 LOGGER.exception("Unable to persist stable strategy build status")
 
+    @_model_scoped_worker()
     @recorded_job("knowledge_forge_strategy_ingestion")
     def _ingest_knowledge_forge_strategy(self, job_id: str, document_id: int) -> None:
         """Build the isolated grounded relation and entity knowledge graph."""
@@ -8452,6 +8979,7 @@ class KnowledgeForgeService:
                 LOGGER.warning("Relation embedding retry deferred for %s: %s", object_key, exc)
         return completed
 
+    @_model_scoped_worker(subject="project")
     @recorded_job("graph_rebuild")
     def _sync_project_graph(self, job_id: str, project_id: int) -> None:
         graph_mutation_started = False
@@ -8544,6 +9072,7 @@ class KnowledgeForgeService:
                 except (LookupError, ValueError):
                     LOGGER.info("A newer project mutation already owns graph recovery: %s", project_id)
 
+    @_model_scoped_worker(subject="project")
     def _reassess_project_schema(self, job_id: str, project_id: int) -> None:
         self._job(
             job_id,
@@ -8715,6 +9244,19 @@ class KnowledgeForgeService:
             )
 
     def search(
+        self, project_id: int, query: str, top_k: int | None = None, *,
+        allow_report_scheduling: bool = True,
+    ) -> dict[str, Any]:
+        project = self.db.get_project(project_id)
+        if not project:
+            raise LookupError("项目不存在")
+        with self.model_scope(project):
+            return self._search_in_model_scope(
+                project_id, query, top_k,
+                allow_report_scheduling=allow_report_scheduling,
+            )
+
+    def _search_in_model_scope(
         self, project_id: int, query: str, top_k: int | None = None, *,
         allow_report_scheduling: bool = True,
     ) -> dict[str, Any]:
@@ -9363,12 +9905,20 @@ class KnowledgeForgeService:
                 "maximum_citation_validation_passes": 1,
             },
         )
-        self.agent_executor.submit(self.agent.run, run_id)
+        self.agent_executor.submit(self._run_agent_scoped, run_id)
         return {
             "run_id": run_id, "message_id": message_id,
             "thread_id": str(thread_id), "status": str(run["status"]),
             "events_url": f"/api/agent/runs/{run_id}/events",
         }
+
+    def _run_agent_scoped(self, run_id: str) -> None:
+        run = self.db.get_agent_run(str(run_id))
+        if not run:
+            raise LookupError("问答运行不存在")
+        self._run_project_scoped(
+            self.agent.run, int(run["project_id"]), str(run_id),
+        )
 
     def get_agent_run(self, run_id: str, *, session_key: str) -> dict[str, Any]:
         row = self.db.get_agent_run_payload(

@@ -57,12 +57,19 @@ def _time(value: object) -> str:
 
 def _model_options(models: list[dict], kind: str, selected: str = "") -> str:
     options = []
+    names: set[str] = set()
     for model in models:
         if model["model_type"] != kind: continue
         name = str(model["name"]); chosen = " selected" if name == selected else ""
+        names.add(name)
         options.append(f'<option value="{_esc(name)}"{chosen}>{_esc(name)}</option>')
+    if selected and selected not in names:
+        options.insert(0, f'<option value="{_esc(selected)}" selected>{_esc(selected)}</option>')
     if not options:
-        fallback = Config.default_embedding_model if kind == "embedding" else Config.default_llm_model
+        fallback = selected or (
+            Config.default_embedding_model if kind == "embedding"
+            else Config.default_llm_model
+        )
         options.append(f'<option value="{_esc(fallback)}">{_esc(fallback)}</option>')
     return "".join(options)
 
@@ -71,6 +78,66 @@ def _available_models() -> list[dict]:
     """Read deployment-appropriate models while keeping old service doubles usable."""
     getter = getattr(SERVICE, "available_models", None)
     return getter() if callable(getter) else SERVICE.db.list_models()
+
+
+def _global_model_settings_for_home() -> dict[str, Any]:
+    """Return homepage-safe defaults while keeping old test doubles usable."""
+
+    getter = getattr(SERVICE, "global_model_settings", None)
+    if callable(getter):
+        return dict(getter())
+    return {
+        "default_llm_model": Config.default_llm_model,
+        "default_embedding_model": Config.default_embedding_model,
+        "llm_provider": Config.llm_provider,
+        "embedding_provider": Config.embedding_provider,
+        "ollama_base_url": Config.ollama_base_url,
+        "ollama_embedding_base_url": Config.ollama_embedding_base_url,
+        "llm_api_base_url": Config.llm_api_base_url,
+        "llm_api_models": Config.llm_api_models,
+        "llm_api_context_tokens": Config.llm_api_context_tokens,
+        "embedding_api_base_url": Config.embedding_api_base_url,
+        "embedding_api_models": Config.embedding_api_models,
+        "embedding_api_context_tokens": Config.embedding_api_context_tokens,
+        "llm_api_key_configured": bool(Config.llm_api_key),
+        "embedding_api_key_configured": bool(Config.embedding_api_key),
+    }
+
+
+def _provider_options(selected: str) -> str:
+    options = {
+        "ollama": "本地（Ollama）",
+        "openai_compatible": "API（OpenAI 兼容）",
+    }
+    return _named_options(options, selected, include_auto=False)
+
+
+def _project_provider_options(selected: str, effective: str) -> str:
+    """Render an explicit inherit option before project-level providers."""
+
+    inherit_label = "跟随主页全局设置"
+    if effective == "openai_compatible":
+        inherit_label += "（当前：API）"
+    else:
+        inherit_label += "（当前：本地 Ollama）"
+    options = (
+        {"": inherit_label, "ollama": "本地 Ollama",
+         "openai_compatible": "API（OpenAI 兼容）"}
+    )
+    return _named_options(options, selected, include_auto=True)
+
+
+def _api_model_value(selected: str, configured: tuple[str, ...] = ()) -> str:
+    """Choose a useful initial value for the free-form API model field.
+
+    Older settings stored one or more API model names separately.  Keep the
+    first configured name as a migration-friendly initial value when the old
+    selected model is absent, while letting the user replace it freely.
+    """
+
+    value = str(selected or "").strip()
+    names = tuple(str(item).strip() for item in configured if str(item).strip())
+    return value if value in names or not names else names[0]
 
 
 def _named_options(options: dict[str, str], selected: str = "", *, include_auto: bool = True) -> str:
@@ -932,6 +999,7 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
     """Common knowledge-base creation/selection page; workspaces are strategy-owned."""
 
     projects, models = SERVICE.db.list_projects(), _available_models()
+    global_settings = _global_model_settings_for_home()
     cards: list[str] = []
     for project in projects:
         project_id = int(project["id"])
@@ -976,12 +1044,13 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       <title>Knowledge Forge · 通用知识库与知识图谱</title><style>{CSS}</style></head><body>
-      <main class="shell home-shell"><header class="home-header"><div><h1>Knowledge Forge</h1>
-      <p>通用知识库与知识图谱构建平台</p></div>
-      <nav class="home-primary-actions" aria-label="主要功能">
-        <button class="button primary" type="button" id="open-project-list">知识库</button>
+      <main class="shell home-shell"><header class="home-header"><a class="brand-link" href="/" aria-label="返回知识库首页"><h1>Knowledge Forge</h1>
+      <p>通用知识库与知识图谱构建平台</p></a>
+      <div class="header-tools"><nav class="home-primary-actions" aria-label="主要功能">
+        <button class="button secondary" type="button" id="open-project-list">知识库</button>
         <a class="button secondary" href="/chat">智能问答</a>
-      </nav></header>
+      </nav><a class="icon-button utility-settings-button" href="/?open=settings"
+        title="系统设置" aria-label="打开系统设置">⚙</a></div></header>
       {notice}
       <section class="panel home-hero" aria-labelledby="home-introduction-title">
         <div class="hero-layout"><div class="hero-copy">
@@ -1078,15 +1147,60 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
         <p class="wide strategy-choice-help" id="strategy-choice-help"></p>
         <label>知识语言<select name="knowledge_language" required>{_knowledge_language_options(CHINESE)}</select>
           <small class="field-help">控制后续构建生成的说明、关系描述和社区报告；专名、缩写与代码保留原文。</small></label>
-        <label>LLM<select name="llm_model">{_model_options(models,'llm',Config.default_llm_model)}</select></label>
-        <label>Embedding<select name="embedding_model">{_model_options(models,'embedding')}</select></label>
+        <label data-create-model-select="llm">本地 LLM<select name="llm_model" data-create-model-field="llm">{_model_options(models,'llm',str(global_settings.get('default_llm_model') or Config.default_llm_model))}</select></label>
+        <label data-create-model-input="llm" hidden>API LLM 模型名称<input name="llm_model" data-create-model-field="llm" value="{_esc(_api_model_value(str(global_settings.get('default_llm_model') or ''), tuple(global_settings.get('llm_api_models') or ())))}" placeholder="例如 qwen-plus、gpt-4o-mini"></label>
+        <label data-create-model-select="embedding">本地 Embedding<select name="embedding_model" data-create-model-field="embedding">{_model_options(models,'embedding',str(global_settings.get('default_embedding_model') or Config.default_embedding_model))}</select></label>
+        <label data-create-model-input="embedding" hidden>API Embedding 模型名称<input name="embedding_model" data-create-model-field="embedding" value="{_esc(_api_model_value(str(global_settings.get('default_embedding_model') or ''), tuple(global_settings.get('embedding_api_models') or ())))}" placeholder="例如 bge-m3、text-embedding-3-large"></label>
         <label class="wide">知识库说明<textarea name="description" rows="2"></textarea></label>
         <div class="form-actions dialog-actions">
           <button class="button secondary" type="button" data-close-create-project>取消</button>
           <button class="button primary" type="submit">创建知识库</button></div></form></dialog>
+      <dialog id="global-settings-dialog" class="global-settings-dialog" aria-labelledby="global-settings-title">
+      <div class="dialog-heading"><div><span class="section-kicker">系统设置</span><h2 id="global-settings-title">全局默认设置</h2>
+        <p>这里的默认值用于新建知识库；保存不会改写已有知识库的模型、语言、Token 上限或构建结果。</p></div>
+        <button class="icon-button" type="button" data-close-global-settings aria-label="关闭设置">×</button></div>
+      <form id="global-settings-form" action="/settings/global" method="post" class="form-grid global-settings-form">
+        <div class="wide global-settings-section global-model-settings-heading"><h3>模型设置</h3><p>默认配置用于新建知识库；已有知识库仍以自己的设置为准。本地 Ollama 从已安装模型中选择，API 模式填写服务实际接受的模型名称。</p></div>
+        <div class="wide global-model-settings">
+          <section class="global-model-connection-card" data-connection-card="llm">
+            <div class="model-connection-card-heading"><h3>LLM</h3><span>回答、知识抽取与社区报告</span></div>
+            <label>连接方式<select name="llm_provider" data-provider-control="llm">{_provider_options(str(global_settings.get('llm_provider') or 'ollama'))}</select></label>
+            <label data-model-select-field="llm">本地模型<select name="default_llm_model" data-model-field="llm" data-local-models="{_esc(json.dumps([str(item.get('name') or '') for item in models if item.get('model_type') == 'llm'], ensure_ascii=False))}" required>{_model_options(models, 'llm', str(global_settings.get('default_llm_model') or Config.default_llm_model))}</select></label>
+            <label data-model-input-field="llm" hidden>API 模型名称<input name="default_llm_model" data-model-field="llm" value="{_esc(_api_model_value(str(global_settings.get('default_llm_model') or ''), tuple(global_settings.get('llm_api_models') or ())))}" placeholder="例如 qwen-plus、gpt-4o-mini" required></label>
+            <div class="connection-fields" data-provider-fields="llm" data-provider-kind="ollama" hidden>
+              <label>Ollama 地址<input name="ollama_base_url" value="{_esc(str(global_settings.get('ollama_base_url') or Config.ollama_base_url))}" placeholder="例如 http://127.0.0.1:11434"></label>
+            </div>
+            <div class="connection-fields" data-provider-fields="llm" data-provider-kind="openai_compatible" hidden>
+              <label>API 地址<input name="llm_api_base_url" value="{_esc(str(global_settings.get('llm_api_base_url') or ''))}" placeholder="例如 https://api.example.com/v1"></label>
+              <label>API Key<input name="llm_api_key" type="password" autocomplete="new-password" placeholder="{_esc('已配置，留空保持不变' if global_settings.get('llm_api_key_configured') else '填写 API Key')}"></label>
+              <label>上下文 Token 上限<input name="llm_api_context_tokens" type="number" min="1024" max="1000000" value="{_esc(str(global_settings.get('llm_api_context_tokens') or Config.llm_api_context_tokens))}"></label>
+              {('<label class="checkbox-line"><span>密钥管理</span><span><input name="clear_llm_api_key" type="checkbox" value="1"> 删除已保存的 LLM API Key</span></label>') if global_settings.get('llm_api_key_configured') else ''}
+            </div>
+          </section>
+          <section class="global-model-connection-card" data-connection-card="embedding">
+            <div class="model-connection-card-heading"><h3>Embedding</h3><span>文档向量化与语义检索</span></div>
+            <label>连接方式<select name="embedding_provider" data-provider-control="embedding">{_provider_options(str(global_settings.get('embedding_provider') or 'ollama'))}</select></label>
+            <label data-model-select-field="embedding">本地模型<select name="default_embedding_model" data-model-field="embedding" data-local-models="{_esc(json.dumps([str(item.get('name') or '') for item in models if item.get('model_type') == 'embedding'], ensure_ascii=False))}" required>{_model_options(models, 'embedding', str(global_settings.get('default_embedding_model') or Config.default_embedding_model))}</select></label>
+            <label data-model-input-field="embedding" hidden>API 模型名称<input name="default_embedding_model" data-model-field="embedding" value="{_esc(_api_model_value(str(global_settings.get('default_embedding_model') or ''), tuple(global_settings.get('embedding_api_models') or ())))}" placeholder="例如 bge-m3、text-embedding-3-large" required></label>
+            <div class="connection-fields" data-provider-fields="embedding" data-provider-kind="ollama" hidden>
+              <label>Ollama 地址<input name="ollama_embedding_base_url" value="{_esc(str(global_settings.get('ollama_embedding_base_url') or Config.ollama_embedding_base_url))}" placeholder="例如 http://127.0.0.1:11434"></label>
+            </div>
+            <div class="connection-fields" data-provider-fields="embedding" data-provider-kind="openai_compatible" hidden>
+              <label>API 地址<input name="embedding_api_base_url" value="{_esc(str(global_settings.get('embedding_api_base_url') or ''))}" placeholder="例如 https://api.example.com/v1"></label>
+              <label>API Key<input name="embedding_api_key" type="password" autocomplete="new-password" placeholder="{_esc('已配置，留空保持不变' if global_settings.get('embedding_api_key_configured') else '填写 API Key')}"></label>
+              <label>上下文 Token 上限<input name="embedding_api_context_tokens" type="number" min="1024" max="1000000" value="{_esc(str(global_settings.get('embedding_api_context_tokens') or Config.embedding_api_context_tokens))}"></label>
+              {('<label class="checkbox-line"><span>密钥管理</span><span><input name="clear_embedding_api_key" type="checkbox" value="1"> 删除已保存的 Embedding API Key</span></label>') if global_settings.get('embedding_api_key_configured') else ''}
+            </div>
+          </section>
+        </div>
+        <div class="wide global-settings-footnote">远程 API 地址应提供 OpenAI 兼容的 `/v1/chat/completions` 或 `/v1/embeddings` 接口；API 模型名称请填写服务实际接受的 `model` 值。API Key 仅用于服务调用，不会回填到页面。</div>
+        <div class="form-actions dialog-actions"><button class="button secondary" type="button" data-close-global-settings>取消</button>
+          <button class="button primary" type="submit">保存全局设置</button></div>
+      </form></dialog>
       </main><script>
       const projectDialog=document.querySelector('#project-list-dialog');
       const dialog=document.querySelector('#create-project-dialog');
+      const settingsDialog=document.querySelector('#global-settings-dialog');
       const strategySelect=document.querySelector('#create-strategy-key');
       const strategyHelp=document.querySelector('#strategy-choice-help');
       const strategyDescriptions={{
@@ -1107,12 +1221,23 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
         }});
         if(projectCount)projectCount.textContent=query?'找到 '+visible+' 个知识库':'';
       }}
-      document.querySelectorAll('#open-project-list,[data-open-knowledge-bases]').forEach(button=>
-        button.addEventListener('click',()=>{{
-          projectDialog.showModal();projectSearch?.focus();filterProjects();
-        }}));
-      if(location.hash==='#knowledge-bases'){{
+      function openProjectList(){{
+        if(!projectDialog)return;
         projectDialog.showModal();projectSearch?.focus();filterProjects();
+      }}
+      document.querySelectorAll('#open-project-list,[data-open-knowledge-bases]').forEach(button=>
+        button.addEventListener('click',openProjectList));
+      const homeUrl=new URL(location.href);
+      if(location.hash==='#knowledge-bases'||homeUrl.searchParams.get('open')==='knowledge-bases'){{
+        openProjectList();
+        if(homeUrl.searchParams.has('open')){{
+          homeUrl.searchParams.delete('open');homeUrl.hash='';
+          history.replaceState({{}},'',homeUrl.pathname+homeUrl.search);
+        }}
+      }} else if(homeUrl.searchParams.get('open')==='settings'){{
+        settingsDialog?.showModal();
+        homeUrl.searchParams.delete('open');homeUrl.hash='';
+        history.replaceState({{}},'',homeUrl.pathname+homeUrl.search);
       }}
       projectSearch?.addEventListener('input',filterProjects);
       document.querySelectorAll('[data-close-project-list]').forEach(
@@ -1126,6 +1251,58 @@ def render_home_page(message: tuple[str, str] | None = None) -> str:
       strategySelect?.addEventListener('change',updateStrategyHelp);updateStrategyHelp();
       document.querySelectorAll('[data-close-create-project]').forEach(
         button=>button.addEventListener('click',()=>dialog.close()));
+      document.querySelectorAll('[data-close-global-settings]').forEach(
+        button=>button.addEventListener('click',()=>settingsDialog.close()));
+      settingsDialog?.addEventListener('click',event=>{{
+        if(event.target===settingsDialog)settingsDialog.close();
+      }});
+      function refreshDefaultModelOptions(control){{
+        const card=control.closest('[data-connection-card]');
+        if(!card)return;
+        const kind=control.dataset.providerControl||'';
+        const mode=String(control.value||control.dataset.effectiveProvider||'ollama');
+        const localField=card.querySelector('[data-model-select-field="'+kind+'"]');
+        const apiField=card.querySelector('[data-model-input-field="'+kind+'"]');
+        const localSelect=localField?.querySelector('[data-model-field]');
+        const apiInput=apiField?.querySelector('[data-model-field]');
+        const isApi=mode==='openai_compatible';
+        if(localField)localField.hidden=isApi;
+        if(apiField)apiField.hidden=!isApi;
+        if(localSelect)localSelect.disabled=isApi;
+        if(apiInput)apiInput.disabled=!isApi;
+      }}
+      function updateProviderFields(control){{
+        const card=control.closest('[data-connection-card]');
+        if(!card)return;
+        const selected=String(control.value||'');
+        const inherited=!selected;
+        card.querySelectorAll('[data-provider-fields]').forEach(fields=>{{
+          const visible=!inherited&&fields.dataset.providerKind===selected;
+          fields.hidden=!visible;
+        }});
+        const note=card.querySelector('[data-provider-inherit-note]');
+        if(note)note.hidden=!inherited;
+        refreshDefaultModelOptions(control);
+      }}
+      function updateCreateModelFields(){{
+        document.querySelectorAll('[data-create-model-select]').forEach(localField=>{{
+          const kind=localField.dataset.createModelSelect||'';
+          const provider=document.querySelector('[data-provider-control="'+kind+'"]')?.value||'ollama';
+          const apiField=document.querySelector('[data-create-model-input="'+kind+'"]');
+          const localControl=localField.querySelector('[data-create-model-field]');
+          const apiControl=apiField?.querySelector('[data-create-model-field]');
+          const isApi=provider==='openai_compatible';
+          localField.hidden=isApi;if(apiField)apiField.hidden=!isApi;
+          if(localControl)localControl.disabled=isApi;if(apiControl)apiControl.disabled=!isApi;
+        }});
+      }}
+      document.querySelectorAll('[data-provider-control]').forEach(control=>{{
+        control.addEventListener('change',()=>{{updateProviderFields(control);updateCreateModelFields();}});
+        const cardApiModelInput=control.closest('[data-connection-card]')?.querySelector('input[name="'+(control.dataset.providerControl||'')+'_api_models"]');
+        cardApiModelInput?.addEventListener('input',()=>refreshDefaultModelOptions(control));
+        updateProviderFields(control);
+      }});
+      updateCreateModelFields();
       </script></body></html>"""
 
 
@@ -1135,12 +1312,13 @@ def render_chat_page() -> str:
     template = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       <title>智能问答 · Knowledge Forge</title><style>__CSS__</style></head><body>
-      <main class="shell home-shell agent-shell"><header class="home-header"><div>
-        <h1>Knowledge Forge</h1><p>通用知识库与知识图谱构建平台</p></div>
-        <nav class="home-primary-actions" aria-label="主要功能">
-          <a class="button secondary" href="/#knowledge-bases">知识库</a>
+      <main class="shell home-shell agent-shell"><header class="home-header"><a class="brand-link" href="/" aria-label="返回知识库首页"><h1>Knowledge Forge</h1>
+        <p>通用知识库与知识图谱构建平台</p></a>
+        <div class="header-tools"><nav class="home-primary-actions" aria-label="主要功能">
+          <a class="button secondary" href="/?open=knowledge-bases">知识库</a>
           <a class="button primary" href="/chat" aria-current="page">智能问答</a>
-        </nav></header>
+        </nav><a class="icon-button utility-settings-button" href="/?open=settings"
+          title="系统设置" aria-label="打开系统设置">⚙</a></div></header>
         <section class="panel agent-workbench" aria-labelledby="agent-title">
           <header class="agent-heading"><div><span class="section-kicker">智能问答</span>
             <h2 id="agent-title">基于当前知识库回答</h2>
@@ -1315,15 +1493,16 @@ def render_status_page(status: int, title: str, message: str) -> str:
       <title>{_esc(title)} · Knowledge Forge</title><style>{CSS}</style></head><body>
       <main class="shell home-shell"><header class="home-header"><div><h1>Knowledge Forge</h1>
       <p>通用知识库与知识图谱构建平台</p></div>
-      <nav class="home-primary-actions" aria-label="主要功能">
-        <a class="button primary" href="/#knowledge-bases">知识库</a>
+      <div class="header-tools"><nav class="home-primary-actions" aria-label="主要功能">
+        <a class="button secondary" href="/?open=knowledge-bases">知识库</a>
         <a class="button secondary" href="/chat">智能问答</a>
-      </nav></header>
+      </nav><a class="icon-button utility-settings-button" href="/?open=settings"
+        title="系统设置" aria-label="打开系统设置">⚙</a></div></header>
       <section class="panel status-page" aria-labelledby="status-page-title">
         <span class="status-page-code">{int(status)}</span>
         <div class="status-page-copy"><h2 id="status-page-title">{_esc(title)}</h2><p>{_esc(message)}</p>
           <div class="status-page-actions"><a class="button primary" href="/">返回首页</a>
-            <a class="button secondary" href="/#knowledge-bases">查看知识库</a></div>
+            <a class="button secondary" href="/?open=knowledge-bases">查看知识库</a></div>
         </div>
       </section></main></body></html>"""
 
@@ -1567,6 +1746,25 @@ def render_page(
     ui = _strategy_ui(strategy_key)
     projects, models = SERVICE.db.list_projects(), _available_models()
     current = next((item for item in projects if item["id"] == project_id), None)
+    project_model_settings: dict[str, Any] = {}
+    if current:
+        global_defaults = _global_model_settings_for_home()
+        getter = getattr(SERVICE, "project_model_settings", None)
+        if callable(getter):
+            try:
+                project_model_settings = dict(getter(current))
+            except (LookupError, TypeError, ValueError):
+                project_model_settings = {}
+        project_model_settings.setdefault("llm_provider", str(current.get("llm_provider") or ""))
+        project_model_settings.setdefault("embedding_provider", str(current.get("embedding_provider") or ""))
+        project_model_settings.setdefault(
+            "effective_llm_provider",
+            str(global_defaults.get("llm_provider") or Config.llm_provider),
+        )
+        project_model_settings.setdefault(
+            "effective_embedding_provider",
+            str(global_defaults.get("embedding_provider") or Config.embedding_provider),
+        )
     if current:
         binding = _project_binding(int(current["id"]))
         if binding is not None:
@@ -1667,7 +1865,10 @@ def render_page(
             <div id="processing-selects" class="form-grid compact">
               <label>解析器<select name="requested_parser" form="document-upload-form">{_named_options(PARSER_OPTIONS,'auto')}</select></label>
               <input type="hidden" name="requested_strategy" value="auto" form="document-upload-form">
-              <div class="native-config-note"><b>文本单元设置</b><span>GraphRAG 3.1.1 固定使用 900 Token、100 Token 重叠和 o200k_base 分词器。</span></div>
+              <div class="native-config-note">
+                <span class="native-config-label">文本单元设置</span>
+                <span class="native-config-value">GraphRAG 3.1.1 固定使用 900 Token、100 Token 重叠和 o200k_base 分词器。</span>
+              </div>
             </div>
             <p id="processing-hint" class="muted">这里只生成源结构；不会生成 Knowledge Forge 知识块、向量索引或知识结构定义。</p>
           </div>
@@ -1787,15 +1988,62 @@ def render_page(
             if strategy_key == KNOWLEDGE_FORGE_STRATEGY
             else f"""<input name="chunk_max_tokens" type="hidden" value="{int(current.get('chunk_max_tokens') or 512)}">"""
         )
+        project_effective_llm_provider = str(project_model_settings.get("effective_llm_provider") or "ollama")
+        project_effective_embedding_provider = str(project_model_settings.get("effective_embedding_provider") or "ollama")
+        project_effective_llm_api_models = tuple(project_model_settings.get("effective_llm_api_models") or ())
+        project_effective_embedding_api_models = tuple(project_model_settings.get("effective_embedding_api_models") or ())
+        project_llm_api_model_value = _api_model_value(
+            str(current.get("llm_model") or ""), project_effective_llm_api_models,
+        )
+        project_embedding_api_model_value = _api_model_value(
+            str(current.get("embedding_model") or ""), project_effective_embedding_api_models,
+        )
+        project_api_settings = f"""
+          <details class="project-api-settings" open>
+            <summary>知识库专用模型连接（可选）</summary>
+            <p class="field-help project-api-help">先选择 LLM 和 Embedding 的连接方式。选择“跟随主页”时使用主页默认配置；选择本地时从已安装模型中选择，选择 API 时填写服务实际接受的模型名称。</p>
+            <div class="project-api-grid">
+              <section class="model-connection-card" data-connection-card="llm">
+                <div class="model-connection-card-heading"><h3>LLM</h3><span>回答、抽取与报告</span></div>
+                <label>连接方式<select name="llm_provider" data-provider-control="llm" data-effective-provider="{_esc(str(project_model_settings.get('effective_llm_provider') or 'ollama'))}">{_project_provider_options(str(project_model_settings.get('llm_provider') or ''), str(project_model_settings.get('effective_llm_provider') or 'ollama'))}</select></label>
+                <label data-model-select-field="llm">本地模型<select name="llm_model" data-model-field="llm" data-local-models="{_esc(json.dumps([str(item.get('name') or '') for item in models if item.get('model_type') == 'llm'], ensure_ascii=False))}">{_model_options(models, 'llm', str(current.get('llm_model') or ''))}</select></label>
+                <label data-model-input-field="llm" hidden>API 模型名称<input name="llm_model" data-model-field="llm" value="{_esc(project_llm_api_model_value if project_effective_llm_provider == 'openai_compatible' else '')}" placeholder="例如 qwen-plus、gpt-4o-mini" required></label>
+                <p class="connection-inherit-note" data-provider-inherit-note="llm">当前跟随主页全局设置。若要只修改本知识库，请选择本地或 API。</p>
+                <div class="connection-fields" data-provider-fields="llm" data-provider-kind="ollama" hidden>
+                  <label>Ollama 地址<input name="ollama_base_url" value="{_esc(project_model_settings.get('ollama_base_url') or '')}" placeholder="例如 http://127.0.0.1:11434"></label>
+                </div>
+                <div class="connection-fields" data-provider-fields="llm" data-provider-kind="openai_compatible" hidden>
+                  <label>API 地址<input name="llm_api_base_url" value="{_esc(project_model_settings.get('llm_api_base_url') or '')}" placeholder="例如 https://api.example.com/v1"></label>
+                  <label>API Key<input name="llm_api_key" type="password" autocomplete="new-password" placeholder="{_esc('已配置，留空保持不变' if project_model_settings.get('llm_api_key_configured') else '填写 API Key')}"></label>
+                  <label>上下文 Token 上限<input name="llm_api_context_tokens" type="number" min="1024" max="1000000" value="{_esc(str(project_model_settings.get('llm_api_context_tokens') or ''))}" placeholder="例如 32768"></label>
+                  {('<label class="checkbox-line"><span>密钥管理</span><span><input name="clear_llm_api_key" type="checkbox" value="1"> 删除本知识库保存的 API Key</span></label>') if project_model_settings.get('llm_api_key_configured') else ''}
+                </div>
+              </section>
+              <section class="model-connection-card" data-connection-card="embedding">
+                <div class="model-connection-card-heading"><h3>Embedding</h3><span>向量化与检索</span></div>
+                <label>连接方式<select name="embedding_provider" data-provider-control="embedding" data-effective-provider="{_esc(str(project_model_settings.get('effective_embedding_provider') or 'ollama'))}">{_project_provider_options(str(project_model_settings.get('embedding_provider') or ''), str(project_model_settings.get('effective_embedding_provider') or 'ollama'))}</select></label>
+                <label data-model-select-field="embedding">本地模型<select name="embedding_model" data-model-field="embedding" data-local-models="{_esc(json.dumps([str(item.get('name') or '') for item in models if item.get('model_type') == 'embedding'], ensure_ascii=False))}">{_model_options(models, 'embedding', str(current.get('embedding_model') or ''))}</select></label>
+                <label data-model-input-field="embedding" hidden>API 模型名称<input name="embedding_model" data-model-field="embedding" value="{_esc(project_embedding_api_model_value if project_effective_embedding_provider == 'openai_compatible' else '')}" placeholder="例如 bge-m3、text-embedding-3-large" required></label>
+                <p class="connection-inherit-note" data-provider-inherit-note="embedding">当前跟随主页全局设置。若要只修改本知识库，请选择本地或 API。</p>
+                <div class="connection-fields" data-provider-fields="embedding" data-provider-kind="ollama" hidden>
+                  <label>Ollama 地址<input name="ollama_embedding_base_url" value="{_esc(project_model_settings.get('ollama_embedding_base_url') or '')}" placeholder="例如 http://127.0.0.1:11434"></label>
+                </div>
+                <div class="connection-fields" data-provider-fields="embedding" data-provider-kind="openai_compatible" hidden>
+                  <label>API 地址<input name="embedding_api_base_url" value="{_esc(project_model_settings.get('embedding_api_base_url') or '')}" placeholder="例如 https://api.example.com/v1"></label>
+                  <label>API Key<input name="embedding_api_key" type="password" autocomplete="new-password" placeholder="{_esc('已配置，留空保持不变' if project_model_settings.get('embedding_api_key_configured') else '填写 API Key')}"></label>
+                  <label>上下文 Token 上限<input name="embedding_api_context_tokens" type="number" min="1024" max="1000000" value="{_esc(str(project_model_settings.get('embedding_api_context_tokens') or ''))}" placeholder="例如 8192"></label>
+                  {('<label class="checkbox-line"><span>密钥管理</span><span><input name="clear_embedding_api_key" type="checkbox" value="1"> 删除本知识库保存的 API Key</span></label>') if project_model_settings.get('embedding_api_key_configured') else ''}
+                </div>
+              </section>
+            </div>
+          </details>"""
         settings_section = f"""
         <div class="workspace-settings"><div class="section-heading"><div><h2>知识库设置</h2>
-          <p>设置当前知识库使用的模型、知识语言与上下文预算；不会修改 Ollama 全局上下文。</p></div>
+          <p>设置当前知识库使用的模型、知识语言与上下文预算；只对当前知识库生效，不修改主页全局默认设置。</p></div>
           <button id="sync-models" class="icon-button refresh-button" type="button"
             title="从 Ollama 同步可用模型" aria-label="从 Ollama 同步可用模型">↻</button></div>
         <p id="model-sync-status" class="model-sync-status" role="status" hidden></p>
         <form id="project-settings-form" method="post" action="/projects/{current['id']}/models" class="form-grid compact">
-          <label>LLM<select name="llm_model">{_model_options(models,'llm',current.get('llm_model') or '')}</select></label>
-          <label>Embedding<select name="embedding_model">{_model_options(models,'embedding',current.get('embedding_model') or '')}</select></label>
           <label>知识语言<select name="knowledge_language" required
             data-original-value="{_esc(current.get('knowledge_language') or DOCUMENT_LANGUAGE)}">{_knowledge_language_options(str(current.get('knowledge_language') or DOCUMENT_LANGUAGE))}</select>
             <small class="field-help">更改不会改写当前知识库或图谱，将从下一次知识构建生效。</small></label>
@@ -1803,6 +2051,7 @@ def render_page(
             <input name="model_max_tokens" type="number" min="1024" step="1" required value="{int(current.get('model_max_tokens') or 32768)}">
             <small id="model-token-limit-hint" class="field-help">正在读取当前 LLM 的上下文上限...</small></label>
           {chunk_setting}
+          {project_api_settings}
           <div class="form-actions"><button class="button primary" type="submit">保存知识库设置</button></div></form>
         {processing_options}</div>"""
     job_hidden = "" if active_job_id else " hidden"
@@ -1851,10 +2100,11 @@ def render_page(
     <body class="workspace-body"><main class="shell workspace-shell">
     <header class="workspace-brand-header"><a class="brand-link" href="/" aria-label="返回知识库首页"><h1>Knowledge Forge</h1>
       <p>通用知识库与知识图谱构建平台</p></a>
-      <nav class="workspace-global-nav" aria-label="全局功能">
-        <a class="button secondary is-current" href="/#knowledge-bases" aria-current="page">知识库</a>
+      <div class="header-tools"><nav class="workspace-global-nav" aria-label="全局功能">
+        <a class="button secondary is-current" href="/?open=knowledge-bases" aria-current="page">知识库</a>
         <a class="button secondary" href="/chat">智能问答</a>
-      </nav></header>{notice}
+      </nav><a class="icon-button utility-settings-button" href="/?open=settings"
+        title="系统设置" aria-label="打开系统设置">⚙</a></div></header>{notice}
     <div class="workspace-layout">
       <aside class="workspace-sidebar" aria-label="知识库工作区导航">
         <div class="workspace-project-summary"><div class="workspace-project-title">
@@ -2694,6 +2944,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._json(200, SERVICE.project_token_limits(
                     params.get("llm_model", [""])[0],
                     params.get("embedding_model", [""])[0],
+                    project_id=(int(params["project"][0]) if params.get("project", [""])[0].isdigit() else None),
                 ))
             except Exception as exc:
                 self._json(400, {"error": str(exc)})
@@ -2796,6 +3047,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     int(project["id"]),
                 )
                 return
+            if parsed.path == "/settings/global":
+                data = self._form()
+                try:
+                    SERVICE.update_global_model_settings(data)
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    self._redirect(
+                        f"/?open=settings&kind=error&message={quote(str(exc))}",
+                    )
+                    return
+                self._redirect(
+                    "/?open=settings&kind=ok&message="
+                    + quote("全局默认设置已保存；已有知识库设置未改变"),
+                )
+                return
             match = re.fullmatch(r"/projects/(\d+)/strategy", parsed.path)
             if match:
                 data = self._form()
@@ -2815,7 +3080,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 data = self._form(); project = SERVICE.update_project_settings(
                     project_id, data.get("llm_model", ""), data.get("embedding_model", ""),
                     int(data.get("model_max_tokens", "0")), int(data.get("chunk_max_tokens", "0")),
-                    data.get("knowledge_language"))
+                    data.get("knowledge_language"), model_connection=data)
                 strategy_key = SERVICE._assert_project_strategy(int(project["id"]))
                 self._redirect(
                     _workspace_path(int(project["id"]), strategy_key)
@@ -3101,13 +3366,23 @@ CSS = r"""
 @media(max-width:440px){.hero-points{grid-template-columns:repeat(2,minmax(0,1fr))}.hero-points div{min-height:104px}.hero-points span{font-size:11.5px}.product-entry-card{grid-template-columns:42px minmax(0,1fr);gap:12px}.product-entry-index{width:40px;height:40px}.product-entry-heading{align-items:flex-start;flex-direction:column}.strategy-summary-list li{grid-template-columns:45px minmax(0,1fr)}}
 
 /* Full-surface refresh: chat, process artifacts, dialogs and result views. */
+.native-config-note{display:flex;flex-direction:column;align-items:stretch;gap:7px;padding:0;border:0;border-radius:0;background:transparent;color:#354963;font-size:14px}
+.native-config-label{display:block;color:#354963}
+.native-config-value{display:block;min-height:40px;padding:9px 10px;border:1px solid #bfd0e2;border-radius:6px;background:#fff;color:#5d7088;font-size:13px;line-height:1.5}
 .workspace-settings #project-settings-form{grid-template-columns:repeat(3,minmax(220px,1fr));align-items:start;gap:17px 18px;max-width:none;margin-top:22px;padding:22px}
 .workspace-settings #project-settings-form>label{min-width:0}
+.workspace-settings #project-settings-form>.project-api-settings{grid-column:1/-1;min-width:0;margin-top:2px;padding:15px 16px;border:1px solid #d7e3ee;border-radius:10px;background:#f7faff}
+.project-api-settings>summary{cursor:pointer;color:#274e76;font-size:14px;font-weight:800}
+.project-api-settings[open]>summary{margin-bottom:8px}
+.project-api-help{max-width:900px;margin:0 0 13px;line-height:1.6}
+.project-api-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:14px 17px}
+.project-api-grid label{min-width:0}
+.project-api-grid .checkbox-line{align-self:end;min-height:40px}
 .workspace-settings #project-settings-form>.native-config-note{grid-column:span 2;min-height:82px}
 .workspace-settings #project-settings-form>.form-actions{grid-column:1/-1;margin-top:3px;padding-top:17px;border-top:1px solid #e0e8f0}
 .workspace-settings .settings-processing-options{padding:19px 20px;background:#f7faff}
 .workspace-settings .settings-processing-options .form-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;max-width:none;margin:0;padding:0;border:0;border-radius:0;background:transparent}
-.workspace-settings .settings-processing-options .native-config-note{min-height:0;justify-content:center;background:rgba(255,255,255,.72)}
+.workspace-settings .settings-processing-options .native-config-note{min-height:0;justify-content:flex-start;background:transparent}
 .workspace-settings .settings-processing-options>.muted{margin:13px 0 0;padding-top:12px;border-top:1px solid #dfe8f1}
 .status-page{display:grid;grid-template-columns:180px minmax(0,1fr);align-items:center;gap:36px;min-height:430px;padding:48px;background:linear-gradient(135deg,#fff 0%,#f7fbff 64%,#edf5fc 100%)}
 .status-page-code{display:grid;place-items:center;width:160px;height:160px;border:1px solid #cbddec;border-radius:36px;background:rgba(255,255,255,.82);box-shadow:0 14px 32px rgba(35,85,133,.08);color:#347cc6;font-size:46px;font-weight:850;letter-spacing:-.04em}
@@ -3331,6 +3606,7 @@ dialog:not(.graph-evidence-modal)>.job-log-error{margin:16px 20px 0}
 @media(max-width:1180px){
   .workspace-settings #project-settings-form{grid-template-columns:repeat(2,minmax(0,1fr))}
   .workspace-settings #project-settings-form>.native-config-note{grid-column:1/-1}
+  .project-api-grid{grid-template-columns:1fr}
 }
 @media(max-width:760px){
   .agent-heading{align-items:flex-start;flex-direction:column;padding:21px 18px}
@@ -3407,6 +3683,39 @@ dialog:not(.graph-evidence-modal)>.job-log-error{margin:16px 20px 0}
   .artifact-table .artifact-empty-row td{display:block;padding:22px}
   .artifact-table .artifact-empty-row td::before{content:none}
 }
+.header-tools{display:flex;align-items:center;gap:10px}.utility-settings-button{display:grid;place-items:center;width:36px;height:36px;padding:0;border:1px solid #c8d8e8;border-radius:9px;background:#fff;color:#49657f;font-size:19px;line-height:1;box-shadow:0 5px 14px rgba(31,64,99,.06)}.utility-settings-button:hover{border-color:#9fc1e2;background:#f3f8fd;color:#1769c2}
+[hidden]{display:none!important}
+.global-settings-dialog{width:min(960px,calc(100% - 28px));height:min(90vh,920px);max-height:min(90vh,920px);overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.global-settings-dialog .dialog-heading{align-items:flex-start;margin-bottom:2px}
+.global-settings-form{grid-template-columns:repeat(2,minmax(0,1fr));max-width:none;gap:15px 18px;margin-top:18px;padding:20px;border:1px solid #dbe5ee;border-radius:11px;background:#fafcff}
+.global-settings-section{padding:0 0 8px;border-bottom:1px solid #dfe8f1}
+.global-model-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:15px 18px}
+.global-model-settings-heading{margin-bottom:0}
+.global-settings-section h3{margin:0;color:#25496d;font-size:15px}
+.global-settings-section p{margin-top:4px;font-size:12px}
+.global-settings-footnote{padding:10px 12px;border-left:3px solid #7da8d4;background:#f3f8fd;color:#55708b;font-size:12px;line-height:1.55}
+.global-model-connection-card{display:grid;align-self:start;align-content:start;gap:13px;padding:15px 16px;border:1px solid #d7e3ee;border-radius:9px;background:#f7faff}
+.global-model-connection-card>label:first-child{max-width:430px}
+.model-connection-card{display:grid;align-self:start;align-content:start;gap:12px;padding:14px 15px;border:1px solid #d7e3ee;border-radius:9px;background:#fff}
+.model-connection-card-heading{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding-bottom:8px;border-bottom:1px solid #e5ecf3}
+.model-connection-card-heading h3{margin:0;color:#25496d;font-size:15px}
+.model-connection-card-heading span{color:#7a8da1;font-size:11px}
+.connection-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 15px}
+.connection-fields[hidden],.connection-inherit-note[hidden]{display:none!important}
+.connection-inherit-note{margin:0;padding:9px 10px;border-left:3px solid #8bb4d8;background:#f4f9fd;color:#5e7690;font-size:12px;line-height:1.5}
+.checkbox-line{justify-content:flex-start;gap:7px}
+.checkbox-line>span:last-child{display:flex;align-items:center;gap:6px;color:#637891;font-size:12px}
+.checkbox-line input{width:auto;margin:0}
+@media(max-width:760px){.global-settings-form{grid-template-columns:1fr;padding:15px}.global-settings-dialog{padding:16px}.global-settings-form .form-actions{align-items:stretch;flex-direction:column}.global-settings-form .form-actions .button{width:100%}.global-model-settings{grid-template-columns:1fr}.connection-fields{grid-template-columns:1fr}.model-connection-card,.global-model-connection-card{padding:13px}}
+@media(max-width:760px){.header-tools{width:100%;justify-content:space-between}.header-tools .home-primary-actions,.header-tools .workspace-global-nav{flex:1}.header-tools .utility-settings-button{flex:0 0 36px}}
+
+/* Primary areas are independent entries, not a mutually exclusive segmented control. */
+.home-primary-actions{padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+.home-primary-actions .button{border-color:#c4d2e1;border-radius:8px;box-shadow:0 4px 12px rgba(31,64,99,.06)}
+.home-primary-actions .button.secondary{background:#fff}
+.workspace-global-nav{gap:10px;padding:0;border:0;border-radius:0;background:transparent}
+.workspace-global-nav .button{border-color:#c4d2e1;border-radius:8px;background:#fff;box-shadow:0 4px 12px rgba(31,64,99,.06)}
+.workspace-global-nav .button.is-current{border-color:#9fc1e2;background:#e8f2fc;color:#185fa8}
 """
 
 SCRIPT = r"""
@@ -3503,17 +3812,31 @@ const createDialog=document.querySelector('#create-project-dialog');
 document.querySelector('#open-create-project')?.addEventListener('click',()=>createDialog?.showModal());
 document.querySelectorAll('[data-close-create-project]').forEach(button=>button.addEventListener('click',()=>createDialog?.close()));
 createDialog?.addEventListener('click',event=>{if(event.target===createDialog)createDialog.close()});
-const settingsForm=document.querySelector('#project-settings-form'),llmSelect=settingsForm?.querySelector('select[name="llm_model"]'),embeddingSelect=settingsForm?.querySelector('select[name="embedding_model"]'),knowledgeLanguageSelect=settingsForm?.querySelector('select[name="knowledge_language"]'),modelTokenInput=settingsForm?.querySelector('input[name="model_max_tokens"]'),chunkTokenInput=settingsForm?.querySelector('input[name="chunk_max_tokens"]'),modelTokenHint=document.querySelector('#model-token-limit-hint'),chunkTokenHint=document.querySelector('#chunk-token-limit-hint');
-settingsForm?.addEventListener('submit',event=>{{
+const settingsForm=document.querySelector('#project-settings-form'),llmSelect=settingsForm?.querySelector('select[data-model-field="llm"]'),embeddingSelect=settingsForm?.querySelector('select[data-model-field="embedding"]'),llmInput=settingsForm?.querySelector('input[data-model-field="llm"]'),embeddingInput=settingsForm?.querySelector('input[data-model-field="embedding"]'),knowledgeLanguageSelect=settingsForm?.querySelector('select[name="knowledge_language"]'),modelTokenInput=settingsForm?.querySelector('input[name="model_max_tokens"]'),chunkTokenInput=settingsForm?.querySelector('input[name="chunk_max_tokens"]'),modelTokenHint=document.querySelector('#model-token-limit-hint'),chunkTokenHint=document.querySelector('#chunk-token-limit-hint');
+function activeProjectModelField(kind){return settingsForm?.querySelector('[data-model-field="'+kind+'"]:not([disabled])')}
+function updateProjectModelFields(control){
+  const card=control.closest('[data-connection-card]');if(!card)return;
+  const kind=control.dataset.providerControl||'',mode=String(control.value||control.dataset.effectiveProvider||'ollama'),isApi=mode==='openai_compatible';
+  card.querySelectorAll('[data-provider-fields]').forEach(fields=>{fields.hidden=fields.dataset.providerKind!==mode});
+  const note=card.querySelector('[data-provider-inherit-note]');if(note)note.hidden=Boolean(control.value);
+  const localField=card.querySelector('[data-model-select-field="'+kind+'"]'),apiField=card.querySelector('[data-model-input-field="'+kind+'"]');
+  const localSelect=localField?.querySelector('[data-model-field]'),apiInput=apiField?.querySelector('[data-model-field]');
+  if(localField)localField.hidden=isApi;if(apiField)apiField.hidden=!isApi;
+  if(localSelect)localSelect.disabled=isApi;if(apiInput)apiInput.disabled=!isApi;
+}
+document.querySelectorAll('#project-settings-form [data-provider-control]').forEach(control=>{
+  control.addEventListener('change',()=>updateProjectModelFields(control));updateProjectModelFields(control);
+});
+settingsForm?.addEventListener('submit',event=>{
   if(!knowledgeLanguageSelect||knowledgeLanguageSelect.value===knowledgeLanguageSelect.dataset.originalValue)return;
   if(!confirm('知识语言更改后不会改写当前知识库或图谱，将从下一次知识构建生效。是否保存？'))event.preventDefault();
-}});
+});
 let tokenLimits=null;
 function applyTokenLimits(clamp=false){if(!tokenLimits||!modelTokenInput||!chunkTokenInput)return;const llmMax=Number(tokenLimits.llm_context_max),embeddingMax=Number(tokenLimits.embedding_context_max);modelTokenInput.max=String(llmMax);if(clamp&&Number(modelTokenInput.value)>llmMax)modelTokenInput.value=String(llmMax);const chunkMax=Math.min(Number(modelTokenInput.value)||llmMax,llmMax,embeddingMax);chunkTokenInput.max=String(chunkMax);if(clamp&&Number(chunkTokenInput.value)>chunkMax)chunkTokenInput.value=String(chunkMax);if(modelTokenHint){modelTokenHint.textContent='当前 LLM 支持的最大上下文：'+llmMax.toLocaleString()+' Token';modelTokenHint.classList.remove('failure')}if(chunkTokenHint){chunkTokenHint.textContent='当前模型组合允许的最大切片：'+chunkMax.toLocaleString()+' Token（Embedding 上限 '+embeddingMax.toLocaleString()+'）';chunkTokenHint.classList.remove('failure')}}
-async function refreshTokenLimits(clamp=false){if(!llmSelect||!embeddingSelect)return;if(modelTokenHint)modelTokenHint.textContent='正在读取当前 LLM 的上下文上限...';if(chunkTokenHint)chunkTokenHint.textContent='正在读取 LLM 与 Embedding 的共同上限...';try{const query=new URLSearchParams({llm_model:llmSelect.value,embedding_model:embeddingSelect.value});const response=await fetch('/api/models/limits?'+query),data=await response.json();if(!response.ok)throw new Error(data.error||'模型上限读取失败');tokenLimits=data;applyTokenLimits(clamp)}catch(error){if(modelTokenHint){modelTokenHint.textContent=error.message||'模型上限读取失败';modelTokenHint.classList.add('failure')}if(chunkTokenHint){chunkTokenHint.textContent='请确认当前模型提供方可用'}}}
+async function refreshTokenLimits(clamp=false){const llmField=activeProjectModelField('llm'),embeddingField=activeProjectModelField('embedding');if(!llmField||!embeddingField)return;if(modelTokenHint)modelTokenHint.textContent='正在读取当前 LLM 的上下文上限...';if(chunkTokenHint)chunkTokenHint.textContent='正在读取 LLM 与 Embedding 的共同上限...';try{const query=new URLSearchParams({llm_model:llmField.value,embedding_model:embeddingField.value,project:String(window.KF.projectId||'')});const response=await fetch('/api/models/limits?'+query),data=await response.json();if(!response.ok)throw new Error(data.error||'模型上限读取失败');tokenLimits=data;applyTokenLimits(clamp)}catch(error){if(modelTokenHint){modelTokenHint.textContent=error.message||'模型上限读取失败';modelTokenHint.classList.add('failure')}if(chunkTokenHint){chunkTokenHint.textContent='请确认当前模型提供方可用'}}}
 function replaceModelOptions(select,models,kind){if(!select)return;const current=select.value,names=models.filter(model=>model.model_type===kind).map(model=>model.name);if(current&&!names.includes(current))names.unshift(current);select.replaceChildren(...names.map(name=>new Option(name,name,name===current,name===current)))}
 document.querySelector('#sync-models')?.addEventListener('click',async e=>{const button=e.currentTarget,status=document.querySelector('#model-sync-status');button.disabled=true;if(status){status.hidden=true;status.className='model-sync-status'}try{const r=await fetch('/api/models/sync',{method:'POST'}),d=await r.json();if(!r.ok)throw new Error(d.error||'同步失败');replaceModelOptions(llmSelect,d.models||[],'llm');replaceModelOptions(embeddingSelect,d.models||[],'embedding');await refreshTokenLimits(true);if(status){status.textContent='已同步 '+d.count+' 个当前提供方模型';status.classList.add('success');status.hidden=false}}catch(error){if(status){status.textContent=error.message||'同步失败';status.classList.add('failure');status.hidden=false}}finally{button.disabled=false}});
-llmSelect?.addEventListener('change',()=>refreshTokenLimits(true));embeddingSelect?.addEventListener('change',()=>refreshTokenLimits(true));modelTokenInput?.addEventListener('input',()=>applyTokenLimits(true));
+llmSelect?.addEventListener('change',()=>refreshTokenLimits(true));embeddingSelect?.addEventListener('change',()=>refreshTokenLimits(true));llmInput?.addEventListener('input',()=>refreshTokenLimits(true));embeddingInput?.addEventListener('input',()=>refreshTokenLimits(true));modelTokenInput?.addEventListener('input',()=>applyTokenLimits(true));
 const workspaceViews=new Set(['documents','build','query','settings']);
 const workspaceNavigation=[...document.querySelectorAll('[data-workspace-target]')];
 const workspacePanels=[...document.querySelectorAll('[data-workspace-panel]')];

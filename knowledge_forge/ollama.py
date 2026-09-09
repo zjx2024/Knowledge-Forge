@@ -94,6 +94,8 @@ class OllamaClient:
         embedding_api_key: str | None = None,
         llm_api_models: Iterable[str] | None = None,
         embedding_api_models: Iterable[str] | None = None,
+        llm_api_context_tokens: int | None = None,
+        embedding_api_context_tokens: int | None = None,
     ):
         self.base_url = (base_url or Config.ollama_base_url).rstrip("/")
         self.embedding_base_url = (
@@ -129,6 +131,20 @@ class OllamaClient:
                 Config.embedding_api_models
                 if embedding_api_models is None else embedding_api_models
             ) if str(item).strip()
+        )
+        self.llm_api_context_tokens = max(
+            1024,
+            int(
+                Config.llm_api_context_tokens
+                if llm_api_context_tokens is None else llm_api_context_tokens
+            ),
+        )
+        self.embedding_api_context_tokens = max(
+            1024,
+            int(
+                Config.embedding_api_context_tokens
+                if embedding_api_context_tokens is None else embedding_api_context_tokens
+            ),
         )
         self.last_call_diagnostics: OllamaCallDiagnostics | None = None
         self.last_raw_response_text = ""
@@ -231,8 +247,8 @@ class OllamaClient:
         resolved_type = model_type or self._infer_model_type(model)
         if self.provider_for(resolved_type) == "openai_compatible":
             configured = (
-                Config.llm_api_context_tokens
-                if resolved_type == "llm" else Config.embedding_api_context_tokens
+                self.llm_api_context_tokens
+                if resolved_type == "llm" else self.embedding_api_context_tokens
             )
             base = self._openai_base_url(
                 self.base_url_for(resolved_type), model_type=resolved_type

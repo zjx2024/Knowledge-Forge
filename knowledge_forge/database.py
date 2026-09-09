@@ -13,7 +13,7 @@ from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 import psycopg
 from psycopg import sql
@@ -644,6 +644,18 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS graph_policy_hash TEXT NOT NULL DE
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS active_policy_hash TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS model_max_tokens INTEGER NOT NULL DEFAULT 32768;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS chunk_max_tokens INTEGER NOT NULL DEFAULT 512;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_provider TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS ollama_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS ollama_embedding_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_models TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS llm_api_context_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_base_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_models TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS embedding_api_context_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS requested_parser TEXT NOT NULL DEFAULT 'auto';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS requested_chunk_strategy TEXT NOT NULL DEFAULT 'auto';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS effective_parser TEXT;
@@ -1308,13 +1320,70 @@ class Database:
 
     @staticmethod
     def _seed_settings(conn: psycopg.Connection) -> None:
-        defaults = {"ollama_base_url": Config.ollama_base_url, "hugegraph_graph": Config.hugegraph_graph}
+        defaults = {
+            "ollama_base_url": Config.ollama_base_url,
+            "hugegraph_graph": Config.hugegraph_graph,
+            # These are persisted defaults, not project overrides.  INSERT
+            # ... DO NOTHING keeps an operator's saved values when the
+            # service restarts or the deployment environment changes.
+            "global_default_llm_model": Config.default_llm_model,
+            "global_default_embedding_model": Config.default_embedding_model,
+            "global_llm_provider": Config.llm_provider,
+            "global_embedding_provider": Config.embedding_provider,
+            "global_ollama_base_url": Config.ollama_base_url,
+            "global_ollama_embedding_base_url": Config.ollama_embedding_base_url,
+            "global_llm_api_base_url": Config.llm_api_base_url,
+            "global_llm_api_key": Config.llm_api_key,
+            "global_llm_api_models": ",".join(Config.llm_api_models),
+            "global_llm_api_context_tokens": str(Config.llm_api_context_tokens),
+            "global_embedding_api_base_url": Config.embedding_api_base_url,
+            "global_embedding_api_key": Config.embedding_api_key,
+            "global_embedding_api_models": ",".join(Config.embedding_api_models),
+            "global_embedding_api_context_tokens": str(Config.embedding_api_context_tokens),
+        }
         for key, value in defaults.items():
             conn.execute("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING", (key, value))
         conn.execute(
             """INSERT INTO settings(key,value) VALUES('vector_backend','pgvector-hnsw')
             ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()"""
         )
+
+    def get_settings(self, prefix: str = "") -> dict[str, str]:
+        """Read persisted runtime settings, optionally limited by key prefix."""
+
+        with self.connection() as conn:
+            if prefix:
+                rows = conn.execute(
+                    "SELECT key,value FROM settings WHERE key LIKE %s ORDER BY key",
+                    (f"{prefix}%",),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT key,value FROM settings ORDER BY key",
+                ).fetchall()
+        return {
+            str(row["key"]): str(row.get("value") or "")
+            for row in rows
+        }
+
+    def set_settings(self, values: Mapping[str, object]) -> dict[str, str]:
+        """Persist a bounded settings update and return the stored values."""
+
+        normalized = {
+            str(key): str(value if value is not None else "")
+            for key, value in values.items()
+            if str(key).strip()
+        }
+        if not normalized:
+            return {}
+        with self.connection() as conn:
+            for key, value in normalized.items():
+                conn.execute(
+                    """INSERT INTO settings(key,value) VALUES(%s,%s)
+                    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()""",
+                    (key, value),
+                )
+        return normalized
 
     def list_models(self) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -1441,6 +1510,10 @@ class Database:
 
     def update_project(self, project_id: int, **values: Any) -> dict[str, Any]:
         allowed = {"llm_model", "embedding_model", "model_max_tokens", "chunk_max_tokens",
+                   "llm_provider", "embedding_provider", "ollama_base_url",
+                   "ollama_embedding_base_url", "llm_api_base_url", "llm_api_key",
+                   "llm_api_models", "llm_api_context_tokens", "embedding_api_base_url",
+                   "embedding_api_key", "embedding_api_models", "embedding_api_context_tokens",
                    "knowledge_language",
                    "schema_status", "active_schema_version", "graph_status",
                    "graph_policy_version", "graph_policy_hash", "graph_error", "metadata", "status"}

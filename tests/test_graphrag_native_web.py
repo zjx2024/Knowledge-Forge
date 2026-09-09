@@ -1149,6 +1149,22 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert "创建知识库" in page
     assert ">知识库</button>" in page
     assert '<a class="button secondary" href="/chat">智能问答</a>' in page
+    assert '<a class="icon-button utility-settings-button" href="/?open=settings"' in page
+    assert '<a class="button secondary" href="/?open=settings">设置</a>' not in page
+    assert 'id="global-settings-dialog"' in page
+    assert 'name="llm_api_base_url"' in page
+    assert 'name="llm_api_key"' in page
+    assert 'name="embedding_api_base_url"' in page
+    assert 'name="default_llm_model"' in page
+    assert 'name="default_embedding_model"' in page
+    assert 'data-model-select-field="llm"' in page
+    assert 'data-model-input-field="llm"' in page
+    assert 'data-model-select-field="embedding"' in page
+    assert 'data-model-input-field="embedding"' in page
+    assert "[hidden]{display:none!important}" in web.CSS
+    assert 'API 模型列表' not in page
+    assert 'API 模型名称' in page
+    assert "保存不会改写已有知识库的模型、语言、Token 上限或构建结果" in page
     assert 'name="strategy_key"' in page
     assert 'name="knowledge_language"' in page
     assert '<option value="zh" selected>中文</option>' in page
@@ -1198,6 +1214,115 @@ def test_common_home_owns_creation_and_routes_bound_project_to_native_workspace(
     assert '<section class="panel project-list-panel"' not in page
 
 
+def test_home_global_settings_entry_and_save_use_public_http_route(monkeypatch):
+    service = _Service()
+    service.global_model_settings = lambda: {
+        "default_llm_model": "local-llm",
+        "default_embedding_model": "local-embedding",
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "ollama_base_url": "http://127.0.0.1:11434",
+        "ollama_embedding_base_url": "http://127.0.0.1:11434",
+        "llm_api_base_url": "",
+        "llm_api_models": (),
+        "llm_api_context_tokens": 32768,
+        "embedding_api_base_url": "",
+        "embedding_api_models": (),
+        "embedding_api_context_tokens": 8192,
+        "llm_api_key_configured": False,
+        "embedding_api_key_configured": False,
+    }
+    captured = {}
+    service.update_global_model_settings = lambda data: captured.update(data) or {}
+    monkeypatch.setattr(web, "SERVICE", service)
+    server = web.ThreadingHTTPServer(("127.0.0.1", 0), web.AppHandler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urlopen(base + "/?open=settings", timeout=3) as response:
+            page = response.read().decode("utf-8")
+        assert response.status == 200
+        assert 'id="global-settings-dialog"' in page
+        assert 'name="llm_api_key"' in page
+        assert 'name="clear_llm_api_key"' not in page
+
+        form = {
+            "default_llm_model": "api-chat",
+            "default_embedding_model": "api-embed",
+            "llm_provider": "openai_compatible",
+            "embedding_provider": "ollama",
+            "ollama_base_url": "http://127.0.0.1:11434",
+            "ollama_embedding_base_url": "http://127.0.0.1:11434",
+            "llm_api_base_url": "https://llm.example.test",
+            "llm_api_models": "api-chat",
+            "llm_api_context_tokens": "32768",
+            "embedding_api_base_url": "",
+            "embedding_api_models": "",
+            "embedding_api_context_tokens": "8192",
+        }
+        request = Request(
+            base + "/settings/global",
+            data=urlencode(form).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urlopen(request, timeout=3) as response:
+            redirected_page = response.read().decode("utf-8")
+        assert response.status == 200
+        assert captured["default_llm_model"] == "api-chat"
+        assert captured["llm_provider"] == "openai_compatible"
+        assert "全局默认设置已保存" in redirected_page
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=3)
+
+
+def test_global_model_settings_update_reconfigures_provider_without_project_fields():
+    class SettingsDatabase:
+        def __init__(self):
+            self.values = {
+                "global_default_llm_model": "old-llm",
+                "global_default_embedding_model": "old-embedding",
+                "global_llm_provider": "ollama",
+                "global_embedding_provider": "ollama",
+                "global_ollama_base_url": "http://127.0.0.1:11434",
+                "global_ollama_embedding_base_url": "http://127.0.0.1:11434",
+                "global_llm_api_context_tokens": "32768",
+                "global_embedding_api_context_tokens": "8192",
+            }
+
+        def get_settings(self, prefix=""):
+            return {key: value for key, value in self.values.items() if key.startswith(prefix)}
+
+        def set_settings(self, values):
+            self.values.update(values)
+
+    service = object.__new__(KnowledgeForgeService)
+    service.db = SettingsDatabase()
+    result = service.update_global_model_settings({
+        "default_llm_model": "remote-chat",
+        "default_embedding_model": "old-embedding",
+        "llm_provider": "openai_compatible",
+        "embedding_provider": "ollama",
+        "ollama_base_url": "http://127.0.0.1:11434",
+        "ollama_embedding_base_url": "http://127.0.0.1:11434",
+        "llm_api_base_url": "https://llm.example.test",
+        "llm_api_context_tokens": "65536",
+        "embedding_api_base_url": "",
+        "embedding_api_models": "",
+        "embedding_api_context_tokens": "8192",
+    })
+    assert result["default_llm_model"] == "remote-chat"
+    assert result["llm_api_key_configured"] is False
+    assert service.ollama.provider_for("llm") == "openai_compatible"
+    assert service.ollama.llm_api_base_url == "https://llm.example.test"
+    assert service.ollama.llm_api_context_tokens == 65536
+    assert service.db.values["global_llm_api_models"] == "remote-chat"
+    assert service.db.values["global_default_embedding_model"] == "old-embedding"
+
+
 def test_chat_entry_is_top_level_and_uses_an_explicit_single_knowledge_base(monkeypatch):
     monkeypatch.setattr(web, "SERVICE", _Service())
 
@@ -1214,7 +1339,8 @@ def test_chat_entry_is_top_level_and_uses_an_explicit_single_knowledge_base(monk
     assert "EventSource" in page
     assert "自动选择知识库" not in page
     assert ".agent-layout{" in web.CSS
-    assert '<a class="button secondary" href="/#knowledge-bases">知识库</a>' in page
+    assert '<a class="brand-link" href="/" aria-label="返回知识库首页">' in page
+    assert '<a class="button secondary" href="/?open=knowledge-bases">知识库</a>' in page
     assert '<a class="button primary" href="/chat" aria-current="page">智能问答</a>' in page
     assert 'name="project_id"' not in page
     assert 'window.KF.projectId' not in page
@@ -1231,7 +1357,7 @@ def test_human_facing_status_page_uses_the_common_product_shell():
     assert '<span class="status-page-code">404</span>' in page
     assert "页面不存在" in page
     assert "页面状态" not in page
-    assert 'href="/#knowledge-bases"' in page
+    assert 'href="/?open=knowledge-bases"' in page
     assert ".status-page{" in web.CSS
 
 
@@ -1247,7 +1373,7 @@ def test_new_project_form_defaults_to_qwen36(monkeypatch):
 
     page = web.render_home_page()
     options = re.search(
-        r'<select name="llm_model">(.*?)</select>', page,
+        r'<select name="llm_model"[^>]*>(.*?)</select>', page,
     )
 
     assert options is not None

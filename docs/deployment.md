@@ -147,6 +147,15 @@ DEFAULT_EMBEDDING_MODEL=<embedding-model-name>
 
 如果两个模型由同一个网关提供，可以把两个 Base URL 和 Key 填成相同值。`LLM_API_MODELS` 和 `EMBEDDING_API_MODELS` 是逗号分隔的模型名；它们用于项目创建页面，不依赖远端实现 `/v1/models`。首次进入页面也能看到配置的模型，点击同步按钮会把当前提供方模型写入 PostgreSQL。
 
+服务启动后，也可以在主页右上角打开“设置”维护相同的提供方、API 地址、模型列表、上下文
+上限和默认模型。主页设置写入 PostgreSQL 的全局 `settings` 表：默认模型只在新建知识库时
+作为初始值，已有知识库的模型、语言、上下文预算和构建结果不会被改写。知识库设置页还可
+配置当前知识库专用的提供方、API 地址、Key、模型列表、Ollama 地址和上下文上限；留空的
+项目字段继承主页全局设置，填写后的项目字段只作用于当前知识库。后台任务会在项目作用域
+内建立对应模型连接，不会通过修改全局客户端影响其他知识库。API Key 不会回显到
+页面；密码框留空表示保留当前 Key，勾选清除选项才会删除。若 LLM 和 Embedding 都使用远程
+API，则本地 Ollama 地址可以留空；选择本地 Ollama 的通道时，才需要填写对应地址。
+
 API 模式下，Knowledge Forge 仍执行相同的结构化 JSON 校验、必填字段校验、失败重试和引用门禁；API 的 `response_format` 只负责 JSON 形状，不能替代服务端 Schema 校验。图片分析要求 LLM 端支持 OpenAI 图片消息格式；不支持视觉输入的 API 只能处理文本。
 
 GraphRAG Native 也读取这两个 API 通道，并将 completion 和 embedding 地址分别写入隔离 run 的 settings。若两个远程服务使用不同 Key，应用会分别注入 `GRAPHRAG_API_KEY` 与 `GRAPHRAG_EMBEDDING_API_KEY`；密钥不会写入 settings 文件。
