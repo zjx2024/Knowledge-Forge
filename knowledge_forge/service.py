@@ -397,8 +397,11 @@ def _model_scoped_worker(*, subject: str = "document") -> Callable:
                 if not document:
                     raise LookupError("文档不存在")
                 project_id = int(document["project_id"])
+            # ``worker`` is the undecorated function; bind it to the service
+            # instance so ``_run_project_scoped`` can call it without the
+            # missing ``self`` argument.
             return service._run_project_scoped(
-                worker, project_id, job_id, subject_id, *args,
+                worker.__get__(service), project_id, job_id, subject_id, *args,
             )
 
         return wrapped
