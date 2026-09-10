@@ -191,7 +191,7 @@ flowchart LR
 
 - 项目名称和隔离键 <code>project_key</code>。
 - 构建策略，当前主要为 <code>knowledge_forge</code> 或 <code>graphrag_native</code>。
-- LLM 模型，默认 <code>qwen3.6:latest</code>。
+- LLM 模型，默认 <code>qwen3.8:27b</code>。
 - Embedding 模型，默认 <code>bge-m3:latest</code>。
 - 项目级模型上下文预算、chunk 上限和策略配置。
 
@@ -2972,7 +2972,7 @@ hard_negative_leak_rate =
 
 ### 23.8 当前端到端运行结果
 
-隔离项目通过公开构建入口、真实 <code>qwen3.6:latest</code> 和持久任务完成：
+隔离项目通过公开构建入口、真实 <code>qwen3.8:27b</code> 和持久任务完成：
 
 - 169 个实体；
 - 157 条发布关系；
@@ -3411,7 +3411,7 @@ Immutable Source
 
 | 配置 | 默认 |
 |---|---|
-| LLM | <code>qwen3.6:latest</code> |
+| LLM | <code>qwen3.8:27b</code> |
 | Embedding | <code>bge-m3:latest</code> |
 | 上传上限 | 200 MB |
 | 默认模型上下文预算 | 8192 |

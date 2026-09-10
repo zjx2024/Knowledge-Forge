@@ -100,12 +100,12 @@ pgvector 数据属于 PostgreSQL 业务数据，不存储在 HugeGraph 中。它
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl enable --now ollama
-ollama pull qwen3.6:latest
+ollama pull qwen3.8:27b
 ollama pull bge-m3:latest
 curl http://127.0.0.1:11434/api/tags
 ```
 
-`qwen3.6:latest` 用于 LLM，`bge-m3:latest` 用于 Embedding。Docker 中的应用通过 `host.docker.internal:11434` 访问宿主机 Ollama；本地虚拟环境则使用 `127.0.0.1:11434`。
+`qwen3.8:27b` 用于 LLM，`bge-m3:latest` 用于 Embedding。Docker 中的应用通过 `host.docker.internal:11434` 访问宿主机 Ollama；本地虚拟环境则使用 `127.0.0.1:11434`。
 
 如果 Ollama 与应用不在同一台机器，需要让 Ollama 监听可信局域网地址，并只在防火墙中允许应用机器访问。不要把未认证的 11434 端口暴露到公网。随后设置：
 
@@ -114,7 +114,7 @@ LLM_PROVIDER=ollama
 EMBEDDING_PROVIDER=ollama
 OLLAMA_BASE_URL=http://<ollama-host>:11434
 OLLAMA_EMBEDDING_BASE_URL=http://<ollama-host>:11434
-DEFAULT_LLM_MODEL=qwen3.6:latest
+DEFAULT_LLM_MODEL=qwen3.8:27b
 DEFAULT_EMBEDDING_MODEL=bge-m3:latest
 ```
 

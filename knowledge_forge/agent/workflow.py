@@ -1124,6 +1124,10 @@ class KnowledgeAgentWorkflow:
                         "问题不属于当前知识库范围"
                         if scope_decision.route == "out_of_scope"
                         else "当前知识库没有直接支持该问题的内容"
+                        if scope_decision.route == "unsupported" else
+                        "当前问题范围无法可靠确认"
+                        if scope_decision.route == "uncertain" else
+                        "模型服务暂时不可用，无法完成可靠的范围与回答判断"
                     )
                     sufficiency = replace(
                         sufficiency,
@@ -1209,7 +1213,7 @@ class KnowledgeAgentWorkflow:
                     effective_mode=(
                         "agent_capabilities"
                         if scope_decision.route == "agent_meta"
-                        else "out_of_scope"
+                        else scope_decision.route
                     ),
                     sufficiency=(
                         scope_response_sufficiency
@@ -1240,19 +1244,89 @@ class KnowledgeAgentWorkflow:
                 },
                 run_metadata=run_metadata,
             )
-            raw_answer = generate_answer(
-                ollama=self.ollama, project=project, query=query,
-                original_query=original_query,
-                selected=selected, sufficiency=sufficiency,
-                candidate_draft=candidate_draft,
-                cancel_check=lambda: self._cancelled(run_id),
-                context_budget_tokens=min(
-                    model_context_limit,
-                    evidence_token_budget + max_output_tokens
-                    + question_tokens + prompt_overhead_tokens,
-                ),
-                max_output_tokens=max_output_tokens,
-            )
+            try:
+                raw_answer = generate_answer(
+                    ollama=self.ollama, project=project, query=query,
+                    original_query=original_query,
+                    selected=selected, sufficiency=sufficiency,
+                    candidate_draft=candidate_draft,
+                    cancel_check=lambda: self._cancelled(run_id),
+                    context_budget_tokens=min(
+                        model_context_limit,
+                        evidence_token_budget + max_output_tokens
+                        + question_tokens + prompt_overhead_tokens,
+                    ),
+                    max_output_tokens=max_output_tokens,
+                )
+            except (AgentCancelled, OllamaCancelled, JobCancellationRequested):
+                raise
+            except Exception as exc:
+                # A transport/protocol/model failure is a service state, not
+                # evidence that the question is unsupported.  Publish a
+                # retryable, citation-free response so the UI and replay API
+                # expose the distinction consistently.
+                error_message = str(exc).strip()[:1000]
+                self.db.finish_agent_tool_call(
+                    active_tool,
+                    status="degraded",
+                    response_summary={
+                        "reason_code": "answer_service_unavailable",
+                        "component": "ollama",
+                    },
+                    error_message=error_message,
+                )
+                active_tool = ""
+                degraded_scope = QueryScopeDecision(
+                    route="service_degraded",
+                    confidence=0.0,
+                    method="answer_generation_service",
+                    reason_code="answer_service_unavailable",
+                    model_used=True,
+                    model_error=error_message,
+                    retryable=True,
+                    degraded_components=("ollama",),
+                )
+                degraded_sufficiency = replace(
+                    sufficiency,
+                    state="insufficient",
+                    reasons=tuple(dict.fromkeys((
+                        *sufficiency.reasons,
+                        "模型服务暂时不可用，未生成知识库事实回答",
+                    ))),
+                )
+                run_metadata["answer_scope"] = scope_decision.to_dict()
+                run_metadata["query_scope"] = degraded_scope.to_dict()
+                run_metadata["service_degraded"] = degraded_scope.to_dict()
+                self.db.update_agent_run(
+                    run_id,
+                    metadata=run_metadata,
+                    sufficiency=degraded_sufficiency.to_dict(),
+                )
+                self._stage(
+                    run_id, project_id, sequence, "answering",
+                    status="degraded",
+                    output_summary={
+                        "route": "service_degraded",
+                        "component": "ollama",
+                    },
+                    error=error_message,
+                )
+                adapter.assert_current(project_id, retrieval.snapshot_ref)
+                self._assert_active(run_id)
+                self._complete_scope_response(
+                    run_id=run_id,
+                    project_id=project_id,
+                    strategy=strategy,
+                    sequence=sequence,
+                    payload=scope_boundary_payload(
+                        project, original_query, route="service_degraded",
+                    ),
+                    scope=degraded_scope,
+                    effective_mode="service_degraded",
+                    sufficiency=degraded_sufficiency.to_dict(),
+                    run_metadata=run_metadata,
+                )
+                return
             if (
                 str(raw_answer.get("answerability") or "") == "insufficient"
                 and sufficiency.state != "insufficient"

@@ -258,6 +258,58 @@ def test_answer_steps_expose_expandable_safe_facts_without_hidden_reasoning():
     assert "NEVER_PUBLIC_REASONING" not in serialized
 
 
+def test_public_trace_explains_scope_uncertainty_and_service_degradation():
+    trace = build_public_execution_trace({
+        "status": "completed",
+        "stage": "completed",
+        "strategy_key": "knowledge_forge",
+        "query_scope": {},
+        "metadata": {
+            "query_scope": {
+                "route": "service_degraded",
+                "method": "service_degraded",
+                "reason_code": "scope_service_unavailable",
+                "confidence": 0.0,
+                "model_used": True,
+                "retryable": True,
+            },
+        },
+        "retrieval_summary": {"selected": 0},
+        "sufficiency": {"state": "insufficient", "score": 0.0},
+        "steps": [{
+            "sequence": 5,
+            "step_type": "checking_scope",
+            "status": "degraded",
+            "output_summary": {"route": "service_degraded"},
+            "started_at": "2026-08-31T10:00:00+00:00",
+            "completed_at": "2026-08-31T10:00:01+00:00",
+        }],
+        "tool_calls": [{
+            "id": "atc_" + "6" * 32,
+            "tool_name": "scope.evidence_alignment",
+            "status": "degraded",
+            "request_summary": {},
+            "response_summary": {
+                "route": "service_degraded",
+                "method": "service_degraded",
+            },
+            "started_at": "2026-08-31T10:00:00+00:00",
+            "completed_at": "2026-08-31T10:00:01+00:00",
+        }],
+    })
+
+    assert any(
+        item["title"] == "回答范围"
+        and "模型服务暂时不可用" in item["detail"]
+        for item in trace["decisions"]
+    )
+    scope_tool = next(
+        item for item in trace["items"]
+        if item["technical_name"] == "scope.evidence_alignment"
+    )
+    assert "范围判断模型暂时不可用" in scope_tool["detail"]
+
+
 def test_running_trace_has_current_stage_and_bounded_safe_fallback_text():
     trace = build_public_execution_trace({
         "status": "running",

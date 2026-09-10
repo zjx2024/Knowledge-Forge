@@ -94,7 +94,7 @@ DOCLING_NUM_THREADS=4
 默认模型为：
 
 ```text
-LLM: qwen3.6:latest
+LLM: qwen3.8:27b
 Embedding: bge-m3:latest
 ```
 
@@ -587,7 +587,7 @@ POST   /api/agent/runs/{run_id}/feedback
 GET    /api/agent/evidence/{evidence_id}
 ```
 
-运行上限通过 `KNOWLEDGE_AGENT_*` 环境变量配置；每次运行会固化自己的候选数、语境解析、证据上下文、输出和调用次数预算。多轮语境窗口先取知识库配置与 Ollama 实际 runner 上下文的较小值，再按本轮完整提示的估算 Token 从 `KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MIN_BUDGET_TOKENS` 起，以 `*_GROWTH_STEP_TOKENS` 为阶梯扩容；动态上限同时受 `*_MAX_BUDGET_TOKENS` 和 `*_MODEL_RATIO` 约束。默认在 qwen3.6 的 262144 Token runner 上按需使用 8192～32768 Token，完整历史能放入动态窗口时不会提前压缩，超过上限后才由 `KNOWLEDGE_AGENT_CONTEXT_RECENT_TOKEN_RATIO` 划分最近原始轮次与增量压缩空间，`KNOWLEDGE_AGENT_CONTEXT_SUMMARY_MAX_TOKENS` 限制滚动摘要。旧的 `KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_BUDGET_TOKENS` 仅作为兼容配置：当新最大值未设置时继续充当上限。`*_MIN_RECENT_TURNS`、`*_RECENT_MAX_MESSAGES`、`*_BOOTSTRAP_MESSAGES` 和字符上限只承担极端输入及数据库读取保护，不再决定日常压缩时机。模型上下文上限低于 `KNOWLEDGE_AGENT_MIN_CONTEXT_TOKENS` 的知识库不会进入问答队列。无答案判断不会采用相对排序分单独决策，而是联合交叉编码器绝对相关度、Embedding 相似度和问题要点覆盖率；三个门槛可分别通过 `KNOWLEDGE_AGENT_WEAK_RERANK_THRESHOLD`、`KNOWLEDGE_AGENT_WEAK_SEMANTIC_THRESHOLD` 和 `KNOWLEDGE_AGENT_WEAK_ASPECT_THRESHOLD` 校准。
+运行上限通过 `KNOWLEDGE_AGENT_*` 环境变量配置；每次运行会固化自己的候选数、语境解析、证据上下文、输出和调用次数预算。多轮语境窗口先取知识库配置与 Ollama 实际 runner 上下文的较小值，再按本轮完整提示的估算 Token 从 `KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_MIN_BUDGET_TOKENS` 起，以 `*_GROWTH_STEP_TOKENS` 为阶梯扩容；动态上限同时受 `*_MAX_BUDGET_TOKENS` 和 `*_MODEL_RATIO` 约束。默认在 qwen3.8:27b 的 262144 Token runner 上按需使用 8192～32768 Token，完整历史能放入动态窗口时不会提前压缩，超过上限后才由 `KNOWLEDGE_AGENT_CONTEXT_RECENT_TOKEN_RATIO` 划分最近原始轮次与增量压缩空间，`KNOWLEDGE_AGENT_CONTEXT_SUMMARY_MAX_TOKENS` 限制滚动摘要。旧的 `KNOWLEDGE_AGENT_CONTEXT_RESOLUTION_BUDGET_TOKENS` 仅作为兼容配置：当新最大值未设置时继续充当上限。`*_MIN_RECENT_TURNS`、`*_RECENT_MAX_MESSAGES`、`*_BOOTSTRAP_MESSAGES` 和字符上限只承担极端输入及数据库读取保护，不再决定日常压缩时机。模型上下文上限低于 `KNOWLEDGE_AGENT_MIN_CONTEXT_TOKENS` 的知识库不会进入问答队列。无答案判断不会采用相对排序分单独决策，而是联合交叉编码器绝对相关度、Embedding 相似度和问题要点覆盖率；三个门槛可分别通过 `KNOWLEDGE_AGENT_WEAK_RERANK_THRESHOLD`、`KNOWLEDGE_AGENT_WEAK_SEMANTIC_THRESHOLD` 和 `KNOWLEDGE_AGENT_WEAK_ASPECT_THRESHOLD` 校准。
 
 问答范围由前后两道独立门禁控制。身份、能力、使用方式和简单问候等智能体交互问题先由高精度通用规则识别；其余问题在完成多轮指代补全后，由当前项目 LLM 结合知识库名称、说明和文档范围做一次只分类、不作答的检索前语义路由。高置信度的知识库外问题直接返回范围说明，不再执行召回和 reranker；低置信度、范围资料不足或分类异常时保留检索，以免降低知识问题召回率。进入检索的问题在召回与重排后还要确认问题和证据属于同一知识范围：强交叉编码器相关度，或同时满足语义相关与问题要点覆盖的结果可直接通过；边界结果再次由结构化模型核验。无关或无直接支持的问题不进入事实回答模型，也不使用通用知识补答。检索前跳过门槛由 `KNOWLEDGE_AGENT_INPUT_SCOPE_CONFIDENCE_THRESHOLD` 配置，证据范围门槛与 Token 上限通过 `KNOWLEDGE_AGENT_SCOPE_*` 配置。
 

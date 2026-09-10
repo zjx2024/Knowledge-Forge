@@ -103,10 +103,20 @@ def test_output_rail_requires_citations_only_for_knowledge_claims():
         route="agent_meta", sufficiency_state="not_required",
         answer_text="我是知识库问答智能体。", claim_count=0, citation_count=0,
     )
+    uncertain = output_policy_decision(
+        route="uncertain", sufficiency_state="insufficient",
+        answer_text="当前无法可靠判断问题范围。", claim_count=0, citation_count=0,
+    )
+    degraded = output_policy_decision(
+        route="service_degraded", sufficiency_state="insufficient",
+        answer_text="模型服务暂时不可用。", claim_count=0, citation_count=0,
+    )
 
     assert grounded.action == "allow"
     assert uncited.action == "deny"
     assert capability.action == "allow"
+    assert uncertain.action == "allow"
+    assert degraded.action == "allow"
 
 
 def test_policy_ledger_upserts_stable_checkpoints():

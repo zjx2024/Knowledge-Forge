@@ -83,6 +83,8 @@ _QUERY_SCOPE_LABELS = {
     "agent_meta": "智能体角色或能力问题",
     "out_of_scope": "不属于当前知识库",
     "unsupported": "当前知识库没有直接支持",
+    "uncertain": "无法可靠判断问题范围",
+    "service_degraded": "模型服务异常",
 }
 
 _POLICY_LAYER_LABELS = {
@@ -114,6 +116,8 @@ _POLICY_ROUTE_LABELS = {
     "evidence_insufficient": "证据不足",
     "out_of_scope": "知识库范围外",
     "unsupported": "知识库未直接覆盖",
+    "uncertain": "问题范围未确认",
+    "service_degraded": "模型服务异常",
     "controlled_refusal": "证据不足说明",
     "read_only_internal_tool": "受控内部工具",
 }
@@ -125,6 +129,7 @@ _POLICY_REASON_LABELS = {
     "model_confirmed_possible_knowledge_scope": "本地模型确认问题可能属于当前知识库",
     "model_detected_agent_meta_before_retrieval": "检索前判定为智能体角色或能力问题",
     "model_detected_out_of_scope_before_retrieval": "检索前判定问题不属于当前知识库",
+    "short_topic_requires_evidence_check": "短主题先检索，再根据实际证据判断是否相关",
     "input_scope_not_confident_to_skip_retrieval": "范围判断把握不足，保留知识检索以避免漏答",
     "knowledge_scope_profile_unavailable": "知识库范围资料不足，保留知识检索",
     "input_scope_model_unavailable_or_invalid": "检索前范围判断异常，保留检索并由后续证据门禁复核",
@@ -146,6 +151,10 @@ _POLICY_REASON_LABELS = {
     "model_found_no_direct_support": "本地模型未找到能够直接支持问题的证据",
     "no_knowledge_evidence": "没有取得可用于回答的知识证据",
     "scope_model_unavailable_or_invalid": "范围核验异常，已按失败关闭处理",
+    "scope_model_low_confidence": "范围模型置信度不足，需要澄清",
+    "scope_model_uncertain": "范围模型无法可靠判断问题归属",
+    "scope_service_unavailable": "范围判断模型暂时不可用",
+    "answer_service_unavailable": "回答模型暂时不可用，请稍后重试",
     "evidence_retryable": "证据只覆盖部分问题要点",
     "evidence_ambiguous": "现有证据支持的解释范围有限",
     "evidence_conflict": "检索证据之间存在冲突",
@@ -179,6 +188,8 @@ _EVIDENCE_TYPE_LABELS = {
 }
 
 _REASON_LABELS = {
+    "short_topic_exact_lexical_support": "短主题在已召回证据中有直接词面依据",
+    "short_topic_requires_evidence_check": "短主题先检索，再根据实际证据判断是否相关",
     "default_fact_lookup": "没有检测到更强的特殊问法，采用通用事实检索计划",
     "safe_family_floors": "每类证据都保留最低召回额度，避免单一路径漏召回",
     "balanced_fallback": "问题类型不明确，使用均衡检索配额",
@@ -511,6 +522,10 @@ def _stage_detail(stage: str, step: dict[str, Any], run: dict[str, Any]) -> str:
             return (
                 "返回智能体角色与能力说明，不执行知识库事实回答"
                 if route == "agent_meta" else
+                "模型服务暂时不可用，未生成知识库事实回答"
+                if route == "service_degraded" else
+                "问题范围无法可靠确认，未生成知识库事实回答"
+                if route == "uncertain" else
                 "说明当前知识库的回答边界，不使用通用知识补答"
             )
         claims = _integer(output.get("claim_count"))
@@ -547,6 +562,8 @@ def _tool_detail(
     if name in {"scope.route.policy", "scope.evidence_alignment"}:
         route = str(response.get("route") or "")
         label = _QUERY_SCOPE_LABELS.get(route, "范围未确认")
+        if str(tool.get("status") or "") == "degraded":
+            return "范围判断模型暂时不可用，已记录为服务异常"
         method = str(response.get("method") or "")
         method_label = {
             "deterministic_interaction_intent": "确定性交互意图规则",
@@ -588,6 +605,8 @@ def _tool_detail(
             return "；".join(parts)
         return f"重排服务降级，使用可审计的融合排序处理 {count} 条候选"
     if name == "answer.ollama_json":
+        if str(tool.get("status") or "") == "degraded":
+            return "回答模型服务暂时不可用，未生成知识库事实回答"
         model = _clip(request.get("model"), 70)
         selected = _integer(request.get("selected_evidence"))
         claims = _integer(response.get("claim_count"))
@@ -599,6 +618,10 @@ def _tool_detail(
         return (
             "按统一模板说明智能体角色与能力，未执行知识检索"
             if route == "agent_meta" else
+            "说明模型服务异常，未生成知识库事实回答"
+            if route == "service_degraded" else
+            "说明问题范围未确认，未生成知识库事实回答"
+            if route == "uncertain" else
             "按统一范围策略说明不作答，未使用通用知识补充"
         )
     return "执行受控内部工具"
@@ -818,6 +841,10 @@ def _tool_facts(
             )),
             _detail("形成陈述", f"{_integer(response.get('claim_count'))} 项"),
             _detail("是否拒答", _yes_no(response.get("refused"))),
+            _detail("执行结果", (
+                "模型服务暂时不可用，未生成回答"
+                if str(tool.get("status") or "") == "degraded" else ""
+            )),
         )
     if name == "answer.scope_policy":
         route = str(response.get("scope_route") or request.get("scope_route") or "")
@@ -826,6 +853,12 @@ def _tool_facts(
             _detail("事实回答模型", "未调用"),
             _detail("形成知识陈述", "0 项"),
             _detail("引用", "0 个"),
+            _detail("执行结果", (
+                "模型服务暂时不可用，请稍后重试"
+                if route == "service_degraded" else
+                "需要补充对象或场景后重试"
+                if route == "uncertain" else ""
+            )),
         )
     return _details(
         _detail("内部工具", name or "受控内部工具"),
@@ -931,7 +964,12 @@ def _decisions(run: dict[str, Any]) -> list[dict[str, str]]:
                 f"范围门禁判定为{_QUERY_SCOPE_LABELS.get(route, '未确认')}；"
                 + (
                     "仅在当前知识库内组织有依据的回答"
-                    if route == "knowledge" else "不会用无关证据或通用知识补答"
+                    if route == "knowledge" else
+                    "当前无法可靠确认范围，需要补充对象或场景"
+                    if route == "uncertain" else
+                    "模型服务暂时不可用，未生成事实回答"
+                    if route == "service_degraded" else
+                    "不会用无关证据或通用知识补答"
                 )
             ),
         })
@@ -1087,13 +1125,19 @@ def _analysis_sections(run: dict[str, Any]) -> list[dict[str, Any]]:
                     "model_evidence_alignment": "本地模型结构化语义核验",
                     "no_evidence": "未取得可用知识证据",
                     "fail_closed": "核验异常后失败关闭",
+                    "service_degraded": "范围判断服务异常",
                 }.get(method, "受控范围策略")),
                 _detail("调用范围模型", _yes_no(query_scope.get("model_used"))),
                 _detail("直接相关证据", f"{len(query_scope.get('matched_evidence_ids') or [])} 条"),
                 _detail("置信度", _percent(query_scope.get("confidence"))),
                 _detail("回答边界", (
                     "只允许依据当前知识库回答"
-                    if route == "knowledge" else "不回答知识库范围外的问题"
+                    if route == "knowledge" else
+                    "暂不生成事实回答，待服务恢复后重试"
+                    if route == "service_degraded" else
+                    "暂不生成事实回答，请补充问题范围"
+                    if route == "uncertain" else
+                    "不回答知识库范围外的问题"
                 )),
             ),
             str(step_by_type.get("checking_scope", {}).get("status") or "completed"),
@@ -1300,7 +1344,9 @@ def _analysis_sections(run: dict[str, Any]) -> list[dict[str, Any]]:
         scope_route = str(answer_response.get("scope_route") or "")
         refused = bool(
             answer_response.get("refused")
-            or scope_route in {"out_of_scope", "unsupported"}
+            or scope_route in {
+                "out_of_scope", "unsupported", "uncertain", "service_degraded",
+            }
         )
         direct_scope = bool(scope_route)
         add(
@@ -1309,6 +1355,10 @@ def _analysis_sections(run: dict[str, Any]) -> list[dict[str, Any]]:
                 (
                     "系统返回智能体角色与能力说明，没有执行知识库事实生成。"
                     if scope_route == "agent_meta" else
+                    "模型服务暂时不可用，系统没有生成知识库事实回答。"
+                    if scope_route == "service_degraded" else
+                    "问题范围无法可靠确认，系统没有生成知识库事实回答。"
+                    if scope_route == "uncertain" else
                     "系统说明当前知识库的回答边界，没有使用通用知识补答。"
                 )
                 if direct_scope else

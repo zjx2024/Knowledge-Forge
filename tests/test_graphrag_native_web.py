@@ -1361,15 +1361,15 @@ def test_human_facing_status_page_uses_the_common_product_shell():
     assert ".status-page{" in web.CSS
 
 
-def test_new_project_form_defaults_to_qwen36(monkeypatch):
+def test_new_project_form_defaults_to_qwen38(monkeypatch):
     service = _Service()
     service.db.list_models = lambda: [
         {"name": "qwen3:0.6b", "model_type": "llm"},
-        {"name": "qwen3.6:latest", "model_type": "llm"},
+        {"name": "qwen3.8:27b", "model_type": "llm"},
         {"name": "bge-m3:latest", "model_type": "embedding"},
     ]
     monkeypatch.setattr(web, "SERVICE", service)
-    monkeypatch.setattr(web.Config, "default_llm_model", "qwen3.6:latest")
+    monkeypatch.setattr(web.Config, "default_llm_model", "qwen3.8:27b")
 
     page = web.render_home_page()
     options = re.search(
@@ -1378,7 +1378,7 @@ def test_new_project_form_defaults_to_qwen36(monkeypatch):
 
     assert options is not None
     assert (
-        '<option value="qwen3.6:latest" selected>qwen3.6:latest</option>'
+        '<option value="qwen3.8:27b" selected>qwen3.8:27b</option>'
         in options.group(1)
     )
     assert '<option value="qwen3:0.6b" selected>' not in options.group(1)

@@ -195,7 +195,7 @@ class Config:
         0, min(2, int(os.getenv("ENTITY_ENDPOINT_GLEANING_ROUNDS", "1")))
     )
     image_analysis_max_output_tokens = int(os.getenv("IMAGE_ANALYSIS_MAX_OUTPUT_TOKENS", "2048"))
-    default_llm_model = os.getenv("DEFAULT_LLM_MODEL", "qwen3.6:latest")
+    default_llm_model = os.getenv("DEFAULT_LLM_MODEL", "qwen3.8:27b")
     default_embedding_model = os.getenv("DEFAULT_EMBEDDING_MODEL", "bge-m3:latest")
     # Native GraphRAG Standard indexing is an isolated long-running job.  The
     # budget is execution control only; it never changes GraphRAG algorithms or

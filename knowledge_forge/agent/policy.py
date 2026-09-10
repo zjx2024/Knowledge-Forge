@@ -301,8 +301,8 @@ def output_policy_decision(
     citations = max(0, int(citation_count))
     has_text = bool(sanitize_unicode_text(str(answer_text or "")).strip())
     no_fact_routes = {
-        "agent_meta", "out_of_scope", "unsupported", "clarify",
-        "controlled_refusal",
+        "agent_meta", "out_of_scope", "unsupported", "uncertain",
+        "service_degraded", "clarify", "controlled_refusal",
     }
     if route_name in no_fact_routes:
         allowed = has_text and claims == 0 and citations == 0

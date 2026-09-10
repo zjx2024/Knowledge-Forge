@@ -4,7 +4,9 @@ from knowledge_forge.agent.contracts import EvidenceItem, SnapshotRef, SourceRef
 from knowledge_forge.agent.scope import (
     assess_input_query_scope,
     assess_query_scope,
+    is_short_bare_topic,
     preflight_query_scope,
+    scope_boundary_payload,
 )
 from knowledge_forge.agent.sufficiency import SufficiencyResult
 
@@ -132,6 +134,39 @@ def test_semantic_input_scope_failure_preserves_recall_by_continuing_to_retrieva
     assert decision.model_error
 
 
+def test_short_bare_topic_always_uses_retrieval_first_for_scope():
+    class NeverCalled:
+        def json_chat(self, **_values):  # pragma: no cover - failure sentinel
+            raise AssertionError("short topics must not be rejected from profile metadata")
+
+    assert is_short_bare_topic("草莓") is True
+    assert is_short_bare_topic("越野跑") is True
+    assert is_short_bare_topic("什么是草莓？") is True
+    assert is_short_bare_topic("介绍草莓") is True
+    assert is_short_bare_topic("其他方法有哪些？") is False
+    assert is_short_bare_topic("它的作用") is False
+
+    decision = assess_input_query_scope(
+        ollama=NeverCalled(),
+        project={
+            "name": "联邦学习资料",
+            "description": "医学领域中的联邦学习研究资料",
+            "llm_model": "qwen3.6:latest",
+            "model_max_tokens": 8192,
+        },
+        query="草莓",
+        knowledge_scope={
+            "documents": [{"filename": "联邦学习在医学领域中的应用.pdf"}],
+        },
+    )
+
+    assert decision.route == "knowledge"
+    assert decision.confidence == 0.0
+    assert decision.method == "short_topic_retrieval_first"
+    assert decision.reason_code == "short_topic_requires_evidence_check"
+    assert decision.model_used is False
+
+
 def test_strong_cross_encoder_alignment_skips_scope_model():
     class NeverCalled:
         def json_chat(self, **_kwargs):  # pragma: no cover - failure sentinel
@@ -149,6 +184,41 @@ def test_strong_cross_encoder_alignment_skips_scope_model():
     assert decision.route == "knowledge"
     assert decision.method == "strong_retrieval_signals"
     assert decision.model_used is False
+    assert decision.matched_evidence_ids == (evidence.evidence_id,)
+
+
+def test_short_abbreviation_with_exact_compound_token_skips_scope_model():
+    class NeverCalled:
+        def json_chat(self, **_kwargs):  # pragma: no cover - failure sentinel
+            raise AssertionError("exact short-topic evidence must skip scope model")
+
+    evidence = EvidenceItem.create(
+        run_id="scope-run", evidence_type="chunk", project_id=7,
+        strategy="knowledge_forge",
+        snapshot_ref=SnapshotRef(
+            strategy="knowledge_forge", identifier="kf:scope",
+            source_hash="source-scope", generation=1, graph_available=True,
+        ),
+        record_key="fl-chunk", title="FL-QSAR 架构",
+        content="该架构基于联邦学习，用于药物发现。",
+        source_refs=[SourceRef.from_dict({
+            "document_id": 3, "revision_id": "revision-1",
+            "filename": "federated-learning.pdf", "pages": [4],
+        })],
+        retrieval_channels=["chunk_lexical"],
+        raw_scores={"chunk_lexical": 0.4},
+    )
+    decision = assess_query_scope(
+        ollama=NeverCalled(),
+        project={"llm_model": "qwen3.6:latest", "model_max_tokens": 8192},
+        query="FL是什么", evidence=[evidence],
+        sufficiency=_sufficiency(
+            relevance=0.28, semantic=0.42, aspect=1.0, state="sufficient",
+        ),
+    )
+
+    assert decision.route == "knowledge"
+    assert decision.method == "short_topic_exact_lexical_alignment"
     assert decision.matched_evidence_ids == (evidence.evidence_id,)
 
 
@@ -189,7 +259,7 @@ def test_borderline_alignment_uses_structured_scope_model_and_does_not_answer():
     assert decision.matched_evidence_ids == ()
 
 
-def test_scope_model_failure_fails_closed():
+def test_scope_model_failure_is_reported_as_retryable_service_degradation():
     class BrokenModel:
         def json_chat(self, **_values):
             raise RuntimeError("model unavailable")
@@ -202,8 +272,11 @@ def test_scope_model_failure_fails_closed():
         sufficiency=_sufficiency(relevance=0.01, semantic=0.50, aspect=0.0),
     )
 
-    assert decision.route == "unsupported"
-    assert decision.method == "fail_closed"
+    assert decision.route == "service_degraded"
+    assert decision.method == "service_degraded"
+    assert decision.reason_code == "scope_service_unavailable"
+    assert decision.retryable is True
+    assert decision.degraded_components == ("ollama",)
     assert decision.model_error
 
 
@@ -224,5 +297,67 @@ def test_post_retrieval_scope_does_not_reclassify_unrelated_question_as_agent_me
         sufficiency=_sufficiency(relevance=0.01, semantic=0.1, aspect=0.0),
     )
 
-    assert decision.route == "unsupported"
-    assert decision.method == "fail_closed"
+    assert decision.route == "service_degraded"
+    assert decision.method == "service_degraded"
+
+
+def test_low_confidence_scope_result_is_uncertain_instead_of_a_hard_rejection():
+    class ScopeModel:
+        def json_chat(self, **_values):
+            return {
+                "route": "out_of_scope",
+                "confidence": 0.42,
+                "matched_evidence_indices": [],
+            }
+
+    decision = assess_query_scope(
+        ollama=ScopeModel(),
+        project={"llm_model": "qwen3.6:latest", "model_max_tokens": 8192},
+        query="一个边界不清的问题",
+        evidence=[_evidence()],
+        sufficiency=_sufficiency(relevance=0.01, semantic=0.1, aspect=0.0),
+    )
+
+    assert decision.route == "uncertain"
+    assert decision.reason_code == "scope_model_low_confidence"
+    assert decision.model_used is True
+
+
+def test_model_can_explicitly_report_an_ambiguous_scope():
+    class ScopeModel:
+        def json_chat(self, **_values):
+            return {
+                "route": "uncertain",
+                "confidence": 0.91,
+                "matched_evidence_indices": [],
+            }
+
+    decision = assess_query_scope(
+        ollama=ScopeModel(),
+        project={"llm_model": "qwen3.6:latest", "model_max_tokens": 8192},
+        query="这个问题可能有多个解释",
+        evidence=[_evidence()],
+        sufficiency=_sufficiency(relevance=0.01, semantic=0.1, aspect=0.0),
+    )
+
+    assert decision.route == "uncertain"
+    assert decision.reason_code == "scope_model_uncertain"
+
+
+def test_scope_boundary_payload_explains_each_non_answer_route():
+    project = {"name": "联邦学习资料", "knowledge_language": "zh-CN"}
+
+    assert "无关" in scope_boundary_payload(
+        project, "草莓", route="out_of_scope",
+    )["answer"]
+    assert "没有找到能直接支持" in scope_boundary_payload(
+        project, "未覆盖的问题", route="unsupported",
+    )["answer"]
+    assert "无法可靠判断" in scope_boundary_payload(
+        project, "边界问题", route="uncertain",
+    )["answer"]
+    degraded = scope_boundary_payload(
+        project, "当前问题", route="service_degraded",
+    )
+    assert degraded["answerability"] == "degraded"
+    assert "模型服务暂时不可用" in degraded["answer"]

@@ -601,3 +601,80 @@ def test_workflow_refuses_semantically_unrelated_question_after_scope_check():
     assert "巴黎" not in service.db.completed["answer_text"]
     assert all(not row["selected"] for row in service.db.evidence)
     assert service.db.run["metadata"]["query_scope"]["route"] == "out_of_scope"
+
+
+def test_workflow_publishes_scope_service_degradation_without_calling_answer_model():
+    class WeakReranker:
+        def rerank(self, _query, items):
+            for item in items:
+                item.rerank_score = 0.01
+            return RerankDiagnostics(True, "bge-reranker-v2-m3", len(items), 3)
+
+    class BrokenModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def json_chat(self, **_values):
+            self.calls += 1
+            raise RuntimeError("scope service unavailable")
+
+    service, workflow, _adapter = _workflow()
+    model = BrokenModel()
+    service.ollama = model
+    workflow.ollama = model
+    workflow.reranker = WeakReranker()
+
+    workflow.run("agent-run-1")
+
+    assert model.calls == 1
+    assert service.db.terminated is None
+    assert service.db.completed is not None
+    assert service.db.completed["effective_mode"] == "service_degraded"
+    assert service.db.completed["answer_json"]["query_scope"]["route"] == "service_degraded"
+    assert "模型服务暂时不可用" in service.db.completed["answer_text"]
+    assert service.db.run["metadata"]["query_scope"]["retryable"] is True
+    scope_tools = [
+        item for item in service.db.tools.values()
+        if item["tool_name"] == "scope.evidence_alignment"
+    ]
+    assert scope_tools[0]["status"] == "degraded"
+    assert not any(
+        item["tool_name"] == "answer.ollama_json"
+        for item in service.db.tools.values()
+    )
+
+
+def test_workflow_turns_answer_model_failure_into_retryable_service_response():
+    class BrokenAnswerModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def json_chat(self, **_values):
+            self.calls += 1
+            raise RuntimeError("answer service unavailable")
+
+    service, workflow, adapter = _workflow()
+    model = BrokenAnswerModel()
+    service.ollama = model
+    workflow.ollama = model
+
+    workflow.run("agent-run-1")
+
+    assert model.calls == 1
+    assert service.db.terminated is None
+    assert service.db.completed is not None
+    assert service.db.completed["effective_mode"] == "service_degraded"
+    assert service.db.completed["answer_json"]["answerability"] == "degraded"
+    assert service.db.completed["answer_json"]["query_scope"]["route"] == "service_degraded"
+    assert "模型服务暂时不可用" in service.db.completed["answer_text"]
+    assert adapter.current_checks == 1
+    answer_tools = [
+        item for item in service.db.tools.values()
+        if item["tool_name"] == "answer.ollama_json"
+    ]
+    assert answer_tools[0]["status"] == "degraded"
+    assert any(
+        item["tool_name"] == "answer.scope_policy"
+        and item["status"] == "completed"
+        for item in service.db.tools.values()
+    )

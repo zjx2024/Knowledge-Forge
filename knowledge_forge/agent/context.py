@@ -29,7 +29,11 @@ from .policy import (
     input_policy_decision,
     skipped_policy_decision,
 )
-from .scope import assess_input_query_scope, preflight_query_scope
+from .scope import (
+    assess_input_query_scope,
+    is_short_bare_topic,
+    preflight_query_scope,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -66,7 +70,6 @@ MULTIPLE_REFERENT_PATTERN = re.compile(
     r"(?:、|，|,|\s(?:and|or|versus|vs\.?|以及)\s|和|与)",
     re.IGNORECASE,
 )
-
 CONTEXT_RESOLUTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -826,6 +829,28 @@ class ConversationContextGraph:
         )
         english = str(state.get("knowledge_language") or "").lower() == "en"
 
+        # A short bare topic is already a usable retrieval query.  Do not
+        # spend a model generation deciding that it is independent merely
+        # because the thread has older messages.  Compaction remains an
+        # exception: its summary must still be generated before the context
+        # watermark can advance.
+        if (
+            is_short_bare_topic(question)
+            and not compact
+            and not bool(state.get("token_budget_triggered"))
+        ):
+            return {
+                "dependency": "independent",
+                "standalone_question": question,
+                "resolved_references": [],
+                "referenced_terms": [],
+                "clarification_question": "",
+                "context_used": False,
+                "model_used": False,
+                "model_error": "",
+                "branch": "ready",
+            }
+
         if not recent and not compact and not previous_summary:
             if int(state.get("history_message_count") or 0) > 0:
                 return {
@@ -906,17 +931,18 @@ class ConversationContextGraph:
                 state.get("run_id"), type(exc).__name__,
             )
             return {
-                "dependency": "ambiguous",
+                # A failed context model is not evidence of ambiguity.  Keep
+                # the user's original query and let the independent scope
+                # gate decide whether it belongs to this knowledge base.
+                "dependency": "independent",
                 "standalone_question": question,
                 "resolved_references": [],
                 "referenced_terms": [],
-                "clarification_question": _context_failure_clarification(
-                    english=english,
-                ),
+                "clarification_question": "",
                 "context_used": False,
                 "model_used": False,
                 "model_error": f"{type(exc).__name__}: {exc}"[:1000],
-                "branch": "clarify",
+                "branch": "ready",
             }
 
         dependency = str(

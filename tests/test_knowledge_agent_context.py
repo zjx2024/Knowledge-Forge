@@ -476,7 +476,7 @@ def test_singular_reference_to_multiple_candidates_requires_clarification():
     assert result.standalone_question == "它的稳定性如何？"
 
 
-def test_context_model_failure_does_not_guess_from_domain_word_lists():
+def test_context_model_failure_preserves_original_question_for_scope_routing():
     service = _ContextService()
     service.ollama = _FailingContextModel()
     service.db.histories["run-model-failure"] = [
@@ -493,10 +493,77 @@ def test_context_model_failure_does_not_guess_from_domain_word_lists():
             run=_run("run-model-failure", question), project=PROJECT,
         )
 
-        assert result.needs_clarification is True
+        assert result.needs_clarification is False
+        assert result.dependency == "independent"
+        assert result.standalone_question == question
+        assert result.branch == "ready"
+        assert result.question_route == "knowledge"
         assert result.model_used is False
-        assert "补写为不依赖上一轮指代的完整问题" in result.clarification_question
         assert "RuntimeError" in result.model_error
+
+
+def test_short_bare_topics_skip_context_model_even_with_history():
+    service = _ContextService()
+    service.ollama = _FailingContextModel()
+    service.db.histories["run-short-topic"] = [
+        _message(1, "user", "介绍联邦学习。"),
+        _message(2, "assistant", "联邦学习支持多方协同训练。"),
+    ]
+    graph = ConversationContextGraph(
+        service,
+        checkpointer_factory=lambda: nullcontext(InMemorySaver()),
+    )
+
+    for question in ("草莓", "越野跑"):
+        result = graph.resolve(
+            run=_run("run-short-topic", question), project=PROJECT,
+        )
+
+        assert result.dependency == "independent"
+        assert result.standalone_question == question
+        assert result.needs_clarification is False
+        assert result.model_used is False
+        assert result.model_error == ""
+    assert service.ollama.calls == []
+
+
+def test_short_bare_topic_skips_pre_retrieval_scope_router():
+    service = _ContextService()
+    service.ollama = _FailingContextModel()
+    service.db.histories["run-short-topic-scope"] = [
+        _message(1, "user", "介绍联邦学习。"),
+        _message(2, "assistant", "联邦学习支持多方协同训练。"),
+    ]
+    service.db.scopes["run-short-topic-scope"] = {
+        "document_count": 1,
+        "documents": [{
+            "document_id": 3,
+            "filename": "联邦学习在医学领域中的应用.pdf",
+        }],
+    }
+    graph = ConversationContextGraph(
+        service,
+        checkpointer_factory=lambda: nullcontext(InMemorySaver()),
+    )
+    project = {
+        **PROJECT,
+        "name": "联邦学习资料",
+        "description": "医学领域中的联邦学习研究资料",
+    }
+
+    result = graph.resolve(
+        run=_run("run-short-topic-scope", "草莓"), project=project,
+    )
+
+    assert result.question_route == "knowledge"
+    assert result.branch == "ready"
+    assert result.scope_preflight["route"] == "knowledge"
+    assert result.scope_preflight["method"] == "short_topic_retrieval_first"
+    assert result.scope_preflight["reason_code"] == (
+        "short_topic_requires_evidence_check"
+    )
+    assert result.scope_preflight["model_used"] is False
+    assert service.ollama.calls == []
 
 
 def test_no_history_pronoun_guard_does_not_confuse_common_words():

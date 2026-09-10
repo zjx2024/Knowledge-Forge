@@ -10,18 +10,43 @@ from .contracts import EvidenceItem
 
 
 STOPWORDS = frozenset({
-    "什么", "如何", "为什么", "是否", "哪些", "这个", "那个", "请问", "介绍",
+    "什么", "什么是", "是什么", "何为", "是何", "定义", "含义", "简介",
+    "如何", "为什么", "是否", "哪些", "这个", "那个", "请问", "介绍", "说明", "解释",
     "the", "a", "an", "is", "are", "what", "how", "why", "which", "please",
 })
 
 
 def terms(text: str) -> set[str]:
     lowered = str(text or "").lower()
+    # Remove generic question/introductory surfaces before making Chinese
+    # bigrams.  Otherwise strings such as “什么是草莓” create artificial
+    # tokens (“么是”, “是草”) and understate topic coverage.
+    normalized = lowered
+    for stopword in sorted(STOPWORDS, key=len, reverse=True):
+        if re.fullmatch(r"[a-z0-9_]+", stopword):
+            normalized = re.sub(
+                rf"(?<![a-z0-9_]){re.escape(stopword)}(?![a-z0-9_])",
+                " ", normalized,
+            )
+        else:
+            normalized = normalized.replace(stopword, " ")
     words = {
-        value for value in re.findall(r"[a-z0-9_][a-z0-9_.:/+-]{1,}|[\u3400-\u9fff]{2,}", lowered)
+        value for value in re.findall(
+            r"[a-z0-9_][a-z0-9_.:/+-]{1,}|[\u3400-\u9fff]{2,}",
+            normalized,
+        )
         if value not in STOPWORDS
     }
-    cjk = re.sub(r"[^\u3400-\u9fff]", "", lowered)
+    # Keep the compound token for ranking, but also expose its meaningful
+    # Latin subtokens so an abbreviation remains visible in “IOP-FL” and
+    # “FL-QSAR”.  This is language- and domain-independent.
+    for value in tuple(words):
+        if re.fullmatch(r"[a-z0-9_][a-z0-9_.:/+-]{1,}", value):
+            words.update(
+                part for part in re.split(r"[^a-z0-9]+", value)
+                if len(part) >= 2 and part not in STOPWORDS
+            )
+    cjk = re.sub(r"[^\u3400-\u9fff]", "", normalized)
     words.update(cjk[index:index + 2] for index in range(max(0, len(cjk) - 1)))
     return {value for value in words if value and value not in STOPWORDS}
 
